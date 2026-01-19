@@ -1,0 +1,152 @@
+diff --git a/index.d.ts b/index.d.ts
+index e6e1eb5..8fae036 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -665,16 +665,16 @@ type ExecaCommonReturnValue<IsSync extends boolean = boolean, OptionsType extend
+ 	timedOut: boolean;
+ 
+ 	/**
+-	Whether the process was terminated using either:
+-	- `childProcess.kill()`.
+-	- A signal sent by another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
++	Whether the process was terminated by a signal (like `SIGTERM`) sent by either:
++	- The current process.
++	- Another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
+ 	*/
+ 	isTerminated: boolean;
+ 
+ 	/**
+-	The name of the signal (like `SIGFPE`) that terminated the process using either:
+-	- `childProcess.kill()`.
+-	- A signal sent by another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
++	The name of the signal (like `SIGTERM`) that terminated the process, sent by either:
++	- The current process.
++	- Another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
+ 
+ 	If a signal terminated the process, this property is defined and included in the error message. Otherwise it is `undefined`.
+ 	*/
+diff --git a/index.js b/index.js
+index 728c0ad..66e2a30 100644
+--- a/index.js
++++ b/index.js
+@@ -161,7 +161,8 @@ const handlePromise = async ({spawned, options, stdioStreamsGroups, command, esc
+ 	const context = {timedOut: false};
+ 
+ 	const [
+-		[exitCode, signal, error],
++		error,
++		[, exitCode, signal],
+ 		stdioResults,
+ 		allResult,
+ 	] = await getSpawnedResult({spawned, options, context, stdioStreamsGroups, controller});
+diff --git a/lib/kill.js b/lib/kill.js
+index ae10671..cb18384 100644
+--- a/lib/kill.js
++++ b/lib/kill.js
+@@ -47,7 +47,7 @@ export const normalizeForceKillAfterTimeout = forceKillAfterTimeout => {
+ const killAfterTimeout = async ({spawned, timeout, killSignal, context, controller}) => {
+ 	await setTimeout(timeout, undefined, {signal: controller.signal});
+ 	spawned.kill(killSignal);
+-	Object.assign(context, {timedOut: true, signal: killSignal});
++	context.timedOut = true;
+ 	throw new Error('Timed out');
+ };
+ 
+diff --git a/lib/stream.js b/lib/stream.js
+index 6192917..be27f9e 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -105,6 +105,29 @@ const cleanupStdioStreams = (customStreams, error) => {
+ 	}
+ };
+ 
++// Like `once()` except it never rejects, especially not on `error` event.
++const pEvent = (eventEmitter, eventName) => new Promise(resolve => {
++	eventEmitter.once(eventName, (...payload) => {
++		resolve([eventName, ...payload]);
++	});
++});
++
++const throwOnProcessError = async processErrorPromise => {
++	const [, error] = await processErrorPromise;
++	throw error;
++};
++
++// First the `spawn` event is emitted, then `exit`.
++// If the `error` event is emitted:
++//  - before `spawn`: `exit` is never emitted.
++//  - after `spawn`: `exit` is always emitted.
++// We only want to listen to `exit` if it will be emitted, i.e. if `spawn` has been emitted.
++// Therefore, the arguments order of `Promise.race()` is significant.
++const waitForFailedProcess = async (processSpawnPromise, processErrorPromise, processExitPromise) => {
++	const [eventName] = await Promise.race([processSpawnPromise, processErrorPromise]);
++	return eventName === 'spawn' ? processExitPromise : [];
++};
++
+ // Retrieve result of child process: exit code, signal, error, streams (stdout/stderr/all)
+ export const getSpawnedResult = async ({
+ 	spawned,
+@@ -113,6 +136,10 @@ export const getSpawnedResult = async ({
+ 	stdioStreamsGroups,
+ 	controller,
+ }) => {
++	const processSpawnPromise = pEvent(spawned, 'spawn');
++	const processErrorPromise = pEvent(spawned, 'error');
++	const processExitPromise = pEvent(spawned, 'exit');
++
+ 	const removeExitHandler = cleanupOnExit(spawned, cleanup, detached);
+ 	const customStreams = getCustomStreams(stdioStreamsGroups);
+ 
+@@ -123,11 +150,13 @@ export const getSpawnedResult = async ({
+ 	try {
+ 		return await Promise.race([
+ 			Promise.all([
+-				once(spawned, 'exit'),
++				undefined,
++				processExitPromise,
+ 				Promise.all(stdioPromises),
+ 				allPromise,
+ 				...customStreamsEndPromises,
+ 			]),
++			throwOnProcessError(processErrorPromise),
+ 			...throwOnCustomStreamsError(customStreams),
+ 			...throwIfStreamError(spawned.stdin),
+ 			...throwOnTimeout({spawned, timeout, killSignal, context, controller}),
+@@ -135,7 +164,8 @@ export const getSpawnedResult = async ({
+ 	} catch (error) {
+ 		spawned.kill();
+ 		const results = await Promise.all([
+-			[undefined, context.signal, error],
++			error,
++			waitForFailedProcess(processSpawnPromise, processErrorPromise, processExitPromise),
+ 			Promise.all(stdioPromises.map(stdioPromise => getBufferedData(stdioPromise, encoding))),
+ 			getBufferedData(allPromise, encoding),
+ 		]);
+diff --git a/readme.md b/readme.md
+index 89cb363..130f69f 100644
+--- a/readme.md
++++ b/readme.md
+@@ -438,17 +438,17 @@ Whether the process was canceled using the [`signal`](#signal-1) option.
+ 
+ Type: `boolean`
+ 
+-Whether the process was terminated using either:
+-- `childProcess.kill()`.
+-- A signal sent by another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
++Whether the process was terminated by a signal (like `SIGTERM`) sent by either:
++- The current process.
++- Another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
+ 
+ #### signal
+ 
+ Type: `string | undefined`
+ 
+-The name of the signal (like `SIGFPE`) that terminated the process using either:
+-- `childProcess.kill()`.
+-- A signal sent by another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
++The name of the signal (like `SIGTERM`) that terminated the process, sent by either:
++- The current process.
++- Another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
+ 
+ If a signal terminated the process, this property is defined and included in the error message. Otherwise it is `undefined`.
+ 

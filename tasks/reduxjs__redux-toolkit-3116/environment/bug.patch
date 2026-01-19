@@ -1,0 +1,319 @@
+diff --git a/packages/toolkit/src/query/apiTypes.ts b/packages/toolkit/src/query/apiTypes.ts
+index 2aa79929..3df10b27 100644
+--- a/packages/toolkit/src/query/apiTypes.ts
++++ b/packages/toolkit/src/query/apiTypes.ts
+@@ -45,7 +45,6 @@ export type Module<Name extends ModuleName> = {
+       | 'refetchOnMountOrArgChange'
+       | 'refetchOnFocus'
+       | 'refetchOnReconnect'
+-      | 'invalidationBehavior'
+       | 'tagTypes'
+     >,
+     context: ApiContext<Definitions>
+diff --git a/packages/toolkit/src/query/core/apiState.ts b/packages/toolkit/src/query/core/apiState.ts
+index 3b1d6624..dad155b3 100644
+--- a/packages/toolkit/src/query/core/apiState.ts
++++ b/packages/toolkit/src/query/core/apiState.ts
+@@ -254,7 +254,6 @@ export type ConfigState<ReducerPath> = RefetchConfigOptions & {
+ 
+ export type ModifiableConfigState = {
+   keepUnusedDataFor: number
+-  invalidationBehavior: 'delayed' | 'immediately'
+ } & RefetchConfigOptions
+ 
+ export type MutationState<D extends EndpointDefinitions> = {
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts b/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
+index 4334d4f8..e92c692d 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
+@@ -1,16 +1,8 @@
+-import {
+-  isAnyOf,
+-  isFulfilled,
+-  isRejected,
+-  isRejectedWithValue,
+-} from '../rtkImports'
++import { isAnyOf, isFulfilled, isRejectedWithValue } from '../rtkImports'
+ 
+-import type {
+-  EndpointDefinitions,
+-  FullTagDescription,
+-} from '../../endpointDefinitions'
++import type { FullTagDescription } from '../../endpointDefinitions'
+ import { calculateProvidedBy } from '../../endpointDefinitions'
+-import type { CombinedState, QueryCacheKey } from '../apiState'
++import type { QueryCacheKey } from '../apiState'
+ import { QueryStatus } from '../apiState'
+ import { calculateProvidedByThunk } from '../buildThunks'
+ import type {
+@@ -26,7 +18,6 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+   context,
+   context: { endpointDefinitions },
+   mutationThunk,
+-  queryThunk,
+   api,
+   assertTagType,
+   refetchQuery,
+@@ -38,13 +29,6 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+     isRejectedWithValue(mutationThunk)
+   )
+ 
+-  const isQueryEnd = isAnyOf(
+-    isFulfilled(mutationThunk, queryThunk),
+-    isRejected(mutationThunk, queryThunk)
+-  )
+-
+-  let pendingTagInvalidations: FullTagDescription<string>[] = []
+-
+   const handler: ApiMiddlewareInternalHandler = (action, mwApi) => {
+     if (isThunkActionWithTags(action)) {
+       invalidateTags(
+@@ -54,11 +38,12 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+           endpointDefinitions,
+           assertTagType
+         ),
+-        mwApi
++        mwApi,
++        internalState
+       )
+-    } else if (isQueryEnd(action)) {
+-      invalidateTags([], mwApi)
+-    } else if (api.util.invalidateTags.match(action)) {
++    }
++
++    if (api.util.invalidateTags.match(action)) {
+       invalidateTags(
+         calculateProvidedBy(
+           action.payload,
+@@ -68,37 +53,20 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+           undefined,
+           assertTagType
+         ),
+-        mwApi
++        mwApi,
++        internalState
+       )
+     }
+   }
+ 
+-  function hasPendingRequests(state: CombinedState<EndpointDefinitions, string, string>) {
+-    for (const key in state.queries) {
+-      if (state.queries[key]?.status === QueryStatus.pending) return true;
+-    }
+-    for (const key in state.mutations) {
+-      if (state.mutations[key]?.status === QueryStatus.pending) return true;
+-    }
+-    return false;
+-  }
+-
+   function invalidateTags(
+-    newTags: readonly FullTagDescription<string>[],
+-    mwApi: SubMiddlewareApi
++    tags: readonly FullTagDescription<string>[],
++    mwApi: SubMiddlewareApi,
++    internalState: InternalMiddlewareState
+   ) {
+     const rootState = mwApi.getState()
+-    const state = rootState[reducerPath]
+-
+-    pendingTagInvalidations.push(...newTags)
+ 
+-    if (state.config.invalidationBehavior === 'delayed' && hasPendingRequests(state)) {
+-      return
+-    }
+-
+-    const tags = pendingTagInvalidations
+-    pendingTagInvalidations = []
+-    if (tags.length === 0) return
++    const state = rootState[reducerPath]
+ 
+     const toInvalidate = api.util.selectInvalidatedBy(rootState, tags)
+ 
+diff --git a/packages/toolkit/src/query/core/module.ts b/packages/toolkit/src/query/core/module.ts
+index bc95e8df..59b25140 100644
+--- a/packages/toolkit/src/query/core/module.ts
++++ b/packages/toolkit/src/query/core/module.ts
+@@ -452,7 +452,6 @@ export const coreModule = (): Module<CoreModule> => ({
+       refetchOnMountOrArgChange,
+       refetchOnFocus,
+       refetchOnReconnect,
+-      invalidationBehavior,
+     },
+     context
+   ) {
+@@ -515,7 +514,6 @@ export const coreModule = (): Module<CoreModule> => ({
+         refetchOnMountOrArgChange,
+         keepUnusedDataFor,
+         reducerPath,
+-        invalidationBehavior,
+       },
+     })
+ 
+diff --git a/packages/toolkit/src/query/createApi.ts b/packages/toolkit/src/query/createApi.ts
+index 8de1107c..26ec2fb2 100644
+--- a/packages/toolkit/src/query/createApi.ts
++++ b/packages/toolkit/src/query/createApi.ts
+@@ -151,16 +151,6 @@ export interface CreateApiOptions<
+    * Note: requires [`setupListeners`](./setupListeners) to have been called.
+    */
+   refetchOnReconnect?: boolean
+-  /**
+-   * Defaults to `'immediately'`. This setting allows you to control when tags are invalidated after a mutation.
+-   *
+-   * - `'immediately'`: Queries are invalidated instantly after the mutation finished, even if they are running.
+-   *   If the query provides tags that were invalidated while it ran, it won't be re-fetched.
+-   * - `'delayed'`: Invalidation only happens after all queries and mutations are settled.
+-   *   This ensures that queries are always invalidated correctly and automatically "batches" invalidations of concurrent mutations.
+-   *   Note that if you constantly have some queries (or mutations) running, this can delay tag invalidations indefinitely.
+-   */
+-  invalidationBehavior?: 'delayed' | 'immediately'
+   /**
+    * A function that is passed every dispatched action. If this returns something other than `undefined`,
+    * that return value will be used to rehydrate fulfilled & errored queries.
+@@ -265,7 +255,6 @@ export function buildCreateApi<Modules extends [Module<any>, ...Module<any>[]]>(
+       refetchOnMountOrArgChange: false,
+       refetchOnFocus: false,
+       refetchOnReconnect: false,
+-      invalidationBehavior: 'delayed',
+       ...options,
+       extractRehydrationInfo,
+       serializeQueryArgs(queryArgsApi) {
+diff --git a/packages/toolkit/src/query/tests/buildSlice.test.ts b/packages/toolkit/src/query/tests/buildSlice.test.ts
+index 1a075beb..6ca643b2 100644
+--- a/packages/toolkit/src/query/tests/buildSlice.test.ts
++++ b/packages/toolkit/src/query/tests/buildSlice.test.ts
+@@ -51,7 +51,6 @@ describe('buildSlice', () => {
+       api: {
+         config: {
+           focused: true,
+-          invalidationBehavior: 'delayed',
+           keepUnusedDataFor: 60,
+           middlewareRegistered: true,
+           online: true,
+diff --git a/packages/toolkit/src/query/tests/raceConditions.test.ts b/packages/toolkit/src/query/tests/raceConditions.test.ts
+deleted file mode 100644
+index 0ec49da2..00000000
+--- a/packages/toolkit/src/query/tests/raceConditions.test.ts
++++ /dev/null
+@@ -1,109 +0,0 @@
+-import { createApi, QueryStatus } from '@reduxjs/toolkit/query'
+-import { getLog } from 'console-testing-library'
+-import { actionsReducer, setupApiStore, waitMs } from './helpers'
+-
+-// We need to be able to control when which query resolves to simulate race
+-// conditions properly, that's the purpose of this factory.
+-const createPromiseFactory = () => {
+-  const resolveQueue: (() => void)[] = []
+-  const createPromise = () =>
+-    new Promise<void>((resolve) => {
+-      resolveQueue.push(resolve)
+-    })
+-  const resolveOldest = () => {
+-    resolveQueue.shift()?.()
+-  }
+-  return { createPromise, resolveOldest }
+-}
+-
+-const getEatenBananaPromises = createPromiseFactory()
+-const eatBananaPromises = createPromiseFactory()
+-
+-let eatenBananas = 0
+-const api = createApi({
+-  invalidationBehavior: 'delayed',
+-  baseQuery: () => undefined as any,
+-  tagTypes: ['Banana'],
+-  endpoints: (build) => ({
+-    // Eat a banana.
+-    eatBanana: build.mutation<unknown, void>({
+-      queryFn: async () => {
+-        await eatBananaPromises.createPromise()
+-        eatenBananas += 1
+-        return { data: null, meta: {} }
+-      },
+-      invalidatesTags: ['Banana'],
+-    }),
+-
+-    // Get the number of eaten bananas.
+-    getEatenBananas: build.query<number, void>({
+-      queryFn: async (arg, arg1, arg2, arg3) => {
+-        const result = eatenBananas
+-        await getEatenBananaPromises.createPromise()
+-        return { data: result }
+-      },
+-      providesTags: ['Banana'],
+-    }),
+-  }),
+-})
+-const { getEatenBananas, eatBanana } = api.endpoints
+-
+-const storeRef = setupApiStore(api, {
+-  ...actionsReducer,
+-})
+-
+-it('invalidates a query after a corresponding mutation', async () => {
+-  eatenBananas = 0
+-
+-  const query = storeRef.store.dispatch(getEatenBananas.initiate())
+-  const getQueryState = () =>
+-    storeRef.store.getState().api.queries[query.queryCacheKey]
+-  getEatenBananaPromises.resolveOldest()
+-  await waitMs(2)
+-
+-  expect(getQueryState()?.data).toBe(0)
+-  expect(getQueryState()?.status).toBe(QueryStatus.fulfilled)
+-
+-  const mutation = storeRef.store.dispatch(eatBanana.initiate())
+-  const getMutationState = () =>
+-    storeRef.store.getState().api.mutations[mutation.requestId]
+-  eatBananaPromises.resolveOldest()
+-  await waitMs(2)
+-
+-  expect(getMutationState()?.status).toBe(QueryStatus.fulfilled)
+-  expect(getQueryState()?.data).toBe(0)
+-  expect(getQueryState()?.status).toBe(QueryStatus.pending)
+-
+-  getEatenBananaPromises.resolveOldest()
+-  await waitMs(2)
+-
+-  expect(getQueryState()?.data).toBe(1)
+-  expect(getQueryState()?.status).toBe(QueryStatus.fulfilled)
+-})
+-
+-it('invalidates a query whose corresponding mutation finished while the query was in flight', async () => {
+-  eatenBananas = 0
+-
+-  const query = storeRef.store.dispatch(getEatenBananas.initiate())
+-  const getQueryState = () =>
+-    storeRef.store.getState().api.queries[query.queryCacheKey]
+-
+-  const mutation = storeRef.store.dispatch(eatBanana.initiate())
+-  const getMutationState = () =>
+-    storeRef.store.getState().api.mutations[mutation.requestId]
+-  eatBananaPromises.resolveOldest()
+-  await waitMs(2)
+-  expect(getMutationState()?.status).toBe(QueryStatus.fulfilled)
+-
+-  getEatenBananaPromises.resolveOldest()
+-  await waitMs(2)
+-  expect(getQueryState()?.data).toBe(0)
+-  expect(getQueryState()?.status).toBe(QueryStatus.pending)
+-
+-  // should already be refetching
+-  getEatenBananaPromises.resolveOldest()
+-  await waitMs(2)
+-
+-  expect(getQueryState()?.status).toBe(QueryStatus.fulfilled)
+-  expect(getQueryState()?.data).toBe(1)
+-})
+diff --git a/packages/toolkit/src/tests/combineSlices.test.ts b/packages/toolkit/src/tests/combineSlices.test.ts
+index 4e3439fd..bb24c0f8 100644
+--- a/packages/toolkit/src/tests/combineSlices.test.ts
++++ b/packages/toolkit/src/tests/combineSlices.test.ts
+@@ -33,7 +33,6 @@ const api = {
+       subscriptions: {},
+       config: {
+         reducerPath: 'api',
+-        invalidationBehavior: 'delayed',
+         online: false,
+         focused: false,
+         keepUnusedDataFor: 60,

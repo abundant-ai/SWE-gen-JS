@@ -1,0 +1,374 @@
+diff --git a/packages/create-turbo/src/cli.ts b/packages/create-turbo/src/cli.ts
+index 0105f0f409..7e31d9682c 100644
+--- a/packages/create-turbo/src/cli.ts
++++ b/packages/create-turbo/src/cli.ts
+@@ -86,7 +86,11 @@ createTurboCli
+   --example-path foo/bar
+ `
+   )
+-  .option("--no-git", "Skip initializing a git repository")
++  .option(
++    "--no-git",
++    "Remove the .git directory after creating the project",
++    false
++  )
+   .version(cliPkg.version, "-v, --version", "Output the current version")
+   .helpOption("-h, --help", "Display help for command")
+   .action(create);
+diff --git a/packages/create-turbo/src/commands/create/index.ts b/packages/create-turbo/src/commands/create/index.ts
+index df2f7f5262..8af8a525c9 100644
+--- a/packages/create-turbo/src/commands/create/index.ts
++++ b/packages/create-turbo/src/commands/create/index.ts
+@@ -13,7 +13,12 @@ import {
+   DownloadError,
+   logger,
+ } from "@turbo/utils";
+-import { tryGitInit, removeGitDirectory } from "../../utils/git";
++import {
++  tryGitCommit,
++  tryGitInit,
++  tryGitAdd,
++  removeGitDirectory,
++} from "../../utils/git";
+ import { isOnline } from "../../utils/isOnline";
+ import { transforms } from "../../transforms";
+ import { TransformError } from "../../transforms/errors";
+@@ -78,7 +83,7 @@ export async function create(
+ 
+   let isMaintainedByCoreTeam = false;
+ 
+-  const { packageManager, skipInstall, skipTransforms, git } = opts;
++  const { packageManager, skipInstall, skipTransforms, noGit } = opts;
+ 
+   const [online, availablePackageManagers] = await Promise.all([
+     isOnline(),
+@@ -124,6 +129,9 @@ export async function create(
+ 
+   const { hasPackageJson, availableScripts, repoInfo } = projectData;
+ 
++  // create a new git repo after creating the project
++  tryGitInit(root, `feat(create-turbo): create ${exampleName}`);
++
+   // read the project after creating it to get details about workspaces, package manager, etc.
+   let project: Project = {} as Project;
+   try {
+@@ -151,6 +159,14 @@ export async function create(
+           opts,
+         });
+ 
++        if (transformResult.result === "success") {
++          // add first to ensure any transforms that add new files are included
++          tryGitAdd();
++          tryGitCommit(
++            `feat(create-turbo): apply ${transformResult.name} transform`
++          );
++        }
++
+         if (transformResult.metaJson?.maintainedByCoreTeam) {
+           isMaintainedByCoreTeam = true;
+         }
+@@ -236,6 +252,7 @@ export async function create(
+         },
+       });
+ 
++      tryGitCommit("feat(create-turbo): install dependencies");
+       loader.stop();
+     }
+   }
+@@ -295,17 +312,11 @@ export async function create(
+     logger.log("- Run a command twice to hit cache");
+   }
+ 
+-  // Initialize git repository with a single commit containing all changes
+-  // This is done at the end so all files (including transforms and installed deps) are in one commit
+-  // Note: git defaults to true, --no-git sets it to false
+-  if (git !== false) {
+-    if (tryGitInit(root)) {
+-      info("Initialized a git repository.");
++  // remove .git directory if --no-git flag is used
++  if (noGit) {
++    if (!removeGitDirectory(root)) {
++      logger.warn("Failed to remove '.git' directory");
+     }
+-  } else {
+-    // User explicitly doesn't want git - remove any .git directory
+-    // (e.g., if the example template came with one)
+-    removeGitDirectory(root);
+   }
+ 
+   opts.telemetry?.trackCommandStatus({ command: "create", status: "end" });
+diff --git a/packages/create-turbo/src/commands/create/prompts.ts b/packages/create-turbo/src/commands/create/prompts.ts
+index 272c4b7b14..5448f9622a 100644
+--- a/packages/create-turbo/src/commands/create/prompts.ts
++++ b/packages/create-turbo/src/commands/create/prompts.ts
+@@ -56,7 +56,7 @@ export async function packageManager({
+       { pm: "npm", label: "npm" },
+       { pm: "pnpm", label: "pnpm" },
+       { pm: "yarn", label: "yarn" },
+-      { pm: "bun", label: "bun" },
++      { pm: "bun", label: "Bun" },
+     ].map(({ pm, label }) => ({
+       name: label,
+       value: pm,
+diff --git a/packages/create-turbo/src/commands/create/types.ts b/packages/create-turbo/src/commands/create/types.ts
+index 2ec47db49c..bd835849d2 100644
+--- a/packages/create-turbo/src/commands/create/types.ts
++++ b/packages/create-turbo/src/commands/create/types.ts
+@@ -10,6 +10,6 @@ export interface CreateCommandOptions {
+   turboVersion?: string;
+   example?: string;
+   examplePath?: string;
+-  git?: boolean;
++  noGit?: boolean;
+   telemetry: CreateTurboTelemetry | undefined;
+ }
+diff --git a/packages/create-turbo/src/utils/git.ts b/packages/create-turbo/src/utils/git.ts
+index 56807d1b66..ba1ed9b7ff 100644
+--- a/packages/create-turbo/src/utils/git.ts
++++ b/packages/create-turbo/src/utils/git.ts
+@@ -32,50 +32,41 @@ yarn-error.log*
+ export const GIT_REPO_COMMAND = "git rev-parse --is-inside-work-tree";
+ export const HG_REPO_COMMAND = "hg --cwd . root";
+ 
+-function isInGitRepository(root: string): boolean {
++export function isInGitRepository(): boolean {
+   try {
+-    execSync(GIT_REPO_COMMAND, { stdio: "ignore", cwd: root });
++    execSync(GIT_REPO_COMMAND, { stdio: "ignore" });
+     return true;
+   } catch (_) {
+-    return false;
++    // do nothing
+   }
++  return false;
+ }
+ 
+-function isInMercurialRepository(root: string): boolean {
++export function isInMercurialRepository(): boolean {
+   try {
+-    execSync(HG_REPO_COMMAND, { stdio: "ignore", cwd: root });
++    execSync(HG_REPO_COMMAND, { stdio: "ignore" });
+     return true;
+   } catch (_) {
+-    return false;
++    // do nothing
+   }
++  return false;
+ }
+ 
+-/**
+- * Initialize a git repository in the given directory with a single commit.
+- * This should be called once at the end of the create process, after all
+- * files have been created and transforms have been applied.
+- *
+- * @param root - The absolute path to the directory where the git repository should be initialized
+- * @returns true if the repository was initialized successfully, false otherwise
+- */
+-export function tryGitInit(root: string): boolean {
+-  // Skip if already in a git or mercurial repository
+-  if (isInGitRepository(root) || isInMercurialRepository(root)) {
+-    return false;
+-  }
+-
++export function tryGitInit(root: string, message: string): boolean {
+   let didInit = false;
+   try {
+-    execSync("git init", { stdio: "ignore", cwd: root });
++    if (isInGitRepository() || isInMercurialRepository()) {
++      return false;
++    }
++
++    execSync("git init", { stdio: "ignore" });
++    execSync("git add -A", { stdio: "ignore" });
++
+     didInit = true;
+ 
+-    execSync("git checkout -b main", { stdio: "ignore", cwd: root });
+-    execSync("git add -A", { stdio: "ignore", cwd: root });
+-    execSync('git commit -m "Initial commit from create-turbo"', {
+-      stdio: "ignore",
+-      cwd: root,
+-    });
++    execSync("git checkout -b main", { stdio: "ignore" });
+ 
++    gitCommit(message);
+     return true;
+   } catch (err) {
+     if (didInit) {
+@@ -89,6 +80,36 @@ export function tryGitInit(root: string): boolean {
+   }
+ }
+ 
++export function tryGitCommit(message: string): boolean {
++  try {
++    gitCommit(message);
++    return true;
++  } catch (err) {
++    return false;
++  }
++}
++
++export function tryGitAdd(): void {
++  try {
++    gitAddAll();
++  } catch (err) {
++    // do nothing
++  }
++}
++
++function gitAddAll() {
++  execSync("git add -A", { stdio: "ignore" });
++}
++
++function gitCommit(message: string) {
++  execSync(
++    `git commit --author="Turbobot <turbobot@vercel.com>" -am "${message}"`,
++    {
++      stdio: "ignore",
++    }
++  );
++}
++
+ export function removeGitDirectory(root: string): boolean {
+   try {
+     rmSync(path.join(root, ".git"), { recursive: true, force: true });
+diff --git a/packages/turbo-utils/package.json b/packages/turbo-utils/package.json
+index 196301d430..52ca64f6a4 100644
+--- a/packages/turbo-utils/package.json
++++ b/packages/turbo-utils/package.json
+@@ -57,5 +57,8 @@
+     "ts-node": "10.9.2",
+     "typescript": "5.5.4",
+     "update-check": "1.5.4"
++  },
++  "dependencies": {
++    "undici": "^6.21.0"
+   }
+ }
+diff --git a/packages/turbo-utils/src/examples.ts b/packages/turbo-utils/src/examples.ts
+index be857c7fc8..f8393dcf98 100644
+--- a/packages/turbo-utils/src/examples.ts
++++ b/packages/turbo-utils/src/examples.ts
+@@ -8,14 +8,51 @@ import { dirname, resolve, relative, join } from "node:path";
+ import { tmpdir } from "node:os";
+ import { execFileSync } from "node:child_process";
+ import { Parse, type ReadEntry, extract } from "tar";
++import { ProxyAgent, type Dispatcher } from "undici";
+ import { error, warn } from "./logger";
+ 
+ const REQUEST_TIMEOUT = 10000;
+ const DOWNLOAD_TIMEOUT = 120000;
+ 
+ /**
+- * Performs a fetch request with an automatic timeout.
++ * Gets proxy URL from environment variables.
++ * Checks both lowercase and uppercase variants.
++ */
++function getProxyForUrl(url: string): string | undefined {
++  const parsedUrl = new URL(url);
++  const isHttps = parsedUrl.protocol === "https:";
++
++  if (isHttps) {
++    return (
++      process.env.https_proxy ||
++      process.env.HTTPS_PROXY ||
++      process.env.http_proxy ||
++      process.env.HTTP_PROXY
++    );
++  }
++  return process.env.http_proxy || process.env.HTTP_PROXY;
++}
++
++let cachedProxyAgent: ProxyAgent | undefined;
++let cachedProxyUrl: string | undefined;
++
++/**
++ * Gets or creates a ProxyAgent for the given proxy URL.
++ * Caches the agent to avoid creating multiple instances.
++ */
++function getProxyAgent(proxyUrl: string): ProxyAgent {
++  if (cachedProxyAgent && cachedProxyUrl === proxyUrl) {
++    return cachedProxyAgent;
++  }
++  cachedProxyUrl = proxyUrl;
++  cachedProxyAgent = new ProxyAgent(proxyUrl);
++  return cachedProxyAgent;
++}
++
++/**
++ * Performs a fetch request with an automatic timeout and proxy support.
+  * Centralizes the AbortController + setTimeout pattern to avoid repetition.
++ * Automatically respects HTTP_PROXY/HTTPS_PROXY environment variables.
+  */
+ async function fetchWithTimeout(
+   url: string,
+@@ -28,9 +65,16 @@ async function fetchWithTimeout(
+   }, timeoutMs);
+ 
+   try {
++    const proxyUrl = getProxyForUrl(url);
++    const dispatcher: Dispatcher | undefined = proxyUrl
++      ? getProxyAgent(proxyUrl)
++      : undefined;
++
+     return await fetch(url, {
+       ...options,
+       signal: controller.signal,
++      // @ts-expect-error - dispatcher is a valid option for undici's fetch
++      dispatcher,
+     });
+   } finally {
+     clearTimeout(timeoutId);
+@@ -206,7 +250,16 @@ export async function streamingExtract({
+   const createdDirs = new Set<string>();
+ 
+   try {
+-    const response = await fetch(url, { signal: controller.signal });
++    const proxyUrl = getProxyForUrl(url);
++    const dispatcher: Dispatcher | undefined = proxyUrl
++      ? getProxyAgent(proxyUrl)
++      : undefined;
++
++    const response = await fetch(url, {
++      signal: controller.signal,
++      // @ts-expect-error - dispatcher is a valid option for undici's fetch
++      dispatcher,
++    });
+     if (!response.ok || !response.body) {
+       throw new Error(`Failed to download: ${response.status}`);
+     }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 28f9a77021..198b29feaf 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -837,6 +837,10 @@ importers:
+         version: 4.19.1
+ 
+   packages/turbo-utils:
++    dependencies:
++      undici:
++        specifier: ^6.21.0
++        version: 6.23.0
+     devDependencies:
+       '@arethetypeswrong/cli':
+         specifier: 0.18.2
+@@ -8378,6 +8382,10 @@ packages:
+     resolution: {integrity: sha512-3ItfzbrhDlINjaP0duwnNsKpDQk3acHI3gVJ1z4fmwMK31k5G9OVIAMLSIaP6w4FaGkaAkN6zaQO9LUvZ1t7VA==}
+     engines: {node: '>=14.0'}
+ 
++  undici@6.23.0:
++    resolution: {integrity: sha512-VfQPToRA5FZs/qJxLIinmU59u0r7LXqoJkCzinq3ckNJp3vKEh7jTWN589YQ5+aoAC/TGRLyJLCPKcLQbM8r9g==}
++    engines: {node: '>=18.17'}
++
+   unicode-emoji-modifier-base@1.0.0:
+     resolution: {integrity: sha512-yLSH4py7oFH3oG/9K+XWrz1pSi3dfUrWEnInbxMfArOfc1+33BlGPQtLsOYwvdMy11AwUBetYuaRxSPqgkq+8g==}
+     engines: {node: '>=4'}
+@@ -17378,6 +17386,8 @@ snapshots:
+     dependencies:
+       '@fastify/busboy': 2.1.0
+ 
++  undici@6.23.0: {}
++
+   unicode-emoji-modifier-base@1.0.0: {}
+ 
+   unified@11.0.5:

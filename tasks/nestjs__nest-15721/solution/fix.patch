@@ -1,0 +1,86 @@
+diff --git a/packages/core/router/router-execution-context.ts b/packages/core/router/router-execution-context.ts
+index d1e983834..9f783f06e 100644
+--- a/packages/core/router/router-execution-context.ts
++++ b/packages/core/router/router-execution-context.ts
+@@ -434,7 +434,7 @@ export class RouterExecutionContext {
+     }
+     const isSseHandler = !!this.reflectSse(callback);
+     if (isSseHandler) {
+-      return <
++      return async <
+         TResult extends Observable<unknown> = any,
+         TResponse extends HeaderStream = any,
+         TRequest extends IncomingMessage = any,
+@@ -443,7 +443,7 @@ export class RouterExecutionContext {
+         res: TResponse,
+         req: TRequest,
+       ) => {
+-        this.responseController.sse(
++        await this.responseController.sse(
+           result,
+           (res as any).raw || res,
+           (req as any).raw || req,
+diff --git a/packages/core/router/router-response-controller.ts b/packages/core/router/router-response-controller.ts
+index e66544a1d..5c5e48ac6 100644
+--- a/packages/core/router/router-response-controller.ts
++++ b/packages/core/router/router-response-controller.ts
+@@ -99,12 +99,12 @@ export class RouterResponseController {
+     this.applicationRef.status(response, statusCode);
+   }
+ 
+-  public sse<
++  public async sse<
+     TInput extends Observable<unknown> = any,
+     TResponse extends WritableHeaderStream = any,
+     TRequest extends IncomingMessage = any,
+   >(
+-    result: TInput,
++    result: TInput | Promise<TInput>,
+     response: TResponse,
+     request: TRequest,
+     options?: { additionalHeaders: AdditionalHeaders },
+@@ -114,12 +114,22 @@ export class RouterResponseController {
+       return;
+     }
+ 
+-    this.assertObservable(result);
++    const observableResult = await Promise.resolve(result);
++
++    this.assertObservable(observableResult);
+ 
+     const stream = new SseStream(request);
+-    stream.pipe(response, options);
+ 
+-    const subscription = result
++    // Extract custom status code from response if it was set
++    const customStatusCode = (response as any).statusCode;
++    const pipeOptions =
++      typeof customStatusCode !== 'undefined'
++        ? { ...options, statusCode: customStatusCode }
++        : options;
++
++    stream.pipe(response, pipeOptions);
++
++    const subscription = observableResult
+       .pipe(
+         map((message): MessageEvent => {
+           if (isObject(message)) {
+diff --git a/packages/core/router/sse-stream.ts b/packages/core/router/sse-stream.ts
+index a354c8a89..26b5a2522 100644
+--- a/packages/core/router/sse-stream.ts
++++ b/packages/core/router/sse-stream.ts
+@@ -66,11 +66,13 @@ export class SseStream extends Transform {
+     destination: T,
+     options?: {
+       additionalHeaders?: AdditionalHeaders;
++      statusCode?: number;
+       end?: boolean;
+     },
+   ): T {
+     if (destination.writeHead) {
+-      destination.writeHead(200, {
++      const statusCode = options?.statusCode ?? 200;
++      destination.writeHead(statusCode, {
+         ...options?.additionalHeaders,
+         // See https://github.com/dunglas/mercure/blob/master/hub/subscribe.go#L124-L130
+         'Content-Type': 'text/event-stream',

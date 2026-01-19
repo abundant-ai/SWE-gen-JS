@@ -1,0 +1,362 @@
+diff --git a/changelog_unreleased/vue/16733.md b/changelog_unreleased/vue/16733.md
+deleted file mode 100644
+index 8068d7e13..000000000
+--- a/changelog_unreleased/vue/16733.md
++++ /dev/null
+@@ -1,22 +0,0 @@
+-#### Fix extra semicolon inserted in Vue event binding with non-ascii characters (#16733 by @fisker)
+-
+-<!-- prettier-ignore -->
+-```vue
+-<!-- Input -->
+-<template>
+-  <button @click="点击事件">点击!</button>
+-  <button @click="onClick">Click!</button>
+-</template>
+-
+-<!-- Prettier stable -->
+-<template>
+-  <button @click="点击事件;">点击!</button>
+-  <button @click="onClick">Click!</button>
+-</template>
+-
+-<!-- Prettier main -->
+-<template>
+-  <button @click="点击事件">点击!</button>
+-  <button @click="onClick">Click!</button>
+-</template>
+-```
+diff --git a/src/language-html/embed/vue-attributes.js b/src/language-html/embed/vue-attributes.js
+index f82bb4f69..6867f1e90 100644
+--- a/src/language-html/embed/vue-attributes.js
++++ b/src/language-html/embed/vue-attributes.js
+@@ -7,7 +7,10 @@ import {
+ import isVueSfcWithTypescriptScript from "../utils/is-vue-sfc-with-typescript-script.js";
+ import { printVueScriptGenericAttributeValue } from "./print-vue-script-generic-attribute-value.js";
+ import { formatAttributeValue, shouldHugJsExpression } from "./utils.js";
+-import { printVueBindings } from "./vue-bindings.js";
++import {
++  isVueEventBindingExpression,
++  printVueBindings,
++} from "./vue-bindings.js";
+ import { printVueVForDirective } from "./vue-v-for-directive.js";
+ 
+ /**
+@@ -68,22 +71,15 @@ function printVueAttribute(path, options) {
+ /**
+  * @returns {Promise<Doc>}
+  */
+-async function printVueVOnDirective(text, textToDoc, { parseWithTs }) {
+-  try {
+-    return await printExpression(text, textToDoc, { parseWithTs });
+-  } catch (error) {
+-    // @ts-expect-error -- expected
+-    if (error.cause?.code !== "BABEL_PARSER_SYNTAX_ERROR") {
+-      throw error;
+-    }
++function printVueVOnDirective(text, textToDoc, { parseWithTs }) {
++  if (isVueEventBindingExpression(text)) {
++    return printExpression(text, textToDoc, { parseWithTs });
+   }
+ 
+   return formatAttributeValue(
+     text,
+     textToDoc,
+-    {
+-      parser: parseWithTs ? "__vue_ts_event_binding" : "__vue_event_binding",
+-    },
++    { parser: parseWithTs ? "__vue_ts_event_binding" : "__vue_event_binding" },
+     shouldHugJsExpression,
+   );
+ }
+diff --git a/src/language-html/embed/vue-bindings.js b/src/language-html/embed/vue-bindings.js
+index 2ca9907a0..fadba6f0c 100644
+--- a/src/language-html/embed/vue-bindings.js
++++ b/src/language-html/embed/vue-bindings.js
+@@ -14,4 +14,18 @@ function printVueBindings(text, textToDoc, { parseWithTs }) {
+   });
+ }
+ 
+-export { printVueBindings };
++function isVueEventBindingExpression(eventBindingValue) {
++  // https://github.com/vuejs/vue/blob/v2.5.17/src/compiler/codegen/events.js#L3-L4
++  // arrow function or anonymous function
++  const fnExpRE = /^(?:[\w$]+|\([^)]*\))\s*=>|^function\s*\(/u;
++  // simple member expression chain (a, a.b, a['b'], a["b"], a[0], a[b])
++  const simplePathRE =
++    /^[$_a-z][\w$]*(?:\.[$_a-z][\w$]*|\['[^']*'\]|\["[^"]*"\]|\[\d+\]|\[[$_a-z][\w$]*\])*$/iu;
++
++  // https://github.com/vuejs/vue/blob/v2.5.17/src/compiler/helpers.js#L104
++  const value = eventBindingValue.trim();
++
++  return fnExpRE.test(value) || simplePathRE.test(value);
++}
++
++export { isVueEventBindingExpression, printVueBindings };
+diff --git a/src/language-js/print/expression-statement.js b/src/language-js/print/expression-statement.js
+index 97de0d7d7..006d6c643 100644
+--- a/src/language-js/print/expression-statement.js
++++ b/src/language-js/print/expression-statement.js
+@@ -1,22 +1,14 @@
+-import {
+-  isVueEventBindingFunctionExpression,
+-  isVueEventBindingMemberExpression,
+-  unwrapVueEventBindingTsNode,
+-} from "../utils/vue-event-binding.js";
+ import {
+   isSingleJsxExpressionStatementInMarkdown,
+   isSingleVueEventBindingExpressionStatement,
++  isVueEventBindingExpression,
+ } from "./semicolon.js";
+ 
+ function printExpressionStatement(path, options, print) {
+   const parts = [print("expression")];
+ 
+   if (isSingleVueEventBindingExpressionStatement(path, options)) {
+-    const expression = unwrapVueEventBindingTsNode(path.node.expression);
+-    if (
+-      isVueEventBindingFunctionExpression(expression) ||
+-      isVueEventBindingMemberExpression(expression)
+-    ) {
++    if (isVueEventBindingExpression(path.node.expression)) {
+       parts.push(";");
+     }
+   } else if (isSingleJsxExpressionStatementInMarkdown(path, options)) {
+diff --git a/src/language-js/print/semicolon.js b/src/language-js/print/semicolon.js
+index 76b1f0b7a..30a2c234c 100644
+--- a/src/language-js/print/semicolon.js
++++ b/src/language-js/print/semicolon.js
+@@ -99,6 +99,24 @@ function isSingleJsxExpressionStatementInMarkdown({ node, parent }, options) {
+   );
+ }
+ 
++// based on /src/language-html/syntax-vue.js isVueEventBindingExpression()
++function isVueEventBindingExpression(node) {
++  switch (node.type) {
++    case "MemberExpression":
++      switch (node.property.type) {
++        case "Identifier":
++        case "NumericLiteral":
++        case "StringLiteral":
++          return isVueEventBindingExpression(node.object);
++      }
++      return false;
++    case "Identifier":
++      return true;
++    default:
++      return false;
++  }
++}
++
+ function isSingleVueEventBindingExpressionStatement({ node, parent }, options) {
+   return (
+     (options.parser === "__vue_event_binding" ||
+@@ -112,5 +130,6 @@ function isSingleVueEventBindingExpressionStatement({ node, parent }, options) {
+ export {
+   isSingleJsxExpressionStatementInMarkdown,
+   isSingleVueEventBindingExpressionStatement,
++  isVueEventBindingExpression,
+   shouldPrintLeadingSemicolon,
+ };
+diff --git a/src/language-js/utils/vue-event-binding.js b/src/language-js/utils/vue-event-binding.js
+deleted file mode 100644
+index 1477ff1da..000000000
+--- a/src/language-js/utils/vue-event-binding.js
++++ /dev/null
+@@ -1,40 +0,0 @@
+-import createTypeCheckFunction from "./create-type-check-function.js";
+-
+-// https://github.com/vuejs/core/blob/35785f3cd7bd86cbec3f8324022491da2d088b61/packages/compiler-core/src/babelUtils.ts#L498
+-const isVueEventBindingTsNode = createTypeCheckFunction([
+-  "TSAsExpression", // `foo as number`
+-  "TSTypeAssertion", // `(<number>foo)`
+-  "TSNonNullExpression", // `foo!`
+-  "TSInstantiationExpression", // `foo<string>`
+-  "TSSatisfiesExpression", // `foo satisfies T`
+-]);
+-
+-// https://github.com/vuejs/core/blob/35785f3cd7bd86cbec3f8324022491da2d088b61/packages/compiler-core/src/babelUtils.ts#L506C8-L512C2
+-function unwrapVueEventBindingTsNode(node) {
+-  if (isVueEventBindingTsNode(node)) {
+-    return unwrapVueEventBindingTsNode(node.expression);
+-  }
+-
+-  return node;
+-}
+-
+-// https://github.com/vuejs/core/blob/35785f3cd7bd86cbec3f8324022491da2d088b61/packages/compiler-core/src/utils.ts#L197
+-const isVueEventBindingFunctionExpression = createTypeCheckFunction([
+-  "FunctionExpression",
+-  "ArrowFunctionExpression",
+-]);
+-
+-// https://github.com/vuejs/core/blob/35785f3cd7bd86cbec3f8324022491da2d088b61/packages/compiler-core/src/utils.ts#L161
+-function isVueEventBindingMemberExpression(node) {
+-  return (
+-    node.type === "MemberExpression" ||
+-    node.type === "OptionalMemberExpression" ||
+-    (node.type === "Identifier" && node.name !== "undefined")
+-  );
+-}
+-
+-export {
+-  isVueEventBindingFunctionExpression,
+-  isVueEventBindingMemberExpression,
+-  unwrapVueEventBindingTsNode,
+-};
+diff --git a/tests/format/vue/event-binding/__snapshots__/format.test.js.snap b/tests/format/vue/event-binding/__snapshots__/format.test.js.snap
+index 87b1cd16b..b78389a98 100644
+--- a/tests/format/vue/event-binding/__snapshots__/format.test.js.snap
++++ b/tests/format/vue/event-binding/__snapshots__/format.test.js.snap
+@@ -77,81 +77,3 @@ printWidth: 80
+ 
+ ================================================================================
+ `;
+-
+-exports[`non-ascii-expression.vue format 1`] = `
+-====================================options=====================================
+-parsers: ["vue"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-<template>
+-  <div @click="   我   " />
+-  <div @click="   me   " />
+-</template>
+-
+-=====================================output=====================================
+-<template>
+-  <div @click="我" />
+-  <div @click="me" />
+-</template>
+-
+-================================================================================
+-`;
+-
+-exports[`non-ascii-expression-ts.vue format 1`] = `
+-====================================options=====================================
+-parsers: ["vue"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-<script setup lang="ts">
+-const 我 = () => {}
+-const me = () => {}
+-
+-type Foo = () => void
+-</script>
+-
+-<template>
+-  <div @click="   我   " />
+-  <div @click="   me   " />
+-  <div @click="我   as Foo" />
+-  <div @click="me   as Foo" />
+-  <div @click="我   satisfies Foo" />
+-  <div @click="me   satisfies Foo" />
+-  <div @click="   (<number>我)" />
+-  <div @click="   (<number>me)" />
+-  <div @click="   我!" />
+-  <div @click="   me!" />
+-  <div @click="我<   string>" />
+-  <div @click="me<   string>" />
+-  <div @click="我!   as unknown   satisfies Foo" />
+-  <div @click="me!   as unknown   satisfies Foo" />
+-</template>
+-
+-=====================================output=====================================
+-<script setup lang="ts">
+-const 我 = () => {};
+-const me = () => {};
+-
+-type Foo = () => void;
+-</script>
+-
+-<template>
+-  <div @click="我" />
+-  <div @click="me" />
+-  <div @click="我 as Foo" />
+-  <div @click="me as Foo" />
+-  <div @click="我 satisfies Foo" />
+-  <div @click="me satisfies Foo" />
+-  <div @click="<number>我" />
+-  <div @click="<number>me" />
+-  <div @click="我!" />
+-  <div @click="me!" />
+-  <div @click="我<string>" />
+-  <div @click="me<string>" />
+-  <div @click="我! as unknown satisfies Foo" />
+-  <div @click="me! as unknown satisfies Foo" />
+-</template>
+-
+-================================================================================
+-`;
+diff --git a/tests/format/vue/event-binding/non-ascii-expression-ts.vue b/tests/format/vue/event-binding/non-ascii-expression-ts.vue
+deleted file mode 100644
+index 96d0cf453..000000000
+--- a/tests/format/vue/event-binding/non-ascii-expression-ts.vue
++++ /dev/null
+@@ -1,23 +0,0 @@
+-<script setup lang="ts">
+-const 我 = () => {}
+-const me = () => {}
+-
+-type Foo = () => void
+-</script>
+-
+-<template>
+-  <div @click="   我   " />
+-  <div @click="   me   " />
+-  <div @click="我   as Foo" />
+-  <div @click="me   as Foo" />
+-  <div @click="我   satisfies Foo" />
+-  <div @click="me   satisfies Foo" />
+-  <div @click="   (<number>我)" />
+-  <div @click="   (<number>me)" />
+-  <div @click="   我!" />
+-  <div @click="   me!" />
+-  <div @click="我<   string>" />
+-  <div @click="me<   string>" />
+-  <div @click="我!   as unknown   satisfies Foo" />
+-  <div @click="me!   as unknown   satisfies Foo" />
+-</template>
+diff --git a/tests/format/vue/event-binding/non-ascii-expression.vue b/tests/format/vue/event-binding/non-ascii-expression.vue
+deleted file mode 100644
+index 7fb474a79..000000000
+--- a/tests/format/vue/event-binding/non-ascii-expression.vue
++++ /dev/null
+@@ -1,4 +0,0 @@
+-<template>
+-  <div @click="   我   " />
+-  <div @click="   me   " />
+-</template>
+diff --git a/tests/format/vue/vue/__snapshots__/format.test.js.snap b/tests/format/vue/vue/__snapshots__/format.test.js.snap
+index a56f6b750..47a9e2d76 100644
+--- a/tests/format/vue/vue/__snapshots__/format.test.js.snap
++++ b/tests/format/vue/vue/__snapshots__/format.test.js.snap
+@@ -354,7 +354,7 @@ semi: false
+     @click="a.b;"
+     @click="a[1];"
+     @click="a['b'];"
+-    @click="a[null];"
++    @click="a[null]"
+     #default="{
+       foo: {
+         bar: { baz },
+@@ -720,7 +720,7 @@ trailingComma: "es5"
+     @click="a.b;"
+     @click="a[1];"
+     @click="a['b'];"
+-    @click="a[null];"
++    @click="a[null]"
+     #default="{
+       foo: {
+         bar: { baz },
+@@ -1086,7 +1086,7 @@ trailingComma: "none"
+     @click="a.b;"
+     @click="a[1];"
+     @click="a['b'];"
+-    @click="a[null];"
++    @click="a[null]"
+     #default="{
+       foo: {
+         bar: { baz }

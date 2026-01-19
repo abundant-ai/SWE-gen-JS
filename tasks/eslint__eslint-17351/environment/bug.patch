@@ -1,0 +1,1857 @@
+diff --git a/lib/config/flat-config-schema.js b/lib/config/flat-config-schema.js
+index a79c02d66..3922e8a94 100644
+--- a/lib/config/flat-config-schema.js
++++ b/lib/config/flat-config-schema.js
+@@ -507,7 +507,7 @@ const eslintrcKeys = [
+ // Full schema
+ //-----------------------------------------------------------------------------
+ 
+-const flatConfigSchema = {
++exports.flatConfigSchema = {
+ 
+     // eslintrc-style keys that should always error
+     ...Object.fromEntries(eslintrcKeys.map(key => [key, createEslintrcErrorSchema(key)])),
+@@ -533,13 +533,3 @@ const flatConfigSchema = {
+     plugins: pluginsSchema,
+     rules: rulesSchema
+ };
+-
+-//-----------------------------------------------------------------------------
+-// Exports
+-//-----------------------------------------------------------------------------
+-
+-module.exports = {
+-    flatConfigSchema,
+-    assertIsRuleSeverity,
+-    assertIsRuleOptions
+-};
+diff --git a/lib/linter/linter.js b/lib/linter/linter.js
+index e195812e5..48b2bdbe5 100644
+--- a/lib/linter/linter.js
++++ b/lib/linter/linter.js
+@@ -42,8 +42,7 @@ const
+     ruleReplacements = require("../../conf/replacements.json");
+ const { getRuleFromConfig } = require("../config/flat-config-helpers");
+ const { FlatConfigArray } = require("../config/flat-config-array");
+-const { RuleValidator } = require("../config/rule-validator");
+-const { assertIsRuleOptions, assertIsRuleSeverity } = require("../config/flat-config-schema");
++
+ const debug = require("debug")("eslint:linter");
+ const MAX_AUTOFIX_PASSES = 10;
+ const DEFAULT_PARSER_NAME = "espree";
+@@ -51,6 +50,7 @@ const DEFAULT_ECMA_VERSION = 5;
+ const commentParser = new ConfigCommentParser();
+ const DEFAULT_ERROR_LOC = { start: { line: 1, column: 0 }, end: { line: 1, column: 1 } };
+ const parserSymbol = Symbol.for("eslint.RuleTester.parser");
++const globals = require("../../conf/globals");
+ 
+ //------------------------------------------------------------------------------
+ // Typedefs
+@@ -145,6 +145,29 @@ function isEspree(parser) {
+     return !!(parser === espree || parser[parserSymbol] === espree);
+ }
+ 
++/**
++ * Retrieves globals for the given ecmaVersion.
++ * @param {number} ecmaVersion The version to retrieve globals for.
++ * @returns {Object} The globals for the given ecmaVersion.
++ */
++function getGlobalsForEcmaVersion(ecmaVersion) {
++
++    switch (ecmaVersion) {
++        case 3:
++            return globals.es3;
++
++        case 5:
++            return globals.es5;
++
++        default:
++            if (ecmaVersion < 2015) {
++                return globals[`es${ecmaVersion + 2009}`];
++            }
++
++            return globals[`es${ecmaVersion}`];
++    }
++}
++
+ /**
+  * Ensures that variables representing built-in properties of the Global Object,
+  * and any globals declared by special block comments, are present in the global
+@@ -338,13 +361,13 @@ function extractDirectiveComment(value) {
+  * Parses comments in file to extract file-specific config of rules, globals
+  * and environments and merges them with global config; also code blocks
+  * where reporting is disabled or enabled and merges them with reporting config.
+- * @param {SourceCode} sourceCode The SourceCode object to get comments from.
++ * @param {ASTNode} ast The top node of the AST.
+  * @param {function(string): {create: Function}} ruleMapper A map from rule IDs to defined rules
+  * @param {string|null} warnInlineConfig If a string then it should warn directive comments as disabled. The string value is the config name what the setting came from.
+  * @returns {{configuredRules: Object, enabledGlobals: {value:string,comment:Token}[], exportedVariables: Object, problems: LintMessage[], disableDirectives: DisableDirective[]}}
+  * A collection of the directive comments that were found, along with any problems that occurred when parsing
+  */
+-function getDirectiveComments(sourceCode, ruleMapper, warnInlineConfig) {
++function getDirectiveComments(ast, ruleMapper, warnInlineConfig) {
+     const configuredRules = {};
+     const enabledGlobals = Object.create(null);
+     const exportedVariables = {};
+@@ -354,7 +377,7 @@ function getDirectiveComments(sourceCode, ruleMapper, warnInlineConfig) {
+         builtInRules: Rules
+     });
+ 
+-    sourceCode.getInlineConfigNodes().filter(token => token.type !== "Shebang").forEach(comment => {
++    ast.comments.filter(token => token.type !== "Shebang").forEach(comment => {
+         const { directivePart, justificationPart } = extractDirectiveComment(comment.value);
+ 
+         const match = directivesPattern.exec(directivePart);
+@@ -488,69 +511,6 @@ function getDirectiveComments(sourceCode, ruleMapper, warnInlineConfig) {
+     };
+ }
+ 
+-/**
+- * Parses comments in file to extract disable directives.
+- * @param {SourceCode} sourceCode The SourceCode object to get comments from.
+- * @param {function(string): {create: Function}} ruleMapper A map from rule IDs to defined rules
+- * @returns {{problems: LintMessage[], disableDirectives: DisableDirective[]}}
+- * A collection of the directive comments that were found, along with any problems that occurred when parsing
+- */
+-function getDirectiveCommentsForFlatConfig(sourceCode, ruleMapper) {
+-    const problems = [];
+-    const disableDirectives = [];
+-
+-    sourceCode.getInlineConfigNodes().filter(token => token.type !== "Shebang").forEach(comment => {
+-        const { directivePart, justificationPart } = extractDirectiveComment(comment.value);
+-
+-        const match = directivesPattern.exec(directivePart);
+-
+-        if (!match) {
+-            return;
+-        }
+-        const directiveText = match[1];
+-        const lineCommentSupported = /^eslint-disable-(next-)?line$/u.test(directiveText);
+-
+-        if (comment.type === "Line" && !lineCommentSupported) {
+-            return;
+-        }
+-
+-        if (directiveText === "eslint-disable-line" && comment.loc.start.line !== comment.loc.end.line) {
+-            const message = `${directiveText} comment should not span multiple lines.`;
+-
+-            problems.push(createLintingProblem({
+-                ruleId: null,
+-                message,
+-                loc: comment.loc
+-            }));
+-            return;
+-        }
+-
+-        const directiveValue = directivePart.slice(match.index + directiveText.length);
+-
+-        switch (directiveText) {
+-            case "eslint-disable":
+-            case "eslint-enable":
+-            case "eslint-disable-next-line":
+-            case "eslint-disable-line": {
+-                const directiveType = directiveText.slice("eslint-".length);
+-                const options = { commentToken: comment, type: directiveType, value: directiveValue, justification: justificationPart, ruleMapper };
+-                const { directives, directiveProblems } = createDisableDirectives(options);
+-
+-                disableDirectives.push(...directives);
+-                problems.push(...directiveProblems);
+-                break;
+-            }
+-
+-            // no default
+-        }
+-    });
+-
+-    return {
+-        problems,
+-        disableDirectives
+-    };
+-}
+-
+ /**
+  * Normalize ECMAScript version from the initial config
+  * @param {Parser} parser The parser which uses this options.
+@@ -1353,7 +1313,7 @@ class Linter {
+ 
+         const sourceCode = slots.lastSourceCode;
+         const commentDirectives = options.allowInlineConfig
+-            ? getDirectiveComments(sourceCode, ruleId => getRule(slots, ruleId), options.warnInlineConfig)
++            ? getDirectiveComments(sourceCode.ast, ruleId => getRule(slots, ruleId), options.warnInlineConfig)
+             : { configuredRules: {}, enabledGlobals: {}, exportedVariables: {}, problems: [], disableDirectives: [] };
+ 
+         // augment global scope with declared global variables
+@@ -1364,6 +1324,7 @@ class Linter {
+         );
+ 
+         const configuredRules = Object.assign({}, config.rules, commentDirectives.configuredRules);
++
+         let lintingProblems;
+ 
+         try {
+@@ -1579,6 +1540,19 @@ class Linter {
+             languageOptions.ecmaVersion
+         );
+ 
++        /*
++         * add configured globals and language globals
++         *
++         * using Object.assign instead of object spread for performance reasons
++         * https://github.com/eslint/eslint/issues/16302
++         */
++        const configuredGlobals = Object.assign(
++            {},
++            getGlobalsForEcmaVersion(languageOptions.ecmaVersion),
++            languageOptions.sourceType === "commonjs" ? globals.commonjs : void 0,
++            languageOptions.globals
++        );
++
+         // double check that there is a parser to avoid mysterious error messages
+         if (!languageOptions.parser) {
+             throw new TypeError(`No parser specified for ${options.filename}`);
+@@ -1634,113 +1608,25 @@ class Linter {
+         }
+ 
+         const sourceCode = slots.lastSourceCode;
++        const commentDirectives = options.allowInlineConfig
++            ? getDirectiveComments(
++                sourceCode.ast,
++                ruleId => getRuleFromConfig(ruleId, config),
++                options.warnInlineConfig
++            )
++            : { configuredRules: {}, enabledGlobals: {}, exportedVariables: {}, problems: [], disableDirectives: [] };
+ 
+-        /*
+-         * Make adjustments based on the language options. For JavaScript,
+-         * this is primarily about adding variables into the global scope
+-         * to account for ecmaVersion and configured globals.
+-         */
+-        sourceCode.applyLanguageOptions(languageOptions);
+-
+-        const mergedInlineConfig = {
+-            rules: {}
+-        };
+-        const inlineConfigProblems = [];
+-
+-        /*
+-         * Inline config can be either enabled or disabled. If disabled, it's possible
+-         * to detect the inline config and emit a warning (though this is not required).
+-         * So we first check to see if inline config is allowed at all, and if so, we
+-         * need to check if it's a warning or not.
+-         */
+-        if (options.allowInlineConfig) {
+-
+-            // if inline config should warn then add the warnings
+-            if (options.warnInlineConfig) {
+-                sourceCode.getInlineConfigNodes().forEach(node => {
+-                    inlineConfigProblems.push(createLintingProblem({
+-                        ruleId: null,
+-                        message: `'${sourceCode.text.slice(node.range[0], node.range[1])}' has no effect because you have 'noInlineConfig' setting in ${options.warnInlineConfig}.`,
+-                        loc: node.loc,
+-                        severity: 1
+-                    }));
+-
+-                });
+-            } else {
+-                const inlineConfigResult = sourceCode.applyInlineConfig();
+-
+-                inlineConfigProblems.push(
+-                    ...inlineConfigResult.problems
+-                        .map(createLintingProblem)
+-                        .map(problem => {
+-                            problem.fatal = true;
+-                            return problem;
+-                        })
+-                );
+-
+-                // next we need to verify information about the specified rules
+-                const ruleValidator = new RuleValidator();
+-
+-                for (const { config: inlineConfig, node } of inlineConfigResult.configs) {
+-
+-                    Object.keys(inlineConfig.rules).forEach(ruleId => {
+-                        const rule = getRuleFromConfig(ruleId, config);
+-                        const ruleValue = inlineConfig.rules[ruleId];
+-
+-                        if (!rule) {
+-                            inlineConfigProblems.push(createLintingProblem({ ruleId, loc: node.loc }));
+-                            return;
+-                        }
+-
+-                        try {
+-
+-                            const ruleOptions = Array.isArray(ruleValue) ? ruleValue : [ruleValue];
+-
+-                            assertIsRuleOptions(ruleId, ruleValue);
+-                            assertIsRuleSeverity(ruleId, ruleOptions[0]);
+-
+-                            ruleValidator.validate({
+-                                plugins: config.plugins,
+-                                rules: {
+-                                    [ruleId]: ruleOptions
+-                                }
+-                            });
+-                            mergedInlineConfig.rules[ruleId] = ruleValue;
+-                        } catch (err) {
+-
+-                            let baseMessage = err.message.slice(
+-                                err.message.startsWith("Key \"rules\":")
+-                                    ? err.message.indexOf(":", 12) + 1
+-                                    : err.message.indexOf(":") + 1
+-                            ).trim();
+-
+-                            if (err.messageTemplate) {
+-                                baseMessage += ` You passed "${ruleValue}".`;
+-                            }
+-
+-                            inlineConfigProblems.push(createLintingProblem({
+-                                ruleId,
+-                                message: `Inline configuration for rule "${ruleId}" is invalid:\n\t${baseMessage}\n`,
+-                                loc: node.loc
+-                            }));
+-                        }
+-                    });
+-                }
+-            }
+-        }
++        // augment global scope with declared global variables
++        addDeclaredGlobals(
++            sourceCode.scopeManager.scopes[0],
++            configuredGlobals,
++            { exportedVariables: commentDirectives.exportedVariables, enabledGlobals: commentDirectives.enabledGlobals }
++        );
+ 
+-        const commentDirectives = options.allowInlineConfig && !options.warnInlineConfig
+-            ? getDirectiveCommentsForFlatConfig(
+-                sourceCode,
+-                ruleId => getRuleFromConfig(ruleId, config)
+-            )
+-            : { problems: [], disableDirectives: [] };
++        const configuredRules = Object.assign({}, config.rules, commentDirectives.configuredRules);
+ 
+-        const configuredRules = Object.assign({}, config.rules, mergedInlineConfig.rules);
+         let lintingProblems;
+ 
+-        sourceCode.finalize();
+-
+         try {
+             lintingProblems = runRules(
+                 sourceCode,
+@@ -1781,7 +1667,6 @@ class Linter {
+             disableFixes: options.disableFixes,
+             problems: lintingProblems
+                 .concat(commentDirectives.problems)
+-                .concat(inlineConfigProblems)
+                 .sort((problemA, problemB) => problemA.line - problemB.line || problemA.column - problemB.column),
+             reportUnusedDisableDirectives: options.reportUnusedDisableDirectives
+         });
+diff --git a/lib/rule-tester/flat-rule-tester.js b/lib/rule-tester/flat-rule-tester.js
+index 300bcb744..d5f5981e6 100644
+--- a/lib/rule-tester/flat-rule-tester.js
++++ b/lib/rule-tester/flat-rule-tester.js
+@@ -133,15 +133,6 @@ const suggestionObjectParameters = new Set([
+ ]);
+ const friendlySuggestionObjectParameterList = `[${[...suggestionObjectParameters].map(key => `'${key}'`).join(", ")}]`;
+ 
+-const forbiddenMethods = [
+-    "applyInlineConfig",
+-    "applyLanguageOptions",
+-    "finalize"
+-];
+-
+-/** @type {Map<string,WeakSet>} */
+-const forbiddenMethodCalls = new Map(forbiddenMethods.map(methodName => ([methodName, new WeakSet()])));
+-
+ const hasOwnProperty = Function.call.bind(Object.hasOwnProperty);
+ 
+ /**
+@@ -300,34 +291,6 @@ function emitCodePathCurrentSegmentsWarning(ruleName) {
+     }
+ }
+ 
+-/**
+- * Function to replace forbidden `SourceCode` methods. Allows just one call per method.
+- * @param {string} methodName The name of the method to forbid.
+- * @param {Function} prototype The prototype with the original method to call.
+- * @returns {Function} The function that throws the error.
+- */
+-function throwForbiddenMethodError(methodName, prototype) {
+-
+-    const original = prototype[methodName];
+-
+-    return function(...args) {
+-
+-        const called = forbiddenMethodCalls.get(methodName);
+-
+-        /* eslint-disable no-invalid-this -- needed to operate as a method. */
+-        if (!called.has(this)) {
+-            called.add(this);
+-
+-            return original.apply(this, args);
+-        }
+-        /* eslint-enable no-invalid-this -- not needed past this point */
+-
+-        throw new Error(
+-            `\`SourceCode#${methodName}()\` cannot be called inside a rule.`
+-        );
+-    };
+-}
+-
+ //------------------------------------------------------------------------------
+ // Public Interface
+ //------------------------------------------------------------------------------
+@@ -716,6 +679,11 @@ class FlatRuleTester {
+                 }
+             }
+ 
++            // Verify the code.
++            const { getComments } = SourceCode.prototype;
++            const originalCurrentSegments = Object.getOwnPropertyDescriptor(CodePath.prototype, "currentSegments");
++            let messages;
++
+             // check for validation errors
+             try {
+                 configs.normalizeSync();
+@@ -725,11 +693,6 @@ class FlatRuleTester {
+                 throw error;
+             }
+ 
+-            // Verify the code.
+-            const { getComments, applyLanguageOptions, applyInlineConfig, finalize } = SourceCode.prototype;
+-            const originalCurrentSegments = Object.getOwnPropertyDescriptor(CodePath.prototype, "currentSegments");
+-            let messages;
+-
+             try {
+                 SourceCode.prototype.getComments = getCommentsDeprecation;
+                 Object.defineProperty(CodePath.prototype, "currentSegments", {
+@@ -739,17 +702,10 @@ class FlatRuleTester {
+                     }
+                 });
+ 
+-                forbiddenMethods.forEach(methodName => {
+-                    SourceCode.prototype[methodName] = throwForbiddenMethodError(methodName, SourceCode.prototype);
+-                });
+-
+                 messages = linter.verify(code, configs, filename);
+             } finally {
+                 SourceCode.prototype.getComments = getComments;
+                 Object.defineProperty(CodePath.prototype, "currentSegments", originalCurrentSegments);
+-                SourceCode.prototype.applyInlineConfig = applyInlineConfig;
+-                SourceCode.prototype.applyLanguageOptions = applyLanguageOptions;
+-                SourceCode.prototype.finalize = finalize;
+             }
+ 
+ 
+diff --git a/lib/rule-tester/rule-tester.js b/lib/rule-tester/rule-tester.js
+index fbabdb562..82d79790a 100644
+--- a/lib/rule-tester/rule-tester.js
++++ b/lib/rule-tester/rule-tester.js
+@@ -163,12 +163,6 @@ const suggestionObjectParameters = new Set([
+ ]);
+ const friendlySuggestionObjectParameterList = `[${[...suggestionObjectParameters].map(key => `'${key}'`).join(", ")}]`;
+ 
+-const forbiddenMethods = [
+-    "applyInlineConfig",
+-    "applyLanguageOptions",
+-    "finalize"
+-];
+-
+ const hasOwnProperty = Function.call.bind(Object.hasOwnProperty);
+ 
+ const DEPRECATED_SOURCECODE_PASSTHROUGHS = {
+@@ -336,19 +330,6 @@ function getCommentsDeprecation() {
+     );
+ }
+ 
+-/**
+- * Function to replace forbidden `SourceCode` methods.
+- * @param {string} methodName The name of the method to forbid.
+- * @returns {Function} The function that throws the error.
+- */
+-function throwForbiddenMethodError(methodName) {
+-    return () => {
+-        throw new Error(
+-            `\`SourceCode#${methodName}()\` cannot be called inside a rule.`
+-        );
+-    };
+-}
+-
+ /**
+  * Emit a deprecation warning if function-style format is being used.
+  * @param {string} ruleName Name of the rule.
+@@ -780,7 +761,7 @@ class RuleTester {
+             validate(config, "rule-tester", id => (id === ruleName ? rule : null));
+ 
+             // Verify the code.
+-            const { getComments, applyLanguageOptions, applyInlineConfig, finalize } = SourceCode.prototype;
++            const { getComments } = SourceCode.prototype;
+             const originalCurrentSegments = Object.getOwnPropertyDescriptor(CodePath.prototype, "currentSegments");
+             let messages;
+ 
+@@ -793,17 +774,10 @@ class RuleTester {
+                     }
+                 });
+ 
+-                forbiddenMethods.forEach(methodName => {
+-                    SourceCode.prototype[methodName] = throwForbiddenMethodError(methodName);
+-                });
+-
+                 messages = linter.verify(code, config, filename);
+             } finally {
+                 SourceCode.prototype.getComments = getComments;
+                 Object.defineProperty(CodePath.prototype, "currentSegments", originalCurrentSegments);
+-                SourceCode.prototype.applyInlineConfig = applyInlineConfig;
+-                SourceCode.prototype.applyLanguageOptions = applyLanguageOptions;
+-                SourceCode.prototype.finalize = finalize;
+             }
+ 
+             const fatalErrorMessage = messages.find(m => m.fatal);
+diff --git a/lib/source-code/source-code.js b/lib/source-code/source-code.js
+index 4bbd5ae3a..07c0d2948 100644
+--- a/lib/source-code/source-code.js
++++ b/lib/source-code/source-code.js
+@@ -12,15 +12,7 @@ const
+     { isCommentToken } = require("@eslint-community/eslint-utils"),
+     TokenStore = require("./token-store"),
+     astUtils = require("../shared/ast-utils"),
+-    Traverser = require("../shared/traverser"),
+-    globals = require("../../conf/globals"),
+-    {
+-        directivesPattern
+-    } = require("../shared/directives"),
+-
+-    /* eslint-disable-next-line n/no-restricted-require -- Too messy to figure out right now. */
+-    ConfigCommentParser = require("../linter/config-comment-parser"),
+-    eslintScope = require("eslint-scope");
++    Traverser = require("../shared/traverser");
+ 
+ //------------------------------------------------------------------------------
+ // Type Definitions
+@@ -32,8 +24,6 @@ const
+ // Private
+ //------------------------------------------------------------------------------
+ 
+-const commentParser = new ConfigCommentParser();
+-
+ /**
+  * Validates that the given AST has the required information.
+  * @param {ASTNode} ast The Program node of the AST to check.
+@@ -59,29 +49,6 @@ function validate(ast) {
+     }
+ }
+ 
+-/**
+- * Retrieves globals for the given ecmaVersion.
+- * @param {number} ecmaVersion The version to retrieve globals for.
+- * @returns {Object} The globals for the given ecmaVersion.
+- */
+-function getGlobalsForEcmaVersion(ecmaVersion) {
+-
+-    switch (ecmaVersion) {
+-        case 3:
+-            return globals.es3;
+-
+-        case 5:
+-            return globals.es5;
+-
+-        default:
+-            if (ecmaVersion < 2015) {
+-                return globals[`es${ecmaVersion + 2009}`];
+-            }
+-
+-            return globals[`es${ecmaVersion}`];
+-    }
+-}
+-
+ /**
+  * Check to see if its a ES6 export declaration.
+  * @param {ASTNode} astNode An AST node.
+@@ -116,36 +83,6 @@ function sortedMerge(tokens, comments) {
+     return result;
+ }
+ 
+-/**
+- * Normalizes a value for a global in a config
+- * @param {(boolean|string|null)} configuredValue The value given for a global in configuration or in
+- * a global directive comment
+- * @returns {("readable"|"writeable"|"off")} The value normalized as a string
+- * @throws Error if global value is invalid
+- */
+-function normalizeConfigGlobal(configuredValue) {
+-    switch (configuredValue) {
+-        case "off":
+-            return "off";
+-
+-        case true:
+-        case "true":
+-        case "writeable":
+-        case "writable":
+-            return "writable";
+-
+-        case null:
+-        case false:
+-        case "false":
+-        case "readable":
+-        case "readonly":
+-            return "readonly";
+-
+-        default:
+-            throw new Error(`'${configuredValue}' is not a valid configuration for a global (use 'readonly', 'writable', or 'off')`);
+-    }
+-}
+-
+ /**
+  * Determines if two nodes or tokens overlap.
+  * @param {ASTNode|Token} first The first node or token to check.
+@@ -208,116 +145,6 @@ function isSpaceBetween(sourceCode, first, second, checkInsideOfJSXText) {
+     return false;
+ }
+ 
+-//-----------------------------------------------------------------------------
+-// Directive Comments
+-//-----------------------------------------------------------------------------
+-
+-/**
+- * Extract the directive and the justification from a given directive comment and trim them.
+- * @param {string} value The comment text to extract.
+- * @returns {{directivePart: string, justificationPart: string}} The extracted directive and justification.
+- */
+-function extractDirectiveComment(value) {
+-    const match = /\s-{2,}\s/u.exec(value);
+-
+-    if (!match) {
+-        return { directivePart: value.trim(), justificationPart: "" };
+-    }
+-
+-    const directive = value.slice(0, match.index).trim();
+-    const justification = value.slice(match.index + match[0].length).trim();
+-
+-    return { directivePart: directive, justificationPart: justification };
+-}
+-
+-/**
+- * Ensures that variables representing built-in properties of the Global Object,
+- * and any globals declared by special block comments, are present in the global
+- * scope.
+- * @param {Scope} globalScope The global scope.
+- * @param {Object|undefined} configGlobals The globals declared in configuration
+- * @param {Object|undefined} inlineGlobals The globals declared in the source code
+- * @returns {void}
+- */
+-function addDeclaredGlobals(globalScope, configGlobals = {}, inlineGlobals = {}) {
+-
+-    // Define configured global variables.
+-    for (const id of new Set([...Object.keys(configGlobals), ...Object.keys(inlineGlobals)])) {
+-
+-        /*
+-         * `normalizeConfigGlobal` will throw an error if a configured global value is invalid. However, these errors would
+-         * typically be caught when validating a config anyway (validity for inline global comments is checked separately).
+-         */
+-        const configValue = configGlobals[id] === void 0 ? void 0 : normalizeConfigGlobal(configGlobals[id]);
+-        const commentValue = inlineGlobals[id] && inlineGlobals[id].value;
+-        const value = commentValue || configValue;
+-        const sourceComments = inlineGlobals[id] && inlineGlobals[id].comments;
+-
+-        if (value === "off") {
+-            continue;
+-        }
+-
+-        let variable = globalScope.set.get(id);
+-
+-        if (!variable) {
+-            variable = new eslintScope.Variable(id, globalScope);
+-
+-            globalScope.variables.push(variable);
+-            globalScope.set.set(id, variable);
+-        }
+-
+-        variable.eslintImplicitGlobalSetting = configValue;
+-        variable.eslintExplicitGlobal = sourceComments !== void 0;
+-        variable.eslintExplicitGlobalComments = sourceComments;
+-        variable.writeable = (value === "writable");
+-    }
+-
+-    /*
+-     * "through" contains all references which definitions cannot be found.
+-     * Since we augment the global scope using configuration, we need to update
+-     * references and remove the ones that were added by configuration.
+-     */
+-    globalScope.through = globalScope.through.filter(reference => {
+-        const name = reference.identifier.name;
+-        const variable = globalScope.set.get(name);
+-
+-        if (variable) {
+-
+-            /*
+-             * Links the variable and the reference.
+-             * And this reference is removed from `Scope#through`.
+-             */
+-            reference.resolved = variable;
+-            variable.references.push(reference);
+-
+-            return false;
+-        }
+-
+-        return true;
+-    });
+-}
+-
+-/**
+- * Sets the given variable names as exported so they won't be triggered by
+- * the `no-unused-vars` rule.
+- * @param {eslint.Scope} globalScope The global scope to define exports in.
+- * @param {Record<string,string>} variables An object whose keys are the variable
+- *      names to export.
+- * @returns {void}
+- */
+-function markExportedVariables(globalScope, variables) {
+-
+-    Object.keys(variables).forEach(name => {
+-        const variable = globalScope.set.get(name);
+-
+-        if (variable) {
+-            variable.eslintUsed = true;
+-            variable.eslintExported = true;
+-        }
+-    });
+-
+-}
+-
+ //------------------------------------------------------------------------------
+ // Public Interface
+ //------------------------------------------------------------------------------
+@@ -360,9 +187,7 @@ class SourceCode extends TokenStore {
+          * General purpose caching for the class.
+          */
+         this[caches] = new Map([
+-            ["scopes", new WeakMap()],
+-            ["vars", new Map()],
+-            ["configNodes", void 0]
++            ["scopes", new WeakMap()]
+         ]);
+ 
+         /**
+@@ -441,7 +266,7 @@ class SourceCode extends TokenStore {
+         // Cache for comments found using getComments().
+         this._commentCache = new WeakMap();
+ 
+-        // don't allow further modification of this object
++        // don't allow modification of this object
+         Object.freeze(this);
+         Object.freeze(this.lines);
+     }
+@@ -899,178 +724,6 @@ class SourceCode extends TokenStore {
+     }
+ 
+ 
+-    /**
+-     * Returns an array of all inline configuration nodes found in the
+-     * source code.
+-     * @returns {Array<Token>} An array of all inline configuration nodes.
+-     */
+-    getInlineConfigNodes() {
+-
+-        // check the cache first
+-        let configNodes = this[caches].get("configNodes");
+-
+-        if (configNodes) {
+-            return configNodes;
+-        }
+-
+-        // calculate fresh config nodes
+-        configNodes = this.ast.comments.filter(comment => {
+-
+-            // shebang comments are never directives
+-            if (comment.type === "Shebang") {
+-                return false;
+-            }
+-
+-            const { directivePart } = extractDirectiveComment(comment.value);
+-
+-            const directiveMatch = directivesPattern.exec(directivePart);
+-
+-            if (!directiveMatch) {
+-                return false;
+-            }
+-
+-            // only certain comment types are supported as line comments
+-            return comment.type !== "Line" || !!/^eslint-disable-(next-)?line$/u.test(directiveMatch[1]);
+-        });
+-
+-        this[caches].set("configNodes", configNodes);
+-
+-        return configNodes;
+-    }
+-
+-    /**
+-     * Applies language options sent in from the core.
+-     * @param {Object} languageOptions The language options for this run.
+-     * @returns {void}
+-     */
+-    applyLanguageOptions(languageOptions) {
+-
+-        /*
+-         * Add configured globals and language globals
+-         *
+-         * Using Object.assign instead of object spread for performance reasons
+-         * https://github.com/eslint/eslint/issues/16302
+-         */
+-        const configGlobals = Object.assign(
+-            {},
+-            getGlobalsForEcmaVersion(languageOptions.ecmaVersion),
+-            languageOptions.sourceType === "commonjs" ? globals.commonjs : void 0,
+-            languageOptions.globals
+-        );
+-        const varsCache = this[caches].get("vars");
+-
+-        varsCache.set("configGlobals", configGlobals);
+-    }
+-
+-    /**
+-     * Applies configuration found inside of the source code. This method is only
+-     * called when ESLint is running with inline configuration allowed.
+-     * @returns {{problems:Array<Problem>,configs:{config:FlatConfigArray,node:ASTNode}}} Information
+-     *      that ESLint needs to further process the inline configuration.
+-     */
+-    applyInlineConfig() {
+-
+-        const problems = [];
+-        const configs = [];
+-        const exportedVariables = {};
+-        const inlineGlobals = Object.create(null);
+-
+-        this.getInlineConfigNodes().forEach(comment => {
+-
+-            const { directivePart } = extractDirectiveComment(comment.value);
+-            const match = directivesPattern.exec(directivePart);
+-            const directiveText = match[1];
+-            const directiveValue = directivePart.slice(match.index + directiveText.length);
+-
+-            switch (directiveText) {
+-                case "exported":
+-                    Object.assign(exportedVariables, commentParser.parseStringConfig(directiveValue, comment));
+-                    break;
+-
+-                case "globals":
+-                case "global":
+-                    for (const [id, { value }] of Object.entries(commentParser.parseStringConfig(directiveValue, comment))) {
+-                        let normalizedValue;
+-
+-                        try {
+-                            normalizedValue = normalizeConfigGlobal(value);
+-                        } catch (err) {
+-                            problems.push({
+-                                ruleId: null,
+-                                loc: comment.loc,
+-                                message: err.message
+-                            });
+-                            continue;
+-                        }
+-
+-                        if (inlineGlobals[id]) {
+-                            inlineGlobals[id].comments.push(comment);
+-                            inlineGlobals[id].value = normalizedValue;
+-                        } else {
+-                            inlineGlobals[id] = {
+-                                comments: [comment],
+-                                value: normalizedValue
+-                            };
+-                        }
+-                    }
+-                    break;
+-
+-                case "eslint": {
+-                    const parseResult = commentParser.parseJsonConfig(directiveValue, comment.loc);
+-
+-                    if (parseResult.success) {
+-                        configs.push({
+-                            config: {
+-                                rules: parseResult.config
+-                            },
+-                            node: comment
+-                        });
+-                    } else {
+-                        problems.push(parseResult.error);
+-                    }
+-
+-                    break;
+-                }
+-
+-                // no default
+-            }
+-        });
+-
+-        // save all the new variables for later
+-        const varsCache = this[caches].get("vars");
+-
+-        varsCache.set("inlineGlobals", inlineGlobals);
+-        varsCache.set("exportedVariables", exportedVariables);
+-
+-        return {
+-            configs,
+-            problems
+-        };
+-    }
+-
+-    /**
+-     * Called by ESLint core to indicate that it has finished providing
+-     * information. We now add in all the missing variables and ensure that
+-     * state-changing methods cannot be called by rules.
+-     * @returns {void}
+-     */
+-    finalize() {
+-
+-        // Step 1: ensure that all of the necessary variables are up to date
+-        const varsCache = this[caches].get("vars");
+-        const globalScope = this.scopeManager.scopes[0];
+-        const configGlobals = varsCache.get("configGlobals");
+-        const inlineGlobals = varsCache.get("inlineGlobals");
+-        const exportedVariables = varsCache.get("exportedVariables");
+-
+-        addDeclaredGlobals(globalScope, configGlobals, inlineGlobals);
+-
+-        if (exportedVariables) {
+-            markExportedVariables(globalScope, exportedVariables);
+-        }
+-
+-    }
+-
+ }
+ 
+ module.exports = SourceCode;
+diff --git a/tests/lib/eslint/flat-eslint.js b/tests/lib/eslint/flat-eslint.js
+index f67e62e5c..9e0ca1245 100644
+--- a/tests/lib/eslint/flat-eslint.js
++++ b/tests/lib/eslint/flat-eslint.js
+@@ -3531,7 +3531,7 @@ describe("FlatESLint", () => {
+                 const messages = results[0].messages;
+ 
+                 assert.strictEqual(messages.length, 1);
+-                assert.strictEqual(messages[0].message, "'/* globals foo */' has no effect because you have 'noInlineConfig' setting in your config.");
++                assert.strictEqual(messages[0].message, "'/*globals*/' has no effect because you have 'noInlineConfig' setting in your config.");
+             });
+ 
+         });
+diff --git a/tests/lib/linter/linter.js b/tests/lib/linter/linter.js
+index 5b3d06826..65957f82a 100644
+--- a/tests/lib/linter/linter.js
++++ b/tests/lib/linter/linter.js
+@@ -2023,44 +2023,6 @@ describe("Linter", () => {
+ 
+             assert.strictEqual(suppressedMessages.length, 0);
+         });
+-
+-        it("should apply valid configuration even if there is an invalid configuration present", () => {
+-            const code = [
+-                "/* eslint no-unused-vars: [ */ // <-- this one is invalid JSON",
+-                "/* eslint no-undef: [\"error\"] */ // <-- this one is fine, and thus should apply",
+-                "foo(); // <-- expected no-undef error here"
+-            ].join("\n");
+-
+-            const messages = linter.verify(code);
+-            const suppressedMessages = linter.getSuppressedMessages();
+-
+-            // different engines have different JSON parsing error messages
+-            assert.match(messages[0].message, /Failed to parse JSON from ' "no-unused-vars": \['/u);
+-            assert.strictEqual(messages[0].severity, 2);
+-            assert.isTrue(messages[0].fatal);
+-            assert.isNull(messages[0].ruleId);
+-            assert.strictEqual(messages[0].line, 1);
+-            assert.strictEqual(messages[0].column, 1);
+-            assert.isNull(messages[0].nodeType);
+-
+-            assert.deepStrictEqual(
+-                messages[1],
+-                {
+-                    severity: 2,
+-                    ruleId: "no-undef",
+-                    message: "'foo' is not defined.",
+-                    messageId: "undef",
+-                    line: 3,
+-                    column: 1,
+-                    endLine: 3,
+-                    endColumn: 4,
+-                    nodeType: "Identifier"
+-                }
+-            );
+-
+-            assert.strictEqual(suppressedMessages.length, 0);
+-        });
+-
+     });
+ 
+     describe("when evaluating code with comments to disable rules", () => {
+@@ -4817,182 +4779,6 @@ var a = "test2";
+         });
+     });
+ 
+-    describe("config.noInlineConfig + options.allowInlineConfig", () => {
+-
+-        it("should report both a rule violation and a warning about inline config", () => {
+-            const code = [
+-                "/* eslint-disable */ // <-- this should be inline config warning",
+-                "foo(); // <-- this should be no-undef error"
+-            ].join("\n");
+-            const config = {
+-                rules: {
+-                    "no-undef": 2
+-                },
+-                noInlineConfig: true
+-            };
+-
+-            const messages = linter.verify(code, config, {
+-                filename,
+-                allowInlineConfig: true
+-            });
+-            const suppressedMessages = linter.getSuppressedMessages();
+-
+-            assert.strictEqual(messages.length, 2);
+-            assert.deepStrictEqual(
+-                messages,
+-                [
+-                    {
+-                        ruleId: null,
+-                        message: "'/*eslint-disable*/' has no effect because you have 'noInlineConfig' setting in your config.",
+-                        line: 1,
+-                        column: 1,
+-                        endLine: 1,
+-                        endColumn: 21,
+-                        severity: 1,
+-                        nodeType: null
+-                    },
+-                    {
+-                        ruleId: "no-undef",
+-                        messageId: "undef",
+-                        message: "'foo' is not defined.",
+-                        line: 2,
+-                        endLine: 2,
+-                        column: 1,
+-                        endColumn: 4,
+-                        severity: 2,
+-                        nodeType: "Identifier"
+-                    }
+-                ]
+-            );
+-
+-            assert.strictEqual(suppressedMessages.length, 0);
+-        });
+-
+-        it("should report both a rule violation without warning about inline config when noInlineConfig is true and allowInlineConfig is false", () => {
+-            const code = [
+-                "/* eslint-disable */ // <-- this should be inline config warning",
+-                "foo(); // <-- this should be no-undef error"
+-            ].join("\n");
+-            const config = {
+-                rules: {
+-                    "no-undef": 2
+-                },
+-                noInlineConfig: true
+-            };
+-
+-            const messages = linter.verify(code, config, {
+-                filename,
+-                allowInlineConfig: false
+-            });
+-            const suppressedMessages = linter.getSuppressedMessages();
+-
+-            assert.strictEqual(messages.length, 1);
+-            assert.deepStrictEqual(
+-                messages,
+-                [
+-                    {
+-                        ruleId: "no-undef",
+-                        messageId: "undef",
+-                        message: "'foo' is not defined.",
+-                        line: 2,
+-                        endLine: 2,
+-                        column: 1,
+-                        endColumn: 4,
+-                        severity: 2,
+-                        nodeType: "Identifier"
+-                    }
+-                ]
+-            );
+-
+-            assert.strictEqual(suppressedMessages.length, 0);
+-        });
+-
+-        it("should report both a rule violation without warning about inline config when both are false", () => {
+-            const code = [
+-                "/* eslint-disable */ // <-- this should be inline config warning",
+-                "foo(); // <-- this should be no-undef error"
+-            ].join("\n");
+-            const config = {
+-                rules: {
+-                    "no-undef": 2
+-                },
+-                noInlineConfig: false
+-            };
+-
+-            const messages = linter.verify(code, config, {
+-                filename,
+-                allowInlineConfig: false
+-            });
+-            const suppressedMessages = linter.getSuppressedMessages();
+-
+-            assert.strictEqual(messages.length, 1);
+-            assert.deepStrictEqual(
+-                messages,
+-                [
+-                    {
+-                        ruleId: "no-undef",
+-                        messageId: "undef",
+-                        message: "'foo' is not defined.",
+-                        line: 2,
+-                        endLine: 2,
+-                        column: 1,
+-                        endColumn: 4,
+-                        severity: 2,
+-                        nodeType: "Identifier"
+-                    }
+-                ]
+-            );
+-
+-            assert.strictEqual(suppressedMessages.length, 0);
+-        });
+-
+-        it("should report one suppresed problem when noInlineConfig is false and allowInlineConfig is true", () => {
+-            const code = [
+-                "/* eslint-disable */ // <-- this should be inline config warning",
+-                "foo(); // <-- this should be no-undef error"
+-            ].join("\n");
+-            const config = {
+-                rules: {
+-                    "no-undef": 2
+-                },
+-                noInlineConfig: false
+-            };
+-
+-            const messages = linter.verify(code, config, {
+-                filename,
+-                allowInlineConfig: true
+-            });
+-            const suppressedMessages = linter.getSuppressedMessages();
+-
+-            assert.strictEqual(messages.length, 0);
+-            assert.strictEqual(suppressedMessages.length, 1);
+-            assert.deepStrictEqual(
+-                suppressedMessages,
+-                [
+-                    {
+-                        ruleId: "no-undef",
+-                        messageId: "undef",
+-                        message: "'foo' is not defined.",
+-                        line: 2,
+-                        endLine: 2,
+-                        column: 1,
+-                        endColumn: 4,
+-                        severity: 2,
+-                        nodeType: "Identifier",
+-                        suppressions: [
+-                            {
+-                                justification: "",
+-                                kind: "directive"
+-                            }
+-                        ]
+-                    }
+-                ]
+-            );
+-
+-        });
+-    });
+-
+-
+     describe("when evaluating code with comments to change config when allowInlineConfig is disabled", () => {
+         it("should not report a violation", () => {
+             const code = [
+@@ -11887,7 +11673,6 @@ describe("Linter with FlatConfigArray", () => {
+                             column: 1,
+                             endLine: 1,
+                             endColumn: 39,
+-                            fatal: true,
+                             nodeType: null
+                         },
+                         {
+@@ -12090,12 +11875,12 @@ describe("Linter with FlatConfigArray", () => {
+                         const messages = linter.verify(code, config, filename);
+                         const suppressedMessages = linter.getSuppressedMessages();
+ 
+-                        assert.strictEqual(messages.length, 1, "Incorrect message length");
++                        assert.strictEqual(messages.length, 1);
+                         assert.strictEqual(messages[0].ruleId, "no-alert");
+                         assert.strictEqual(messages[0].message, "Unexpected alert.");
+                         assert.include(messages[0].nodeType, "CallExpression");
+ 
+-                        assert.strictEqual(suppressedMessages.length, 0, "Incorrect suppressed message length");
++                        assert.strictEqual(suppressedMessages.length, 0);
+                     });
+ 
+                     it("rules should not change initial config", () => {
+@@ -12193,7 +11978,7 @@ describe("Linter with FlatConfigArray", () => {
+                                 {
+                                     severity: 2,
+                                     ruleId: "no-alert",
+-                                    message: "Inline configuration for rule \"no-alert\" is invalid:\n\tExpected severity of \"off\", 0, \"warn\", 1, \"error\", or 2. You passed \"true\".\n",
++                                    message: "Configuration for rule \"no-alert\" is invalid:\n\tSeverity should be one of the following: 0 = off, 1 = warn, 2 = error (you passed 'true').\n",
+                                     line: 1,
+                                     column: 1,
+                                     endLine: 1,
+@@ -12216,7 +12001,7 @@ describe("Linter with FlatConfigArray", () => {
+                                 {
+                                     severity: 2,
+                                     ruleId: "no-alert",
+-                                    message: "Inline configuration for rule \"no-alert\" is invalid:\n\tValue [{\"nonExistentPropertyName\":true}] should NOT have more than 0 items.\n",
++                                    message: "Configuration for rule \"no-alert\" is invalid:\n\tValue [{\"nonExistentPropertyName\":true}] should NOT have more than 0 items.\n",
+                                     line: 1,
+                                     column: 1,
+                                     endLine: 1,
+@@ -12228,44 +12013,6 @@ describe("Linter with FlatConfigArray", () => {
+ 
+                         assert.strictEqual(suppressedMessages.length, 0);
+                     });
+-
+-                    it("should apply valid configuration even if there is an invalid configuration present", () => {
+-                        const code = [
+-                            "/* eslint no-unused-vars: [ */ // <-- this one is invalid JSON",
+-                            "/* eslint no-undef: [\"error\"] */ // <-- this one is fine, and thus should apply",
+-                            "foo(); // <-- expected no-undef error here"
+-                        ].join("\n");
+-
+-                        const messages = linter.verify(code, {});
+-                        const suppressedMessages = linter.getSuppressedMessages();
+-
+-                        // different engines have different JSON parsing error messages
+-                        assert.match(messages[0].message, /Failed to parse JSON from ' "no-unused-vars": \['/u);
+-                        assert.strictEqual(messages[0].severity, 2);
+-                        assert.isTrue(messages[0].fatal);
+-                        assert.isNull(messages[0].ruleId);
+-                        assert.strictEqual(messages[0].line, 1);
+-                        assert.strictEqual(messages[0].column, 1);
+-                        assert.isNull(messages[0].nodeType);
+-
+-                        assert.deepStrictEqual(
+-                            messages[1],
+-                            {
+-                                severity: 2,
+-                                ruleId: "no-undef",
+-                                message: "'foo' is not defined.",
+-                                messageId: "undef",
+-                                line: 3,
+-                                column: 1,
+-                                endLine: 3,
+-                                endColumn: 4,
+-                                nodeType: "Identifier"
+-                            }
+-                        );
+-
+-                        assert.strictEqual(suppressedMessages.length, 0);
+-                    });
+-
+                 });
+ 
+                 describe("when evaluating code with comments to disable rules", () => {
+@@ -14278,7 +14025,7 @@ var a = "test2";
+                             assert.deepStrictEqual(messages[0].fatal, void 0);
+                             assert.deepStrictEqual(messages[0].ruleId, null);
+                             assert.deepStrictEqual(messages[0].severity, 1);
+-                            assert.deepStrictEqual(messages[0].message, `'/* ${directive} */' has no effect because you have 'noInlineConfig' setting in your config.`);
++                            assert.deepStrictEqual(messages[0].message, `'/*${directive.split(" ")[0]}*/' has no effect because you have 'noInlineConfig' setting in your config.`);
+ 
+                             assert.strictEqual(suppressedMessages.length, 0);
+                         });
+@@ -14301,7 +14048,7 @@ var a = "test2";
+                             assert.deepStrictEqual(messages[0].fatal, void 0);
+                             assert.deepStrictEqual(messages[0].ruleId, null);
+                             assert.deepStrictEqual(messages[0].severity, 1);
+-                            assert.deepStrictEqual(messages[0].message, `'// ${directive}' has no effect because you have 'noInlineConfig' setting in your config.`);
++                            assert.deepStrictEqual(messages[0].message, `'//${directive.split(" ")[0]}' has no effect because you have 'noInlineConfig' setting in your config.`);
+ 
+                             assert.strictEqual(suppressedMessages.length, 0);
+                         });
+@@ -14346,191 +14093,6 @@ var a = "test2";
+ 
+             });
+ 
+-
+-            describe("config.noInlineConfig + options.allowInlineConfig", () => {
+-
+-                it("should report both a rule violation and a warning about inline config", () => {
+-                    const code = [
+-                        "/* eslint-disable */ // <-- this should be inline config warning",
+-                        "foo(); // <-- this should be no-undef error"
+-                    ].join("\n");
+-                    const config = {
+-                        rules: {
+-                            "no-undef": 2
+-                        },
+-                        linterOptions: {
+-                            noInlineConfig: true
+-                        }
+-                    };
+-
+-                    const messages = linter.verify(code, config, {
+-                        filename,
+-                        allowInlineConfig: true
+-                    });
+-                    const suppressedMessages = linter.getSuppressedMessages();
+-
+-                    assert.strictEqual(messages.length, 2);
+-                    assert.deepStrictEqual(
+-                        messages,
+-                        [
+-                            {
+-                                ruleId: null,
+-                                message: "'/* eslint-disable */' has no effect because you have 'noInlineConfig' setting in your config.",
+-                                line: 1,
+-                                column: 1,
+-                                endLine: 1,
+-                                endColumn: 21,
+-                                severity: 1,
+-                                nodeType: null
+-                            },
+-                            {
+-                                ruleId: "no-undef",
+-                                messageId: "undef",
+-                                message: "'foo' is not defined.",
+-                                line: 2,
+-                                endLine: 2,
+-                                column: 1,
+-                                endColumn: 4,
+-                                severity: 2,
+-                                nodeType: "Identifier"
+-                            }
+-                        ]
+-                    );
+-
+-                    assert.strictEqual(suppressedMessages.length, 0);
+-                });
+-
+-
+-                it("should report both a rule violation without warning about inline config when noInlineConfig is true and allowInlineConfig is false", () => {
+-                    const code = [
+-                        "/* eslint-disable */ // <-- this should be inline config warning",
+-                        "foo(); // <-- this should be no-undef error"
+-                    ].join("\n");
+-                    const config = {
+-                        rules: {
+-                            "no-undef": 2
+-                        },
+-                        linterOptions: {
+-                            noInlineConfig: true
+-                        }
+-                    };
+-
+-                    const messages = linter.verify(code, config, {
+-                        filename,
+-                        allowInlineConfig: false
+-                    });
+-                    const suppressedMessages = linter.getSuppressedMessages();
+-
+-                    assert.strictEqual(messages.length, 1);
+-                    assert.deepStrictEqual(
+-                        messages,
+-                        [
+-                            {
+-                                ruleId: "no-undef",
+-                                messageId: "undef",
+-                                message: "'foo' is not defined.",
+-                                line: 2,
+-                                endLine: 2,
+-                                column: 1,
+-                                endColumn: 4,
+-                                severity: 2,
+-                                nodeType: "Identifier"
+-                            }
+-                        ]
+-                    );
+-
+-                    assert.strictEqual(suppressedMessages.length, 0);
+-                });
+-
+-                it("should report both a rule violation without warning about inline config when both are false", () => {
+-                    const code = [
+-                        "/* eslint-disable */ // <-- this should be inline config warning",
+-                        "foo(); // <-- this should be no-undef error"
+-                    ].join("\n");
+-                    const config = {
+-                        rules: {
+-                            "no-undef": 2
+-                        },
+-                        linterOptions: {
+-                            noInlineConfig: false
+-                        }
+-                    };
+-
+-                    const messages = linter.verify(code, config, {
+-                        filename,
+-                        allowInlineConfig: false
+-                    });
+-                    const suppressedMessages = linter.getSuppressedMessages();
+-
+-                    assert.strictEqual(messages.length, 1);
+-                    assert.deepStrictEqual(
+-                        messages,
+-                        [
+-                            {
+-                                ruleId: "no-undef",
+-                                messageId: "undef",
+-                                message: "'foo' is not defined.",
+-                                line: 2,
+-                                endLine: 2,
+-                                column: 1,
+-                                endColumn: 4,
+-                                severity: 2,
+-                                nodeType: "Identifier"
+-                            }
+-                        ]
+-                    );
+-
+-                    assert.strictEqual(suppressedMessages.length, 0);
+-                });
+-
+-                it("should report one suppresed problem when noInlineConfig is false and allowInlineConfig is true", () => {
+-                    const code = [
+-                        "/* eslint-disable */ // <-- this should be inline config warning",
+-                        "foo(); // <-- this should be no-undef error"
+-                    ].join("\n");
+-                    const config = {
+-                        rules: {
+-                            "no-undef": 2
+-                        },
+-                        linterOptions: {
+-                            noInlineConfig: false
+-                        }
+-                    };
+-
+-                    const messages = linter.verify(code, config, {
+-                        filename,
+-                        allowInlineConfig: true
+-                    });
+-                    const suppressedMessages = linter.getSuppressedMessages();
+-
+-                    assert.strictEqual(messages.length, 0);
+-                    assert.strictEqual(suppressedMessages.length, 1);
+-                    assert.deepStrictEqual(
+-                        suppressedMessages,
+-                        [
+-                            {
+-                                ruleId: "no-undef",
+-                                messageId: "undef",
+-                                message: "'foo' is not defined.",
+-                                line: 2,
+-                                endLine: 2,
+-                                column: 1,
+-                                endColumn: 4,
+-                                severity: 2,
+-                                nodeType: "Identifier",
+-                                suppressions: [
+-                                    {
+-                                        justification: "",
+-                                        kind: "directive"
+-                                    }
+-                                ]
+-                            }
+-                        ]
+-                    );
+-
+-                });
+-            });
+-
+             describe("reportUnusedDisableDirectives option", () => {
+                 it("reports problems for unused eslint-disable comments", () => {
+                     const messages = linter.verify("/* eslint-disable */", {}, { reportUnusedDisableDirectives: true });
+@@ -15622,6 +15184,7 @@ var a = "test2";
+             });
+         });
+ 
++
+         describe("Error Conditions", () => {
+             describe("when evaluating broken code", () => {
+                 const code = BROKEN_TEST_CODE;
+@@ -16695,6 +16258,7 @@ var a = "test2";
+             assert(spy.calledOnce);
+         });
+ 
++
+         describe("when evaluating an empty string", () => {
+             it("runs rules", () => {
+ 
+diff --git a/tests/lib/rule-tester/flat-rule-tester.js b/tests/lib/rule-tester/flat-rule-tester.js
+index a3be696d0..3e34c4c34 100644
+--- a/tests/lib/rule-tester/flat-rule-tester.js
++++ b/tests/lib/rule-tester/flat-rule-tester.js
+@@ -2620,49 +2620,6 @@ describe("FlatRuleTester", () => {
+         });
+     });
+ 
+-    describe("SourceCode forbidden methods", () => {
+-
+-        [
+-            "applyInlineConfig",
+-            "applyLanguageOptions",
+-            "finalize"
+-        ].forEach(methodName => {
+-
+-            const useForbiddenMethodRule = {
+-                create: context => ({
+-                    Program() {
+-                        const sourceCode = context.sourceCode;
+-
+-                        sourceCode[methodName]();
+-                    }
+-                })
+-            };
+-
+-            it(`should throw if ${methodName} is called from a valid test case`, () => {
+-                assert.throws(() => {
+-                    ruleTester.run("use-forbidden-method", useForbiddenMethodRule, {
+-                        valid: [""],
+-                        invalid: []
+-                    });
+-                }, `\`SourceCode#${methodName}()\` cannot be called inside a rule.`);
+-            });
+-
+-            it(`should throw if ${methodName} is called from an invalid test case`, () => {
+-                assert.throws(() => {
+-                    ruleTester.run("use-forbidden-method", useForbiddenMethodRule, {
+-                        valid: [],
+-                        invalid: [{
+-                            code: "",
+-                            errors: [{}]
+-                        }]
+-                    });
+-                }, `\`SourceCode#${methodName}()\` cannot be called inside a rule.`);
+-            });
+-
+-        });
+-
+-    });
+-
+     describe("Subclassing", () => {
+         it("should allow subclasses to set the describe/it/itOnly statics and should correctly use those values", () => {
+             const assertionDescribe = assertEmitted(ruleTesterTestEmitter, "custom describe", "this-is-a-rule-name");
+diff --git a/tests/lib/rule-tester/rule-tester.js b/tests/lib/rule-tester/rule-tester.js
+index 6dc811bb4..68cf887ad 100644
+--- a/tests/lib/rule-tester/rule-tester.js
++++ b/tests/lib/rule-tester/rule-tester.js
+@@ -2915,50 +2915,6 @@ describe("RuleTester", () => {
+         });
+     });
+ 
+-
+-    describe("SourceCode forbidden methods", () => {
+-
+-        [
+-            "applyInlineConfig",
+-            "applyLanguageOptions",
+-            "finalize"
+-        ].forEach(methodName => {
+-
+-            const useForbiddenMethodRule = {
+-                create: context => ({
+-                    Program() {
+-                        const sourceCode = context.sourceCode;
+-
+-                        sourceCode[methodName]();
+-                    }
+-                })
+-            };
+-
+-            it(`should throw if ${methodName} is called from a valid test case`, () => {
+-                assert.throws(() => {
+-                    ruleTester.run("use-forbidden-method", useForbiddenMethodRule, {
+-                        valid: [""],
+-                        invalid: []
+-                    });
+-                }, `\`SourceCode#${methodName}()\` cannot be called inside a rule.`);
+-            });
+-
+-            it(`should throw if ${methodName} is called from an invalid test case`, () => {
+-                assert.throws(() => {
+-                    ruleTester.run("use-forbidden-method", useForbiddenMethodRule, {
+-                        valid: [],
+-                        invalid: [{
+-                            code: "",
+-                            errors: [{}]
+-                        }]
+-                    });
+-                }, `\`SourceCode#${methodName}()\` cannot be called inside a rule.`);
+-            });
+-
+-        });
+-
+-    });
+-
+     describe("Subclassing", () => {
+ 
+         it("should allow subclasses to set the describe/it/itOnly statics and should correctly use those values", () => {
+diff --git a/tests/lib/source-code/source-code.js b/tests/lib/source-code/source-code.js
+index 763db27bc..dae9bcf4c 100644
+--- a/tests/lib/source-code/source-code.js
++++ b/tests/lib/source-code/source-code.js
+@@ -12,7 +12,6 @@ const fs = require("fs"),
+     path = require("path"),
+     assert = require("chai").assert,
+     espree = require("espree"),
+-    eslintScope = require("eslint-scope"),
+     sinon = require("sinon"),
+     { Linter } = require("../../../lib/linter"),
+     SourceCode = require("../../../lib/source-code/source-code"),
+@@ -3788,257 +3787,4 @@ describe("SourceCode", () => {
+         });
+ 
+     });
+-
+-    describe("getInlineConfigNodes()", () => {
+-
+-        it("should return inline config comments", () => {
+-
+-            const code = "/*eslint foo: 1*/ foo; /* non-config comment*/ /* eslint-disable bar */ bar; /* eslint-enable bar */";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const sourceCode = new SourceCode(code, ast);
+-            const configComments = sourceCode.getInlineConfigNodes();
+-
+-            // not sure why but without the JSON parse/stringify Chai won't see these as equal
+-            assert.deepStrictEqual(JSON.parse(JSON.stringify(configComments)), [
+-                {
+-                    type: "Block",
+-                    value: "eslint foo: 1",
+-                    start: 0,
+-                    end: 17,
+-                    range: [
+-                        0,
+-                        17
+-                    ],
+-                    loc: {
+-                        start: {
+-                            line: 1,
+-                            column: 0
+-                        },
+-                        end: {
+-                            line: 1,
+-                            column: 17
+-                        }
+-                    }
+-                },
+-                {
+-                    type: "Block",
+-                    value: " eslint-disable bar ",
+-                    start: 47,
+-                    end: 71,
+-                    range: [
+-                        47,
+-                        71
+-                    ],
+-                    loc: {
+-                        start: {
+-                            line: 1,
+-                            column: 47
+-                        },
+-                        end: {
+-                            line: 1,
+-                            column: 71
+-                        }
+-                    }
+-                },
+-                {
+-                    type: "Block",
+-                    value: " eslint-enable bar ",
+-                    start: 77,
+-                    end: 100,
+-                    range: [
+-                        77,
+-                        100
+-                    ],
+-                    loc: {
+-                        start: {
+-                            line: 1,
+-                            column: 77
+-                        },
+-                        end: {
+-                            line: 1,
+-                            column: 100
+-                        }
+-                    }
+-                }
+-            ]);
+-
+-        });
+-
+-    });
+-
+-    describe("applyLanguageOptions()", () => {
+-
+-        it("should add ES6 globals", () => {
+-
+-            const code = "foo";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const scopeManager = eslintScope.analyze(ast, {
+-                ignoreEval: true,
+-                ecmaVersion: 6
+-            });
+-            const sourceCode = new SourceCode({ text: code, ast, scopeManager });
+-
+-            sourceCode.applyLanguageOptions({
+-                ecmaVersion: 2015
+-            });
+-
+-            sourceCode.finalize();
+-
+-            const globalScope = sourceCode.scopeManager.scopes[0];
+-            const variable = globalScope.set.get("Promise");
+-
+-            assert.isDefined(variable);
+-
+-        });
+-
+-        it("should add custom globals", () => {
+-
+-            const code = "foo";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const scopeManager = eslintScope.analyze(ast, {
+-                ignoreEval: true,
+-                ecmaVersion: 6
+-            });
+-            const sourceCode = new SourceCode({ text: code, ast, scopeManager });
+-
+-            sourceCode.applyLanguageOptions({
+-                ecmaVersion: 2015,
+-                globals: {
+-                    FOO: true
+-                }
+-            });
+-
+-            sourceCode.finalize();
+-
+-            const globalScope = sourceCode.scopeManager.scopes[0];
+-            const variable = globalScope.set.get("FOO");
+-
+-            assert.isDefined(variable);
+-            assert.isTrue(variable.writeable);
+-        });
+-
+-        it("should add commonjs globals", () => {
+-
+-            const code = "foo";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const scopeManager = eslintScope.analyze(ast, {
+-                ignoreEval: true,
+-                nodejsScope: true,
+-                ecmaVersion: 6
+-            });
+-            const sourceCode = new SourceCode({ text: code, ast, scopeManager });
+-
+-            sourceCode.applyLanguageOptions({
+-                ecmaVersion: 2015,
+-                sourceType: "commonjs"
+-            });
+-
+-            sourceCode.finalize();
+-
+-            const globalScope = sourceCode.scopeManager.scopes[0];
+-            const variable = globalScope.set.get("require");
+-
+-            assert.isDefined(variable);
+-
+-        });
+-
+-    });
+-
+-    describe("applyInlineConfig()", () => {
+-
+-        it("should add inline globals", () => {
+-
+-            const code = "/*global bar: true */ foo";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const scopeManager = eslintScope.analyze(ast, {
+-                ignoreEval: true,
+-                ecmaVersion: 6
+-            });
+-            const sourceCode = new SourceCode({ text: code, ast, scopeManager });
+-
+-            sourceCode.applyInlineConfig();
+-            sourceCode.finalize();
+-
+-            const globalScope = sourceCode.scopeManager.scopes[0];
+-            const variable = globalScope.set.get("bar");
+-
+-            assert.isDefined(variable);
+-            assert.isTrue(variable.writeable);
+-        });
+-
+-
+-        it("should mark exported variables", () => {
+-
+-            const code = "/*exported foo */ var foo;";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const scopeManager = eslintScope.analyze(ast, {
+-                ignoreEval: true,
+-                ecmaVersion: 6
+-            });
+-            const sourceCode = new SourceCode({ text: code, ast, scopeManager });
+-
+-            sourceCode.applyInlineConfig();
+-            sourceCode.finalize();
+-
+-            const globalScope = sourceCode.scopeManager.scopes[0];
+-            const variable = globalScope.set.get("foo");
+-
+-            assert.isDefined(variable);
+-            assert.isTrue(variable.eslintUsed);
+-            assert.isTrue(variable.eslintExported);
+-        });
+-
+-        it("should extract rule configuration", () => {
+-
+-            const code = "/*eslint some-rule: 2 */ var foo;";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const sourceCode = new SourceCode(code, ast);
+-            const result = sourceCode.applyInlineConfig();
+-
+-            assert.strictEqual(result.configs.length, 1);
+-            assert.strictEqual(result.configs[0].config.rules["some-rule"], 2);
+-        });
+-
+-        it("should extract multiple rule configurations", () => {
+-
+-            const code = "/*eslint some-rule: 2, other-rule: [\"error\", { skip: true }] */ var foo;";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const sourceCode = new SourceCode(code, ast);
+-            const result = sourceCode.applyInlineConfig();
+-
+-            assert.strictEqual(result.configs.length, 1);
+-            assert.strictEqual(result.configs[0].config.rules["some-rule"], 2);
+-            assert.deepStrictEqual(result.configs[0].config.rules["other-rule"], ["error", { skip: true }]);
+-        });
+-
+-        it("should extract multiple comments into multiple configurations", () => {
+-
+-            const code = "/*eslint some-rule: 2*/ /*eslint other-rule: [\"error\", { skip: true }] */ var foo;";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const sourceCode = new SourceCode(code, ast);
+-            const result = sourceCode.applyInlineConfig();
+-
+-            assert.strictEqual(result.configs.length, 2);
+-            assert.strictEqual(result.configs[0].config.rules["some-rule"], 2);
+-            assert.deepStrictEqual(result.configs[1].config.rules["other-rule"], ["error", { skip: true }]);
+-        });
+-
+-        it("should report problem with rule configuration parsing", () => {
+-
+-            const code = "/*eslint some-rule::, */ var foo;";
+-            const ast = espree.parse(code, DEFAULT_CONFIG);
+-            const sourceCode = new SourceCode(code, ast);
+-            const result = sourceCode.applyInlineConfig();
+-            const problem = result.problems[0];
+-
+-            // Node.js 19 changes the JSON parsing error format, so we need to check each field separately to use a regex
+-            assert.strictEqual(problem.column, 1);
+-            assert.strictEqual(problem.line, 1);
+-            assert.isTrue(problem.fatal);
+-            assert.match(problem.message, /Failed to parse JSON from ' "some-rule"::,': Unexpected token '?:'?/u);
+-            assert.isNull(problem.nodeType);
+-            assert.isNull(problem.ruleId);
+-            assert.strictEqual(problem.severity, 2);
+-        });
+-    });
+ });

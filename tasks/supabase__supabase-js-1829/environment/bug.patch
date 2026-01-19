@@ -1,0 +1,1466 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 482d4ee7..5c75d2cc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,18 @@
++## 2.80.0 (2025-11-06)
++
++### 🚀 Features
++
++- **auth:** add TypeScript types for documented JWT claims fields ([#1802](https://github.com/supabase/supabase-js/pull/1802))
++
++### 🩹 Fixes
++
++- **auth:** only warn if multiple clients share a storage-key ([#1767](https://github.com/supabase/supabase-js/pull/1767))
++
++### ❤️ Thank You
++
++- Steve Hall @sh41
++- Sumit Kumar @Software-Engineering-Project-Team-Bob
++
+ ## 2.79.0 (2025-11-04)
+ 
+ ### 🚀 Features
+diff --git a/packages/core/auth-js/CHANGELOG.md b/packages/core/auth-js/CHANGELOG.md
+index cdd1b545..35b105c4 100644
+--- a/packages/core/auth-js/CHANGELOG.md
++++ b/packages/core/auth-js/CHANGELOG.md
+@@ -1,3 +1,18 @@
++## 2.80.0 (2025-11-06)
++
++### 🚀 Features
++
++- **auth:** add TypeScript types for documented JWT claims fields ([#1802](https://github.com/supabase/supabase-js/pull/1802))
++
++### 🩹 Fixes
++
++- **auth:** only warn if multiple clients share a storage-key ([#1767](https://github.com/supabase/supabase-js/pull/1767))
++
++### ❤️ Thank You
++
++- Steve Hall @sh41
++- Sumit Kumar @Software-Engineering-Project-Team-Bob
++
+ ## 2.79.0 (2025-11-04)
+ 
+ ### 🚀 Features
+diff --git a/packages/core/auth-js/src/GoTrueClient.ts b/packages/core/auth-js/src/GoTrueClient.ts
+index 53c073b3..a62f6bd3 100644
+--- a/packages/core/auth-js/src/GoTrueClient.ts
++++ b/packages/core/auth-js/src/GoTrueClient.ts
+@@ -188,7 +188,7 @@ async function lockNoOp<R>(name: string, acquireTimeout: number, fn: () => Promi
+ const GLOBAL_JWKS: { [storageKey: string]: { cachedAt: number; jwks: { keys: JWK[] } } } = {}
+ 
+ export default class GoTrueClient {
+-  private static nextInstanceID = 0
++  private static nextInstanceID: Record<string, number> = {}
+ 
+   private instanceID: number
+ 
+@@ -277,24 +277,26 @@ export default class GoTrueClient {
+    * Create a new client for use in the browser.
+    */
+   constructor(options: GoTrueClientOptions) {
+-    this.instanceID = GoTrueClient.nextInstanceID
+-    GoTrueClient.nextInstanceID += 1
+-
+-    if (this.instanceID > 0 && isBrowser()) {
+-      console.warn(
+-        'Multiple GoTrueClient instances detected in the same browser context. It is not an error, but this should be avoided as it may produce undefined behavior when used concurrently under the same storage key.'
+-      )
+-    }
+-
+     const settings = { ...DEFAULT_OPTIONS, ...options }
++    this.storageKey = settings.storageKey
++
++    this.instanceID = GoTrueClient.nextInstanceID[this.storageKey] ?? 0
++    GoTrueClient.nextInstanceID[this.storageKey] = this.instanceID + 1
+ 
+     this.logDebugMessages = !!settings.debug
+     if (typeof settings.debug === 'function') {
+       this.logger = settings.debug
+     }
+ 
++    if (this.instanceID > 0 && isBrowser()) {
++      const message = `${this._logPrefix()} Multiple GoTrueClient instances detected in the same browser context. It is not an error, but this should be avoided as it may produce undefined behavior when used concurrently under the same storage key.`
++      console.warn(message)
++      if (this.logDebugMessages) {
++        console.trace(message)
++      }
++    }
++
+     this.persistSession = settings.persistSession
+-    this.storageKey = settings.storageKey
+     this.autoRefreshToken = settings.autoRefreshToken
+     this.admin = new GoTrueAdminApi({
+       url: settings.url,
+@@ -400,12 +402,16 @@ export default class GoTrueClient {
+     return result
+   }
+ 
++  private _logPrefix(): string {
++    return (
++      'GoTrueClient@' +
++      `${this.storageKey}:${this.instanceID} (${version}) ${new Date().toISOString()}`
++    )
++  }
++
+   private _debug(...args: any[]): GoTrueClient {
+     if (this.logDebugMessages) {
+-      this.logger(
+-        `GoTrueClient@${this.instanceID} (${version}) ${new Date().toISOString()}`,
+-        ...args
+-      )
++      this.logger(this._logPrefix(), ...args)
+     }
+ 
+     return this
+diff --git a/packages/core/auth-js/src/lib/types.ts b/packages/core/auth-js/src/lib/types.ts
+index 5a2327d6..930d994f 100644
+--- a/packages/core/auth-js/src/lib/types.ts
++++ b/packages/core/auth-js/src/lib/types.ts
+@@ -1439,7 +1439,31 @@ export type RequiredClaims = {
+   session_id: string
+ }
+ 
+-export type JwtPayload = RequiredClaims & {
++/**
++ * JWT Payload containing claims for Supabase authentication tokens.
++ *
++ * Required claims (iss, aud, exp, iat, sub, role, aal, session_id) are inherited from RequiredClaims.
++ * All other claims are optional as they can be customized via Custom Access Token Hooks.
++ *
++ * @see https://supabase.com/docs/guides/auth/jwt-fields
++ */
++export interface JwtPayload extends RequiredClaims {
++  // Standard optional claims (can be customized via custom access token hooks)
++  email?: string
++  phone?: string
++  is_anonymous?: boolean
++
++  // Optional claims
++  jti?: string
++  nbf?: number
++  app_metadata?: UserAppMetadata
++  user_metadata?: UserMetadata
++  amr?: AMREntry[]
++
++  // Special claims (only in anon/service role tokens)
++  ref?: string
++
++  // Allow custom claims via custom access token hooks
+   [key: string]: any
+ }
+ 
+diff --git a/packages/core/auth-js/test/GoTrueClient.browser.test.ts b/packages/core/auth-js/test/GoTrueClient.browser.test.ts
+index 253cbd78..b2d363bf 100644
+--- a/packages/core/auth-js/test/GoTrueClient.browser.test.ts
++++ b/packages/core/auth-js/test/GoTrueClient.browser.test.ts
+@@ -2,7 +2,12 @@
+  * @jest-environment jsdom
+  */
+ 
+-import { autoRefreshClient, getClientWithSpecificStorage, pkceClient } from './lib/clients'
++import {
++  autoRefreshClient,
++  getClientWithSpecificStorage,
++  getClientWithSpecificStorageKey,
++  pkceClient,
++} from './lib/clients'
+ import { mockUserCredentials } from './lib/utils'
+ import {
+   supportsLocalStorage,
+@@ -190,6 +195,94 @@ describe('Fetch resolution in browser environment', () => {
+     const resolvedFetch = resolveFetch(customFetch)
+     expect(typeof resolvedFetch).toBe('function')
+   })
++
++  it('should warn when two clients are created with the same storage key', () => {
++    let consoleWarnSpy
++    let consoleTraceSpy
++    try {
++      consoleWarnSpy = jest.spyOn(console, 'warn')
++      consoleTraceSpy = jest.spyOn(console, 'trace')
++      getClientWithSpecificStorageKey('same-storage-key')
++      getClientWithSpecificStorageKey('same-storage-key')
++      expect(consoleWarnSpy).toHaveBeenCalledTimes(1)
++      expect(consoleWarnSpy).toHaveBeenCalledWith(
++        expect.stringMatching(
++          /GoTrueClient@same-storage-key:1 .* Multiple GoTrueClient instances detected in the same browser context. It is not an error, but this should be avoided as it may produce undefined behavior when used concurrently under the same storage key./
++        )
++      )
++      expect(consoleTraceSpy).not.toHaveBeenCalled()
++    } finally {
++      consoleWarnSpy?.mockRestore()
++      consoleTraceSpy?.mockRestore()
++    }
++  })
++
++  it('should warn & trace when two clients are created with the same storage key and debug is enabled', () => {
++    let consoleWarnSpy
++    let consoleTraceSpy
++    try {
++      consoleWarnSpy = jest.spyOn(console, 'warn')
++      consoleTraceSpy = jest.spyOn(console, 'trace')
++      getClientWithSpecificStorageKey('identical-storage-key')
++      getClientWithSpecificStorageKey('identical-storage-key', { debug: true })
++      expect(consoleWarnSpy).toHaveBeenCalledTimes(1)
++      expect(consoleWarnSpy).toHaveBeenCalledWith(
++        expect.stringMatching(
++          /GoTrueClient@identical-storage-key:1 .* Multiple GoTrueClient instances detected in the same browser context. It is not an error, but this should be avoided as it may produce undefined behavior when used concurrently under the same storage key./
++        )
++      )
++      expect(consoleTraceSpy).toHaveBeenCalledWith(
++        expect.stringMatching(
++          /GoTrueClient@identical-storage-key:1 .* Multiple GoTrueClient instances detected in the same browser context. It is not an error, but this should be avoided as it may produce undefined behavior when used concurrently under the same storage key./
++        )
++      )
++    } finally {
++      consoleWarnSpy?.mockRestore()
++      consoleTraceSpy?.mockRestore()
++    }
++  })
++
++  it('should not warn when two clients are created with differing storage keys', () => {
++    let consoleWarnSpy
++    let consoleTraceSpy
++    try {
++      consoleWarnSpy = jest.spyOn(console, 'warn')
++      consoleTraceSpy = jest.spyOn(console, 'trace')
++      getClientWithSpecificStorageKey('first-storage-key')
++      getClientWithSpecificStorageKey('second-storage-key')
++      expect(consoleWarnSpy).not.toHaveBeenCalled()
++      expect(consoleTraceSpy).not.toHaveBeenCalled()
++    } finally {
++      consoleWarnSpy?.mockRestore()
++      consoleTraceSpy?.mockRestore()
++    }
++  })
++
++  it('should warn only when a second client with a duplicate key is created', () => {
++    let consoleWarnSpy
++    let consoleTraceSpy
++    try {
++      consoleWarnSpy = jest.spyOn(console, 'warn')
++      consoleTraceSpy = jest.spyOn(console, 'trace')
++      getClientWithSpecificStorageKey('test-storage-key1')
++      expect(consoleWarnSpy).not.toHaveBeenCalled()
++      getClientWithSpecificStorageKey('test-storage-key2')
++      expect(consoleWarnSpy).not.toHaveBeenCalled()
++      getClientWithSpecificStorageKey('test-storage-key3')
++      expect(consoleWarnSpy).not.toHaveBeenCalled()
++      getClientWithSpecificStorageKey('test-storage-key2')
++      expect(consoleWarnSpy).toHaveBeenCalledTimes(1)
++      expect(consoleWarnSpy).toHaveBeenCalledWith(
++        expect.stringMatching(
++          /GoTrueClient@test-storage-key2:1 .* Multiple GoTrueClient instances detected in the same browser context. It is not an error, but this should be avoided as it may produce undefined behavior when used concurrently under the same storage key./
++        )
++      )
++      expect(consoleTraceSpy).not.toHaveBeenCalled()
++    } finally {
++      consoleWarnSpy?.mockRestore()
++      consoleTraceSpy?.mockRestore()
++    }
++  })
+ })
+ 
+ describe('Callback URL handling', () => {
+diff --git a/packages/core/auth-js/test/GoTrueClient.test.ts b/packages/core/auth-js/test/GoTrueClient.test.ts
+index 5ed3fd4f..d5141511 100644
+--- a/packages/core/auth-js/test/GoTrueClient.test.ts
++++ b/packages/core/auth-js/test/GoTrueClient.test.ts
+@@ -1613,6 +1613,87 @@ describe('getClaims', () => {
+     expect(authWithSession.getUser).toHaveBeenCalled()
+   })
+ 
++  test('getClaims returns properly typed JwtPayload with documented fields', async () => {
++    const { email, password } = mockUserCredentials()
++    const {
++      data: { user },
++      error: initialError,
++    } = await authWithSession.signUp({
++      email,
++      password,
++    })
++    expect(initialError).toBeNull()
++    expect(user).not.toBeNull()
++
++    const { data, error } = await authWithSession.getClaims()
++    expect(error).toBeNull()
++    expect(data).not.toBeNull()
++
++    const claims = data?.claims
++    expect(claims).toBeDefined()
++
++    // Test core required claims that are always present
++    expect(typeof claims?.sub).toBe('string')
++    expect(typeof claims?.role).toBe('string')
++
++    // Test standard optional claims
++    if (claims?.email !== undefined) {
++      expect(typeof claims.email).toBe('string')
++    }
++    if (claims?.phone !== undefined) {
++      expect(typeof claims.phone).toBe('string')
++    }
++    if (claims?.user_metadata !== undefined) {
++      expect(typeof claims.user_metadata).toBe('object')
++    }
++    if (claims?.app_metadata !== undefined) {
++      expect(typeof claims.app_metadata).toBe('object')
++    }
++    if (claims?.is_anonymous !== undefined) {
++      expect(typeof claims.is_anonymous).toBe('boolean')
++    }
++
++    // Test optional JWT standard claims if present
++    if (claims?.iss !== undefined) {
++      expect(typeof claims.iss).toBe('string')
++    }
++    if (claims?.aud !== undefined) {
++      expect(['string', 'object']).toContain(typeof claims.aud)
++    }
++    if (claims?.exp !== undefined) {
++      expect(typeof claims.exp).toBe('number')
++    }
++    if (claims?.iat !== undefined) {
++      expect(typeof claims.iat).toBe('number')
++    }
++    if (claims?.aal !== undefined) {
++      expect(typeof claims.aal).toBe('string')
++    }
++    if (claims?.session_id !== undefined) {
++      expect(typeof claims.session_id).toBe('string')
++    }
++    if (claims?.jti !== undefined) {
++      expect(typeof claims.jti).toBe('string')
++    }
++    if (claims?.nbf !== undefined) {
++      expect(typeof claims.nbf).toBe('number')
++    }
++
++    // Verify amr array structure if present
++    if (claims?.amr) {
++      expect(Array.isArray(claims.amr)).toBe(true)
++      if (claims.amr.length > 0) {
++        expect(typeof claims.amr[0].method).toBe('string')
++        expect(typeof claims.amr[0].timestamp).toBe('number')
++      }
++    }
++
++    // Verify ref claim if present (anon/service role tokens)
++    if (claims?.ref !== undefined) {
++      expect(typeof claims.ref).toBe('string')
++    }
++  })
++
+   test('getClaims fetches JWKS to verify asymmetric jwt', async () => {
+     const fetchedUrls: any[] = []
+     const fetchedResponse: any[] = []
+diff --git a/packages/core/auth-js/test/lib/clients.ts b/packages/core/auth-js/test/lib/clients.ts
+index 5a70eae8..83c1e788 100644
+--- a/packages/core/auth-js/test/lib/clients.ts
++++ b/packages/core/auth-js/test/lib/clients.ts
+@@ -1,5 +1,5 @@
+ import jwt from 'jsonwebtoken'
+-import { GoTrueAdminApi, GoTrueClient } from '../../src/index'
++import { GoTrueAdminApi, GoTrueClient, type GoTrueClientOptions } from '../../src/index'
+ import { SupportedStorage } from '../../src/lib/types'
+ 
+ export const SIGNUP_ENABLED_AUTO_CONFIRM_OFF_PORT = 9999
+@@ -156,3 +156,16 @@ export function getClientWithSpecificStorage(storage: SupportedStorage) {
+     storage,
+   })
+ }
++
++export function getClientWithSpecificStorageKey(
++  storageKey: string,
++  opts: GoTrueClientOptions = {}
++) {
++  return new GoTrueClient({
++    url: GOTRUE_URL_SIGNUP_ENABLED_AUTO_CONFIRM_ON,
++    autoRefreshToken: false,
++    persistSession: true,
++    storageKey,
++    ...opts,
++  })
++}
+diff --git a/packages/core/functions-js/CHANGELOG.md b/packages/core/functions-js/CHANGELOG.md
+index 5dadcb95..cc10265c 100644
+--- a/packages/core/functions-js/CHANGELOG.md
++++ b/packages/core/functions-js/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## 2.80.0 (2025-11-06)
++
++This was a version bump only for @supabase/functions-js to align it with other projects, there were no code changes.
++
+ ## 2.79.0 (2025-11-04)
+ 
+ ### 🚀 Features
+diff --git a/packages/core/functions-js/src/FunctionsClient.ts b/packages/core/functions-js/src/FunctionsClient.ts
+index 5781e8a1..203a1ad3 100644
+--- a/packages/core/functions-js/src/FunctionsClient.ts
++++ b/packages/core/functions-js/src/FunctionsClient.ts
+@@ -50,8 +50,11 @@ export class FunctionsClient {
+     functionName: string,
+     options: FunctionInvokeOptions = {}
+   ): Promise<FunctionsResponse<T>> {
++    let timeoutId: ReturnType<typeof setTimeout> | undefined
++    let timeoutController: AbortController | undefined
++
+     try {
+-      const { headers, method, body: functionArgs, signal } = options
++      const { headers, method, body: functionArgs, signal, timeout } = options
+       let _headers: Record<string, string> = {}
+       let { region } = options
+       if (!region) {
+@@ -94,6 +97,22 @@ export class FunctionsClient {
+         body = functionArgs
+       }
+ 
++      // Handle timeout by creating an AbortController
++      let effectiveSignal = signal
++      if (timeout) {
++        timeoutController = new AbortController()
++        timeoutId = setTimeout(() => timeoutController!.abort(), timeout)
++
++        // If user provided their own signal, we need to respect both
++        if (signal) {
++          effectiveSignal = timeoutController.signal
++          // If the user's signal is aborted, abort our timeout controller too
++          signal.addEventListener('abort', () => timeoutController!.abort())
++        } else {
++          effectiveSignal = timeoutController.signal
++        }
++      }
++
+       const response = await this.fetch(url.toString(), {
+         method: method || 'POST',
+         // headers priority is (high to low):
+@@ -102,11 +121,8 @@ export class FunctionsClient {
+         // 3. default Content-Type header
+         headers: { ..._headers, ...this.headers, ...headers },
+         body,
+-        signal,
++        signal: effectiveSignal,
+       }).catch((fetchError) => {
+-        if (fetchError.name === 'AbortError') {
+-          throw fetchError
+-        }
+         throw new FunctionsFetchError(fetchError)
+       })
+ 
+@@ -139,9 +155,6 @@ export class FunctionsClient {
+ 
+       return { data, error: null, response }
+     } catch (error) {
+-      if (error instanceof Error && error.name === 'AbortError') {
+-        return { data: null, error: new FunctionsFetchError(error) }
+-      }
+       return {
+         data: null,
+         error,
+@@ -150,6 +163,11 @@ export class FunctionsClient {
+             ? error.context
+             : undefined,
+       }
++    } finally {
++      // Clear the timeout if it was set
++      if (timeoutId) {
++        clearTimeout(timeoutId)
++      }
+     }
+   }
+ }
+diff --git a/packages/core/functions-js/src/types.ts b/packages/core/functions-js/src/types.ts
+index 208c4330..dc5f35e2 100644
+--- a/packages/core/functions-js/src/types.ts
++++ b/packages/core/functions-js/src/types.ts
+@@ -88,4 +88,9 @@ export type FunctionInvokeOptions = {
+    * The AbortSignal to use for the request.
+    * */
+   signal?: AbortSignal
++  /**
++   * The timeout for the request in milliseconds.
++   * If the function takes longer than this, the request will be aborted.
++   * */
++  timeout?: number
+ }
+diff --git a/packages/core/functions-js/test/functions/slow/index.ts b/packages/core/functions-js/test/functions/slow/index.ts
+new file mode 100644
+index 00000000..25ce2bfb
+--- /dev/null
++++ b/packages/core/functions-js/test/functions/slow/index.ts
+@@ -0,0 +1,7 @@
++import { serve } from 'https://deno.land/std/http/server.ts'
++
++serve(async () => {
++  // Sleep for 3 seconds
++  await new Promise((resolve) => setTimeout(resolve, 3000))
++  return new Response('Slow Response')
++})
+diff --git a/packages/core/functions-js/test/spec/timeout.spec.ts b/packages/core/functions-js/test/spec/timeout.spec.ts
+new file mode 100644
+index 00000000..6b7cc50d
+--- /dev/null
++++ b/packages/core/functions-js/test/spec/timeout.spec.ts
+@@ -0,0 +1,121 @@
++import 'jest'
++import { nanoid } from 'nanoid'
++import { sign } from 'jsonwebtoken'
++
++import { FunctionsClient } from '../../src/index'
++
++import { Relay, runRelay } from '../relay/container'
++import { log } from '../utils/jest-custom-reporter'
++
++describe('timeout tests (slow function)', () => {
++  let relay: Relay
++  const jwtSecret = nanoid(10)
++  const apiKey = sign({ name: 'anon' }, jwtSecret)
++
++  beforeAll(async () => {
++    relay = await runRelay('slow', jwtSecret)
++  })
++
++  afterAll(async () => {
++    if (relay) {
++      await relay.stop()
++    }
++  })
++
++  test('invoke slow function without timeout should succeed', async () => {
++    /**
++     * @feature timeout
++     */
++    log('create FunctionsClient')
++    const fclient = new FunctionsClient(`http://localhost:${relay.container.getMappedPort(8081)}`, {
++      headers: {
++        Authorization: `Bearer ${apiKey}`,
++      },
++    })
++
++    log('invoke slow without timeout')
++    const { data, error } = await fclient.invoke<string>('slow', {})
++
++    log('assert no error')
++    expect(error).toBeNull()
++    log(`assert ${data} is equal to 'Slow Response'`)
++    expect(data).toEqual('Slow Response')
++  })
++
++  test('invoke slow function with short timeout should fail', async () => {
++    /**
++     * @feature timeout
++     */
++    log('create FunctionsClient')
++    const fclient = new FunctionsClient(`http://localhost:${relay.container.getMappedPort(8081)}`, {
++      headers: {
++        Authorization: `Bearer ${apiKey}`,
++      },
++    })
++
++    log('invoke slow with 1000ms timeout (function takes 3000ms)')
++    const { data, error } = await fclient.invoke<string>('slow', {
++      timeout: 1000,
++    })
++
++    log('assert error occurred')
++    expect(error).not.toBeNull()
++    expect(error?.name).toEqual('FunctionsFetchError')
++    expect(data).toBeNull()
++  })
++
++  test('invoke slow function with long timeout should succeed', async () => {
++    /**
++     * @feature timeout
++     */
++    log('create FunctionsClient')
++    const fclient = new FunctionsClient(`http://localhost:${relay.container.getMappedPort(8081)}`, {
++      headers: {
++        Authorization: `Bearer ${apiKey}`,
++      },
++    })
++
++    log('invoke slow with 5000ms timeout (function takes 3000ms)')
++    const { data, error } = await fclient.invoke<string>('slow', {
++      timeout: 5000,
++    })
++
++    log('assert no error')
++    expect(error).toBeNull()
++    log(`assert ${data} is equal to 'Slow Response'`)
++    expect(data).toEqual('Slow Response')
++  })
++
++  test('invoke slow function with timeout and custom AbortSignal', async () => {
++    /**
++     * @feature timeout
++     */
++    log('create FunctionsClient')
++    const fclient = new FunctionsClient(`http://localhost:${relay.container.getMappedPort(8081)}`, {
++      headers: {
++        Authorization: `Bearer ${apiKey}`,
++      },
++    })
++
++    const abortController = new AbortController()
++
++    log('invoke slow with both timeout and AbortSignal')
++    const invokePromise = fclient.invoke<string>('slow', {
++      timeout: 5000, // 5 second timeout
++      signal: abortController.signal,
++    })
++
++    // Abort after 500ms
++    setTimeout(() => {
++      log('aborting request via AbortController')
++      abortController.abort()
++    }, 500)
++
++    const { data, error } = await invokePromise
++
++    log('assert error occurred from abort')
++    expect(error).not.toBeNull()
++    expect(error?.name).toEqual('FunctionsFetchError')
++    expect(data).toBeNull()
++  })
++})
+diff --git a/packages/core/postgrest-js/CHANGELOG.md b/packages/core/postgrest-js/CHANGELOG.md
+index b9238692..f9260a1a 100644
+--- a/packages/core/postgrest-js/CHANGELOG.md
++++ b/packages/core/postgrest-js/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## 2.80.0 (2025-11-06)
++
++This was a version bump only for @supabase/postgrest-js to align it with other projects, there were no code changes.
++
+ ## 2.79.0 (2025-11-04)
+ 
+ ### 🚀 Features
+diff --git a/packages/core/realtime-js/CHANGELOG.md b/packages/core/realtime-js/CHANGELOG.md
+index 4ca6d34d..37981421 100644
+--- a/packages/core/realtime-js/CHANGELOG.md
++++ b/packages/core/realtime-js/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## 2.80.0 (2025-11-06)
++
++This was a version bump only for @supabase/realtime-js to align it with other projects, there were no code changes.
++
+ ## 2.79.0 (2025-11-04)
+ 
+ ### 🚀 Features
+diff --git a/packages/core/realtime-js/src/RealtimeClient.ts b/packages/core/realtime-js/src/RealtimeClient.ts
+index e843afe7..ece630e1 100755
+--- a/packages/core/realtime-js/src/RealtimeClient.ts
++++ b/packages/core/realtime-js/src/RealtimeClient.ts
+@@ -7,9 +7,7 @@ import {
+   DEFAULT_TIMEOUT,
+   SOCKET_STATES,
+   TRANSPORTS,
+-  DEFAULT_VSN,
+-  VSN_1_0_0,
+-  VSN_2_0_0,
++  VSN,
+   WS_CLOSE_NORMAL,
+ } from './lib/constants'
+ 
+@@ -72,7 +70,6 @@ export type RealtimeClientOptions = {
+   timeout?: number
+   heartbeatIntervalMs?: number
+   heartbeatCallback?: (status: HeartbeatStatus) => void
+-  vsn?: string
+   logger?: Function
+   encode?: Function
+   decode?: Function
+@@ -112,7 +109,6 @@ export default class RealtimeClient {
+   heartbeatCallback: (status: HeartbeatStatus) => void = noop
+   ref: number = 0
+   reconnectTimer: Timer | null = null
+-  vsn: string = DEFAULT_VSN
+   logger: Function = noop
+   logLevel?: LogLevel
+   encode!: Function
+@@ -230,7 +226,7 @@ export default class RealtimeClient {
+    * @returns string The URL of the websocket.
+    */
+   endpointURL(): string {
+-    return this._appendParams(this.endPoint, Object.assign({}, this.params, { vsn: this.vsn }))
++    return this._appendParams(this.endPoint, Object.assign({}, this.params, { vsn: VSN }))
+   }
+ 
+   /**
+@@ -815,8 +811,6 @@ export default class RealtimeClient {
+     this.worker = options?.worker ?? false
+     this.accessToken = options?.accessToken ?? null
+     this.heartbeatCallback = options?.heartbeatCallback ?? noop
+-    this.vsn = options?.vsn ?? DEFAULT_VSN
+-
+     // Handle special cases
+     if (options?.params) this.params = options.params
+     if (options?.logger) this.logger = options.logger
+@@ -832,27 +826,13 @@ export default class RealtimeClient {
+         return RECONNECT_INTERVALS[tries - 1] || DEFAULT_RECONNECT_FALLBACK
+       })
+ 
+-    switch (this.vsn) {
+-      case VSN_1_0_0:
+-        this.encode =
+-          options?.encode ??
+-          ((payload: JSON, callback: Function) => {
+-            return callback(JSON.stringify(payload))
+-          })
++    this.encode =
++      options?.encode ??
++      ((payload: JSON, callback: Function) => {
++        return callback(JSON.stringify(payload))
++      })
+ 
+-        this.decode =
+-          options?.decode ??
+-          ((payload: string, callback: Function) => {
+-            return callback(JSON.parse(payload))
+-          })
+-        break
+-      case VSN_2_0_0:
+-        this.encode = options?.encode ?? this.serializer.encode.bind(this.serializer)
+-        this.decode = options?.decode ?? this.serializer.decode.bind(this.serializer)
+-        break
+-      default:
+-        throw new Error(`Unsupported serializer version: ${this.vsn}`)
+-    }
++    this.decode = options?.decode ?? this.serializer.decode.bind(this.serializer)
+ 
+     // Handle worker setup
+     if (this.worker) {
+diff --git a/packages/core/realtime-js/src/lib/constants.ts b/packages/core/realtime-js/src/lib/constants.ts
+index 9024833f..8706a26d 100755
+--- a/packages/core/realtime-js/src/lib/constants.ts
++++ b/packages/core/realtime-js/src/lib/constants.ts
+@@ -1,10 +1,7 @@
+ import { version } from './version'
+ 
+ export const DEFAULT_VERSION = `realtime-js/${version}`
+-
+-export const VSN_1_0_0: string = '1.0.0'
+-export const VSN_2_0_0: string = '2.0.0'
+-export const DEFAULT_VSN: string = VSN_1_0_0
++export const VSN: string = '1.0.0'
+ 
+ export const VERSION = version
+ 
+diff --git a/packages/core/realtime-js/src/lib/serializer.ts b/packages/core/realtime-js/src/lib/serializer.ts
+index c88a3c1f..d8d86b45 100644
+--- a/packages/core/realtime-js/src/lib/serializer.ts
++++ b/packages/core/realtime-js/src/lib/serializer.ts
+@@ -1,160 +1,16 @@
+ // This file draws heavily from https://github.com/phoenixframework/phoenix/commit/cf098e9cf7a44ee6479d31d911a97d3c7430c6fe
+ // License: https://github.com/phoenixframework/phoenix/blob/master/LICENSE.md
+-import { CHANNEL_EVENTS } from '../lib/constants'
+-
+-export type Msg<T> = {
+-  join_ref: string
+-  ref: string
+-  topic: string
+-  event: string
+-  payload: T
+-}
+ 
+ export default class Serializer {
+   HEADER_LENGTH = 1
+-  META_LENGTH = 4
+-  USER_BROADCAST_PUSH_META_LENGTH = 5
+-  KINDS = { push: 0, reply: 1, broadcast: 2, userBroadcastPush: 3, userBroadcast: 4 }
+-  BINARY_ENCODING = 0
+-  JSON_ENCODING = 1
+-  BROADCAST = 'broadcast'
+-
+-  encode(
+-    msg: Msg<{ [key: string]: any } | ArrayBuffer>,
+-    callback: (result: ArrayBuffer | string) => any
+-  ) {
+-    if (this._isArrayBuffer(msg.payload)) {
+-      return callback(this._binaryEncodePush(msg as Msg<ArrayBuffer>))
+-    }
+-
+-    if (
+-      msg.event === this.BROADCAST &&
+-      !(msg.payload instanceof ArrayBuffer) &&
+-      typeof msg.payload.event === 'string'
+-    ) {
+-      return callback(
+-        this._binaryEncodeUserBroadcastPush(msg as Msg<{ event: string } & { [key: string]: any }>)
+-      )
+-    }
+-
+-    let payload = [msg.join_ref, msg.ref, msg.topic, msg.event, msg.payload]
+-    return callback(JSON.stringify(payload))
+-  }
+-
+-  private _binaryEncodePush(message: Msg<ArrayBuffer>) {
+-    const { join_ref, ref, event, topic, payload } = message
+-    const metaLength = this.META_LENGTH + join_ref.length + ref.length + topic.length + event.length
+-
+-    const header = new ArrayBuffer(this.HEADER_LENGTH + metaLength)
+-    let view = new DataView(header)
+-    let offset = 0
+-
+-    view.setUint8(offset++, this.KINDS.push) // kind
+-    view.setUint8(offset++, join_ref.length)
+-    view.setUint8(offset++, ref.length)
+-    view.setUint8(offset++, topic.length)
+-    view.setUint8(offset++, event.length)
+-    Array.from(join_ref, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(ref, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(topic, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(event, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-
+-    var combined = new Uint8Array(header.byteLength + payload.byteLength)
+-    combined.set(new Uint8Array(header), 0)
+-    combined.set(new Uint8Array(payload), header.byteLength)
+-
+-    return combined.buffer
+-  }
+-
+-  private _binaryEncodeUserBroadcastPush(message: Msg<{ event: string } & { [key: string]: any }>) {
+-    if (this._isArrayBuffer(message.payload?.payload)) {
+-      return this._encodeBinaryUserBroadcastPush(message)
+-    } else {
+-      return this._encodeJsonUserBroadcastPush(message)
+-    }
+-  }
+-
+-  private _encodeBinaryUserBroadcastPush(message: Msg<{ event: string } & { [key: string]: any }>) {
+-    const { join_ref, ref, topic } = message
+-    const userEvent = message.payload.event
+-    const userPayload = message.payload?.payload ?? new ArrayBuffer(0)
+-
+-    const metaLength =
+-      this.USER_BROADCAST_PUSH_META_LENGTH +
+-      join_ref.length +
+-      ref.length +
+-      topic.length +
+-      userEvent.length
+-
+-    const header = new ArrayBuffer(this.HEADER_LENGTH + metaLength)
+-    let view = new DataView(header)
+-    let offset = 0
+-
+-    view.setUint8(offset++, this.KINDS.userBroadcastPush) // kind
+-    view.setUint8(offset++, join_ref.length)
+-    view.setUint8(offset++, ref.length)
+-    view.setUint8(offset++, topic.length)
+-    view.setUint8(offset++, userEvent.length)
+-    view.setUint8(offset++, this.BINARY_ENCODING)
+-    Array.from(join_ref, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(ref, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(topic, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(userEvent, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-
+-    var combined = new Uint8Array(header.byteLength + userPayload.byteLength)
+-    combined.set(new Uint8Array(header), 0)
+-    combined.set(new Uint8Array(userPayload), header.byteLength)
+-
+-    return combined.buffer
+-  }
+-
+-  private _encodeJsonUserBroadcastPush(message: Msg<{ event: string } & { [key: string]: any }>) {
+-    const { join_ref, ref, topic } = message
+-    const userEvent = message.payload.event
+-    const userPayload = message.payload?.payload ?? {}
+-
+-    const encoder = new TextEncoder() // Encodes to UTF-8
+-    const encodedUserPayload = encoder.encode(JSON.stringify(userPayload)).buffer
+-
+-    const metaLength =
+-      this.USER_BROADCAST_PUSH_META_LENGTH +
+-      join_ref.length +
+-      ref.length +
+-      topic.length +
+-      userEvent.length
+-
+-    const header = new ArrayBuffer(this.HEADER_LENGTH + metaLength)
+-    let view = new DataView(header)
+-    let offset = 0
+-
+-    view.setUint8(offset++, this.KINDS.userBroadcastPush) // kind
+-    view.setUint8(offset++, join_ref.length)
+-    view.setUint8(offset++, ref.length)
+-    view.setUint8(offset++, topic.length)
+-    view.setUint8(offset++, userEvent.length)
+-    view.setUint8(offset++, this.JSON_ENCODING)
+-    Array.from(join_ref, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(ref, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(topic, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-    Array.from(userEvent, (char) => view.setUint8(offset++, char.charCodeAt(0)))
+-
+-    var combined = new Uint8Array(header.byteLength + encodedUserPayload.byteLength)
+-    combined.set(new Uint8Array(header), 0)
+-    combined.set(new Uint8Array(encodedUserPayload), header.byteLength)
+-
+-    return combined.buffer
+-  }
+ 
+   decode(rawPayload: ArrayBuffer | string, callback: Function) {
+-    if (this._isArrayBuffer(rawPayload)) {
+-      let result = this._binaryDecode(rawPayload as ArrayBuffer)
+-      return callback(result)
++    if (rawPayload.constructor === ArrayBuffer) {
++      return callback(this._binaryDecode(rawPayload))
+     }
+ 
+     if (typeof rawPayload === 'string') {
+-      const jsonPayload = JSON.parse(rawPayload)
+-      const [join_ref, ref, topic, event, payload] = jsonPayload
+-      return callback({ join_ref, ref, topic, event, payload })
++      return callback(JSON.parse(rawPayload))
+     }
+ 
+     return callback({})
+@@ -162,84 +18,9 @@ export default class Serializer {
+ 
+   private _binaryDecode(buffer: ArrayBuffer) {
+     const view = new DataView(buffer)
+-    const kind = view.getUint8(0)
+     const decoder = new TextDecoder()
+-    switch (kind) {
+-      case this.KINDS.push:
+-        return this._decodePush(buffer, view, decoder)
+-      case this.KINDS.reply:
+-        return this._decodeReply(buffer, view, decoder)
+-      case this.KINDS.broadcast:
+-        return this._decodeBroadcast(buffer, view, decoder)
+-      case this.KINDS.userBroadcast:
+-        return this._decodeUserBroadcast(buffer, view, decoder)
+-    }
+-  }
+-
+-  private _decodePush(
+-    buffer: ArrayBuffer,
+-    view: DataView,
+-    decoder: TextDecoder
+-  ): {
+-    join_ref: string
+-    ref: null
+-    topic: string
+-    event: string
+-    payload: { [key: string]: any }
+-  } {
+-    const joinRefSize = view.getUint8(1)
+-    const topicSize = view.getUint8(2)
+-    const eventSize = view.getUint8(3)
+-    let offset = this.HEADER_LENGTH + this.META_LENGTH - 1 // pushes have no ref
+-    const joinRef = decoder.decode(buffer.slice(offset, offset + joinRefSize))
+-    offset = offset + joinRefSize
+-    const topic = decoder.decode(buffer.slice(offset, offset + topicSize))
+-    offset = offset + topicSize
+-    const event = decoder.decode(buffer.slice(offset, offset + eventSize))
+-    offset = offset + eventSize
+-    const data = JSON.parse(decoder.decode(buffer.slice(offset, buffer.byteLength)))
+-    return {
+-      join_ref: joinRef,
+-      ref: null,
+-      topic: topic,
+-      event: event,
+-      payload: data,
+-    }
+-  }
+ 
+-  private _decodeReply(
+-    buffer: ArrayBuffer,
+-    view: DataView,
+-    decoder: TextDecoder
+-  ): {
+-    join_ref: string
+-    ref: string
+-    topic: string
+-    event: CHANNEL_EVENTS.reply
+-    payload: { status: string; response: { [key: string]: any } }
+-  } {
+-    const joinRefSize = view.getUint8(1)
+-    const refSize = view.getUint8(2)
+-    const topicSize = view.getUint8(3)
+-    const eventSize = view.getUint8(4)
+-    let offset = this.HEADER_LENGTH + this.META_LENGTH
+-    const joinRef = decoder.decode(buffer.slice(offset, offset + joinRefSize))
+-    offset = offset + joinRefSize
+-    const ref = decoder.decode(buffer.slice(offset, offset + refSize))
+-    offset = offset + refSize
+-    const topic = decoder.decode(buffer.slice(offset, offset + topicSize))
+-    offset = offset + topicSize
+-    const event = decoder.decode(buffer.slice(offset, offset + eventSize))
+-    offset = offset + eventSize
+-    const data = JSON.parse(decoder.decode(buffer.slice(offset, buffer.byteLength)))
+-    const payload = { status: event, response: data }
+-    return {
+-      join_ref: joinRef,
+-      ref: ref,
+-      topic: topic,
+-      event: CHANNEL_EVENTS.reply,
+-      payload: payload,
+-    }
++    return this._decodeBroadcast(buffer, view, decoder)
+   }
+ 
+   private _decodeBroadcast(
+@@ -247,7 +28,6 @@ export default class Serializer {
+     view: DataView,
+     decoder: TextDecoder
+   ): {
+-    join_ref: null
+     ref: null
+     topic: string
+     event: string
+@@ -262,52 +42,6 @@ export default class Serializer {
+     offset = offset + eventSize
+     const data = JSON.parse(decoder.decode(buffer.slice(offset, buffer.byteLength)))
+ 
+-    return { join_ref: null, ref: null, topic: topic, event: event, payload: data }
+-  }
+-
+-  private _decodeUserBroadcast(
+-    buffer: ArrayBuffer,
+-    view: DataView,
+-    decoder: TextDecoder
+-  ): {
+-    join_ref: null
+-    ref: null
+-    topic: string
+-    event: string
+-    payload: { [key: string]: any }
+-  } {
+-    const topicSize = view.getUint8(1)
+-    const userEventSize = view.getUint8(2)
+-    const metadataSize = view.getUint8(3)
+-    const payloadEncoding = view.getUint8(4)
+-
+-    let offset = this.HEADER_LENGTH + 4
+-    const topic = decoder.decode(buffer.slice(offset, offset + topicSize))
+-    offset = offset + topicSize
+-    const userEvent = decoder.decode(buffer.slice(offset, offset + userEventSize))
+-    offset = offset + userEventSize
+-    const metadata = decoder.decode(buffer.slice(offset, offset + metadataSize))
+-    offset = offset + metadataSize
+-
+-    const payload = buffer.slice(offset, buffer.byteLength)
+-    const parsedPayload =
+-      payloadEncoding === this.JSON_ENCODING ? JSON.parse(decoder.decode(payload)) : payload
+-
+-    const data: { [key: string]: any } = {
+-      type: this.BROADCAST,
+-      event: userEvent,
+-      payload: parsedPayload,
+-    }
+-
+-    // Metadata is optional and always JSON encoded
+-    if (metadataSize > 0) {
+-      data['meta'] = JSON.parse(metadata)
+-    }
+-
+-    return { join_ref: null, ref: null, topic: topic, event: this.BROADCAST, payload: data }
+-  }
+-
+-  private _isArrayBuffer(buffer: any): boolean {
+-    return buffer instanceof ArrayBuffer || buffer?.constructor?.name === 'ArrayBuffer'
++    return { ref: null, topic: topic, event: event, payload: data }
+   }
+ }
+diff --git a/packages/core/realtime-js/test/RealtimeClient.config.test.ts b/packages/core/realtime-js/test/RealtimeClient.config.test.ts
+index 17e3e8a4..22d8e6d0 100644
+--- a/packages/core/realtime-js/test/RealtimeClient.config.test.ts
++++ b/packages/core/realtime-js/test/RealtimeClient.config.test.ts
+@@ -1,5 +1,5 @@
+ import assert from 'assert'
+-import { afterEach, beforeEach, describe, expect, test } from 'vitest'
++import { afterEach, beforeEach, describe, test } from 'vitest'
+ import RealtimeClient from '../src/RealtimeClient'
+ import { setupRealtimeTest, cleanupRealtimeTest, TestSetup } from './helpers/setup'
+ 
+@@ -38,20 +38,6 @@ describe('endpointURL', () => {
+     assert.equal(socket.endpointURL(), `${testSetup.url}/websocket?apikey=123456789&vsn=1.0.0`)
+   })
+ 
+-  test('returns endpoint with valid vsn', () => {
+-    const socket = new RealtimeClient(testSetup.url, {
+-      params: { apikey: '123456789' },
+-      vsn: '2.0.0',
+-    })
+-    assert.equal(socket.endpointURL(), `${testSetup.url}/websocket?apikey=123456789&vsn=2.0.0`)
+-  })
+-
+-  test('errors out with unsupported version', () => {
+-    expect(
+-      () => new RealtimeClient(testSetup.url, { params: { apikey: '123456789' }, vsn: '4.0.0' })
+-    ).toThrow(/Unsupported serializer/)
+-  })
+-
+   test('returns endpoint with no params (empty params object)', () => {
+     const socket = new RealtimeClient(testSetup.url, {
+       params: { apikey: '123456789' },
+diff --git a/packages/core/realtime-js/test/RealtimeClient.transport.test.ts b/packages/core/realtime-js/test/RealtimeClient.transport.test.ts
+index 47ebddc5..ea2fe4d4 100644
+--- a/packages/core/realtime-js/test/RealtimeClient.transport.test.ts
++++ b/packages/core/realtime-js/test/RealtimeClient.transport.test.ts
+@@ -282,6 +282,46 @@ describe('custom encoder and decoder', () => {
+     })
+   })
+ 
++  test('decodes ArrayBuffer by default', () => {
++    testSetup.socket = new RealtimeClient(`wss://${testSetup.projectRef}/socket`, {
++      params: { apikey: '123456789' },
++    })
++    const buffer = new Uint8Array([
++      2, 20, 6, 114, 101, 97, 108, 116, 105, 109, 101, 58, 112, 117, 98, 108, 105, 99, 58, 116, 101,
++      115, 116, 73, 78, 83, 69, 82, 84, 123, 34, 102, 111, 111, 34, 58, 34, 98, 97, 114, 34, 125,
++    ]).buffer
++
++    testSetup.socket.decode(buffer, (decoded) => {
++      assert.deepStrictEqual(decoded, {
++        ref: null,
++        topic: 'realtime:public:test',
++        event: 'INSERT',
++        payload: { foo: 'bar' },
++      })
++    })
++  })
++
++  test('decodes unexpected payload types to empty object by default', () => {
++    testSetup.socket = new RealtimeClient(`wss://${testSetup.projectRef}/socket`, {
++      params: { apikey: '123456789' },
++    })
++
++    // Test various non-string, non-ArrayBuffer payload types that have .constructor
++    // This tests the fallback path on line 16 of serializer.ts
++    const testCases = [
++      { payload: 123, description: 'number' },
++      { payload: { foo: 'bar' }, description: 'object' },
++      { payload: [1, 2, 3], description: 'array' },
++      { payload: true, description: 'boolean' },
++    ]
++
++    testCases.forEach(({ payload, description }) => {
++      testSetup.socket.decode(payload as any, (decoded) => {
++        assert.deepStrictEqual(decoded, {}, `Expected empty object for ${description}`)
++      })
++    })
++  })
++
+   test('allows custom decoding when using WebSocket transport', () => {
+     let decoder = (_payload, callback) => callback('decode works')
+     testSetup.socket = new RealtimeClient(`wss://${testSetup.projectRef}/socket`, {
+diff --git a/packages/core/realtime-js/test/serializer.test.ts b/packages/core/realtime-js/test/serializer.test.ts
+deleted file mode 100644
+index c75415ee..00000000
+--- a/packages/core/realtime-js/test/serializer.test.ts
++++ /dev/null
+@@ -1,286 +0,0 @@
+-import { describe, expect, it } from 'vitest'
+-import Serializer from '../src/lib/serializer'
+-import type { Msg } from '../src/lib/serializer'
+-
+-let serializer = new Serializer()
+-let decoder = new TextDecoder()
+-
+-const encodeAsync = (
+-  serializer: Serializer,
+-  msg: Msg<ArrayBuffer | { [key: string]: any }>
+-): Promise<ArrayBuffer | string> => {
+-  return new Promise((resolve) => {
+-    serializer.encode(msg, (result: ArrayBuffer | string) => {
+-      resolve(result)
+-    })
+-  })
+-}
+-
+-const decodeAsync = (
+-  serializer: Serializer,
+-  buffer: ArrayBuffer | string
+-): Promise<Msg<{ [key: string]: any }>> => {
+-  return new Promise((resolve) => {
+-    serializer.decode(buffer, (result: Msg<{ [key: string]: any }>) => {
+-      resolve(result)
+-    })
+-  })
+-}
+-
+-let exampleMsg = { join_ref: '0', ref: '1', topic: 't', event: 'e', payload: { foo: 1 } }
+-
+-// \x01\x04
+-let binPayload = () => {
+-  let buffer = new ArrayBuffer(2)
+-  new DataView(buffer).setUint8(0, 1)
+-  new DataView(buffer).setUint8(1, 4)
+-  return buffer
+-}
+-
+-describe('JSON', () => {
+-  it('encodes', async () => {
+-    const result = await encodeAsync(serializer, exampleMsg)
+-    expect(result).toBe('["0","1","t","e",{"foo":1}]')
+-  })
+-
+-  it('decodes', async () => {
+-    const result = await decodeAsync(serializer, '["0","1","t","e",{"foo":1}]')
+-    expect(result).toEqual(exampleMsg)
+-  })
+-})
+-
+-describe('binary', () => {
+-  it('encodes push', async () => {
+-    let buffer = binPayload()
+-    let bin = '\0\x01\x01\x01\x0101te\x01\x04'
+-    const result = await encodeAsync(serializer, {
+-      join_ref: '0',
+-      ref: '1',
+-      topic: 't',
+-      event: 'e',
+-      payload: buffer,
+-    })
+-    expect(decoder.decode(result as ArrayBuffer)).toBe(bin)
+-  })
+-
+-  it('encodes variable length segments', async () => {
+-    let buffer = binPayload()
+-    let bin = '\0\x02\x01\x03\x02101topev\x01\x04'
+-
+-    const result = await encodeAsync(serializer, {
+-      join_ref: '10',
+-      ref: '1',
+-      topic: 'top',
+-      event: 'ev',
+-      payload: buffer,
+-    })
+-    expect(decoder.decode(result as ArrayBuffer)).toBe(bin)
+-  })
+-
+-  it('encodes user broadcast push with JSON payload', async () => {
+-    // 3 -> user_broadcast_push
+-    // 2 join_ref length
+-    // 1 for ref length
+-    // 3 for topic length
+-    // 10 for user event length
+-    // 1 for JSON encoding
+-    // actual join ref
+-    // actual ref
+-    // actual topic
+-    // actual user event
+-    // actual payload
+-    let bin = '\x03\x02\x01\x03\x0a\x01101topuser-event{"a":"b"}'
+-
+-    const result = await encodeAsync(serializer, {
+-      join_ref: '10',
+-      ref: '1',
+-      topic: 'top',
+-      event: 'broadcast',
+-      payload: {
+-        event: 'user-event',
+-        payload: {
+-          a: 'b',
+-        },
+-      },
+-    })
+-    expect(decoder.decode(result as ArrayBuffer)).toBe(bin)
+-  })
+-
+-  it('encodes user broadcast push with Binary payload', async () => {
+-    // 3 -> user_broadcast_push
+-    // 2 join_ref length
+-    // 1 for ref length
+-    // 3 for topic length
+-    // 10 for user event length
+-    // 0 for Binary encoding
+-    // actual join ref
+-    // actual ref
+-    // actual topic
+-    // actual user event
+-    // actual payload
+-    let bin = '\x03\x02\x01\x03\x0a\x00101topuser-event\x01\x04'
+-
+-    const result = await encodeAsync(serializer, {
+-      join_ref: '10',
+-      ref: '1',
+-      topic: 'top',
+-      event: 'broadcast',
+-      payload: {
+-        event: 'user-event',
+-        payload: binPayload(),
+-      },
+-    })
+-    expect(decoder.decode(result as ArrayBuffer)).toBe(bin)
+-  })
+-
+-  it('decodes push payload as JSON', async () => {
+-    let bin = '\0\x03\x03\n123topsome-event{"a":"b"}'
+-    let buffer = new TextEncoder().encode(bin).buffer
+-
+-    const result = await decodeAsync(serializer, buffer)
+-
+-    expect(result.join_ref).toBe('123')
+-    expect(result.ref).toBeNull()
+-    expect(result.topic).toBe('top')
+-    expect(result.event).toBe('some-event')
+-    expect(result.payload.constructor).toBe(Object)
+-    expect(result.payload).toStrictEqual({ a: 'b' })
+-  })
+-
+-  it('decodes reply payload as JSON', async () => {
+-    let bin = '\x01\x03\x02\x03\x0210012topok{"a":"b"}'
+-    let buffer = new TextEncoder().encode(bin).buffer
+-
+-    const result = await decodeAsync(serializer, buffer)
+-
+-    expect(result.join_ref).toBe('100')
+-    expect(result.ref).toBe('12')
+-    expect(result.topic).toBe('top')
+-    expect(result.event).toBe('phx_reply')
+-    expect(result.payload.status).toBe('ok')
+-    expect(result.payload.response.constructor).toBe(Object)
+-    expect(result.payload.response).toStrictEqual({ a: 'b' })
+-  })
+-
+-  it('decodes broadcast payload as JSON', async () => {
+-    let bin = '\x02\x03\ntopsome-event{"a":"b"}'
+-    let buffer = new TextEncoder().encode(bin).buffer
+-
+-    const result = await decodeAsync(serializer, buffer)
+-
+-    expect(result.join_ref).toBeNull()
+-    expect(result.ref).toBeNull()
+-    expect(result.topic).toBe('top')
+-    expect(result.event).toBe('some-event')
+-    expect(result.payload.constructor).toBe(Object)
+-    expect(result.payload).toStrictEqual({ a: 'b' })
+-  })
+-
+-  it('decodes user broadcast with JSON payload and no metadata', async () => {
+-    // 4 -> user_broadcast
+-    // 3 for topic length
+-    // 10 for user event length
+-    // 0 for metadata length
+-    // 1 for JSON encoding
+-    // actual topic
+-    // actual user event
+-    // (no metadata)
+-    // actual payload
+-    let bin = '\x04\x03\x0a\x00\x01topuser-event{"a":"b"}'
+-    let buffer = new TextEncoder().encode(bin).buffer
+-
+-    const result = await decodeAsync(serializer, buffer)
+-
+-    expect(result.join_ref).toBeNull()
+-    expect(result.ref).toBeNull()
+-    expect(result.topic).toBe('top')
+-    expect(result.event).toBe('broadcast')
+-    expect(result.payload.constructor).toBe(Object)
+-    expect(result.payload).toStrictEqual({
+-      type: 'broadcast',
+-      event: 'user-event',
+-      payload: { a: 'b' },
+-    })
+-  })
+-
+-  it('decodes user broadcast with JSON payload and metadata', async () => {
+-    // 4 -> user_broadcast
+-    // 3 for topic length
+-    // 10 for user event length (\x0a)
+-    // 17 for metadata length 17 (\x11)
+-    // 1 for JSON encoding
+-    // actual topic
+-    // actual user event
+-    // actual metadata
+-    // actual payload
+-    let bin = '\x04\x03\x0a\x11\x01topuser-event{"replayed":true}{"a":"b"}'
+-    let buffer = new TextEncoder().encode(bin).buffer
+-    ;('{"replayed":true}')
+-    const result = await decodeAsync(serializer, buffer)
+-
+-    expect(result.join_ref).toBeNull()
+-    expect(result.ref).toBeNull()
+-    expect(result.topic).toBe('top')
+-    expect(result.event).toBe('broadcast')
+-    expect(result.payload.constructor).toBe(Object)
+-    expect(result.payload).toStrictEqual({
+-      type: 'broadcast',
+-      event: 'user-event',
+-      meta: { replayed: true },
+-      payload: { a: 'b' },
+-    })
+-  })
+-
+-  it('decodes user broadcast with binary payload and no metadata', async () => {
+-    // 4 -> user_broadcast
+-    // 3 for topic length
+-    // 10 for user event length (\x0a)
+-    // 0 for metadata length
+-    // 0 for binary encoding
+-    // actual topic
+-    // actual user event
+-    // (no metadata)
+-    // actual payload
+-    let bin = '\x04\x03\x0a\x00\x00topuser-event\x01\x04'
+-    let buffer = new TextEncoder().encode(bin).buffer
+-
+-    const result = await decodeAsync(serializer, buffer)
+-
+-    expect(result.join_ref).toBeNull()
+-    expect(result.ref).toBeNull()
+-    expect(result.topic).toBe('top')
+-    expect(result.event).toBe('broadcast')
+-    expect(result.payload.constructor).toBe(Object)
+-    expect(Object.keys(result.payload)).toHaveLength(3)
+-    expect(result.payload.type).toBe('broadcast')
+-    expect(result.payload.event).toBe('user-event')
+-    expect(decoder.decode(result.payload.payload as ArrayBuffer)).toBe('\x01\x04')
+-  })
+-
+-  it('decodes user broadcast with binary payload and metadata', async () => {
+-    // 4 -> user_broadcast
+-    // 3 for topic length
+-    // 10 for user event length (\x0a)
+-    // 17 for metadata length 17 (\x11)
+-    // 0 for binary encoding
+-    // actual topic
+-    // actual user event
+-    // actual metadata
+-    // actual payload
+-    let bin = '\x04\x03\x0a\x11\x00topuser-event{"replayed":true}\x01\x04'
+-    let buffer = new TextEncoder().encode(bin).buffer
+-
+-    const result = await decodeAsync(serializer, buffer)
+-
+-    expect(result.join_ref).toBeNull()
+-    expect(result.ref).toBeNull()
+-    expect(result.topic).toBe('top')
+-    expect(result.event).toBe('broadcast')
+-    expect(result.payload.constructor).toBe(Object)
+-    expect(Object.keys(result.payload)).toHaveLength(4)
+-    expect(result.payload.type).toBe('broadcast')
+-    expect(result.payload.event).toBe('user-event')
+-    expect(result.payload.meta).toStrictEqual({ replayed: true })
+-    expect(decoder.decode(result.payload.payload as ArrayBuffer)).toBe('\x01\x04')
+-  })
+-})
+diff --git a/packages/core/storage-js/CHANGELOG.md b/packages/core/storage-js/CHANGELOG.md
+index 3aac44a9..6bd007ac 100644
+--- a/packages/core/storage-js/CHANGELOG.md
++++ b/packages/core/storage-js/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## 2.80.0 (2025-11-06)
++
++This was a version bump only for @supabase/storage-js to align it with other projects, there were no code changes.
++
+ ## 2.79.0 (2025-11-04)
+ 
+ ### 🚀 Features
+diff --git a/packages/core/supabase-js/CHANGELOG.md b/packages/core/supabase-js/CHANGELOG.md
+index cc3c33f2..ef26e4aa 100644
+--- a/packages/core/supabase-js/CHANGELOG.md
++++ b/packages/core/supabase-js/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## 2.80.0 (2025-11-06)
++
++This was a version bump only for @supabase/supabase-js to align it with other projects, there were no code changes.
++
+ ## 2.79.0 (2025-11-04)
+ 
+ ### 🚀 Features

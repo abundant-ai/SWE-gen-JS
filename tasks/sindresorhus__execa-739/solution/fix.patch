@@ -1,0 +1,113 @@
+diff --git a/lib/stdio/async.js b/lib/stdio/async.js
+index 4105d83..bb5d8a2 100644
+--- a/lib/stdio/async.js
++++ b/lib/stdio/async.js
+@@ -5,6 +5,7 @@ import mergeStreams from '@sindresorhus/merge-streams';
+ import {handleInput} from './handle.js';
+ import {TYPE_TO_MESSAGE} from './type.js';
+ import {generatorToDuplexStream, pipeGenerator} from './generator.js';
++import {pipeStreams} from './utils.js';
+ 
+ // Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in async mode
+ export const handleInputAsync = options => handleInput(addPropertiesAsync, options, false);
+@@ -50,7 +51,7 @@ export const pipeOutputAsync = (spawned, stdioStreamsGroups) => {
+ 
+ 	for (const [index, inputStreams] of Object.entries(inputStreamsGroups)) {
+ 		const value = inputStreams.length === 1 ? inputStreams[0] : mergeStreams(inputStreams);
+-		value.pipe(spawned.stdio[index]);
++		pipeStreams(value, spawned.stdio[index]);
+ 	}
+ };
+ 
+@@ -60,7 +61,7 @@ const pipeStdioOption = (spawned, {type, value, direction, index}, inputStreamsG
+ 	}
+ 
+ 	if (direction === 'output') {
+-		spawned.stdio[index].pipe(value);
++		pipeStreams(spawned.stdio[index], value);
+ 	} else {
+ 		inputStreamsGroups[index] = [...(inputStreamsGroups[index] ?? []), value];
+ 	}
+diff --git a/lib/stdio/generator.js b/lib/stdio/generator.js
+index 462eac8..661556d 100644
+--- a/lib/stdio/generator.js
++++ b/lib/stdio/generator.js
+@@ -2,7 +2,7 @@ import {generatorsToDuplex} from './duplex.js';
+ import {getEncodingStartGenerator} from './encoding.js';
+ import {getLinesGenerator} from './lines.js';
+ import {isGeneratorOptions} from './type.js';
+-import {isBinary} from './utils.js';
++import {isBinary, pipeStreams} from './utils.js';
+ 
+ export const normalizeGenerators = stdioStreams => {
+ 	const nonGenerators = stdioStreams.filter(({type}) => type !== 'generator');
+@@ -98,9 +98,9 @@ const validateTransformReturn = async function * (optionName, chunks) {
+ // `childProcess.stdin|stdout|stderr|stdio` is directly mutated.
+ export const pipeGenerator = (spawned, {value, direction, index}) => {
+ 	if (direction === 'output') {
+-		spawned.stdio[index].pipe(value);
+-	}	else {
+-		value.pipe(spawned.stdio[index]);
++		pipeStreams(spawned.stdio[index], value);
++	} else {
++		pipeStreams(value, spawned.stdio[index]);
+ 	}
+ 
+ 	const streamProperty = PROCESS_STREAM_PROPERTIES[index];
+diff --git a/lib/stdio/utils.js b/lib/stdio/utils.js
+index f9aa542..386c6db 100644
+--- a/lib/stdio/utils.js
++++ b/lib/stdio/utils.js
+@@ -1,4 +1,5 @@
+ import {Buffer} from 'node:buffer';
++import {finished} from 'node:stream/promises';
+ 
+ export const bufferToUint8Array = buffer => new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+ 
+@@ -7,3 +8,16 @@ export const isBinary = value => isUint8Array(value) || Buffer.isBuffer(value);
+ 
+ const textDecoder = new TextDecoder();
+ export const binaryToString = uint8ArrayOrBuffer => textDecoder.decode(uint8ArrayOrBuffer);
++
++// Like `source.pipe(destination)`, if `source` ends, `destination` ends.
++// Like `Stream.pipeline(source, destination)`, if `source` aborts/errors, `destination` aborts.
++// Unlike `Stream.pipeline(source, destination)`, if `destination` ends/aborts/errors, `source` does not end/abort/error.
++export const pipeStreams = async (source, destination) => {
++	source.pipe(destination);
++
++	try {
++		await finished(source);
++	} catch {
++		destination.destroy();
++	}
++};
+diff --git a/lib/stream.js b/lib/stream.js
+index 001f1c7..ebef5a5 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -115,17 +115,6 @@ const throwOnStreamError = async stream => {
+ 	throw error;
+ };
+ 
+-// The streams created by the `std*` options are automatically ended by `.pipe()`.
+-// However `.pipe()` only does so when the source stream ended, not when it errored.
+-// Therefore, when `childProcess.stdin|stdout|stderr` errors, those streams must be manually destroyed.
+-const cleanupStdioStreams = (customStreams, error) => {
+-	for (const {value} of customStreams) {
+-		if (!STANDARD_STREAMS.includes(value)) {
+-			value.destroy(error);
+-		}
+-	}
+-};
+-
+ // Like `once()` except it never rejects, especially not on `error` event.
+ const pEvent = (eventEmitter, eventName) => new Promise(resolve => {
+ 	eventEmitter.once(eventName, (...payload) => {
+@@ -191,7 +180,6 @@ export const getSpawnedResult = async ({
+ 			Promise.all(stdioPromises.map(stdioPromise => getBufferedData(stdioPromise, encoding))),
+ 			getBufferedData(allPromise, encoding),
+ 		]);
+-		cleanupStdioStreams(customStreams, error);
+ 		await Promise.allSettled(customStreamsEndPromises);
+ 		return results;
+ 	} finally {

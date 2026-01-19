@@ -1,0 +1,1100 @@
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 6c01ba1b9..6397e5305 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -33,14 +33,6 @@ jobs:
+         run: |
+           pnpm run ci --coverage
+ 
+-      - name: Run ganttDb tests using California timezone
+-        env:
+-          # Makes sure that gantt db works even in a timezone that has daylight savings
+-          # since some days have 25 hours instead of 24.
+-          TZ: America/Los_Angeles
+-        run: |
+-          pnpm exec vitest run ./packages/mermaid/src/diagrams/gantt/ganttDb.spec.ts
+-
+       - name: Upload Coverage to Coveralls
+         # it feels a bit weird to use @master, but that's what the docs use
+         # (coveralls also doesn't publish a @v1 we can use)
+diff --git a/docs/syntax/gantt.md b/docs/syntax/gantt.md
+index 6a7af3331..8e9ad3cfd 100644
+--- a/docs/syntax/gantt.md
++++ b/docs/syntax/gantt.md
+@@ -184,7 +184,7 @@ The following formatting options are supported:
+ | `YY`       | 14             | 2 digit year                                           |
+ | `Q`        | 1..4           | Quarter of year. Sets month to first month in quarter. |
+ | `M MM`     | 1..12          | Month number                                           |
+-| `MMM MMMM` | January..Dec   | Month name in locale set by `dayjs.locale()`           |
++| `MMM MMMM` | January..Dec   | Month name in locale set by `moment.locale()`          |
+ | `D DD`     | 1..31          | Day of month                                           |
+ | `Do`       | 1st..31st      | Day of month with ordinal                              |
+ | `DDD DDDD` | 1..365         | Day of year                                            |
+@@ -200,7 +200,7 @@ The following formatting options are supported:
+ | `SSS`      | 0..999         | Thousandths of a second                                |
+ | `Z ZZ`     | +12:00         | Offset from UTC as +-HH:mm, +-HHmm, or Z               |
+ 
+-More info in: <https://day.js.org/docs/en/parse/string-format/>
++More info in: <https://momentjs.com/docs/#/parsing/string-format/>
+ 
+ ### Output date format on the axis
+ 
+diff --git a/packages/mermaid/package.json b/packages/mermaid/package.json
+index b20a8e6eb..ab1157bd7 100644
+--- a/packages/mermaid/package.json
++++ b/packages/mermaid/package.json
+@@ -57,11 +57,11 @@
+     "cytoscape-fcose": "^2.1.0",
+     "d3": "^7.4.0",
+     "dagre-d3-es": "7.0.9",
+-    "dayjs": "^1.11.7",
+     "dompurify": "2.4.3",
+     "elkjs": "^0.8.2",
+     "khroma": "^2.0.0",
+     "lodash-es": "^4.17.21",
++    "moment-mini": "^2.29.4",
+     "non-layered-tidy-tree-layout": "^2.0.2",
+     "stylis": "^4.1.2",
+     "ts-dedent": "^2.2.0",
+diff --git a/packages/mermaid/src/diagrams/gantt/ganttDb.js b/packages/mermaid/src/diagrams/gantt/ganttDb.js
+index 27ad1a0b8..a1c74dd62 100644
+--- a/packages/mermaid/src/diagrams/gantt/ganttDb.js
++++ b/packages/mermaid/src/diagrams/gantt/ganttDb.js
+@@ -1,8 +1,5 @@
++import moment from 'moment-mini';
+ import { sanitizeUrl } from '@braintree/sanitize-url';
+-import dayjs from 'dayjs';
+-import dayjsIsoWeek from 'dayjs/plugin/isoWeek';
+-import dayjsCustomParseFormat from 'dayjs/plugin/customParseFormat';
+-import dayjsAdvancedFormat from 'dayjs/plugin/advancedFormat';
+ import { log } from '../../logger';
+ import * as configApi from '../../config';
+ import utils from '../../utils';
+@@ -18,10 +15,6 @@ import {
+   getDiagramTitle,
+ } from '../../commonDb';
+ 
+-dayjs.extend(dayjsIsoWeek);
+-dayjs.extend(dayjsCustomParseFormat);
+-dayjs.extend(dayjsAdvancedFormat);
+-
+ let dateFormat = '';
+ let axisFormat = '';
+ let tickInterval = undefined;
+@@ -169,58 +162,18 @@ export const isInvalidDate = function (date, dateFormat, excludes, includes) {
+   return excludes.includes(date.format(dateFormat.trim()));
+ };
+ 
+-/**
+- * TODO: fully document what this function does and what types it accepts
+- *
+- * @param {object} task - The task to check.
+- * @param {string | Date} task.startTime - Might be a `Date` or a `string`.
+- * TODO: is this always a Date?
+- * @param {string | Date} task.endTime - Might be a `Date` or a `string`.
+- * TODO: is this always a Date?
+- * @param {string} dateFormat - Dayjs date format string.
+- * @param {*} excludes
+- * @param {*} includes
+- */
+ const checkTaskDates = function (task, dateFormat, excludes, includes) {
+   if (!excludes.length || task.manualEndTime) {
+     return;
+   }
+-  let startTime;
+-  if (task.startTime instanceof Date) {
+-    startTime = dayjs(task.startTime);
+-  } else {
+-    startTime = dayjs(task.startTime, dateFormat, true);
+-  }
+-  startTime = startTime.add(1, 'd');
+-
+-  let originalEndTime;
+-  if (task.endTime instanceof Date) {
+-    originalEndTime = dayjs(task.endTime);
+-  } else {
+-    originalEndTime = dayjs(task.endTime, dateFormat, true);
+-  }
+-  const [fixedEndTime, renderEndTime] = fixTaskDates(
+-    startTime,
+-    originalEndTime,
+-    dateFormat,
+-    excludes,
+-    includes
+-  );
+-  task.endTime = fixedEndTime.toDate();
++  let startTime = moment(task.startTime, dateFormat, true);
++  startTime.add(1, 'd');
++  let endTime = moment(task.endTime, dateFormat, true);
++  let renderEndTime = fixTaskDates(startTime, endTime, dateFormat, excludes, includes);
++  task.endTime = endTime.toDate();
+   task.renderEndTime = renderEndTime;
+ };
+ 
+-/**
+- * TODO: what does this function do?
+- *
+- * @param {dayjs.Dayjs} startTime - The start time.
+- * @param {dayjs.Dayjs} endTime - The original end time (will return a different end time if it's invalid).
+- * @param {string} dateFormat - Dayjs date format string.
+- * @param {*} excludes
+- * @param {*} includes
+- * @returns {[endTime: dayjs.Dayjs, renderEndTime: Date | null]} The new `endTime`, and the end time to render.
+- * `renderEndTime` may be `null` if `startTime` is newer than `endTime`.
+- */
+ const fixTaskDates = function (startTime, endTime, dateFormat, excludes, includes) {
+   let invalid = false;
+   let renderEndTime = null;
+@@ -230,11 +183,11 @@ const fixTaskDates = function (startTime, endTime, dateFormat, excludes, include
+     }
+     invalid = isInvalidDate(startTime, dateFormat, excludes, includes);
+     if (invalid) {
+-      endTime = endTime.add(1, 'd');
++      endTime.add(1, 'd');
+     }
+-    startTime = startTime.add(1, 'd');
++    startTime.add(1, 'd');
+   }
+-  return [endTime, renderEndTime];
++  return renderEndTime;
+ };
+ 
+ const getStartDate = function (prevTime, dateFormat, str) {
+@@ -270,7 +223,7 @@ const getStartDate = function (prevTime, dateFormat, str) {
+   }
+ 
+   // Check for actual date set
+-  let mDate = dayjs(str, dateFormat.trim(), true);
++  let mDate = moment(str, dateFormat.trim(), true);
+   if (mDate.isValid()) {
+     return mDate.toDate();
+   } else {
+@@ -285,14 +238,11 @@ const getStartDate = function (prevTime, dateFormat, str) {
+ };
+ 
+ /**
+- * Parse a string into the args for `dayjs.add()`.
++ * Parse a string as a moment duration.
+  *
+  * The string have to be compound by a value and a shorthand duration unit. For example `5d`
+  * represents 5 days.
+  *
+- * Please be aware that 1 day may be 23 or 25 hours, if the user lives in an area
+- * that has daylight savings time (or even 23.5/24.5 hours in Lord Howe Island!)
+- *
+  * Shorthand unit supported are:
+  *
+  * - `y` for years
+@@ -304,36 +254,33 @@ const getStartDate = function (prevTime, dateFormat, str) {
+  * - `ms` for milliseconds
+  *
+  * @param {string} str - A string representing the duration.
+- * @returns {[value: number, unit: dayjs.ManipulateType]} Arguments to pass to `dayjs.add()`
++ * @returns {moment.Duration} A moment duration, including an invalid moment for invalid input
++ *   string.
+  */
+ const parseDuration = function (str) {
+   const statement = /^(\d+(?:\.\d+)?)([Mdhmswy]|ms)$/.exec(str.trim());
+   if (statement !== null) {
+-    return [Number.parseFloat(statement[1]), statement[2]];
++    return moment.duration(Number.parseFloat(statement[1]), statement[2]);
+   }
+-  // NaN means an invalid duration
+-  return [NaN, 'ms'];
++  return moment.duration.invalid();
+ };
+ 
+ const getEndDate = function (prevTime, dateFormat, str, inclusive = false) {
+   str = str.trim();
+ 
+   // Check for actual date
+-  let mDate = dayjs(str, dateFormat.trim(), true);
++  let mDate = moment(str, dateFormat.trim(), true);
+   if (mDate.isValid()) {
+     if (inclusive) {
+-      mDate = mDate.add(1, 'd');
++      mDate.add(1, 'd');
+     }
+     return mDate.toDate();
+   }
+ 
+-  let endTime = dayjs(prevTime);
+-  const [durationValue, durationUnit] = parseDuration(str);
+-  if (!Number.isNaN(durationValue)) {
+-    const newEndTime = endTime.add(durationValue, durationUnit);
+-    if (newEndTime.isValid()) {
+-      endTime = newEndTime;
+-    }
++  const endTime = moment(prevTime);
++  const duration = parseDuration(str);
++  if (duration.isValid()) {
++    endTime.add(duration);
+   }
+   return endTime.toDate();
+ };
+@@ -399,7 +346,7 @@ const compileData = function (prevTask, dataStr) {
+ 
+   if (endTimeData) {
+     task.endTime = getEndDate(task.startTime, dateFormat, endTimeData, inclusiveEndDates);
+-    task.manualEndTime = dayjs(endTimeData, 'YYYY-MM-DD', true).isValid();
++    task.manualEndTime = moment(endTimeData, 'YYYY-MM-DD', true).isValid();
+     checkTaskDates(task, dateFormat, excludes, includes);
+   }
+ 
+@@ -549,7 +496,7 @@ const compileTasks = function () {
+       );
+       if (rawTasks[pos].endTime) {
+         rawTasks[pos].processed = true;
+-        rawTasks[pos].manualEndTime = dayjs(
++        rawTasks[pos].manualEndTime = moment(
+           rawTasks[pos].raw.endTime.data,
+           'YYYY-MM-DD',
+           true
+diff --git a/packages/mermaid/src/diagrams/gantt/ganttDb.spec.ts b/packages/mermaid/src/diagrams/gantt/ganttDb.spec.ts
+index d65f2fdfd..09df96f12 100644
+--- a/packages/mermaid/src/diagrams/gantt/ganttDb.spec.ts
++++ b/packages/mermaid/src/diagrams/gantt/ganttDb.spec.ts
+@@ -1,5 +1,5 @@
+ // @ts-nocheck TODO: Fix TS
+-import dayjs from 'dayjs';
++import moment from 'moment-mini';
+ import ganttDb from './ganttDb';
+ import { convert } from '../../tests/util';
+ 
+@@ -9,7 +9,7 @@ describe('when using the ganttDb', function () {
+   });
+ 
+   describe('when using duration', function () {
+-    it.each([{ str: '1d', expected: [1, 'd'] }])(
++    it.each([{ str: '1d', expected: moment.duration(1, 'd') }])(
+       'should %s resulting in $o duration',
+       ({ str, expected }) => {
+         expect(ganttDb.parseDuration(str)).toEqual(expected);
+@@ -19,11 +19,11 @@ describe('when using the ganttDb', function () {
+     it.each(
+       convert`
+       str       | expected
+-      ${'1d'}   | ${[1, 'd']}
+-      ${'2w'}   | ${[2, 'w']}
+-      ${'1ms'}  | ${[1, 'ms']}
+-      ${'0.1s'} | ${[0.1, 's']}
+-      ${'1f'}   | ${[NaN, 'ms']}
++      ${'1d'}   | ${moment.duration(1, 'd')}
++      ${'2w'}   | ${moment.duration(2, 'w')}
++      ${'1ms'}  | ${moment.duration(1, 'ms')}
++      ${'0.1s'} | ${moment.duration(100, 'ms')}
++      ${'1f'}   | ${moment.duration.invalid()}
+     `
+     )('should $str resulting in $expected duration', ({ str, expected }) => {
+       expect(ganttDb.parseDuration(str)).toEqual(expected);
+@@ -171,44 +171,44 @@ describe('when using the ganttDb', function () {
+ 
+     const tasks = ganttDb.getTasks();
+ 
+-    expect(tasks[0].startTime).toEqual(dayjs('2019-02-01', 'YYYY-MM-DD').toDate());
+-    expect(tasks[0].endTime).toEqual(dayjs('2019-02-04', 'YYYY-MM-DD').toDate());
+-    expect(tasks[0].renderEndTime).toEqual(dayjs('2019-02-02', 'YYYY-MM-DD').toDate());
++    expect(tasks[0].startTime).toEqual(moment('2019-02-01', 'YYYY-MM-DD').toDate());
++    expect(tasks[0].endTime).toEqual(moment('2019-02-04', 'YYYY-MM-DD').toDate());
++    expect(tasks[0].renderEndTime).toEqual(moment('2019-02-02', 'YYYY-MM-DD').toDate());
+     expect(tasks[0].id).toEqual('id1');
+     expect(tasks[0].task).toEqual('test1');
+ 
+-    expect(tasks[1].startTime).toEqual(dayjs('2019-02-04', 'YYYY-MM-DD').toDate());
+-    expect(tasks[1].endTime).toEqual(dayjs('2019-02-07', 'YYYY-MM-DD').toDate());
+-    expect(tasks[1].renderEndTime).toEqual(dayjs('2019-02-06', 'YYYY-MM-DD').toDate());
++    expect(tasks[1].startTime).toEqual(moment('2019-02-04', 'YYYY-MM-DD').toDate());
++    expect(tasks[1].endTime).toEqual(moment('2019-02-07', 'YYYY-MM-DD').toDate());
++    expect(tasks[1].renderEndTime).toEqual(moment('2019-02-06', 'YYYY-MM-DD').toDate());
+     expect(tasks[1].id).toEqual('id2');
+     expect(tasks[1].task).toEqual('test2');
+ 
+-    expect(tasks[2].startTime).toEqual(dayjs('2019-02-07', 'YYYY-MM-DD').toDate());
+-    expect(tasks[2].endTime).toEqual(dayjs('2019-02-20', 'YYYY-MM-DD').toDate());
+-    expect(tasks[2].renderEndTime).toEqual(dayjs('2019-02-20', 'YYYY-MM-DD').toDate());
++    expect(tasks[2].startTime).toEqual(moment('2019-02-07', 'YYYY-MM-DD').toDate());
++    expect(tasks[2].endTime).toEqual(moment('2019-02-20', 'YYYY-MM-DD').toDate());
++    expect(tasks[2].renderEndTime).toEqual(moment('2019-02-20', 'YYYY-MM-DD').toDate());
+     expect(tasks[2].id).toEqual('id3');
+     expect(tasks[2].task).toEqual('test3');
+ 
+-    expect(tasks[3].startTime).toEqual(dayjs('2019-02-01', 'YYYY-MM-DD').toDate());
+-    expect(tasks[3].endTime).toEqual(dayjs('2019-02-20', 'YYYY-MM-DD').toDate());
++    expect(tasks[3].startTime).toEqual(moment('2019-02-01', 'YYYY-MM-DD').toDate());
++    expect(tasks[3].endTime).toEqual(moment('2019-02-20', 'YYYY-MM-DD').toDate());
+     expect(tasks[3].renderEndTime).toBeNull(); // Fixed end
+     expect(tasks[3].id).toEqual('id4');
+     expect(tasks[3].task).toEqual('test4');
+ 
+-    expect(tasks[4].startTime).toEqual(dayjs('2019-02-20', 'YYYY-MM-DD').toDate());
+-    expect(tasks[4].endTime).toEqual(dayjs('2019-02-21', 'YYYY-MM-DD').toDate());
+-    expect(tasks[4].renderEndTime).toEqual(dayjs('2019-02-21', 'YYYY-MM-DD').toDate());
++    expect(tasks[4].startTime).toEqual(moment('2019-02-20', 'YYYY-MM-DD').toDate());
++    expect(tasks[4].endTime).toEqual(moment('2019-02-21', 'YYYY-MM-DD').toDate());
++    expect(tasks[4].renderEndTime).toEqual(moment('2019-02-21', 'YYYY-MM-DD').toDate());
+     expect(tasks[4].id).toEqual('id5');
+     expect(tasks[4].task).toEqual('test5');
+ 
+-    expect(tasks[5].startTime).toEqual(dayjs('2019-02-13', 'YYYY-MM-DD').toDate());
+-    expect(tasks[5].endTime).toEqual(dayjs('2019-02-18', 'YYYY-MM-DD').toDate());
+-    expect(tasks[5].renderEndTime).toEqual(dayjs('2019-02-15', 'YYYY-MM-DD').toDate());
++    expect(tasks[5].startTime).toEqual(moment('2019-02-13', 'YYYY-MM-DD').toDate());
++    expect(tasks[5].endTime).toEqual(moment('2019-02-18', 'YYYY-MM-DD').toDate());
++    expect(tasks[5].renderEndTime).toEqual(moment('2019-02-15', 'YYYY-MM-DD').toDate());
+     expect(tasks[5].id).toEqual('id6');
+     expect(tasks[5].task).toEqual('test6');
+ 
+-    expect(tasks[6].startTime).toEqual(dayjs('2019-02-18', 'YYYY-MM-DD').toDate());
+-    expect(tasks[6].endTime).toEqual(dayjs('2019-02-19', 'YYYY-MM-DD').toDate());
++    expect(tasks[6].startTime).toEqual(moment('2019-02-18', 'YYYY-MM-DD').toDate());
++    expect(tasks[6].endTime).toEqual(moment('2019-02-19', 'YYYY-MM-DD').toDate());
+     expect(tasks[6].id).toEqual('id7');
+     expect(tasks[6].task).toEqual('test7');
+   });
+@@ -243,103 +243,109 @@ describe('when using the ganttDb', function () {
+     const tasks = ganttDb.getTasks();
+ 
+     // Section - A section
+-    expect(tasks[0].startTime).toEqual(dayjs('2014-01-06', 'YYYY-MM-DD').toDate());
+-    expect(tasks[0].endTime).toEqual(dayjs('2014-01-08', 'YYYY-MM-DD').toDate());
++    expect(tasks[0].startTime).toEqual(moment('2014-01-06', 'YYYY-MM-DD').toDate());
++    expect(tasks[0].endTime).toEqual(moment('2014-01-08', 'YYYY-MM-DD').toDate());
+     expect(tasks[0].order).toEqual(0);
+     expect(tasks[0].id).toEqual('des1');
+     expect(tasks[0].task).toEqual('Completed task');
+ 
+-    expect(tasks[1].startTime).toEqual(dayjs('2014-01-09', 'YYYY-MM-DD').toDate());
+-    expect(tasks[1].endTime).toEqual(dayjs('2014-01-12', 'YYYY-MM-DD').toDate());
++    expect(tasks[1].startTime).toEqual(moment('2014-01-09', 'YYYY-MM-DD').toDate());
++    expect(tasks[1].endTime).toEqual(moment('2014-01-12', 'YYYY-MM-DD').toDate());
+     expect(tasks[1].order).toEqual(1);
+     expect(tasks[1].id).toEqual('des2');
+     expect(tasks[1].task).toEqual('Active task');
+ 
+-    expect(tasks[2].startTime).toEqual(dayjs('2014-01-12', 'YYYY-MM-DD').toDate());
+-    expect(tasks[2].endTime).toEqual(dayjs('2014-01-17', 'YYYY-MM-DD').toDate());
++    expect(tasks[2].startTime).toEqual(moment('2014-01-12', 'YYYY-MM-DD').toDate());
++    expect(tasks[2].endTime).toEqual(moment('2014-01-17', 'YYYY-MM-DD').toDate());
+     expect(tasks[2].order).toEqual(2);
+     expect(tasks[2].id).toEqual('des3');
+     expect(tasks[2].task).toEqual('Future task');
+ 
+-    expect(tasks[3].startTime).toEqual(dayjs('2014-01-17', 'YYYY-MM-DD').toDate());
+-    expect(tasks[3].endTime).toEqual(dayjs('2014-01-22', 'YYYY-MM-DD').toDate());
++    expect(tasks[3].startTime).toEqual(moment('2014-01-17', 'YYYY-MM-DD').toDate());
++    expect(tasks[3].endTime).toEqual(moment('2014-01-22', 'YYYY-MM-DD').toDate());
+     expect(tasks[3].order).toEqual(3);
+     expect(tasks[3].id).toEqual('des4');
+     expect(tasks[3].task).toEqual('Future task2');
+ 
+     // Section - Critical tasks
+-    expect(tasks[4].startTime).toEqual(dayjs('2014-01-06', 'YYYY-MM-DD').toDate());
+-    expect(tasks[4].endTime).toEqual(dayjs('2014-01-07', 'YYYY-MM-DD').toDate());
++    expect(tasks[4].startTime).toEqual(moment('2014-01-06', 'YYYY-MM-DD').toDate());
++    expect(tasks[4].endTime).toEqual(moment('2014-01-07', 'YYYY-MM-DD').toDate());
+     expect(tasks[4].order).toEqual(4);
+     expect(tasks[4].id).toEqual('task1');
+     expect(tasks[4].task).toEqual('Completed task in the critical line');
+ 
+-    expect(tasks[5].startTime).toEqual(dayjs('2014-01-08', 'YYYY-MM-DD').toDate());
+-    expect(tasks[5].endTime).toEqual(dayjs('2014-01-10', 'YYYY-MM-DD').toDate());
++    expect(tasks[5].startTime).toEqual(moment('2014-01-08', 'YYYY-MM-DD').toDate());
++    expect(tasks[5].endTime).toEqual(moment('2014-01-10', 'YYYY-MM-DD').toDate());
+     expect(tasks[5].order).toEqual(5);
+     expect(tasks[5].id).toEqual('task2');
+     expect(tasks[5].task).toEqual('Implement parser and jison');
+ 
+-    expect(tasks[6].startTime).toEqual(dayjs('2014-01-10', 'YYYY-MM-DD').toDate());
+-    expect(tasks[6].endTime).toEqual(dayjs('2014-01-13', 'YYYY-MM-DD').toDate());
++    expect(tasks[6].startTime).toEqual(moment('2014-01-10', 'YYYY-MM-DD').toDate());
++    expect(tasks[6].endTime).toEqual(moment('2014-01-13', 'YYYY-MM-DD').toDate());
+     expect(tasks[6].order).toEqual(6);
+     expect(tasks[6].id).toEqual('task3');
+     expect(tasks[6].task).toEqual('Create tests for parser');
+ 
+-    expect(tasks[7].startTime).toEqual(dayjs('2014-01-13', 'YYYY-MM-DD').toDate());
+-    expect(tasks[7].endTime).toEqual(dayjs('2014-01-18', 'YYYY-MM-DD').toDate());
++    expect(tasks[7].startTime).toEqual(moment('2014-01-13', 'YYYY-MM-DD').toDate());
++    expect(tasks[7].endTime).toEqual(moment('2014-01-18', 'YYYY-MM-DD').toDate());
+     expect(tasks[7].order).toEqual(7);
+     expect(tasks[7].id).toEqual('task4');
+     expect(tasks[7].task).toEqual('Future task in critical line');
+ 
+-    expect(tasks[8].startTime).toEqual(dayjs('2014-01-18', 'YYYY-MM-DD').toDate());
+-    expect(tasks[8].endTime).toEqual(dayjs('2014-01-20', 'YYYY-MM-DD').toDate());
++    expect(tasks[8].startTime).toEqual(moment('2014-01-18', 'YYYY-MM-DD').toDate());
++    expect(tasks[8].endTime).toEqual(moment('2014-01-20', 'YYYY-MM-DD').toDate());
+     expect(tasks[8].order).toEqual(8);
+     expect(tasks[8].id).toEqual('task5');
+     expect(tasks[8].task).toEqual('Create tests for renderer');
+ 
+-    expect(tasks[9].startTime).toEqual(dayjs('2014-01-20', 'YYYY-MM-DD').toDate());
+-    expect(tasks[9].endTime).toEqual(dayjs('2014-01-21', 'YYYY-MM-DD').toDate());
++    expect(tasks[9].startTime).toEqual(moment('2014-01-20', 'YYYY-MM-DD').toDate());
++    expect(tasks[9].endTime).toEqual(moment('2014-01-21', 'YYYY-MM-DD').toDate());
+     expect(tasks[9].order).toEqual(9);
+     expect(tasks[9].id).toEqual('task6');
+     expect(tasks[9].task).toEqual('Add to mermaid');
+ 
+     // Section - Documentation
+-    expect(tasks[10].startTime).toEqual(dayjs('2014-01-08', 'YYYY-MM-DD').toDate());
+-    expect(tasks[10].endTime).toEqual(dayjs('2014-01-11', 'YYYY-MM-DD').toDate());
++    expect(tasks[10].startTime).toEqual(moment('2014-01-08', 'YYYY-MM-DD').toDate());
++    expect(tasks[10].endTime).toEqual(moment('2014-01-11', 'YYYY-MM-DD').toDate());
+     expect(tasks[10].order).toEqual(10);
+     expect(tasks[10].id).toEqual('a1');
+     expect(tasks[10].task).toEqual('Describe gantt syntax');
+ 
+-    expect(tasks[11].startTime).toEqual(dayjs('2014-01-11', 'YYYY-MM-DD').toDate());
+-    expect(tasks[11].endTime).toEqual(dayjs('2014-01-11 20:00:00', 'YYYY-MM-DD HH:mm:ss').toDate());
++    expect(tasks[11].startTime).toEqual(moment('2014-01-11', 'YYYY-MM-DD').toDate());
++    expect(tasks[11].endTime).toEqual(
++      moment('2014-01-11 20:00:00', 'YYYY-MM-DD HH:mm:ss').toDate()
++    );
+     expect(tasks[11].order).toEqual(11);
+     expect(tasks[11].id).toEqual('task7');
+     expect(tasks[11].task).toEqual('Add gantt diagram to demo page');
+ 
+-    expect(tasks[12].startTime).toEqual(dayjs('2014-01-11', 'YYYY-MM-DD').toDate());
+-    expect(tasks[12].endTime).toEqual(dayjs('2014-01-13', 'YYYY-MM-DD').toDate());
++    expect(tasks[12].startTime).toEqual(moment('2014-01-11', 'YYYY-MM-DD').toDate());
++    expect(tasks[12].endTime).toEqual(moment('2014-01-13', 'YYYY-MM-DD').toDate());
+     expect(tasks[12].order).toEqual(12);
+     expect(tasks[12].id).toEqual('doc1');
+     expect(tasks[12].task).toEqual('Add another diagram to demo page');
+ 
+     // Section - Last section
+-    expect(tasks[13].startTime).toEqual(dayjs('2014-01-13', 'YYYY-MM-DD').toDate());
+-    expect(tasks[13].endTime).toEqual(dayjs('2014-01-16', 'YYYY-MM-DD').toDate());
++    expect(tasks[13].startTime).toEqual(moment('2014-01-13', 'YYYY-MM-DD').toDate());
++    expect(tasks[13].endTime).toEqual(moment('2014-01-16', 'YYYY-MM-DD').toDate());
+     expect(tasks[13].order).toEqual(13);
+     expect(tasks[13].id).toEqual('task8');
+     expect(tasks[13].task).toEqual('Describe gantt syntax');
+ 
+-    expect(tasks[14].startTime).toEqual(dayjs('2014-01-16', 'YYYY-MM-DD').toDate());
+-    expect(tasks[14].endTime).toEqual(dayjs('2014-01-16 20:00:00', 'YYYY-MM-DD HH:mm:ss').toDate());
++    expect(tasks[14].startTime).toEqual(moment('2014-01-16', 'YYYY-MM-DD').toDate());
++    expect(tasks[14].endTime).toEqual(
++      moment('2014-01-16 20:00:00', 'YYYY-MM-DD HH:mm:ss').toDate()
++    );
+     expect(tasks[14].order).toEqual(14);
+     expect(tasks[14].id).toEqual('task9');
+     expect(tasks[14].task).toEqual('Add gantt diagram to demo page');
+ 
+     expect(tasks[15].startTime).toEqual(
+-      dayjs('2014-01-16 20:00:00', 'YYYY-MM-DD HH:mm:ss').toDate()
++      moment('2014-01-16 20:00:00', 'YYYY-MM-DD HH:mm:ss').toDate()
++    );
++    expect(tasks[15].endTime).toEqual(
++      moment('2014-01-18 20:00:00', 'YYYY-MM-DD HH:mm:ss').toDate()
+     );
+-    expect(tasks[15].endTime).toEqual(dayjs('2014-01-18 20:00:00', 'YYYY-MM-DD HH:mm:ss').toDate());
+     expect(tasks[15].order).toEqual(15);
+     expect(tasks[15].id).toEqual('task10');
+     expect(tasks[15].task).toEqual('Add another diagram to demo page');
+@@ -352,53 +358,19 @@ describe('when using the ganttDb', function () {
+     ganttDb.addTask('test2', 'id2,after id1,20d');
+     const tasks = ganttDb.getTasks();
+ 
+-    expect(tasks[0].startTime).toEqual(dayjs('2019-09-30', 'YYYY-MM-DD').toDate());
+-    expect(tasks[0].endTime).toEqual(dayjs('2019-10-11', 'YYYY-MM-DD').toDate());
++    expect(tasks[0].startTime).toEqual(moment('2019-09-30', 'YYYY-MM-DD').toDate());
++    expect(tasks[0].endTime).toEqual(moment('2019-10-11', 'YYYY-MM-DD').toDate());
+     expect(tasks[1].renderEndTime).toBeNull(); // Fixed end
+     expect(tasks[0].id).toEqual('id1');
+     expect(tasks[0].task).toEqual('test1');
+ 
+-    expect(tasks[1].startTime).toEqual(dayjs('2019-10-11', 'YYYY-MM-DD').toDate());
+-    expect(tasks[1].endTime).toEqual(dayjs('2019-10-31', 'YYYY-MM-DD').toDate());
++    expect(tasks[1].startTime).toEqual(moment('2019-10-11', 'YYYY-MM-DD').toDate());
++    expect(tasks[1].endTime).toEqual(moment('2019-10-31', 'YYYY-MM-DD').toDate());
+     expect(tasks[1].renderEndTime).toBeNull(); // Fixed end
+     expect(tasks[1].id).toEqual('id2');
+     expect(tasks[1].task).toEqual('test2');
+   });
+ 
+-  /**
+-   * Unfortunately, Vitest has no way of modifying the timezone at runtime, so
+-   * in order to test this, please run this test with
+-   *
+-   * ```bash
+-   * TZ='America/Los_Angeles' pnpm exec vitest run ganttDb
+-   * ```
+-   */
+-  /* c8 ignore start */ // tell code-coverage to ignore this block of code
+-  describe.skipIf(process.env.TZ != 'America/Los_Angeles')(
+-    'when using a timezone with daylight savings (only run if TZ="America/Los_Angeles")',
+-    () => {
+-      it('should add 1 day even on days with 25 hours', function () {
+-        const startTime = new Date(2020, 10, 1);
+-        expect(startTime.toISOString()).toBe('2020-11-01T07:00:00.000Z');
+-
+-        const endTime = new Date(2020, 10, 2);
+-        expect(endTime.toISOString()).toBe('2020-11-02T08:00:00.000Z');
+-
+-        ganttDb.setDateFormat('YYYY-MM-DD');
+-        ganttDb.addSection('Task handles 25 hour day');
+-        ganttDb.addTask('daylight savings day', 'id1,2020-11-01,1d');
+-        const tasks = ganttDb.getTasks();
+-        expect(tasks[0].startTime).toEqual(startTime);
+-        expect(tasks[0].endTime).toEqual(endTime);
+-
+-        // In USA states that use daylight savings, 2020-11-01 had 25 hours
+-        const millisecondsIn25Hours = 25 * 60 * 60 * 1000;
+-        expect(endTime - startTime).toEqual(millisecondsIn25Hours);
+-      });
+-    }
+-  );
+-  /* c8 ignore stop */
+-
+   describe('when setting inclusive end dates', function () {
+     beforeEach(function () {
+       ganttDb.setDateFormat('YYYY-MM-DD');
+@@ -408,13 +380,13 @@ describe('when using the ganttDb', function () {
+     });
+     it('should automatically add one day to all end dates', function () {
+       const tasks = ganttDb.getTasks();
+-      expect(tasks[0].startTime).toEqual(dayjs('2019-02-01', 'YYYY-MM-DD').toDate());
+-      expect(tasks[0].endTime).toEqual(dayjs('2019-02-02', 'YYYY-MM-DD').toDate());
++      expect(tasks[0].startTime).toEqual(moment('2019-02-01', 'YYYY-MM-DD').toDate());
++      expect(tasks[0].endTime).toEqual(moment('2019-02-02', 'YYYY-MM-DD').toDate());
+       expect(tasks[0].id).toEqual('id1');
+       expect(tasks[0].task).toEqual('test1');
+ 
+-      expect(tasks[1].startTime).toEqual(dayjs('2019-02-01', 'YYYY-MM-DD').toDate());
+-      expect(tasks[1].endTime).toEqual(dayjs('2019-02-04', 'YYYY-MM-DD').toDate());
++      expect(tasks[1].startTime).toEqual(moment('2019-02-01', 'YYYY-MM-DD').toDate());
++      expect(tasks[1].endTime).toEqual(moment('2019-02-04', 'YYYY-MM-DD').toDate());
+       expect(tasks[1].renderEndTime).toBeNull(); // Fixed end
+       expect(tasks[1].manualEndTime).toBeTruthy();
+       expect(tasks[1].id).toEqual('id2');
+diff --git a/packages/mermaid/src/diagrams/gantt/ganttRenderer.js b/packages/mermaid/src/diagrams/gantt/ganttRenderer.js
+index 7a012beb5..faec35a86 100644
+--- a/packages/mermaid/src/diagrams/gantt/ganttRenderer.js
++++ b/packages/mermaid/src/diagrams/gantt/ganttRenderer.js
+@@ -1,4 +1,4 @@
+-import dayjs from 'dayjs';
++import moment from 'moment-mini';
+ import { log } from '../../logger';
+ import {
+   select,
+@@ -435,16 +435,16 @@ export const draw = function (text, id, version, diagObj) {
+ 
+     const excludeRanges = [];
+     let range = null;
+-    let d = dayjs(minTime);
++    let d = moment(minTime);
+     while (d.valueOf() <= maxTime) {
+       if (diagObj.db.isInvalidDate(d, dateFormat, excludes, includes)) {
+         if (!range) {
+           range = {
+-            start: d,
+-            end: d,
++            start: d.clone(),
++            end: d.clone(),
+           };
+         } else {
+-          range.end = d;
++          range.end = d.clone();
+         }
+       } else {
+         if (range) {
+@@ -452,7 +452,7 @@ export const draw = function (text, id, version, diagObj) {
+           range = null;
+         }
+       }
+-      d = d.add(1, 'd');
++      d.add(1, 'd');
+     }
+ 
+     const rectangles = svg.append('g').selectAll('rect').data(excludeRanges).enter();
+@@ -467,7 +467,7 @@ export const draw = function (text, id, version, diagObj) {
+       })
+       .attr('y', conf.gridLineStartPadding)
+       .attr('width', function (d) {
+-        const renderEnd = d.end.add(1, 'day');
++        const renderEnd = d.end.clone().add(1, 'day');
+         return timeScale(renderEnd) - timeScale(d.start);
+       })
+       .attr('height', h - theTopPad - conf.gridLineStartPadding)
+diff --git a/packages/mermaid/src/docs/syntax/gantt.md b/packages/mermaid/src/docs/syntax/gantt.md
+index 7c446d91f..0cc915ca1 100644
+--- a/packages/mermaid/src/docs/syntax/gantt.md
++++ b/packages/mermaid/src/docs/syntax/gantt.md
+@@ -116,7 +116,7 @@ The following formatting options are supported:
+ | `YY`       | 14             | 2 digit year                                           |
+ | `Q`        | 1..4           | Quarter of year. Sets month to first month in quarter. |
+ | `M MM`     | 1..12          | Month number                                           |
+-| `MMM MMMM` | January..Dec   | Month name in locale set by `dayjs.locale()`           |
++| `MMM MMMM` | January..Dec   | Month name in locale set by `moment.locale()`          |
+ | `D DD`     | 1..31          | Day of month                                           |
+ | `Do`       | 1st..31st      | Day of month with ordinal                              |
+ | `DDD DDDD` | 1..365         | Day of year                                            |
+@@ -132,7 +132,7 @@ The following formatting options are supported:
+ | `SSS`      | 0..999         | Thousandths of a second                                |
+ | `Z ZZ`     | +12:00         | Offset from UTC as +-HH:mm, +-HHmm, or Z               |
+ 
+-More info in: https://day.js.org/docs/en/parse/string-format/
++More info in: https://momentjs.com/docs/#/parsing/string-format/
+ 
+ ### Output date format on the axis
+ 
+diff --git a/packages/mermaid/src/logger.ts b/packages/mermaid/src/logger.ts
+index 44b98315c..b1c035e22 100644
+--- a/packages/mermaid/src/logger.ts
++++ b/packages/mermaid/src/logger.ts
+@@ -2,7 +2,7 @@
+ /* eslint-disable @typescript-eslint/no-unused-vars */
+ /* eslint-disable @typescript-eslint/no-empty-function */
+ /* eslint-disable no-console */
+-import dayjs from 'dayjs';
++import moment from 'moment-mini';
+ 
+ export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+ 
+@@ -85,6 +85,6 @@ export const setLogLevel = function (level: keyof typeof LEVELS | number | strin
+  * @returns The format with the timestamp and log level
+  */
+ const format = (level: Uppercase<LogLevel>): string => {
+-  const time = dayjs().format('ss.SSS');
++  const time = moment().format('ss.SSS');
+   return `%c${time} : ${level} : `;
+ };
+diff --git a/packages/mermaid/src/tests/util.ts b/packages/mermaid/src/tests/util.ts
+index 922078876..042f2cb43 100644
+--- a/packages/mermaid/src/tests/util.ts
++++ b/packages/mermaid/src/tests/util.ts
+@@ -7,8 +7,8 @@ Jest code
+ ```ts
+ it.each`
+ str       | expected
+-${'1d'}   | ${dayjs.duration(1, 'd')}
+-${'2w'}   | ${dayjs.duration(2, 'w')}
++${'1d'}   | ${moment.duration(1, 'd')}
++${'2w'}   | ${moment.duration(2, 'w')}
+ `('should parse $str to $expected duration', ({ str, expected }) => {
+    expect(yourFunction(str)).toEqual(expected);
+  });
+@@ -18,8 +18,8 @@ Vitest code
+ ```ts
+ it.each(convert`
+ str       | expected
+-${'1d'}   | ${dayjs.duration(1, 'd')}
+-${'2w'}   | ${dayjs.duration(2, 'w')}
++${'1d'}   | ${moment.duration(1, 'd')}
++${'2w'}   | ${moment.duration(2, 'w')}
+ `)('should parse $str to $expected duration', ({ str, expected }) => {
+    expect(yourFunction(str)).toEqual(expected);
+  });
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 2c16c1965..39d5709da 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -48,10 +48,10 @@ importers:
+         version: 4.2.1
+       '@typescript-eslint/eslint-plugin':
+         specifier: ^5.48.2
+-        version: 5.48.2_iljmjqxcygjq3saipl7gerxpvi
++        version: 5.48.2_azmbqzqvrlvblbdtiwxwvyvjjy
+       '@typescript-eslint/parser':
+         specifier: ^5.48.2
+-        version: 5.48.2_yygwinqv3a2io74xmwofqb7uka
++        version: 5.48.2_et5x32uxl7z5ldub3ye5rhlyqm
+       '@vitest/coverage-c8':
+         specifier: ^0.28.4
+         version: 0.28.4_vun5xzxu3tkrssf3erdbijyyki
+@@ -93,7 +93,7 @@ importers:
+         version: 7.1.0
+       eslint-plugin-jest:
+         specifier: ^27.1.5
+-        version: 27.1.5_5rcd23qw3h5vuffwo2owxb3hw4
++        version: 27.1.5_i5clxtuiaceouxhg5syqkw5wwi
+       eslint-plugin-jsdoc:
+         specifier: ^39.6.2
+         version: 39.6.2_eslint@8.32.0
+@@ -162,10 +162,10 @@ importers:
+         version: 1.15.4
+       ts-node:
+         specifier: ^10.9.1
+-        version: 10.9.1_cbe7ovvae6zqfnmtgctpgpys54
++        version: 10.9.1_w6ufic3jqylcjznzspnj4wjqfe
+       typescript:
+         specifier: ^4.8.4
+-        version: 4.8.4
++        version: 4.9.5
+       vite:
+         specifier: ^4.1.1
+         version: 4.1.1_@types+node@18.11.9
+@@ -193,9 +193,6 @@ importers:
+       dagre-d3-es:
+         specifier: 7.0.9
+         version: 7.0.9
+-      dayjs:
+-        specifier: ^1.11.7
+-        version: 1.11.7
+       dompurify:
+         specifier: 2.4.3
+         version: 2.4.3
+@@ -208,6 +205,9 @@ importers:
+       lodash-es:
+         specifier: ^4.17.21
+         version: 4.17.21
++      moment-mini:
++        specifier: ^2.29.4
++        version: 2.29.4
+       non-layered-tidy-tree-layout:
+         specifier: ^2.0.2
+         version: 2.0.2
+@@ -1266,11 +1266,11 @@ packages:
+       '@types/node': 14.18.29
+       chalk: 4.1.2
+       cosmiconfig: 7.0.1
+-      cosmiconfig-typescript-loader: 4.1.0_nxlrwu45zhpwmwjzs33dzt3ak4
++      cosmiconfig-typescript-loader: 4.1.0_2uclxasecupgvdn72amnhmyg7y
+       lodash: 4.17.21
+       resolve-from: 5.0.0
+-      ts-node: 10.9.1_sqjhzn5m3vxyw66a2xhtc43hby
+-      typescript: 4.8.4
++      ts-node: 10.9.1_yxpazyh7n5pql7jdaglasgwqki
++      typescript: 4.9.5
+     transitivePeerDependencies:
+       - '@swc/core'
+       - '@swc/wasm'
+@@ -3087,7 +3087,7 @@ packages:
+   /@types/serve-index/1.9.1:
+     resolution: {integrity: sha512-d/Hs3nWDxNL2xAczmOVZNj92YZCS6RGxfBPjKzuu/XirCgXdpKEb88dYNbrYGint6IVWLNP+yonwVAuRC0T2Dg==}
+     dependencies:
+-      '@types/express': 4.17.17
++      '@types/express': 4.17.14
+     dev: true
+ 
+   /@types/serve-static/1.15.0:
+@@ -3190,7 +3190,7 @@ packages:
+       - supports-color
+     dev: true
+ 
+-  /@typescript-eslint/eslint-plugin/5.48.2_iljmjqxcygjq3saipl7gerxpvi:
++  /@typescript-eslint/eslint-plugin/5.48.2_azmbqzqvrlvblbdtiwxwvyvjjy:
+     resolution: {integrity: sha512-sR0Gja9Ky1teIq4qJOl0nC+Tk64/uYdX+mi+5iB//MH8gwyx8e3SOyhEzeLZEFEEfCaLf8KJq+Bd/6je1t+CAg==}
+     engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
+     peerDependencies:
+@@ -3201,18 +3201,18 @@ packages:
+       typescript:
+         optional: true
+     dependencies:
+-      '@typescript-eslint/parser': 5.48.2_yygwinqv3a2io74xmwofqb7uka
++      '@typescript-eslint/parser': 5.48.2_et5x32uxl7z5ldub3ye5rhlyqm
+       '@typescript-eslint/scope-manager': 5.48.2
+-      '@typescript-eslint/type-utils': 5.48.2_yygwinqv3a2io74xmwofqb7uka
+-      '@typescript-eslint/utils': 5.48.2_yygwinqv3a2io74xmwofqb7uka
++      '@typescript-eslint/type-utils': 5.48.2_et5x32uxl7z5ldub3ye5rhlyqm
++      '@typescript-eslint/utils': 5.48.2_et5x32uxl7z5ldub3ye5rhlyqm
+       debug: 4.3.4
+       eslint: 8.32.0
+       ignore: 5.2.0
+       natural-compare-lite: 1.4.0
+       regexpp: 3.2.0
+       semver: 7.3.8
+-      tsutils: 3.21.0_typescript@4.8.4
+-      typescript: 4.8.4
++      tsutils: 3.21.0_typescript@4.9.5
++      typescript: 4.9.5
+     transitivePeerDependencies:
+       - supports-color
+     dev: true
+@@ -3237,7 +3237,7 @@ packages:
+       - supports-color
+     dev: true
+ 
+-  /@typescript-eslint/parser/5.48.2_yygwinqv3a2io74xmwofqb7uka:
++  /@typescript-eslint/parser/5.48.2_et5x32uxl7z5ldub3ye5rhlyqm:
+     resolution: {integrity: sha512-38zMsKsG2sIuM5Oi/olurGwYJXzmtdsHhn5mI/pQogP+BjYVkK5iRazCQ8RGS0V+YLk282uWElN70zAAUmaYHw==}
+     engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
+     peerDependencies:
+@@ -3249,10 +3249,10 @@ packages:
+     dependencies:
+       '@typescript-eslint/scope-manager': 5.48.2
+       '@typescript-eslint/types': 5.48.2
+-      '@typescript-eslint/typescript-estree': 5.48.2_typescript@4.8.4
++      '@typescript-eslint/typescript-estree': 5.48.2_typescript@4.9.5
+       debug: 4.3.4
+       eslint: 8.32.0
+-      typescript: 4.8.4
++      typescript: 4.9.5
+     transitivePeerDependencies:
+       - supports-color
+     dev: true
+@@ -3293,7 +3293,7 @@ packages:
+       - supports-color
+     dev: true
+ 
+-  /@typescript-eslint/type-utils/5.48.2_yygwinqv3a2io74xmwofqb7uka:
++  /@typescript-eslint/type-utils/5.48.2_et5x32uxl7z5ldub3ye5rhlyqm:
+     resolution: {integrity: sha512-QVWx7J5sPMRiOMJp5dYshPxABRoZV1xbRirqSk8yuIIsu0nvMTZesKErEA3Oix1k+uvsk8Cs8TGJ6kQ0ndAcew==}
+     engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
+     peerDependencies:
+@@ -3303,12 +3303,12 @@ packages:
+       typescript:
+         optional: true
+     dependencies:
+-      '@typescript-eslint/typescript-estree': 5.48.2_typescript@4.8.4
+-      '@typescript-eslint/utils': 5.48.2_yygwinqv3a2io74xmwofqb7uka
++      '@typescript-eslint/typescript-estree': 5.48.2_typescript@4.9.5
++      '@typescript-eslint/utils': 5.48.2_et5x32uxl7z5ldub3ye5rhlyqm
+       debug: 4.3.4
+       eslint: 8.32.0
+-      tsutils: 3.21.0_typescript@4.8.4
+-      typescript: 4.8.4
++      tsutils: 3.21.0_typescript@4.9.5
++      typescript: 4.9.5
+     transitivePeerDependencies:
+       - supports-color
+     dev: true
+@@ -3344,7 +3344,28 @@ packages:
+       - supports-color
+     dev: true
+ 
+-  /@typescript-eslint/typescript-estree/5.48.2_typescript@4.8.4:
++  /@typescript-eslint/typescript-estree/5.42.1_typescript@4.9.5:
++    resolution: {integrity: sha512-qElc0bDOuO0B8wDhhW4mYVgi/LZL+igPwXtV87n69/kYC/7NG3MES0jHxJNCr4EP7kY1XVsRy8C/u3DYeTKQmw==}
++    engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
++    peerDependencies:
++      typescript: '*'
++    peerDependenciesMeta:
++      typescript:
++        optional: true
++    dependencies:
++      '@typescript-eslint/types': 5.42.1
++      '@typescript-eslint/visitor-keys': 5.42.1
++      debug: 4.3.4
++      globby: 11.1.0
++      is-glob: 4.0.3
++      semver: 7.3.8
++      tsutils: 3.21.0_typescript@4.9.5
++      typescript: 4.9.5
++    transitivePeerDependencies:
++      - supports-color
++    dev: true
++
++  /@typescript-eslint/typescript-estree/5.48.2_typescript@4.9.5:
+     resolution: {integrity: sha512-bibvD3z6ilnoVxUBFEgkO0k0aFvUc4Cttt0dAreEr+nrAHhWzkO83PEVVuieK3DqcgL6VAK5dkzK8XUVja5Zcg==}
+     engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
+     peerDependencies:
+@@ -3359,12 +3380,32 @@ packages:
+       globby: 11.1.0
+       is-glob: 4.0.3
+       semver: 7.3.8
+-      tsutils: 3.21.0_typescript@4.8.4
+-      typescript: 4.8.4
++      tsutils: 3.21.0_typescript@4.9.5
++      typescript: 4.9.5
+     transitivePeerDependencies:
+       - supports-color
+     dev: true
+ 
++  /@typescript-eslint/utils/5.42.1_et5x32uxl7z5ldub3ye5rhlyqm:
++    resolution: {integrity: sha512-Gxvf12xSp3iYZd/fLqiQRD4uKZjDNR01bQ+j8zvhPjpsZ4HmvEFL/tC4amGNyxN9Rq+iqvpHLhlqx6KTxz9ZyQ==}
++    engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
++    peerDependencies:
++      eslint: ^6.0.0 || ^7.0.0 || ^8.0.0
++    dependencies:
++      '@types/json-schema': 7.0.11
++      '@types/semver': 7.3.12
++      '@typescript-eslint/scope-manager': 5.42.1
++      '@typescript-eslint/types': 5.42.1
++      '@typescript-eslint/typescript-estree': 5.42.1_typescript@4.9.5
++      eslint: 8.32.0
++      eslint-scope: 5.1.1
++      eslint-utils: 3.0.0_eslint@8.32.0
++      semver: 7.3.8
++    transitivePeerDependencies:
++      - supports-color
++      - typescript
++    dev: true
++
+   /@typescript-eslint/utils/5.42.1_yygwinqv3a2io74xmwofqb7uka:
+     resolution: {integrity: sha512-Gxvf12xSp3iYZd/fLqiQRD4uKZjDNR01bQ+j8zvhPjpsZ4HmvEFL/tC4amGNyxN9Rq+iqvpHLhlqx6KTxz9ZyQ==}
+     engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
+@@ -3385,7 +3426,7 @@ packages:
+       - typescript
+     dev: true
+ 
+-  /@typescript-eslint/utils/5.48.2_yygwinqv3a2io74xmwofqb7uka:
++  /@typescript-eslint/utils/5.48.2_et5x32uxl7z5ldub3ye5rhlyqm:
+     resolution: {integrity: sha512-2h18c0d7jgkw6tdKTlNaM7wyopbLRBiit8oAxoP89YnuBOzCZ8g8aBCaCqq7h208qUTroL7Whgzam7UY3HVLow==}
+     engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
+     peerDependencies:
+@@ -3395,7 +3436,7 @@ packages:
+       '@types/semver': 7.3.12
+       '@typescript-eslint/scope-manager': 5.48.2
+       '@typescript-eslint/types': 5.48.2
+-      '@typescript-eslint/typescript-estree': 5.48.2_typescript@4.8.4
++      '@typescript-eslint/typescript-estree': 5.48.2_typescript@4.9.5
+       eslint: 8.32.0
+       eslint-scope: 5.1.1
+       eslint-utils: 3.0.0_eslint@8.32.0
+@@ -4973,7 +5014,7 @@ packages:
+       layout-base: 2.0.1
+     dev: false
+ 
+-  /cosmiconfig-typescript-loader/4.1.0_nxlrwu45zhpwmwjzs33dzt3ak4:
++  /cosmiconfig-typescript-loader/4.1.0_2uclxasecupgvdn72amnhmyg7y:
+     resolution: {integrity: sha512-HbWIuR5O+XO5Oj9SZ5bzgrD4nN+rfhrm2PMb0FVx+t+XIvC45n8F0oTNnztXtspWGw0i2IzHaUWFD5LzV1JB4A==}
+     engines: {node: '>=12', npm: '>=6'}
+     peerDependencies:
+@@ -4984,8 +5025,8 @@ packages:
+     dependencies:
+       '@types/node': 14.18.29
+       cosmiconfig: 7.0.1
+-      ts-node: 10.9.1_sqjhzn5m3vxyw66a2xhtc43hby
+-      typescript: 4.8.4
++      ts-node: 10.9.1_yxpazyh7n5pql7jdaglasgwqki
++      typescript: 4.9.5
+     dev: true
+ 
+   /cosmiconfig/7.0.1:
+@@ -5337,7 +5378,7 @@ packages:
+       cli-table3: 0.6.3
+       commander: 5.1.0
+       common-tags: 1.8.2
+-      dayjs: 1.11.7
++      dayjs: 1.11.5
+       debug: 4.3.4_supports-color@8.1.1
+       enquirer: 2.3.6
+       eventemitter2: 6.4.7
+@@ -5677,8 +5718,9 @@ packages:
+     engines: {node: '>=0.11'}
+     dev: true
+ 
+-  /dayjs/1.11.7:
+-    resolution: {integrity: sha512-+Yw9U6YO5TQohxLcIkrXBeY73WP3ejHWVvx8XCk3gxvQDCTEmS48ZrSZCKciI7Bhl/uCMyxYtE9UqRILmFphkQ==}
++  /dayjs/1.11.5:
++    resolution: {integrity: sha512-CAdX5Q3YW3Gclyo5Vpqkgpj8fSdLQcRuzfX6mC6Phy0nfJ0eGYOeS7m4mt2plDWLAtA4TqTakvbboHvUxfe4iA==}
++    dev: true
+ 
+   /debug/2.6.9:
+     resolution: {integrity: sha512-bC7ElrdJaJnPbAP+1EotYvqZsb3ecl5wi6Bfi6BJTUcNowp6cvspg0jXznRTKDjm/E7AdgFBVeAPVMNcKGsHMA==}
+@@ -6198,7 +6240,7 @@ packages:
+       htmlparser2: 8.0.1
+     dev: true
+ 
+-  /eslint-plugin-jest/27.1.5_5rcd23qw3h5vuffwo2owxb3hw4:
++  /eslint-plugin-jest/27.1.5_i5clxtuiaceouxhg5syqkw5wwi:
+     resolution: {integrity: sha512-CK2dekZ5VBdzsOSOH5Fc1rwC+cWXjkcyrmf1RV714nDUDKu+o73TTJiDxpbILG8PtPPpAAl3ywzh5QA7Ft0mjA==}
+     engines: {node: ^14.15.0 || ^16.10.0 || >=18.0.0}
+     peerDependencies:
+@@ -6211,8 +6253,8 @@ packages:
+       jest:
+         optional: true
+     dependencies:
+-      '@typescript-eslint/eslint-plugin': 5.48.2_iljmjqxcygjq3saipl7gerxpvi
+-      '@typescript-eslint/utils': 5.42.1_yygwinqv3a2io74xmwofqb7uka
++      '@typescript-eslint/eslint-plugin': 5.48.2_azmbqzqvrlvblbdtiwxwvyvjjy
++      '@typescript-eslint/utils': 5.42.1_et5x32uxl7z5ldub3ye5rhlyqm
+       eslint: 8.32.0
+       jest: 29.3.1_odkjkoia5xunhxkdrka32ib6vi
+     transitivePeerDependencies:
+@@ -7840,7 +7882,7 @@ packages:
+       pretty-format: 29.3.1
+       slash: 3.0.0
+       strip-json-comments: 3.1.1
+-      ts-node: 10.9.1_cbe7ovvae6zqfnmtgctpgpys54
++      ts-node: 10.9.1_w6ufic3jqylcjznzspnj4wjqfe
+     transitivePeerDependencies:
+       - supports-color
+     dev: true
+@@ -8217,8 +8259,8 @@ packages:
+       '@sideway/pinpoint': 2.0.0
+     dev: true
+ 
+-  /joi/17.8.3:
+-    resolution: {integrity: sha512-q5Fn6Tj/jR8PfrLrx4fpGH4v9qM6o+vDUfD4/3vxxyg34OmKcNqYZ1qn2mpLza96S8tL0p0rIw2gOZX+/cTg9w==}
++  /joi/17.7.1:
++    resolution: {integrity: sha512-teoLhIvWE298R6AeJywcjR4sX2hHjB3/xJX4qPjg+gTg+c0mzUDsziYlqPmLomq9gVsfaMcgPaGc7VxtD/9StA==}
+     dependencies:
+       '@hapi/hoek': 9.3.0
+       '@hapi/topo': 5.1.0
+@@ -9296,6 +9338,10 @@ packages:
+       ufo: 1.0.1
+     dev: true
+ 
++  /moment-mini/2.29.4:
++    resolution: {integrity: sha512-uhXpYwHFeiTbY9KSgPPRoo1nt8OxNVdMVoTBYHfSEKeRkIkwGpO+gERmhuhBtzfaeOyTkykSrm2+noJBgqt3Hg==}
++    dev: false
++
+   /mri/1.2.0:
+     resolution: {integrity: sha512-tzzskb3bG8LvYGFF/mDTpq3jpI6Q9wc3LEmBaghu+DdCssd1FakN7Bc0hVNmEyGq1bq3RgfkCb3cmQLpNPOroA==}
+     engines: {node: '>=4'}
+@@ -11306,7 +11352,7 @@ packages:
+     engines: {node: '>=6.10'}
+     dev: false
+ 
+-  /ts-node/10.9.1_cbe7ovvae6zqfnmtgctpgpys54:
++  /ts-node/10.9.1_w6ufic3jqylcjznzspnj4wjqfe:
+     resolution: {integrity: sha512-NtVysVPkxxrwFGUUxGYhfux8k78pQB3JqYBXlLRZgdGUqTO5wU/UyHop5p70iEbGhB7q5KmiZiU0Y3KlJrScEw==}
+     hasBin: true
+     peerDependencies:
+@@ -11332,12 +11378,12 @@ packages:
+       create-require: 1.1.1
+       diff: 4.0.2
+       make-error: 1.3.6
+-      typescript: 4.8.4
++      typescript: 4.9.5
+       v8-compile-cache-lib: 3.0.1
+       yn: 3.1.1
+     dev: true
+ 
+-  /ts-node/10.9.1_sqjhzn5m3vxyw66a2xhtc43hby:
++  /ts-node/10.9.1_yxpazyh7n5pql7jdaglasgwqki:
+     resolution: {integrity: sha512-NtVysVPkxxrwFGUUxGYhfux8k78pQB3JqYBXlLRZgdGUqTO5wU/UyHop5p70iEbGhB7q5KmiZiU0Y3KlJrScEw==}
+     hasBin: true
+     peerDependencies:
+@@ -11363,7 +11409,7 @@ packages:
+       create-require: 1.1.1
+       diff: 4.0.2
+       make-error: 1.3.6
+-      typescript: 4.8.4
++      typescript: 4.9.5
+       v8-compile-cache-lib: 3.0.1
+       yn: 3.1.1
+     dev: true
+@@ -11386,6 +11432,16 @@ packages:
+       typescript: 4.8.4
+     dev: true
+ 
++  /tsutils/3.21.0_typescript@4.9.5:
++    resolution: {integrity: sha512-mHKK3iUXL+3UF6xL5k0PEhKRUBKPBCv/+RkEOpjRWxxx27KKRBmmA60A9pgOUvMi8GKhRMPEmjBRPzs2W7O1OA==}
++    engines: {node: '>= 6'}
++    peerDependencies:
++      typescript: '>=2.8.0 || >= 3.2.0-dev || >= 3.3.0-dev || >= 3.4.0-dev || >= 3.5.0-dev || >= 3.6.0-dev || >= 3.6.0-beta || >= 3.7.0-dev || >= 3.7.0-beta'
++    dependencies:
++      tslib: 1.14.1
++      typescript: 4.9.5
++    dev: true
++
+   /tunnel-agent/0.6.0:
+     resolution: {integrity: sha512-McnNiV1l8RYeY8tBgEpuodCC1mLUdbSN+CYBL7kJsJNInOP8UjDDEwdk6Mw60vdLLrr5NHKZhMAOSrR2NZuQ+w==}
+     dependencies:
+@@ -11488,6 +11544,12 @@ packages:
+     hasBin: true
+     dev: true
+ 
++  /typescript/4.9.5:
++    resolution: {integrity: sha512-1FXk9E2Hm+QzZQ7z+McJiHL4NW1F2EzMu9Nq9i3zAaGqibafqYwCVU6WyWAuyQRRzOlxou8xZSyXLEN8oKj24g==}
++    engines: {node: '>=4.2.0'}
++    hasBin: true
++    dev: true
++
+   /uc.micro/1.0.6:
+     resolution: {integrity: sha512-8Y75pvTYkLJW2hWQHXxoqRgV7qb9B+9vFEtidML+7koHUFapnVJAZ6cKs+Qjz5Aw3aZWHMC6u0wJE3At+nSGwA==}
+     dev: true
+@@ -12084,7 +12146,7 @@ packages:
+     hasBin: true
+     dependencies:
+       axios: 0.27.2_debug@4.3.4
+-      joi: 17.8.3
++      joi: 17.7.1
+       lodash: 4.17.21
+       minimist: 1.2.8
+       rxjs: 7.8.0

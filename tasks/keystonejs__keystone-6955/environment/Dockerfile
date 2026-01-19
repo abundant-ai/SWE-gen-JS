@@ -1,0 +1,78 @@
+FROM ubuntu:20.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base system packages (common to all languages)
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    ca-certificates \
+    patch \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 16 (required by this commit's package.json engines field)
+RUN curl -fsSL https://deb.nodesource.com/setup_16.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Enable Yarn Classic 1.x (this commit uses Yarn v1 lockfile)
+RUN npm install -g yarn@1.22.22
+
+WORKDIR /app
+
+# Clone repo at HEAD commit (with fix applied)
+RUN git clone https://github.com/keystonejs/keystone.git src && \
+    cd src && \
+    (git fetch --depth 1 origin c2141e2c48c35e973cfd7803e54b09181f984051 || git fetch --depth 1 origin "+refs/pull/6955/head:refs/remotes/origin/pr/6955") && \
+    git checkout --detach FETCH_HEAD && \
+    git submodule update --init --recursive
+
+WORKDIR /app/src
+
+# Set environment variables
+ENV CI=true
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV TEST_ADAPTER=sqlite
+ENV DATABASE_URL=file:./dev.db
+
+# Temporarily modify package.json to skip keystone postinstall during prepare
+RUN sed -i 's/&& cd examples-staging\/basic && yarn keystone-next postinstall//' package.json
+
+# Install dependencies
+RUN yarn install --frozen-lockfile
+
+# Restore package.json
+RUN git checkout package.json || true
+
+# Build the project (preconstruct build)
+RUN yarn build
+
+# Generate artifacts for examples-staging/basic which includes downloading Prisma binaries
+# Use --fix to generate artifacts without validation (which requires the binary we're trying to get)
+RUN cd examples-staging/basic && yarn keystone-next postinstall --fix || echo "Postinstall with --fix failed, continuing..."
+
+# If install/build steps touched tracked files (lockfiles, generated assets),
+# reset them so bug.patch applies cleanly.
+RUN git reset --hard
+
+# Apply bug.patch to revert to buggy state (BASE)
+COPY bug.patch /tmp/bug.patch
+RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
+
+# Temporarily modify package.json again to skip keystone postinstall
+RUN sed -i 's/&& cd examples-staging\/basic && yarn keystone-next postinstall//' package.json
+
+# Reinstall dependencies after bug.patch (package.json and yarn.lock were modified)
+RUN yarn install
+
+# Restore package.json
+RUN git checkout package.json || true
+
+# Rebuild after applying bug.patch (TypeScript needs recompilation)
+RUN yarn build
+
+RUN rm -rf /app/src/.git
+
+WORKDIR /app/src

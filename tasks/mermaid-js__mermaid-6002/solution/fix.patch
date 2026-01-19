@@ -1,0 +1,199 @@
+diff --git a/.changeset/thick-elephants-search.md b/.changeset/thick-elephants-search.md
+new file mode 100644
+index 000000000..5e29c42d6
+--- /dev/null
++++ b/.changeset/thick-elephants-search.md
+@@ -0,0 +1,5 @@
++---
++'mermaid': patch
++---
++
++fix: error `mermaid.parse` on an invalid shape, so that it matches the errors thrown by `mermaid.render`
+diff --git a/packages/mermaid/src/diagrams/flowchart/flowDb.ts b/packages/mermaid/src/diagrams/flowchart/flowDb.ts
+index 8d8245e67..9e3f64a6c 100644
+--- a/packages/mermaid/src/diagrams/flowchart/flowDb.ts
++++ b/packages/mermaid/src/diagrams/flowchart/flowDb.ts
+@@ -2,6 +2,7 @@ import { select } from 'd3';
+ import utils, { getEdgeId } from '../../utils.js';
+ import { getConfig, defaultConfig } from '../../diagram-api/diagramAPI.js';
+ import common from '../common/common.js';
++import { isValidShape, type ShapeID } from '../../rendering-util/rendering-elements/shapes.js';
+ import type { Node, Edge } from '../../rendering-util/types.js';
+ import { log } from '../../logger.js';
+ import * as yaml from 'js-yaml';
+@@ -14,7 +15,15 @@ import {
+   setDiagramTitle,
+   getDiagramTitle,
+ } from '../common/commonDb.js';
+-import type { FlowVertex, FlowClass, FlowSubGraph, FlowText, FlowEdge, FlowLink } from './types.js';
++import type {
++  FlowVertex,
++  FlowClass,
++  FlowSubGraph,
++  FlowText,
++  FlowEdge,
++  FlowLink,
++  FlowVertexTypeParam,
++} from './types.js';
+ import type { NodeMetaData } from '../../types.js';
+ 
+ const MERMAID_DOM_ID_PREFIX = 'flowchart-';
+@@ -53,12 +62,11 @@ export const lookUpDomId = function (id: string) {
+ 
+ /**
+  * Function called by parser when a node definition has been found
+- *
+  */
+ export const addVertex = function (
+   id: string,
+   textObj: FlowText,
+-  type: 'group',
++  type: FlowVertexTypeParam,
+   style: string[],
+   classes: string[],
+   dir: string,
+@@ -133,14 +141,15 @@ export const addVertex = function (
+     }
+     // console.log('yamlData', yamlData);
+     const doc = yaml.load(yamlData, { schema: yaml.JSON_SCHEMA }) as NodeMetaData;
+-    if (doc.shape && (doc.shape !== doc.shape.toLowerCase() || doc.shape.includes('_'))) {
+-      throw new Error(`No such shape: ${doc.shape}. Shape names should be lowercase.`);
+-    }
+-
+-    // console.log('yamlData doc', doc);
+-    if (doc?.shape) {
++    if (doc.shape) {
++      if (doc.shape !== doc.shape.toLowerCase() || doc.shape.includes('_')) {
++        throw new Error(`No such shape: ${doc.shape}. Shape names should be lowercase.`);
++      } else if (!isValidShape(doc.shape)) {
++        throw new Error(`No such shape: ${doc.shape}.`);
++      }
+       vertex.type = doc?.shape;
+     }
++
+     if (doc?.label) {
+       vertex.text = doc?.label;
+     }
+@@ -816,7 +825,7 @@ export const lex = {
+   firstGraph,
+ };
+ 
+-const getTypeFromVertex = (vertex: FlowVertex) => {
++const getTypeFromVertex = (vertex: FlowVertex): ShapeID => {
+   if (vertex.img) {
+     return 'imageSquare';
+   }
+@@ -832,14 +841,18 @@ const getTypeFromVertex = (vertex: FlowVertex) => {
+     }
+     return 'icon';
+   }
+-  if (vertex.type === 'square') {
+-    return 'squareRect';
+-  }
+-  if (vertex.type === 'round') {
+-    return 'roundedRect';
++  switch (vertex.type) {
++    case 'square':
++    case undefined:
++      return 'squareRect';
++    case 'round':
++      return 'roundedRect';
++    case 'ellipse':
++      // @ts-expect-error -- Ellipses are broken, see https://github.com/mermaid-js/mermaid/issues/5976
++      return 'ellipse';
++    default:
++      return vertex.type;
+   }
+-
+-  return vertex.type ?? 'squareRect';
+ };
+ 
+ const findNode = (nodes: Node[], id: string) => nodes.find((node) => node.id === id);
+diff --git a/packages/mermaid/src/diagrams/flowchart/types.ts b/packages/mermaid/src/diagrams/flowchart/types.ts
+index 770ee24b4..b2c5cf620 100644
+--- a/packages/mermaid/src/diagrams/flowchart/types.ts
++++ b/packages/mermaid/src/diagrams/flowchart/types.ts
+@@ -1,3 +1,28 @@
++import type { ShapeID } from '../../rendering-util/rendering-elements/shapes.js';
++
++/**
++ * Valid `type` args to `yy.addVertex` taken from
++ * `packages/mermaid/src/diagrams/flowchart/parser/flow.jison`
++ */
++export type FlowVertexTypeParam =
++  | undefined
++  | 'square'
++  | 'doublecircle'
++  | 'circle'
++  | 'ellipse'
++  | 'stadium'
++  | 'subroutine'
++  | 'rect'
++  | 'cylinder'
++  | 'round'
++  | 'diamond'
++  | 'hexagon'
++  | 'odd'
++  | 'trapezoid'
++  | 'inv_trapezoid'
++  | 'lean_right'
++  | 'lean_left';
++
+ export interface FlowVertex {
+   classes: string[];
+   dir?: string;
+@@ -10,7 +35,7 @@ export interface FlowVertex {
+   props?: any;
+   styles: string[];
+   text?: string;
+-  type?: string;
++  type?: ShapeID | FlowVertexTypeParam;
+   icon?: string;
+   form?: string;
+   pos?: 't' | 'b';
+diff --git a/packages/mermaid/src/rendering-util/rendering-elements/nodes.ts b/packages/mermaid/src/rendering-util/rendering-elements/nodes.ts
+index 071776df2..e2eea5e19 100644
+--- a/packages/mermaid/src/rendering-util/rendering-elements/nodes.ts
++++ b/packages/mermaid/src/rendering-util/rendering-elements/nodes.ts
+@@ -23,7 +23,7 @@ export async function insertNode(elem: SVGGroup, node: Node, renderOptions: Shap
+     }
+   }
+ 
+-  const shapeHandler = shapes[(node.shape ?? 'undefined') as keyof typeof shapes];
++  const shapeHandler = node.shape ? shapes[node.shape] : undefined;
+ 
+   if (!shapeHandler) {
+     throw new Error(`No such shape: ${node.shape}. Please check your syntax.`);
+diff --git a/packages/mermaid/src/rendering-util/rendering-elements/shapes.ts b/packages/mermaid/src/rendering-util/rendering-elements/shapes.ts
+index 40f9c7199..4f6459d85 100644
+--- a/packages/mermaid/src/rendering-util/rendering-elements/shapes.ts
++++ b/packages/mermaid/src/rendering-util/rendering-elements/shapes.ts
+@@ -500,4 +500,8 @@ const generateShapeMap = () => {
+ 
+ export const shapes = generateShapeMap();
+ 
++export function isValidShape(shape: string): shape is ShapeID {
++  return shape in shapes;
++}
++
+ export type ShapeID = keyof typeof shapes;
+diff --git a/packages/mermaid/src/rendering-util/types.ts b/packages/mermaid/src/rendering-util/types.ts
+index 074e2c4a2..e49218f71 100644
+--- a/packages/mermaid/src/rendering-util/types.ts
++++ b/packages/mermaid/src/rendering-util/types.ts
+@@ -1,5 +1,6 @@
+ export type MarkdownWordType = 'normal' | 'strong' | 'em';
+ import type { MermaidConfig } from '../config.type.js';
++import type { ShapeID } from './rendering-elements/shapes.js';
+ export interface MarkdownWord {
+   content: string;
+   type: MarkdownWordType;
+@@ -37,7 +38,7 @@ export interface Node {
+   linkTarget?: string;
+   tooltip?: string;
+   padding?: number; //REMOVE?, use from LayoutData.config - Keep, this could be shape specific
+-  shape?: string;
++  shape?: ShapeID;
+   isGroup: boolean;
+   width?: number;
+   height?: number;

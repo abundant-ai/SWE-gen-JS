@@ -1,0 +1,1357 @@
+diff --git a/docs/react/guides/migrating-to-v5.md b/docs/react/guides/migrating-to-v5.md
+index b19440e22..a1c4e8ada 100644
+--- a/docs/react/guides/migrating-to-v5.md
++++ b/docs/react/guides/migrating-to-v5.md
+@@ -276,14 +276,6 @@ There are some caveats to this change however, which you must be aware of:
+ 
+ The `visibilitychange` event is used exclusively now. This is possible because we only support browsers that support the `visibilitychange` event. This fixes a bunch of issues [as listed here](https://github.com/TanStack/query/pull/4805).
+ 
+-### Network status no longer relies on the `navigator.onLine` property
+-
+-`navigator.onLine` doesn't work well in Chromium based browsers. There are [a lot of issues](https://bugs.chromium.org/p/chromium/issues/list?q=navigator.online) around false negatives, which lead to Queries being wrongfully marked as `offline`.
+-
+-To circumvent this, we now always start with `online: true` and only listen to `online` and `offline` events to update the status.
+-
+-This should reduce the likelihood of false negatives, however, it might mean false positives for offline apps that load via serviceWorkers, which can work even without an internet connection.
+-
+ ### Removed custom `context` prop in favor of custom `queryClient` instance
+ 
+ In v4, we introduced the possibility to pass a custom `context` to all react-query hooks. This allowed for proper isolation when using MicroFrontends.
+diff --git a/docs/react/reference/focusManager.md b/docs/react/reference/focusManager.md
+index 1d8abe614..edf2c94e7 100644
+--- a/docs/react/reference/focusManager.md
++++ b/docs/react/reference/focusManager.md
+@@ -10,7 +10,6 @@ It can be used to change the default event listeners or to manually change the f
+ Its available methods are:
+ 
+ - [`setEventListener`](#focusmanagerseteventlistener)
+-- [`subscribe`](#focusmanagersubscribe)
+ - [`setFocused`](#focusmanagersetfocused)
+ - [`isFocused`](#focusmanagerisfocused)
+ 
+@@ -34,21 +33,9 @@ focusManager.setEventListener((handleFocus) => {
+ })
+ ```
+ 
+-## `focusManager.subscribe`
+-
+-`subscribe` can be used to subscribe to changes in the visibility state. It returns an unsubscribe function:
+-
+-```tsx
+-import { focusManager } from '@tanstack/react-query'
+-
+-const unsubscribe = focusManager.subscribe(isVisible => {
+-  console.log('isVisible', isVisible)
+-})
+-```
+-
+ ## `focusManager.setFocused`
+ 
+-`setFocused` can be used to manually set the focus state. Set `undefined` to fall back to the default focus check.
++`setFocused` can be used to manually set the focus state. Set `undefined` to fallback to the default focus check.
+ 
+ ```tsx
+ import { focusManager } from '@tanstack/react-query'
+diff --git a/docs/react/reference/onlineManager.md b/docs/react/reference/onlineManager.md
+index b563010ae..4b6536e9e 100644
+--- a/docs/react/reference/onlineManager.md
++++ b/docs/react/reference/onlineManager.md
+@@ -3,20 +3,13 @@ id: OnlineManager
+ title: OnlineManager
+ ---
+ 
+-The `OnlineManager` manages the online state within TanStack Query. It can be used to change the default event listeners or to manually change the online state.
++The `OnlineManager` manages the online state within TanStack Query.
+ 
+-> Per default, the `onlineManager` assumes an active network connection, and listens to the `online` and `offline` events on the `window` object to detect changes.
+-
+-> In previous versions, `navigator.onLine` was used to determine the network status. However, it doesn't work well in Chromium based browsers. There are [a lot of issues](https://bugs.chromium.org/p/chromium/issues/list?q=navigator.online) around false negatives, which lead to Queries being wrongfully marked as `offline`.
+-
+-> To circumvent this, we now always start with `online: true` and only listen to `online` and `offline` events to update the status.
+-
+-> This should reduce the likelihood of false negatives, however, it might mean false positives for offline apps that load via serviceWorkers, which can work even without an internet connection.
++It can be used to change the default event listeners or to manually change the online state.
+ 
+ Its available methods are:
+ 
+ - [`setEventListener`](#onlinemanagerseteventlistener)
+-- [`subscribe`](#onlinemanagersubscribe)
+ - [`setOnline`](#onlinemanagersetonline)
+ - [`isOnline`](#onlinemanagerisonline)
+ 
+@@ -35,21 +28,9 @@ onlineManager.setEventListener(setOnline => {
+ })
+ ```
+ 
+-## `onlineManager.subscribe`
+-
+-`subscribe` can be used to subscribe to changes in the online state. It returns an unsubscribe function:
+-
+-```tsx
+-import { onlineManager } from '@tanstack/react-query'
+-
+-const unsubscribe = onlineManager.subscribe(isOnline => {
+-  console.log('isOnline', isOnline)
+-})
+-```
+-
+ ## `onlineManager.setOnline`
+ 
+-`setOnline` can be used to manually set the online state.
++`setOnline` can be used to manually set the online state. Set `undefined` to fallback to the default online check.
+ 
+ ```tsx
+ import { onlineManager } from '@tanstack/react-query'
+@@ -59,11 +40,14 @@ onlineManager.setOnline(true)
+ 
+ // Set to offline
+ onlineManager.setOnline(false)
++
++// Fallback to the default online check
++onlineManager.setOnline(undefined)
+ ```
+ 
+ **Options**
+ 
+-- `online: boolean`
++- `online: boolean | undefined`
+ 
+ ## `onlineManager.isOnline`
+ 
+diff --git a/packages/query-core/src/onlineManager.ts b/packages/query-core/src/onlineManager.ts
+index daf77d5a4..22c4c1375 100644
+--- a/packages/query-core/src/onlineManager.ts
++++ b/packages/query-core/src/onlineManager.ts
+@@ -1,11 +1,14 @@
+ import { Subscribable } from './subscribable'
+ import { isServer } from './utils'
+ 
+-type Listener = (online: boolean) => void
+-type SetupFn = (setOnline: Listener) => (() => void) | undefined
++type SetupFn = (
++  setOnline: (online?: boolean) => void,
++) => (() => void) | undefined
+ 
+-export class OnlineManager extends Subscribable<Listener> {
+-  #online = true
++const onlineEvents = ['online', 'offline'] as const
++
++export class OnlineManager extends Subscribable {
++  #online?: boolean
+   #cleanup?: () => void
+ 
+   #setup: SetupFn
+@@ -16,16 +19,17 @@ export class OnlineManager extends Subscribable<Listener> {
+       // addEventListener does not exist in React Native, but window does
+       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+       if (!isServer && window.addEventListener) {
+-        const onlineListener = () => onOnline(true)
+-        const offlineListener = () => onOnline(false)
++        const listener = () => onOnline()
+         // Listen to online
+-        window.addEventListener('online', onlineListener, false)
+-        window.addEventListener('offline', offlineListener, false)
++        onlineEvents.forEach((event) => {
++          window.addEventListener(event, listener, false)
++        })
+ 
+         return () => {
+           // Be sure to unsubscribe if a new handler is set
+-          window.removeEventListener('online', onlineListener)
+-          window.removeEventListener('offline', offlineListener)
++          onlineEvents.forEach((event) => {
++            window.removeEventListener(event, listener)
++          })
+         }
+       }
+ 
+@@ -49,22 +53,43 @@ export class OnlineManager extends Subscribable<Listener> {
+   setEventListener(setup: SetupFn): void {
+     this.#setup = setup
+     this.#cleanup?.()
+-    this.#cleanup = setup(this.setOnline.bind(this))
++    this.#cleanup = setup((online?: boolean) => {
++      if (typeof online === 'boolean') {
++        this.setOnline(online)
++      } else {
++        this.onOnline()
++      }
++    })
+   }
+ 
+-  setOnline(online: boolean): void {
++  setOnline(online?: boolean): void {
+     const changed = this.#online !== online
+ 
+     if (changed) {
+       this.#online = online
+-      this.listeners.forEach((listener) => {
+-        listener(online)
+-      })
++      this.onOnline()
+     }
+   }
+ 
++  onOnline(): void {
++    this.listeners.forEach((listener) => {
++      listener()
++    })
++  }
++
+   isOnline(): boolean {
+-    return this.#online
++    if (typeof this.#online === 'boolean') {
++      return this.#online
++    }
++
++    if (
++      typeof navigator === 'undefined' ||
++      typeof navigator.onLine === 'undefined'
++    ) {
++      return true
++    }
++
++    return navigator.onLine
+   }
+ }
+ 
+diff --git a/packages/query-core/src/tests/hydration.test.tsx b/packages/query-core/src/tests/hydration.test.tsx
+index 1974b4ae1..92f8e4381 100644
+--- a/packages/query-core/src/tests/hydration.test.tsx
++++ b/packages/query-core/src/tests/hydration.test.tsx
+@@ -5,7 +5,7 @@ import { MutationCache } from '../mutationCache'
+ import {
+   createQueryClient,
+   executeMutation,
+-  mockOnlineManagerIsOnline,
++  mockNavigatorOnLine,
+   sleep,
+ } from './utils'
+ 
+@@ -347,7 +347,7 @@ describe('dehydration and rehydration', () => {
+   test('should be able to dehydrate mutations and continue on hydration', async () => {
+     const consoleMock = vi.spyOn(console, 'error')
+     consoleMock.mockImplementation(() => undefined)
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+ 
+     const serverAddTodo = vi
+       .fn()
+diff --git a/packages/query-core/src/tests/onlineManager.test.tsx b/packages/query-core/src/tests/onlineManager.test.tsx
+index 88d3c6b33..79971d307 100644
+--- a/packages/query-core/src/tests/onlineManager.test.tsx
++++ b/packages/query-core/src/tests/onlineManager.test.tsx
+@@ -31,7 +31,7 @@ describe('onlineManager', () => {
+   test('setEventListener should use online boolean arg', async () => {
+     let count = 0
+ 
+-    const setup = (setOnline: (online: boolean) => void) => {
++    const setup = (setOnline: (online?: boolean) => void) => {
+       setTimeout(() => {
+         count++
+         setOnline(false)
+@@ -154,15 +154,19 @@ describe('onlineManager', () => {
+ 
+     onlineManager.subscribe(listener)
+ 
++    onlineManager.setOnline(true)
++    onlineManager.setOnline(true)
++
++    expect(listener).toHaveBeenCalledTimes(1)
++
+     onlineManager.setOnline(false)
+     onlineManager.setOnline(false)
+ 
+-    expect(listener).toHaveBeenNthCalledWith(1, false)
++    expect(listener).toHaveBeenCalledTimes(2)
+ 
+-    onlineManager.setOnline(true)
+-    onlineManager.setOnline(true)
++    onlineManager.setOnline(undefined)
++    onlineManager.setOnline(undefined)
+ 
+-    expect(listener).toHaveBeenCalledTimes(2)
+-    expect(listener).toHaveBeenNthCalledWith(2, true)
++    expect(listener).toHaveBeenCalledTimes(3)
+   })
+ })
+diff --git a/packages/query-core/src/tests/queryClient.test.tsx b/packages/query-core/src/tests/queryClient.test.tsx
+index c1a41812f..2821451ed 100644
+--- a/packages/query-core/src/tests/queryClient.test.tsx
++++ b/packages/query-core/src/tests/queryClient.test.tsx
+@@ -1,6 +1,7 @@
+ import { waitFor } from '@testing-library/react'
+ import '@testing-library/jest-dom'
+ 
++import { vi } from 'vitest'
+ import {
+   MutationObserver,
+   QueryObserver,
+@@ -10,7 +11,7 @@ import {
+ import { noop } from '../utils'
+ import {
+   createQueryClient,
+-  mockOnlineManagerIsOnline,
++  mockNavigatorOnLine,
+   queryKey,
+   sleep,
+ } from './utils'
+@@ -1073,7 +1074,7 @@ describe('queryClient', () => {
+       const key1 = queryKey()
+       const queryFn1 = vi.fn<unknown[], string>().mockReturnValue('data1')
+       await queryClient.fetchQuery({ queryKey: key1, queryFn: queryFn1 })
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       await queryClient.refetchQueries({ queryKey: key1 })
+ 
+@@ -1087,7 +1088,7 @@ describe('queryClient', () => {
+       queryClient.setQueryDefaults(key1, { networkMode: 'always' })
+       const queryFn1 = vi.fn<unknown[], string>().mockReturnValue('data1')
+       await queryClient.fetchQuery({ queryKey: key1, queryFn: queryFn1 })
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       await queryClient.refetchQueries({ queryKey: key1 })
+ 
+@@ -1393,7 +1394,7 @@ describe('queryClient', () => {
+       queryCacheOnFocusSpy.mockRestore()
+       queryCacheOnOnlineSpy.mockRestore()
+       mutationCacheResumePausedMutationsSpy.mockRestore()
+-      onlineManager.setOnline(true)
++      onlineManager.setOnline(undefined)
+     })
+ 
+     test('should resume paused mutations when coming online', async () => {
+@@ -1423,7 +1424,7 @@ describe('queryClient', () => {
+         expect(observer1.getCurrentResult().status).toBe('success')
+       })
+ 
+-      onlineManager.setOnline(true)
++      onlineManager.setOnline(undefined)
+     })
+ 
+     test('should resume paused mutations one after the other when invoked manually at the same time', async () => {
+@@ -1458,7 +1459,7 @@ describe('queryClient', () => {
+         expect(observer2.getCurrentResult().isPaused).toBeTruthy()
+       })
+ 
+-      onlineManager.setOnline(true)
++      onlineManager.setOnline(undefined)
+       void queryClient.resumePausedMutations()
+       await sleep(5)
+       await queryClient.resumePausedMutations()
+@@ -1490,7 +1491,6 @@ describe('queryClient', () => {
+         'resumePausedMutations',
+       )
+ 
+-      onlineManager.setOnline(false)
+       onlineManager.setOnline(true)
+       expect(queryCacheOnOnlineSpy).toHaveBeenCalledTimes(1)
+       expect(mutationCacheResumePausedMutationsSpy).toHaveBeenCalledTimes(1)
+@@ -1503,7 +1503,7 @@ describe('queryClient', () => {
+       queryCacheOnOnlineSpy.mockRestore()
+       mutationCacheResumePausedMutationsSpy.mockRestore()
+       focusManager.setFocused(undefined)
+-      onlineManager.setOnline(true)
++      onlineManager.setOnline(undefined)
+     })
+ 
+     test('should not notify queryCache and mutationCache after multiple mounts/unmounts', async () => {
+@@ -1538,7 +1538,7 @@ describe('queryClient', () => {
+       queryCacheOnOnlineSpy.mockRestore()
+       mutationCacheResumePausedMutationsSpy.mockRestore()
+       focusManager.setFocused(undefined)
+-      onlineManager.setOnline(true)
++      onlineManager.setOnline(undefined)
+     })
+   })
+ 
+diff --git a/packages/query-core/src/tests/utils.ts b/packages/query-core/src/tests/utils.ts
+index ad8e9d159..230f3c7eb 100644
+--- a/packages/query-core/src/tests/utils.ts
++++ b/packages/query-core/src/tests/utils.ts
+@@ -1,6 +1,6 @@
+ import { act } from '@testing-library/react'
+ import { vi } from 'vitest'
+-import { QueryClient, onlineManager } from '..'
++import { QueryClient } from '..'
+ import * as utils from '../utils'
+ import type { SpyInstance } from 'vitest'
+ import type { MutationOptions, QueryClientConfig } from '..'
+@@ -15,10 +15,8 @@ export function mockVisibilityState(
+   return vi.spyOn(document, 'visibilityState', 'get').mockReturnValue(value)
+ }
+ 
+-export function mockOnlineManagerIsOnline(
+-  value: boolean,
+-): SpyInstance<[], boolean> {
+-  return vi.spyOn(onlineManager, 'isOnline').mockReturnValue(value)
++export function mockNavigatorOnLine(value: boolean): SpyInstance<[], boolean> {
++  return vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(value)
+ }
+ 
+ let queryKeyCount = 0
+diff --git a/packages/query-devtools/src/Devtools.tsx b/packages/query-devtools/src/Devtools.tsx
+index f27f3ddbd..6f27b3d69 100644
+--- a/packages/query-devtools/src/Devtools.tsx
++++ b/packages/query-devtools/src/Devtools.tsx
+@@ -485,11 +485,13 @@ export const DevtoolsPanel: Component<DevtoolsPanelProps> = (props) => {
+             <button
+               onClick={() => {
+                 if (offline()) {
+-                  onlineManager().setOnline(true)
++                  onlineManager().setOnline(undefined)
+                   setOffline(false)
++                  window.dispatchEvent(new Event('online'))
+                 } else {
+                   onlineManager().setOnline(false)
+                   setOffline(true)
++                  window.dispatchEvent(new Event('offline'))
+                 }
+               }}
+               class={styles.actionsBtn}
+diff --git a/packages/react-query/src/__tests__/useMutation.test.tsx b/packages/react-query/src/__tests__/useMutation.test.tsx
+index 3ebfa7f8e..f0cdab589 100644
+--- a/packages/react-query/src/__tests__/useMutation.test.tsx
++++ b/packages/react-query/src/__tests__/useMutation.test.tsx
+@@ -7,7 +7,7 @@ import { vi } from 'vitest'
+ import { MutationCache, QueryCache, useMutation } from '..'
+ import {
+   createQueryClient,
+-  mockOnlineManagerIsOnline,
++  mockNavigatorOnLine,
+   queryKey,
+   renderWithClient,
+   setActTimeout,
+@@ -427,7 +427,7 @@ describe('useMutation', () => {
+   })
+ 
+   it('should not retry mutations while offline', async () => {
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+ 
+     let count = 0
+ 
+@@ -455,8 +455,6 @@ describe('useMutation', () => {
+ 
+     const rendered = renderWithClient(queryClient, <Page />)
+ 
+-    window.dispatchEvent(new Event('offline'))
+-
+     await waitFor(() => {
+       expect(
+         rendered.getByText('error: null, status: idle, isPaused: false'),
+@@ -473,7 +471,7 @@ describe('useMutation', () => {
+ 
+     expect(count).toBe(0)
+ 
+-    onlineMock.mockRestore()
++    onlineMock.mockReturnValue(true)
+     window.dispatchEvent(new Event('online'))
+ 
+     await sleep(100)
+@@ -485,10 +483,12 @@ describe('useMutation', () => {
+     })
+ 
+     expect(count).toBe(2)
++
++    onlineMock.mockRestore()
+   })
+ 
+   it('should call onMutate even if paused', async () => {
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+     const onMutate = vi.fn()
+     let count = 0
+ 
+@@ -517,8 +517,6 @@ describe('useMutation', () => {
+ 
+     await rendered.findByText('data: null, status: idle, isPaused: false')
+ 
+-    window.dispatchEvent(new Event('offline'))
+-
+     fireEvent.click(rendered.getByRole('button', { name: /mutate/i }))
+ 
+     await rendered.findByText('data: null, status: pending, isPaused: true')
+@@ -526,17 +524,19 @@ describe('useMutation', () => {
+     expect(onMutate).toHaveBeenCalledTimes(1)
+     expect(onMutate).toHaveBeenCalledWith('todo')
+ 
+-    onlineMock.mockRestore()
++    onlineMock.mockReturnValue(true)
+     window.dispatchEvent(new Event('online'))
+ 
+     await rendered.findByText('data: 1, status: success, isPaused: false')
+ 
+     expect(onMutate).toHaveBeenCalledTimes(1)
+     expect(count).toBe(1)
++
++    onlineMock.mockRestore()
+   })
+ 
+   it('should optimistically go to paused state if offline', async () => {
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+     let count = 0
+     const states: Array<string> = []
+ 
+@@ -566,8 +566,6 @@ describe('useMutation', () => {
+ 
+     await rendered.findByText('data: null, status: idle, isPaused: false')
+ 
+-    window.dispatchEvent(new Event('offline'))
+-
+     fireEvent.click(rendered.getByRole('button', { name: /mutate/i }))
+ 
+     await rendered.findByText('data: null, status: pending, isPaused: true')
+@@ -576,14 +574,16 @@ describe('useMutation', () => {
+     expect(states[0]).toBe('idle, false')
+     expect(states[1]).toBe('pending, true')
+ 
+-    onlineMock.mockRestore()
++    onlineMock.mockReturnValue(true)
+     window.dispatchEvent(new Event('online'))
+ 
+     await rendered.findByText('data: 1, status: success, isPaused: false')
++
++    onlineMock.mockRestore()
+   })
+ 
+   it('should be able to retry a mutation when online', async () => {
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+ 
+     let count = 0
+     const states: UseMutationResult<any, any, any, any>[] = []
+@@ -608,7 +608,6 @@ describe('useMutation', () => {
+ 
+       React.useEffect(() => {
+         setActTimeout(() => {
+-          window.dispatchEvent(new Event('offline'))
+           mutate('todo')
+         }, 10)
+       }, [mutate])
+@@ -646,7 +645,7 @@ describe('useMutation', () => {
+       failureReason: new Error('oops'),
+     })
+ 
+-    onlineMock.mockRestore()
++    onlineMock.mockReturnValue(true)
+     window.dispatchEvent(new Event('online'))
+ 
+     await sleep(50)
+@@ -665,6 +664,8 @@ describe('useMutation', () => {
+       failureReason: null,
+       data: 'data',
+     })
++
++    onlineMock.mockRestore()
+   })
+ 
+   it('should not change state if unmounted', async () => {
+diff --git a/packages/react-query/src/__tests__/useQuery.test.tsx b/packages/react-query/src/__tests__/useQuery.test.tsx
+index 7c55bce5f..628e849b3 100644
+--- a/packages/react-query/src/__tests__/useQuery.test.tsx
++++ b/packages/react-query/src/__tests__/useQuery.test.tsx
+@@ -8,7 +8,7 @@ import {
+   Blink,
+   createQueryClient,
+   expectType,
+-  mockOnlineManagerIsOnline,
++  mockNavigatorOnLine,
+   mockVisibilityState,
+   queryKey,
+   renderWithClient,
+@@ -18,6 +18,7 @@ import {
+ import type {
+   DefinedUseQueryResult,
+   QueryFunction,
++  QueryFunctionContext,
+   UseQueryOptions,
+   UseQueryResult,
+ } from '..'
+@@ -2436,6 +2437,33 @@ describe('useQuery', () => {
+     rendered.getByText('status: pending')
+   })
+ 
++  // See https://github.com/tannerlinsley/react-query/issues/147
++  it('should not pass stringified variables to query function', async () => {
++    const key = queryKey()
++    const variables = { number: 5, boolean: false, object: {}, array: [] }
++    type CustomQueryKey = [typeof key, typeof variables]
++    const states: UseQueryResult<CustomQueryKey>[] = []
++
++    const queryFn = async (ctx: QueryFunctionContext<CustomQueryKey>) => {
++      await sleep(10)
++      return ctx.queryKey
++    }
++
++    function Page() {
++      const state = useQuery({ queryKey: [key, variables], queryFn })
++      states.push(state)
++      return <div>{state.status}</div>
++    }
++
++    const rendered = renderWithClient(queryClient, <Page />)
++
++    await waitFor(() => {
++      rendered.getByText('success')
++    })
++
++    expect(states[1]?.data).toEqual([key, variables])
++  })
++
+   it('should not refetch query on focus when `enabled` is set to `false`', async () => {
+     const key = queryKey()
+     const queryFn = vi.fn<unknown[], string>().mockReturnValue('data')
+@@ -5053,7 +5081,7 @@ describe('useQuery', () => {
+ 
+   describe('networkMode online', () => {
+     it('online queries should not start fetching if you are offline', async () => {
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const key = queryKey()
+       const states: Array<any> = []
+@@ -5082,11 +5110,10 @@ describe('useQuery', () => {
+       }
+ 
+       const rendered = renderWithClient(queryClient, <Page />)
+-      window.dispatchEvent(new Event('offline'))
+ 
+       await waitFor(() => rendered.getByText('status: pending, isPaused: true'))
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() =>
+@@ -5097,6 +5124,8 @@ describe('useQuery', () => {
+       })
+ 
+       expect(states).toEqual(['paused', 'fetching', 'idle'])
++
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should not refetch if you are offline', async () => {
+@@ -5134,9 +5163,7 @@ describe('useQuery', () => {
+ 
+       await waitFor(() => rendered.getByText('data: data1'))
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
+-      window.dispatchEvent(new Event('offline'))
+-
++      const onlineMock = mockNavigatorOnLine(false)
+       fireEvent.click(rendered.getByRole('button', { name: /invalidate/i }))
+ 
+       await waitFor(() =>
+@@ -5146,7 +5173,7 @@ describe('useQuery', () => {
+       )
+       await waitFor(() => rendered.getByText('failureReason: null'))
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() =>
+@@ -5165,6 +5192,8 @@ describe('useQuery', () => {
+       await waitFor(() => {
+         expect(rendered.getByText('data: data2')).toBeInTheDocument()
+       })
++
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should not refetch if you are offline and refocus', async () => {
+@@ -5200,7 +5229,7 @@ describe('useQuery', () => {
+ 
+       await waitFor(() => rendered.getByText('data: data1'))
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+       fireEvent.click(rendered.getByRole('button', { name: /invalidate/i }))
+ 
+       await waitFor(() =>
+@@ -5246,7 +5275,7 @@ describe('useQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const rendered = renderWithClient(queryClient, <Page />)
+ 
+@@ -5297,7 +5326,7 @@ describe('useQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const rendered = renderWithClient(queryClient, <Page />)
+ 
+@@ -5351,10 +5380,9 @@ describe('useQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const rendered = renderWithClient(queryClient, <Page />)
+-      window.dispatchEvent(new Event('offline'))
+ 
+       await waitFor(() =>
+         rendered.getByText('status: success, fetchStatus: paused'),
+@@ -5377,7 +5405,7 @@ describe('useQuery', () => {
+         window.dispatchEvent(new Event('visibilitychange'))
+       })
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       act(() => {
+         window.dispatchEvent(new Event('online'))
+       })
+@@ -5390,6 +5418,7 @@ describe('useQuery', () => {
+       })
+ 
+       expect(count).toBe(1)
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should pause retries if you are offline', async () => {
+@@ -5428,7 +5457,7 @@ describe('useQuery', () => {
+       )
+       await waitFor(() => rendered.getByText('failureReason: failed1'))
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+       window.dispatchEvent(new Event('offline'))
+ 
+       await sleep(20)
+@@ -5490,19 +5519,17 @@ describe('useQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const rendered = renderWithClient(queryClient, <Page />)
+ 
+-      window.dispatchEvent(new Event('offline'))
+-
+       await waitFor(() =>
+         rendered.getByText('status: pending, fetchStatus: paused'),
+       )
+ 
+       fireEvent.click(rendered.getByRole('button', { name: /hide/i }))
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() => {
+@@ -5515,6 +5542,8 @@ describe('useQuery', () => {
+       // give it a bit more time to make sure queryFn is not called again
+       await sleep(15)
+       expect(count).toBe(1)
++
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should not fetch if paused and we go online when cancelled and no refetchOnReconnect', async () => {
+@@ -5547,7 +5576,7 @@ describe('useQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const rendered = renderWithClient(queryClient, <Page />)
+ 
+@@ -5623,7 +5652,7 @@ describe('useQuery', () => {
+         rendered.getByText('status: success, fetchStatus: idle'),
+       )
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       fireEvent.click(rendered.getByRole('button', { name: /invalidate/i }))
+ 
+@@ -5653,7 +5682,7 @@ describe('useQuery', () => {
+ 
+   describe('networkMode always', () => {
+     it('always queries should start fetching even if you are offline', async () => {
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const key = queryKey()
+       let count = 0
+@@ -5693,7 +5722,7 @@ describe('useQuery', () => {
+     })
+ 
+     it('always queries should not pause retries', async () => {
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const key = queryKey()
+       let count = 0
+@@ -5739,7 +5768,7 @@ describe('useQuery', () => {
+ 
+   describe('networkMode offlineFirst', () => {
+     it('offlineFirst queries should start fetching if you are offline, but pause retries', async () => {
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const key = queryKey()
+       let count = 0
+@@ -5770,8 +5799,6 @@ describe('useQuery', () => {
+ 
+       const rendered = renderWithClient(queryClient, <Page />)
+ 
+-      window.dispatchEvent(new Event('offline'))
+-
+       await waitFor(() =>
+         rendered.getByText(
+           'status: pending, fetchStatus: paused, failureCount: 1',
+@@ -5781,7 +5808,7 @@ describe('useQuery', () => {
+ 
+       expect(count).toBe(1)
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() =>
+@@ -5790,6 +5817,8 @@ describe('useQuery', () => {
+       await waitFor(() => rendered.getByText('failureReason: failed3'))
+ 
+       expect(count).toBe(3)
++
++      onlineMock.mockRestore()
+     })
+   })
+ 
+diff --git a/packages/react-query/src/__tests__/utils.tsx b/packages/react-query/src/__tests__/utils.tsx
+index 9691ff8a6..02d056950 100644
+--- a/packages/react-query/src/__tests__/utils.tsx
++++ b/packages/react-query/src/__tests__/utils.tsx
+@@ -1,9 +1,8 @@
+ import * as React from 'react'
+ import { act, render } from '@testing-library/react'
+-
+ import * as utils from '@tanstack/query-core'
+ import { vi } from 'vitest'
+-import { QueryClient, QueryClientProvider, onlineManager } from '..'
++import { QueryClient, QueryClientProvider } from '..'
+ import type { QueryClientConfig } from '..'
+ import type { SpyInstance } from 'vitest'
+ 
+@@ -53,10 +52,8 @@ export function mockVisibilityState(
+   return vi.spyOn(document, 'visibilityState', 'get').mockReturnValue(value)
+ }
+ 
+-export function mockOnlineManagerIsOnline(
+-  value: boolean,
+-): SpyInstance<[], boolean> {
+-  return vi.spyOn(onlineManager, 'isOnline').mockReturnValue(value)
++export function mockNavigatorOnLine(value: boolean): SpyInstance<[], boolean> {
++  return vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(value)
+ }
+ 
+ let queryKeyCount = 0
+diff --git a/packages/solid-query/src/__tests__/createMutation.test.tsx b/packages/solid-query/src/__tests__/createMutation.test.tsx
+index 482b4794f..1cc0b2f72 100644
+--- a/packages/solid-query/src/__tests__/createMutation.test.tsx
++++ b/packages/solid-query/src/__tests__/createMutation.test.tsx
+@@ -15,7 +15,7 @@ import {
+ } from '..'
+ import {
+   createQueryClient,
+-  mockOnlineManagerIsOnline,
++  mockNavigatorOnLine,
+   queryKey,
+   setActTimeout,
+   sleep,
+@@ -495,7 +495,7 @@ describe('createMutation', () => {
+   })
+ 
+   it('should not retry mutations while offline', async () => {
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+ 
+     let count = 0
+ 
+@@ -535,8 +535,6 @@ describe('createMutation', () => {
+       ).toBeInTheDocument()
+     })
+ 
+-    window.dispatchEvent(new Event('offline'))
+-
+     fireEvent.click(screen.getByRole('button', { name: /mutate/i }))
+ 
+     await waitFor(() => {
+@@ -547,7 +545,7 @@ describe('createMutation', () => {
+ 
+     expect(count).toBe(0)
+ 
+-    onlineMock.mockRestore()
++    onlineMock.mockReturnValue(true)
+     window.dispatchEvent(new Event('online'))
+ 
+     await sleep(100)
+@@ -559,10 +557,12 @@ describe('createMutation', () => {
+     })
+ 
+     expect(count).toBe(2)
++
++    onlineMock.mockRestore()
+   })
+ 
+   it('should call onMutate even if paused', async () => {
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+     const onMutate = vi.fn()
+     let count = 0
+ 
+@@ -595,8 +595,6 @@ describe('createMutation', () => {
+ 
+     await screen.findByText('data: null, status: idle, isPaused: false')
+ 
+-    window.dispatchEvent(new Event('offline'))
+-
+     fireEvent.click(screen.getByRole('button', { name: /mutate/i }))
+ 
+     await screen.findByText('data: null, status: pending, isPaused: true')
+@@ -604,17 +602,19 @@ describe('createMutation', () => {
+     expect(onMutate).toHaveBeenCalledTimes(1)
+     expect(onMutate).toHaveBeenCalledWith('todo')
+ 
+-    onlineMock.mockRestore()
++    onlineMock.mockReturnValue(true)
+     window.dispatchEvent(new Event('online'))
+ 
+     await screen.findByText('data: 1, status: success, isPaused: false')
+ 
+     expect(onMutate).toHaveBeenCalledTimes(1)
+     expect(count).toBe(1)
++
++    onlineMock.mockRestore()
+   })
+ 
+   it('should optimistically go to paused state if offline', async () => {
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+     let count = 0
+     const states: Array<string> = []
+ 
+@@ -667,7 +667,7 @@ describe('createMutation', () => {
+   })
+ 
+   it('should be able to retry a mutation when online', async () => {
+-    const onlineMock = mockOnlineManagerIsOnline(false)
++    const onlineMock = mockNavigatorOnLine(false)
+ 
+     let count = 0
+     const states: CreateMutationResult<any, any, any, any>[] = []
+@@ -693,7 +693,6 @@ describe('createMutation', () => {
+       createEffect(() => {
+         const { mutate } = mutation
+         setActTimeout(() => {
+-          window.dispatchEvent(new Event('offline'))
+           mutate('todo')
+         }, 10)
+       })
+@@ -735,7 +734,7 @@ describe('createMutation', () => {
+       failureReason: new Error('oops'),
+     })
+ 
+-    onlineMock.mockRestore()
++    onlineMock.mockReturnValue(true)
+     window.dispatchEvent(new Event('online'))
+ 
+     await sleep(50)
+@@ -754,6 +753,8 @@ describe('createMutation', () => {
+       failureReason: null,
+       data: 'data',
+     })
++
++    onlineMock.mockRestore()
+   })
+ 
+   it('should not change state if unmounted', async () => {
+diff --git a/packages/solid-query/src/__tests__/createQuery.test.tsx b/packages/solid-query/src/__tests__/createQuery.test.tsx
+index c56e10611..48225f89e 100644
+--- a/packages/solid-query/src/__tests__/createQuery.test.tsx
++++ b/packages/solid-query/src/__tests__/createQuery.test.tsx
+@@ -22,7 +22,7 @@ import {
+   Blink,
+   createQueryClient,
+   expectType,
+-  mockOnlineManagerIsOnline,
++  mockNavigatorOnLine,
+   mockVisibilityState,
+   queryKey,
+   setActTimeout,
+@@ -2129,6 +2129,39 @@ describe('createQuery', () => {
+     screen.getByText('status: pending')
+   })
+ 
++  // See https://github.com/tannerlinsley/react-query/issues/147
++  it('should not pass stringified variables to query function', async () => {
++    const key = queryKey()
++    const variables = { number: 5, boolean: false, object: {}, array: [] }
++    type CustomQueryKey = readonly [typeof key, typeof variables]
++    const states: CreateQueryResult<CustomQueryKey, unknown>[] = []
++
++    function Page() {
++      const state = createQuery(() => ({
++        queryKey: [key, variables] as const,
++        queryFn: async (ctx) => {
++          await sleep(10)
++          return ctx.queryKey
++        },
++      }))
++
++      createRenderEffect(() => {
++        states.push({ ...state })
++      })
++      return null
++    }
++
++    render(() => (
++      <QueryClientProvider client={queryClient}>
++        <Page />
++      </QueryClientProvider>
++    ))
++
++    await sleep(20)
++
++    expect(states[1]?.data).toEqual([key, variables])
++  })
++
+   it('should not refetch query on focus when `enabled` is set to `false`', async () => {
+     const key = queryKey()
+     const queryFn = vi.fn<unknown[], string>().mockReturnValue('data')
+@@ -4966,7 +4999,7 @@ describe('createQuery', () => {
+ 
+   describe('networkMode online', () => {
+     it('online queries should not start fetching if you are offline', async () => {
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const key = queryKey()
+       const states: Array<any> = []
+@@ -5000,11 +5033,9 @@ describe('createQuery', () => {
+         </QueryClientProvider>
+       ))
+ 
+-      window.dispatchEvent(new Event('offline'))
+-
+       await waitFor(() => screen.getByText('status: pending, isPaused: true'))
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() => screen.getByText('status: success, isPaused: false'))
+@@ -5013,6 +5044,8 @@ describe('createQuery', () => {
+       })
+ 
+       expect(states).toEqual(['paused', 'fetching', 'idle'])
++
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should not refetch if you are offline', async () => {
+@@ -5054,8 +5087,7 @@ describe('createQuery', () => {
+ 
+       await waitFor(() => screen.getByText('data: data1'))
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
+-      window.dispatchEvent(new Event('offline'))
++      const onlineMock = mockNavigatorOnLine(false)
+       fireEvent.click(screen.getByRole('button', { name: /invalidate/i }))
+ 
+       await waitFor(() =>
+@@ -5065,7 +5097,7 @@ describe('createQuery', () => {
+       )
+       await waitFor(() => screen.getByText('failureReason: null'))
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() =>
+@@ -5082,6 +5114,8 @@ describe('createQuery', () => {
+       await waitFor(() => {
+         expect(screen.getByText('data: data2')).toBeInTheDocument()
+       })
++
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should not refetch if you are offline and refocus', async () => {
+@@ -5121,7 +5155,7 @@ describe('createQuery', () => {
+ 
+       await waitFor(() => screen.getByText('data: data1'))
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+       fireEvent.click(screen.getByRole('button', { name: /invalidate/i }))
+ 
+       await waitFor(() =>
+@@ -5167,7 +5201,7 @@ describe('createQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       render(() => (
+         <QueryClientProvider client={queryClient}>
+@@ -5222,7 +5256,7 @@ describe('createQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       render(() => (
+         <QueryClientProvider client={queryClient}>
+@@ -5280,7 +5314,7 @@ describe('createQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       render(() => (
+         <QueryClientProvider client={queryClient}>
+@@ -5288,8 +5322,6 @@ describe('createQuery', () => {
+         </QueryClientProvider>
+       ))
+ 
+-      window.dispatchEvent(new Event('offline'))
+-
+       await waitFor(() =>
+         screen.getByText('status: success, fetchStatus: paused'),
+       )
+@@ -5309,7 +5341,7 @@ describe('createQuery', () => {
+       // triggers a second pause
+       window.dispatchEvent(new Event('visibilitychange'))
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() =>
+@@ -5320,6 +5352,7 @@ describe('createQuery', () => {
+       })
+ 
+       expect(count).toBe(1)
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should pause retries if you are offline', async () => {
+@@ -5362,8 +5395,7 @@ describe('createQuery', () => {
+       )
+       await waitFor(() => screen.getByText('failureReason: failed1'))
+ 
+-      window.dispatchEvent(new Event('offline'))
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       await sleep(20)
+ 
+@@ -5376,7 +5408,7 @@ describe('createQuery', () => {
+ 
+       expect(count).toBe(1)
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() =>
+@@ -5385,6 +5417,8 @@ describe('createQuery', () => {
+       await waitFor(() => screen.getByText('failureReason: failed3'))
+ 
+       expect(count).toBe(3)
++
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should fetch if paused and we go online even if already unmounted (because not cancelled)', async () => {
+@@ -5422,7 +5456,7 @@ describe('createQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       render(() => (
+         <QueryClientProvider client={queryClient}>
+@@ -5430,15 +5464,13 @@ describe('createQuery', () => {
+         </QueryClientProvider>
+       ))
+ 
+-      window.dispatchEvent(new Event('offline'))
+-
+       await waitFor(() =>
+         screen.getByText('status: pending, fetchStatus: paused'),
+       )
+ 
+       fireEvent.click(screen.getByRole('button', { name: /hide/i }))
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await sleep(15)
+@@ -5449,6 +5481,8 @@ describe('createQuery', () => {
+       })
+ 
+       expect(count).toBe(1)
++
++      onlineMock.mockRestore()
+     })
+ 
+     it('online queries should not fetch if paused and we go online when cancelled and no refetchOnReconnect', async () => {
+@@ -5481,7 +5515,7 @@ describe('createQuery', () => {
+         )
+       }
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       render(() => (
+         <QueryClientProvider client={queryClient}>
+@@ -5565,7 +5599,7 @@ describe('createQuery', () => {
+         screen.getByText('status: success, fetchStatus: idle'),
+       )
+ 
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       fireEvent.click(screen.getByRole('button', { name: /invalidate/i }))
+ 
+@@ -5595,7 +5629,7 @@ describe('createQuery', () => {
+ 
+   describe('networkMode always', () => {
+     it('always queries should start fetching even if you are offline', async () => {
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const key = queryKey()
+       let count = 0
+@@ -5637,7 +5671,7 @@ describe('createQuery', () => {
+     })
+ 
+     it('always queries should not pause retries', async () => {
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const key = queryKey()
+       let count = 0
+@@ -5687,7 +5721,7 @@ describe('createQuery', () => {
+ 
+   describe('networkMode offlineFirst', () => {
+     it('offlineFirst queries should start fetching if you are offline, but pause retries', async () => {
+-      const onlineMock = mockOnlineManagerIsOnline(false)
++      const onlineMock = mockNavigatorOnLine(false)
+ 
+       const key = queryKey()
+       let count = 0
+@@ -5722,8 +5756,6 @@ describe('createQuery', () => {
+         </QueryClientProvider>
+       ))
+ 
+-      window.dispatchEvent(new Event('offline'))
+-
+       await waitFor(() =>
+         screen.getByText(
+           'status: pending, fetchStatus: paused, failureCount: 1',
+@@ -5733,7 +5765,7 @@ describe('createQuery', () => {
+ 
+       expect(count).toBe(1)
+ 
+-      onlineMock.mockRestore()
++      onlineMock.mockReturnValue(true)
+       window.dispatchEvent(new Event('online'))
+ 
+       await waitFor(() =>
+@@ -5742,6 +5774,8 @@ describe('createQuery', () => {
+       await waitFor(() => screen.getByText('failureReason: failed3'))
+ 
+       expect(count).toBe(3)
++
++      onlineMock.mockRestore()
+     })
+   })
+ 
+diff --git a/packages/solid-query/src/__tests__/utils.tsx b/packages/solid-query/src/__tests__/utils.tsx
+index d8dc5303e..f9f99d05b 100644
+--- a/packages/solid-query/src/__tests__/utils.tsx
++++ b/packages/solid-query/src/__tests__/utils.tsx
+@@ -1,6 +1,5 @@
+ import { Show, createEffect, createSignal, onCleanup } from 'solid-js'
+ import { vi } from 'vitest'
+-import { onlineManager } from '@tanstack/query-core'
+ import { QueryClient } from '../QueryClient'
+ import type { QueryClientConfig } from '@tanstack/query-core'
+ import type { ParentProps } from 'solid-js'
+@@ -42,10 +41,8 @@ export function mockVisibilityState(
+   return vi.spyOn(document, 'visibilityState', 'get').mockReturnValue(value)
+ }
+ 
+-export function mockOnlineManagerIsOnline(
+-  value: boolean,
+-): SpyInstance<[], boolean> {
+-  return vi.spyOn(onlineManager, 'isOnline').mockReturnValue(value)
++export function mockNavigatorOnLine(value: boolean): SpyInstance<[], boolean> {
++  return vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(value)
+ }
+ 
+ export function sleep(timeout: number): Promise<void> {
+diff --git a/packages/svelte-query/src/__tests__/utils.ts b/packages/svelte-query/src/__tests__/utils.ts
+index 42ef674e0..ab1bf3cdb 100644
+--- a/packages/svelte-query/src/__tests__/utils.ts
++++ b/packages/svelte-query/src/__tests__/utils.ts
+@@ -1,10 +1,23 @@
++import { vi } from 'vitest'
+ import { act } from '@testing-library/svelte'
+-import { QueryClient, type QueryClientConfig } from '../index'
++import { QueryClient } from '../index'
++import type { QueryClientConfig } from '../index'
++import type { SpyInstance } from 'vitest'
+ 
+ export function createQueryClient(config?: QueryClientConfig): QueryClient {
+   return new QueryClient(config)
+ }
+ 
++export function mockVisibilityState(
++  value: DocumentVisibilityState,
++): SpyInstance<[], DocumentVisibilityState> {
++  return vi.spyOn(document, 'visibilityState', 'get').mockReturnValue(value)
++}
++
++export function mockNavigatorOnLine(value: boolean): SpyInstance<[], boolean> {
++  return vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(value)
++}
++
+ let queryKeyCount = 0
+ export function queryKey(): Array<string> {
+   queryKeyCount++
+@@ -17,6 +30,11 @@ export function sleep(timeout: number): Promise<void> {
+   })
+ }
+ 
++export async function simplefetcher() {
++  await sleep(10)
++  return 'test'
++}
++
+ export function setActTimeout(fn: () => void, ms?: number) {
+   return setTimeout(() => {
+     act(() => {

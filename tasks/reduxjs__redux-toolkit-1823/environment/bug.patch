@@ -1,0 +1,2153 @@
+diff --git a/packages/action-listener-middleware/src/exceptions.ts b/packages/action-listener-middleware/src/exceptions.ts
+deleted file mode 100644
+index a4f904b4..00000000
+--- a/packages/action-listener-middleware/src/exceptions.ts
++++ /dev/null
+@@ -1,8 +0,0 @@
+-export class TaskAbortError implements Error {
+-  name: string
+-  message: string
+-  constructor(public reason?: string) {
+-    this.name = 'TaskAbortError'
+-    this.message = `task cancelled` + (reason != null ? `: "${reason}"` : '')
+-  }
+-}
+diff --git a/packages/action-listener-middleware/src/index.ts b/packages/action-listener-middleware/src/index.ts
+index 586c404c..7c26d48d 100644
+--- a/packages/action-listener-middleware/src/index.ts
++++ b/packages/action-listener-middleware/src/index.ts
+@@ -4,7 +4,6 @@ import type {
+   AnyAction,
+   Action,
+   ThunkDispatch,
+-  MiddlewareAPI,
+ } from '@reduxjs/toolkit'
+ import { createAction, nanoid } from '@reduxjs/toolkit'
+ 
+@@ -29,19 +28,17 @@ import type {
+   WithMiddlewareType,
+   TakePattern,
+   ListenerErrorInfo,
+-  ForkedTaskExecutor,
+-  ForkedTask,
+ } from './types'
+-import { assertFunction } from './utils'
+-import { TaskAbortError } from './exceptions'
++
+ import {
+-  runTask,
+-  promisifyAbortSignal,
+-  validateActive,
+-  createPause,
+-  createDelay,
+-} from './task'
+-export { TaskAbortError } from './exceptions'
++  Job,
++  SupervisorJob,
++  JobHandle,
++  JobCancellationReason,
++  JobCancellationException,
++} from './job'
++import { Outcome } from './outcome'
++
+ export type {
+   ActionListener,
+   ActionListenerMiddleware,
+@@ -54,101 +51,87 @@ export type {
+   TypedAddListener,
+   TypedAddListenerAction,
+   Unsubscribe,
+-  ForkedTaskExecutor,
+-  ForkedTask,
+-  ForkedTaskAPI,
+-  AsyncTaskExecutor,
+-  SyncTaskExecutor,
+-  TaskCancelled,
+-  TaskRejected,
+-  TaskResolved,
+-  TaskResult,
+ } from './types'
+ 
+-const defaultWhen: MiddlewarePhase = 'afterReducer'
+-const actualMiddlewarePhases = ['beforeReducer', 'afterReducer'] as const
+-
+-const createFork = (parentAbortSignal: AbortSignal) => {
+-  return <T>(taskExecutor: ForkedTaskExecutor<T>): ForkedTask<T> => {
+-    assertFunction(taskExecutor, 'taskExecutor')
+-    const childAbortController = new AbortController()
+-    const cancel = () => {
+-      childAbortController.abort()
+-    }
+-
+-    const result = runTask<T>(async (): Promise<T> => {
+-      validateActive(parentAbortSignal)
+-      validateActive(childAbortController.signal)
+-      const result = (await taskExecutor({
+-        pause: createPause(childAbortController.signal),
+-        delay: createDelay(childAbortController.signal),
+-        signal: childAbortController.signal,
+-      })) as T
+-      validateActive(parentAbortSignal)
+-      validateActive(childAbortController.signal)
+-      return result
+-    }, cancel)
+-
+-    return {
+-      result,
+-      cancel,
+-    }
++function assertFunction(
++  func: unknown,
++  expected: string
++): asserts func is (...args: unknown[]) => unknown {
++  if (typeof func !== 'function') {
++    throw new TypeError(`${expected} is not a function`)
+   }
+ }
+ 
+-const createTakePattern = <S>(
++const defaultWhen: MiddlewarePhase = 'afterReducer'
++const actualMiddlewarePhases = ['beforeReducer', 'afterReducer'] as const
++
++function createTakePattern<S>(
+   addListener: AddListenerOverloads<Unsubscribe, S, Dispatch<AnyAction>>,
+-  signal: AbortSignal
+-): TakePattern<S> => {
++  parentJob: Job<any>
++): TakePattern<S> {
+   /**
+    * A function that takes an ActionListenerPredicate and an optional timeout,
+    * and resolves when either the predicate returns `true` based on an action
+    * state combination or when the timeout expires.
+    * If the parent listener is canceled while waiting, this will throw a
+-   * TaskAbortError.
++   * JobCancellationException.
+    */
+-  const take = async <P extends AnyActionListenerPredicate<S>>(
++  async function take<P extends AnyActionListenerPredicate<S>>(
+     predicate: P,
+     timeout: number | undefined
+-  ) => {
+-    validateActive(signal)
+-
++  ) {
+     // Placeholder unsubscribe function until the listener is added
+     let unsubscribe: Unsubscribe = () => {}
+ 
+-    const tuplePromise = new Promise<[AnyAction, S, S]>((resolve) => {
+-      // Inside the Promise, we synchronously add the listener.
+-      unsubscribe = addListener({
+-        predicate: predicate as any,
+-        listener: (action, listenerApi): void => {
+-          // One-shot listener that cleans up as soon as the predicate passes
+-          listenerApi.unsubscribe()
+-          // Resolve the promise with the same arguments the predicate saw
+-          resolve([
+-            action,
+-            listenerApi.getState(),
+-            listenerApi.getOriginalState(),
+-          ])
+-        },
+-      })
+-    })
+-
+-    const promises: (Promise<null> | Promise<[AnyAction, S, S]>)[] = [
+-      promisifyAbortSignal(signal),
+-      tuplePromise,
+-    ]
+-
+-    if (timeout != null) {
+-      promises.push(
+-        new Promise<null>((resolve) => setTimeout(resolve, timeout, null))
++    // We'll add an additional nested Job representing this function.
++    // TODO This is really a duplicate of the other job inside the middleware.
++    // This behavior requires some additional nesting:
++    // We're going to create a `Promise` representing the result of the listener,
++    // but then wrap that in an `Outcome` for consistent error handling.
++    let job: Job<[AnyAction, S, S]> = parentJob.launch(async (job) =>
++      Outcome.wrap(
++        new Promise<[AnyAction, S, S]>((resolve) => {
++          // Inside the Promise, we synchronously add the listener.
++          unsubscribe = addListener({
++            predicate: predicate as any,
++            listener: (action, listenerApi): void => {
++              // One-shot listener that cleans up as soon as the predicate passes
++              listenerApi.unsubscribe()
++              // Resolve the promise with the same arguments the predicate saw
++              resolve([
++                action,
++                listenerApi.getState(),
++                listenerApi.getOriginalState(),
++              ])
++            },
++            parentJob,
++          })
++        })
+       )
+-    }
++    )
+ 
+-    try {
+-      const output = await Promise.race(promises)
++    let result: Outcome<[AnyAction, S, S]>
+ 
+-      validateActive(signal)
+-      return output
++    try {
++      // Run the job and use the timeout if given
++      result = await (timeout !== undefined
++        ? job.runWithTimeout(timeout)
++        : job.run())
++
++      if (result.isOk()) {
++        // Resolve the actual `take` promise with the action+states
++        return result.value
++      } else {
++        if (
++          result.error instanceof JobCancellationException &&
++          result.error.reason === JobCancellationReason.JobCancelled
++        ) {
++          // The `take` job itself was canceled due to timeout.
++          return null
++        }
++        // The parent was canceled - reject this promise with that error
++        throw result.error
++      }
+     } finally {
+       // Always clean up the listener
+       unsubscribe()
+@@ -188,10 +171,10 @@ export const createListenerEntry: TypedCreateListenerEntry<unknown> = (
+     listener: options.listener,
+     type,
+     predicate,
+-    pendingSet: new Set<AbortController>(),
+     unsubscribe: () => {
+       throw new Error('Unsubscribe not initialized')
+     },
++    parentJob: new SupervisorJob(),
+   }
+ 
+   return entry
+@@ -298,9 +281,9 @@ export function createActionListenerMiddleware<
+     return entry.unsubscribe
+   }
+ 
+-  const findListenerEntry = (
++  function findListenerEntry(
+     comparator: (entry: ListenerEntry) => boolean
+-  ): ListenerEntry | undefined => {
++  ): ListenerEntry | undefined {
+     for (const entry of listenerMap.values()) {
+       if (comparator(entry)) {
+         return entry
+@@ -351,64 +334,6 @@ export function createActionListenerMiddleware<
+     return true
+   }
+ 
+-  const notifyListener = async (
+-    entry: ListenerEntry<unknown, Dispatch<AnyAction>>,
+-    action: AnyAction,
+-    api: MiddlewareAPI,
+-    getOriginalState: () => S,
+-    currentPhase: MiddlewarePhase
+-  ) => {
+-    const internalTaskController = new AbortController()
+-    const take = createTakePattern(addListener, internalTaskController.signal)
+-    const condition: ConditionFunction<S> = (predicate, timeout) => {
+-      return take(predicate, timeout).then(Boolean)
+-    }
+-    const delay = createDelay(internalTaskController.signal)
+-    const fork = createFork(internalTaskController.signal)
+-    const pause: (val: Promise<any>) => Promise<any> = createPause(
+-      internalTaskController.signal
+-    )
+-    try {
+-      entry.pendingSet.add(internalTaskController)
+-      await Promise.resolve(
+-        entry.listener(action, {
+-          ...api,
+-          getOriginalState,
+-          condition,
+-          take,
+-          delay,
+-          pause,
+-          currentPhase,
+-          extra,
+-          signal: internalTaskController.signal,
+-          fork,
+-          unsubscribe: entry.unsubscribe,
+-          subscribe: () => {
+-            listenerMap.set(entry.id, entry)
+-          },
+-          cancelPrevious: () => {
+-            entry.pendingSet.forEach((controller, _, set) => {
+-              if (controller !== internalTaskController) {
+-                controller.abort()
+-                set.delete(controller)
+-              }
+-            })
+-          },
+-        })
+-      )
+-    } catch (listenerError) {
+-      if (!(listenerError instanceof TaskAbortError)) {
+-        safelyNotifyError(onError, listenerError, {
+-          raisedBy: 'listener',
+-          phase: currentPhase,
+-        })
+-      }
+-    } finally {
+-      internalTaskController.abort() // Notify that the task has completed
+-      entry.pendingSet.delete(internalTaskController)
+-    }
+-  }
+-
+   const middleware: Middleware<
+     {
+       (action: Action<'actionListenerMiddleware/add'>): Unsubscribe
+@@ -465,7 +390,47 @@ export function createActionListenerMiddleware<
+           continue
+         }
+ 
+-        notifyListener(entry, action, api, getOriginalState, currentPhase)
++        entry.parentJob.launchAndRun(async (jobHandle) => {
++          const take = createTakePattern(addListener, jobHandle as Job<any>)
++          const condition: ConditionFunction<S> = (predicate, timeout) => {
++            return take(predicate, timeout).then(Boolean)
++          }
++
++          const result = await Outcome.try(async () =>
++            entry.listener(action, {
++              ...api,
++              getOriginalState,
++              condition,
++              take,
++              currentPhase,
++              extra,
++              unsubscribe: entry.unsubscribe,
++              subscribe: () => {
++                listenerMap.set(entry.id, entry)
++              },
++              job: jobHandle,
++              cancelPrevious: () => {
++                entry.parentJob.cancelChildren(
++                  new JobCancellationException(
++                    JobCancellationReason.JobCancelled
++                  ),
++                  [jobHandle]
++                )
++              },
++            })
++          )
++          if (
++            result.isError() &&
++            !(result.error instanceof JobCancellationException)
++          ) {
++            safelyNotifyError(onError, result.error, {
++              raisedBy: 'listener',
++              phase: currentPhase,
++            })
++          }
++
++          return Outcome.ok(1)
++        })
+       }
+       if (currentPhase === 'beforeReducer') {
+         result = next(action)
+diff --git a/packages/action-listener-middleware/src/job.ts b/packages/action-listener-middleware/src/job.ts
+new file mode 100644
+index 00000000..6e82c22a
+--- /dev/null
++++ b/packages/action-listener-middleware/src/job.ts
+@@ -0,0 +1,324 @@
++// Source: https://github.com/ethossoftworks/job-ts
++
++import { Outcome } from './outcome'
++import type { Error as OutcomeError } from './outcome'
++
++/**
++ * The block of work a [Job] executes. The [job] parameter is a handle of the job's instance to allow
++ * launching of new jobs or pausing the job.
++ */
++export type JobFunc<T> = (job: JobHandle) => Promise<Outcome<T>>
++
++/**
++ * A handle for the current job used in [JobFunc]. This interface is equivalent to [Job]'s interface with the exception
++ * of [run] and [runWithTimeout] to prevent recursive running of the [Job] inside its [JobFunc].
++ */
++export interface JobHandle {
++  isActive: boolean
++  isCompleted: boolean
++  isCancelled: boolean
++  childCount: number
++  ensureActive(): void
++  launch<R>(func: JobFunc<R>): Job<R>
++  launchAndRun<R>(func: JobFunc<R>): Promise<Outcome<R>>
++  pause<R>(func: Promise<R>): Promise<R>
++  delay(milliseconds: number): Promise<void>
++  cancel(reason?: JobCancellationException): void
++  cancelChildren(
++    reason?: JobCancellationException,
++    skipChildren?: JobHandle[]
++  ): void
++}
++
++/**
++ * Thrown when a job or its parent is cancelled or if a job is run more than once.
++ */
++export class JobCancellationException implements Error {
++  reason: JobCancellationReason
++  name: string
++  message: string
++  constructor(reason: JobCancellationReason) {
++    this.name = 'JobCancellationException'
++    this.reason = reason
++    this.message = `${this.reason}`
++  }
++}
++
++/**
++ * The reason a job was cancelled.
++ *
++ * [ParentJobCancelled]: The parent job was cancelled
++ * [ParentJobCompleted]: The parent job completed
++ * [JobCancelled]: The current job was cancelled
++ * [JobCompleted]: The current job was already completed. This only happens if the same job is run more than once.
++ */
++export enum JobCancellationReason {
++  ParentJobCancelled = 'ParentJobCancelled',
++  ParentJobCompleted = 'ParentJobCompleted',
++  JobCancelled = 'JobCancelled',
++  JobCompleted = 'JobCompleted',
++}
++
++/**
++ * A cancellable unit of work with optional cancellation hierarchy.
++ *
++ * Cancellation is cooperative, meaning the user has to define pause/suspension points in the task via the [pause] or
++ * [ensureActive] methods or by checking [isActive].
++ *
++ * Cancelling a parent Job will cancel all children Jobs launched with the job defined as its parent. All children must
++ * also cooperatively check for cancellation.
++ *
++ * A parent job will not wait for any children jobs unless explicitly awaited on in the provided [JobFunc]. In this
++ * instance, if the parent completes before its child has completed, the parent will be marked as completed and the
++ * children will be cancelled at the next pause point.
++ *
++ * If an exception is thrown during a JobFunc, the job will cancel itself and its children and then rethrow the
++ * exception to be handled by the user.
++ *
++ * Running a job more than once will result in a [JobCancellationException].
++ *
++ * Note: When adding a try/catch mechanism inside of a [JobFunc], make sure to rethrow any [JobCancellationException]
++ * exceptions, otherwise job cancellation will not work as intended.
++ *
++ * Example:
++ * ```
++ const job = Job(async (job) => {
++ *     // This creates a pause point. If the job is cancelled while this operation is running,
++ *     // the job will immediately return [Error] with a [JobCancellationException] as its result.
++ *     const result = await job.pause(someLongRunningTask());
++ *
++ *     if (result.error != null) {
++ *         return Outcome.error("Problem");
++ *     }
++ *     return Outcome.ok("All good!");
++ * });
++ *
++ * const jobResult = await job.run();
++ * ```
++ */
++export class Job<T> implements JobHandle {
++  private _parent: Job<any> | undefined
++  private _children: Job<any>[] = []
++  private _func: JobFunc<T>
++  private _cancelResolver: (value: Outcome<T>) => void = () => {}
++  private _isCancelled = false
++  private _isCompleted = false
++
++  private _cancelPromise: Promise<Outcome<T>> = new Promise<Outcome<T>>(
++    (resolve) => (this._cancelResolver = resolve)
++  )
++
++  constructor(func: JobFunc<T>, options?: { parent?: Job<any> }) {
++    this._func = func
++    this._parent = options?.parent
++    this._parent?._addChild(this)
++  }
++
++  /**
++   * Returns true if the given outcome was cancelled
++   */
++  static isCancelled = (
++    outcome: Outcome<unknown>
++  ): outcome is OutcomeError<JobCancellationException> =>
++    outcome.isError() && outcome.error instanceof JobCancellationException
++
++  /**
++   * Returns true if both the parent job (if one exists) and the current job are both active. A job is active at
++   * creation and remains active until it has completed or been cancelled.
++   */
++  get isActive(): boolean {
++    return (
++      !this._isCompleted &&
++      !this._isCancelled &&
++      (this._parent?.isActive ?? true)
++    )
++  }
++
++  /**
++   * Returns true if the job was completed successfully
++   */
++  get isCompleted(): boolean {
++    return !this.isActive && !this.isCancelled
++  }
++
++  /**
++   * Returns true if the job was cancelled for any reason, either by explicit invocation of cancel or because its
++   * parent was cancelled. This does not imply that the job has fully completed because it may still be finishing
++   * whatever it was doing and waiting for its children to complete.
++   */
++  get isCancelled(): boolean {
++    return this._isCancelled || !(this._parent?.isCancelled ?? true)
++  }
++
++  /**
++   * Checks if the parent job and current job are active and throws [JobCancellationException] if either are inactive.
++   *
++   * Note: This should only be used inside of a [JobFunc].
++   */
++  ensureActive() {
++    if (this._isCompleted)
++      throw new JobCancellationException(JobCancellationReason.JobCompleted)
++    if (this._isCancelled)
++      throw new JobCancellationException(JobCancellationReason.JobCancelled)
++
++    // Check parent
++    if (this._parent === undefined) return
++    if (!this._parent.isActive) {
++      if (this._parent.isCompleted)
++        throw new JobCancellationException(
++          JobCancellationReason.ParentJobCompleted
++        )
++      throw new JobCancellationException(
++        JobCancellationReason.ParentJobCancelled
++      )
++    }
++  }
++
++  /**
++   * The current number of active children jobs.
++   */
++  get childCount(): number {
++    return this._children.length
++  }
++
++  /**
++   * Creates and returns a new job with the current job as the parent.
++   */
++  launch<R>(func: JobFunc<R>): Job<R> {
++    return new Job(func, { parent: this })
++  }
++
++  /**
++   * Creates a new job with the current job as the parent and executes it returning its result.
++   *
++   * Note: This should only be used inside of a [JobFunc].
++   */
++  launchAndRun<R>(func: JobFunc<R>): Promise<Outcome<R>> {
++    return this.launch(func).run()
++  }
++
++  /**
++   * Execute the job and return its result.
++   *
++   * [run] handles all [JobCancellationException] and will return an [Error] if a cancellation occurs.
++   */
++  async run(): Promise<Outcome<T>> {
++    try {
++      this.ensureActive()
++      const result = this._validateResult(
++        await Promise.race([this._func(this), this._cancelPromise])
++      )
++      this.ensureActive()
++      this._isCompleted = true
++      return result
++    } catch (e) {
++      if (e instanceof JobCancellationException) {
++        return Outcome.error(e)
++      } else {
++        this.cancel(
++          new JobCancellationException(JobCancellationReason.JobCancelled)
++        )
++        throw e
++      }
++    } finally {
++      this._parent?._removeChild(this)
++    }
++  }
++
++  /**
++   * Executes the job and cancels the job if it takes longer than the timeout to complete/cancel.
++   */
++  async runWithTimeout(milliseconds: number): Promise<Outcome<T>> {
++    setTimeout(() => this.cancel(), milliseconds)
++    return this.run()
++  }
++
++  private _validateResult(result: Outcome<T>): Outcome<T> {
++    if (result.isError() && result.error instanceof JobCancellationException)
++      throw result.error
++    return result
++  }
++
++  /**
++   * Await a given [func] and ensures the job is active before and after [func] execution. This effectively
++   * creates a pause/suspend point for the job and prevents returning a result or performing an action on a result
++   * if the job has been completed/cancelled.
++   *
++   * Note: This should only be used inside of a [JobFunc].
++   */
++  async pause<R>(func: Promise<R>): Promise<R> {
++    this.ensureActive()
++    const result = await Promise.race([func, this._cancelPromise])
++    this.ensureActive()
++    return result as R
++  }
++
++  /**
++   * Delays a job for the specified amount of time and checks for cancellation before and after the delay.
++   */
++  async delay(milliseconds: number): Promise<void> {
++    return await this.pause(
++      new Promise((resolve) => setTimeout(resolve, milliseconds))
++    )
++  }
++
++  /**
++   * Cancels the current job and all children jobs.
++   */
++  cancel(reason?: JobCancellationException) {
++    this._parent?._removeChild(this)
++    this.cancelChildren(
++      new JobCancellationException(JobCancellationReason.ParentJobCancelled)
++    )
++
++    if (this._isCancelled || this._isCompleted) return
++    this._isCancelled = true
++    this._cancelResolver(
++      Outcome.error(
++        reason ??
++          new JobCancellationException(JobCancellationReason.JobCancelled)
++      )
++    )
++  }
++
++  /**
++   * Cancels all children jobs without cancelling the current job.
++   */
++  cancelChildren(
++    reason?: JobCancellationException,
++    skipChildren: JobHandle[] = []
++  ) {
++    const childrenCopy = [...this._children]
++    const skipSet = new Set(skipChildren)
++    const remainingChildren: typeof this._children = []
++    childrenCopy.forEach((job) => {
++      if (skipSet.has(job)) {
++        remainingChildren.push(job)
++      } else {
++        job.cancel(
++          reason ??
++            new JobCancellationException(JobCancellationReason.JobCancelled)
++        )
++      }
++    })
++    this._children = remainingChildren
++  }
++
++  private _addChild(child: Job<any>) {
++    if (this.isActive) this._children.push(child)
++  }
++
++  private _removeChild(child: Job<any>) {
++    this._children.splice(this._children.indexOf(child), 1)
++  }
++}
++
++/**
++ * A helper extension of [Job] that never completes until it is cancelled. This effectively provides a long-running
++ * context to launch children jobs in.
++ */
++export class SupervisorJob extends Job<void> {
++  constructor(parent?: Job<any>) {
++    super(() => new Promise<Outcome<void>>(() => {}), { parent: parent })
++  }
++}
+diff --git a/packages/action-listener-middleware/src/outcome.ts b/packages/action-listener-middleware/src/outcome.ts
+new file mode 100644
+index 00000000..d2e017a0
+--- /dev/null
++++ b/packages/action-listener-middleware/src/outcome.ts
+@@ -0,0 +1,58 @@
++// Source: https://github.com/ethossoftworks/outcome-ts
++
++const outcomeSymbol = Symbol()
++
++export class Ok<T> {
++  private outcomeSymbol = outcomeSymbol
++
++  constructor(public value: T) {}
++
++  isError(): this is Error<T> {
++    return false
++  }
++
++  isOk(): this is Ok<T> {
++    return true
++  }
++}
++
++export class Error<E = unknown> {
++  private outcomeSymbol = outcomeSymbol
++
++  constructor(public error: E) {}
++
++  isError(): this is Error {
++    return true
++  }
++
++  isOk(): this is Ok<any> {
++    return false
++  }
++}
++
++export const Outcome = {
++  ok: <T>(value: T) => new Ok(value),
++  error: <E>(error: E) => new Error(error),
++
++  wrap: async <T>(promise: Promise<T>): Promise<Outcome<T>> => {
++    try {
++      return new Ok(await promise)
++    } catch (e) {
++      return new Error(e)
++    }
++  },
++
++  try: async <T>(block: () => Promise<T>): Promise<Outcome<T>> => {
++    try {
++      return new Ok(await block())
++    } catch (e) {
++      return new Error(e)
++    }
++  },
++
++  isOutcome: (other: any): other is Outcome<any> => {
++    return other !== undefined && other.outcomeSymbol === outcomeSymbol
++  },
++}
++
++export type Outcome<T, E = unknown> = Ok<T> | Error<E>
+diff --git a/packages/action-listener-middleware/src/task.ts b/packages/action-listener-middleware/src/task.ts
+deleted file mode 100644
+index efa1e12e..00000000
+--- a/packages/action-listener-middleware/src/task.ts
++++ /dev/null
+@@ -1,96 +0,0 @@
+-import { TaskAbortError } from './exceptions'
+-import type { TaskResult } from './types'
+-import { noop } from './utils'
+-
+-/**
+- * Synchronously raises {@link TaskAbortError} if the task tied to the input `signal` has been cancelled.
+- * @param signal
+- * @param reason
+- * @see {TaskAbortError}
+- */
+-export const validateActive = (signal: AbortSignal, reason?: string): void => {
+-  if (signal.aborted) {
+-    throw new TaskAbortError(reason)
+-  }
+-}
+-
+-/**
+- * Returns a promise that will reject {@link TaskAbortError} if the task is cancelled.
+- * @param signal
+- * @returns
+- */
+-export const promisifyAbortSignal = (
+-  signal: AbortSignal,
+-  reason?: string
+-): Promise<never> => {
+-  const promise = new Promise<never>((_, reject) => {
+-    const notifyRejection = () => reject(new TaskAbortError(reason))
+-
+-    if (signal.aborted) {
+-      notifyRejection()
+-    } else {
+-      signal.addEventListener('abort', notifyRejection, { once: true })
+-    }
+-  })
+-
+-  // We do not want 'unhandledRejection' warnings or crashes caused by cancelled tasks
+-  promise.catch(noop)
+-
+-  return promise
+-}
+-
+-/**
+- * Runs a task and returns promise that resolves to {@link TaskResult}.
+- *
+- * Second argument is an optional `cleanUp` function that always runs after task.
+- * @returns
+- */
+-export const runTask = async <T>(
+-  task: () => Promise<T>,
+-  cleanUp?: () => void
+-): Promise<TaskResult<T>> => {
+-  try {
+-    await Promise.resolve()
+-    const value = await task()
+-    return {
+-      status: 'ok',
+-      value,
+-    }
+-  } catch (error: any) {
+-    return {
+-      status: error instanceof TaskAbortError ? 'cancelled' : 'rejected',
+-      error,
+-    }
+-  } finally {
+-    cleanUp?.()
+-  }
+-}
+-
+-/**
+- * Given an input `AbortSignal` and a promise returns another promise that resolves
+- * as soon the input promise is provided or rejects as soon as
+- * `AbortSignal.abort` is `true`.
+- * @param signal
+- * @returns
+- */
+-export const createPause = <T>(signal: AbortSignal) => {
+-  return async (promise: Promise<T>): Promise<T> => {
+-    validateActive(signal)
+-    const result = await Promise.race([promisifyAbortSignal(signal), promise])
+-    validateActive(signal)
+-    return result
+-  }
+-}
+-
+-/**
+- * Given an input `AbortSignal` and `timeoutMs` returns a promise that resolves
+- * after `timeoutMs` or rejects as soon as `AbortSignal.abort` is `true`.
+- * @param signal
+- * @returns
+- */
+-export const createDelay = (signal: AbortSignal) => {
+-  const pause = createPause<void>(signal)
+-  return (timeoutMs: number): Promise<void> => {
+-    return pause(new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)))
+-  }
+-}
+diff --git a/packages/action-listener-middleware/src/tests/effectScenarios.test.ts b/packages/action-listener-middleware/src/tests/effectScenarios.test.ts
+index cde1d5f6..e3096735 100644
+--- a/packages/action-listener-middleware/src/tests/effectScenarios.test.ts
++++ b/packages/action-listener-middleware/src/tests/effectScenarios.test.ts
+@@ -12,7 +12,6 @@ import {
+   createListenerEntry,
+   addListenerAction,
+   removeListenerAction,
+-  TaskAbortError,
+ } from '../index'
+ 
+ import type {
+@@ -22,6 +21,8 @@ import type {
+   TypedAddListener,
+   Unsubscribe,
+ } from '../index'
++import { JobCancellationException } from '../job'
++import { Outcome } from '../outcome'
+ 
+ describe('Saga-style Effects Scenarios', () => {
+   interface CounterState {
+@@ -144,7 +145,7 @@ describe('Saga-style Effects Scenarios', () => {
+         listenerApi.cancelPrevious()
+ 
+         // Delay before starting actual work
+-        await listenerApi.delay(15)
++        await listenerApi.job.delay(15)
+ 
+         workPerformed++
+       },
+@@ -207,7 +208,7 @@ describe('Saga-style Effects Scenarios', () => {
+         listenerApi.unsubscribe()
+ 
+         // Pretend we're doing expensive work
+-        await listenerApi.delay(15)
++        await listenerApi.job.delay(15)
+ 
+         workPerformed++
+ 
+@@ -259,18 +260,20 @@ describe('Saga-style Effects Scenarios', () => {
+ 
+     addListener({
+       actionCreator: increment,
+-      listener: async (_, listenerApi) => {
+-        const childOutput = 42
++      listener: async (action, listenerApi) => {
+         // Spawn a child job and start it immediately
+-        const result = await listenerApi.fork(async () => {
+-          // Artificially wait a bit inside the child
+-          await listenerApi.delay(5)
+-          // Complete the child by returning an Outcome-wrapped value
+-          return childOutput
+-        }).result
++        const childJobPromise = listenerApi.job.launchAndRun(
++          async (jobHandle) => {
++            // Artificially wait a bit inside the child
++            await jobHandle.delay(5)
++            // Complete the child by returning an Outcome-wrapped value
++            return Outcome.ok(42)
++          }
++        )
+ 
++        const result = await childJobPromise
+         // Unwrap the child result in the listener
+-        if (result.status === 'ok') {
++        if (result.isOk()) {
+           childResult = result.value
+         }
+       },
+@@ -294,17 +297,18 @@ describe('Saga-style Effects Scenarios', () => {
+       actionCreator: increment,
+       listener: async (action, listenerApi) => {
+         // Spawn a child job and start it immediately
+-        const forkedTask = listenerApi.fork(async () => {
++        const childJob = listenerApi.job.launch(async (jobHandle) => {
+           // Artificially wait a bit inside the child
+-          await listenerApi.delay(15)
++          await jobHandle.delay(15)
+           // Complete the child by returning an Outcome-wrapped value
+           childResult = 42
+ 
+-          return 0
++          return Outcome.ok(0)
+         })
+ 
+-        await listenerApi.delay(5)
+-        forkedTask.cancel()
++        childJob.run()
++        await listenerApi.job.delay(5)
++        childJob.cancel()
+         listenerCompleted = true
+       },
+     })
+@@ -333,10 +337,10 @@ describe('Saga-style Effects Scenarios', () => {
+         if (increment.match(action)) {
+           // Have this branch wait around to be canceled by the other
+           try {
+-            await listenerApi.delay(10)
++            await listenerApi.job.delay(10)
+           } catch (err) {
+             // Can check cancelation based on the exception and its reason
+-            if (err instanceof TaskAbortError) {
++            if (err instanceof JobCancellationException) {
+               canceledAndCaught = true
+             }
+           }
+@@ -344,7 +348,7 @@ describe('Saga-style Effects Scenarios', () => {
+           // do a non-cancelation-aware wait
+           await delay(15)
+           // Or can check based on `job.isCancelled`
+-          if (listenerApi.signal.aborted) {
++          if (listenerApi.job.isCancelled) {
+             canceledCheck = true
+           }
+         } else if (decrement.match(action)) {
+diff --git a/packages/action-listener-middleware/src/tests/fork.test.ts b/packages/action-listener-middleware/src/tests/fork.test.ts
+deleted file mode 100644
+index dded5513..00000000
+--- a/packages/action-listener-middleware/src/tests/fork.test.ts
++++ /dev/null
+@@ -1,349 +0,0 @@
+-import type { EnhancedStore } from '@reduxjs/toolkit'
+-import { configureStore, createSlice } from '@reduxjs/toolkit'
+-
+-import type { PayloadAction } from '@reduxjs/toolkit'
+-import type { ForkedTaskExecutor, TaskResult } from '../types'
+-import { createActionListenerMiddleware, TaskAbortError } from '../index'
+-
+-function delay(ms: number) {
+-  return new Promise((resolve) => setTimeout(resolve, ms))
+-}
+-
+-// @see https://deno.land/std@0.95.0/async/deferred.ts (MIT)
+-export interface Deferred<T> extends Promise<T> {
+-  resolve(value?: T | PromiseLike<T>): void
+-  reject(reason?: any): void
+-}
+-
+-/** Creates a Promise with the `reject` and `resolve` functions
+- * placed as methods on the promise object itself. It allows you to do:
+- *
+- *     const p = deferred<number>();
+- *     // ...
+- *     p.resolve(42);
+- */
+-export function deferred<T>(): Deferred<T> {
+-  let methods
+-  const promise = new Promise<T>((resolve, reject): void => {
+-    methods = { resolve, reject }
+-  })
+-  return Object.assign(promise, methods) as Deferred<T>
+-}
+-
+-interface CounterSlice {
+-  value: number
+-}
+-
+-describe('fork', () => {
+-  const counterSlice = createSlice({
+-    name: 'counter',
+-    initialState: { value: 0 } as CounterSlice,
+-    reducers: {
+-      increment(state) {
+-        state.value += 1
+-      },
+-      decrement(state) {
+-        state.value -= 1
+-      },
+-      // Use the PayloadAction type to declare the contents of `action.payload`
+-      incrementByAmount: (state, action: PayloadAction<number>) => {
+-        state.value += action.payload
+-      },
+-    },
+-  })
+-  const { increment, decrement, incrementByAmount } = counterSlice.actions
+-  let middleware: ReturnType<typeof createActionListenerMiddleware>
+-  let store: EnhancedStore<CounterSlice>
+-
+-  beforeEach(() => {
+-    middleware = createActionListenerMiddleware()
+-    store = configureStore({
+-      reducer: counterSlice.reducer,
+-      middleware: (gDM) => gDM().prepend(middleware),
+-    })
+-  })
+-
+-  it('runs executors in the next microtask', async () => {
+-    let hasRunSyncExector = false
+-    let hasRunAsyncExecutor = false
+-
+-    middleware.addListener({
+-      actionCreator: increment,
+-      listener: async (_, listenerApi) => {
+-        listenerApi.fork(() => {
+-          hasRunSyncExector = true
+-        })
+-
+-        listenerApi.fork(async () => {
+-          hasRunAsyncExecutor = true
+-        })
+-      },
+-    })
+-
+-    store.dispatch(increment())
+-
+-    expect(hasRunSyncExector).toBe(false)
+-    expect(hasRunAsyncExecutor).toBe(false)
+-
+-    await Promise.resolve()
+-
+-    expect(hasRunSyncExector).toBe(true)
+-    expect(hasRunAsyncExecutor).toBe(true)
+-  })
+-
+-  it('runs forked tasks that are cancelled if parent listener is cancelled', async () => {
+-    const deferredForkedTaskError = deferred()
+-
+-    middleware.addListener({
+-      actionCreator: increment,
+-      listener: async (_, listenerApi) => {
+-        listenerApi.cancelPrevious()
+-        const result = await listenerApi.fork(async () => {
+-          await delay(20)
+-
+-          throw new Error('unreachable code')
+-        }).result
+-
+-        if (result.status !== 'ok') {
+-          deferredForkedTaskError.resolve(result.error)
+-        } else {
+-          deferredForkedTaskError.reject(new Error('unreachable code'))
+-        }
+-      },
+-    })
+-
+-    store.dispatch(increment())
+-    store.dispatch(increment())
+-
+-    expect(await deferredForkedTaskError).toEqual(new TaskAbortError())
+-  })
+-
+-  it('synchronously throws TypeError error if the provided executor is not a function', () => {
+-    const invalidExecutors = [null, {}, undefined, 1]
+-
+-    middleware.addListener({
+-      predicate: () => true,
+-      listener: async (_, listenerApi) => {
+-        invalidExecutors.forEach((invalidExecutor) => {
+-          let caughtError
+-          try {
+-            listenerApi.fork(invalidExecutor as any)
+-          } catch (err) {
+-            caughtError = err
+-          }
+-
+-          expect(caughtError).toBeInstanceOf(TypeError)
+-        })
+-      },
+-    })
+-
+-    store.dispatch(increment())
+-
+-    expect.assertions(invalidExecutors.length)
+-  })
+-
+-  it('does not run an executor if the task is synchronously cancelled', async () => {
+-    const storeStateAfter = deferred()
+-
+-    middleware.addListener({
+-      actionCreator: increment,
+-      listener: async (action, listenerApi) => {
+-        const forkedTask = listenerApi.fork(() => {
+-          listenerApi.dispatch(decrement())
+-          listenerApi.dispatch(decrement())
+-          listenerApi.dispatch(decrement())
+-        })
+-        forkedTask.cancel()
+-
+-        const result = await forkedTask.result
+-        storeStateAfter.resolve(listenerApi.getState())
+-      },
+-    })
+-    store.dispatch(increment())
+-
+-    expect(storeStateAfter).resolves.toEqual({ value: 1 })
+-  })
+-
+-  it.each<{
+-    desc: string
+-    executor: ForkedTaskExecutor<any>
+-    cancelAfterMs?: number
+-    expected: TaskResult<any>
+-  }>([
+-    {
+-      desc: 'sync exec - success',
+-      executor: () => 42,
+-      expected: { status: 'ok', value: 42 },
+-    },
+-    {
+-      desc: 'sync exec - error',
+-      executor: () => {
+-        throw new Error('2020')
+-      },
+-      expected: { status: 'rejected', error: new Error('2020') },
+-    },
+-    {
+-      desc: 'sync exec - sync cancel',
+-      executor: () => 42,
+-      cancelAfterMs: -1,
+-      expected: { status: 'cancelled', error: new TaskAbortError() },
+-    },
+-    {
+-      desc: 'sync exec - async cancel',
+-      executor: () => 42,
+-      cancelAfterMs: 0,
+-      expected: { status: 'ok', value: 42 },
+-    },
+-    {
+-      desc: 'async exec - async cancel',
+-      executor: async (forkApi) => {
+-        await forkApi.delay(100)
+-        throw new Error('2020')
+-      },
+-      cancelAfterMs: 10,
+-      expected: { status: 'cancelled', error: new TaskAbortError() },
+-    },
+-    {
+-      desc: 'async exec - success',
+-      executor: async () => {
+-        await delay(20)
+-        return Promise.resolve(21)
+-      },
+-      expected: { status: 'ok', value: 21 },
+-    },
+-    {
+-      desc: 'async exec - error',
+-      executor: async () => {
+-        await Promise.resolve()
+-        throw new Error('2020')
+-      },
+-      expected: { status: 'rejected', error: new Error('2020') },
+-    },
+-    {
+-      desc: 'async exec - success with forkApi.pause',
+-      executor: async (forkApi) => {
+-        return forkApi.pause(Promise.resolve(2))
+-      },
+-      expected: { status: 'ok', value: 2 },
+-    },
+-    {
+-      desc: 'async exec - error with forkApi.pause',
+-      executor: async (forkApi) => {
+-        return forkApi.pause(Promise.reject(22))
+-      },
+-      expected: { status: 'rejected', error: 22 },
+-    },
+-    {
+-      desc: 'async exec - success with forkApi.delay',
+-      executor: async (forkApi) => {
+-        await forkApi.delay(10)
+-        return 5
+-      },
+-      expected: { status: 'ok', value: 5 },
+-    },
+-  ])('%# - %j', async ({ executor, expected, cancelAfterMs }) => {
+-    let deferredResult = deferred()
+-    let forkedTask: any = {}
+-
+-    middleware.addListener({
+-      predicate: () => true,
+-      listener: async (_, listenerApi) => {
+-        forkedTask = listenerApi.fork(executor)
+-
+-        deferredResult.resolve(await forkedTask.result)
+-      },
+-    })
+-
+-    store.dispatch({ type: '' })
+-
+-    if (typeof cancelAfterMs === 'number') {
+-      if (cancelAfterMs < 0) {
+-        forkedTask.cancel()
+-      } else {
+-        await delay(cancelAfterMs)
+-        forkedTask.cancel()
+-      }
+-    }
+-
+-    const result = await deferredResult
+-
+-    expect(result).toEqual(expected)
+-  })
+-
+-  describe('forkAPI', () => {
+-    test('forkApi.delay rejects as soon as the task is cancelled', async () => {
+-      let deferredResult = deferred()
+-
+-      middleware.addListener({
+-        actionCreator: increment,
+-        listener: async (_, listenerApi) => {
+-          const forkedTask = listenerApi.fork(async (forkApi) => {
+-            await forkApi.delay(100)
+-
+-            return 4
+-          })
+-
+-          await listenerApi.delay(10)
+-          forkedTask.cancel()
+-          deferredResult.resolve(await forkedTask.result)
+-        },
+-      })
+-
+-      store.dispatch(increment())
+-
+-      expect(await deferredResult).toEqual({
+-        status: 'cancelled',
+-        error: new TaskAbortError(),
+-      })
+-    })
+-  })
+-
+-  test('forkApi.pause rejects if task is cancelled', async () => {
+-    let deferredResult = deferred()
+-    middleware.addListener({
+-      actionCreator: increment,
+-      listener: async (_, listenerApi) => {
+-        const forkedTask = listenerApi.fork(async (forkApi) => {
+-          await forkApi.pause(delay(30))
+-
+-          return 4
+-        })
+-
+-        await listenerApi.delay(10)
+-        forkedTask.cancel()
+-        deferredResult.resolve(await forkedTask.result)
+-      },
+-    })
+-
+-    store.dispatch(increment())
+-
+-    expect(await deferredResult).toEqual({
+-      status: 'cancelled',
+-      error: new TaskAbortError(),
+-    })
+-  })
+-
+-  test('forkApi.pause rejects if listener is cancelled', async () => {
+-    let deferredResult = deferred()
+-    middleware.addListener({
+-      actionCreator: increment,
+-      listener: async (_, listenerApi) => {
+-        listenerApi.cancelPrevious()
+-        const forkedTask = listenerApi.fork(async (forkApi) => {
+-          await forkApi.pause(delay(30))
+-
+-          return 4
+-        })
+-        deferredResult.resolve(await forkedTask.result)
+-      },
+-    })
+-
+-    store.dispatch(increment())
+-    store.dispatch(increment())
+-
+-    expect(await deferredResult).toEqual({
+-      status: 'cancelled',
+-      error: new TaskAbortError(),
+-    })
+-  })
+-})
+diff --git a/packages/action-listener-middleware/src/tests/job.test.ts b/packages/action-listener-middleware/src/tests/job.test.ts
+new file mode 100644
+index 00000000..a2dd86cb
+--- /dev/null
++++ b/packages/action-listener-middleware/src/tests/job.test.ts
+@@ -0,0 +1,509 @@
++// Source: https://github.com/ethossoftworks/job-ts/blob/main/src/job.test.ts
++
++import { Outcome } from '../outcome'
++import {
++  Job,
++  JobCancellationException,
++  JobCancellationReason,
++  SupervisorJob,
++} from '../job'
++
++import { performance } from 'perf_hooks'
++;(global as any).performance = performance
++;(global as any).window = {
++  setTimeout: setTimeout,
++  clearTimeout: clearTimeout,
++}
++
++const delay = (milliseconds: number) =>
++  new Promise((resolve) => setTimeout(resolve, milliseconds))
++
++describe('Job', () => {
++  test('Cancel when exception thrown', async () => {
++    let child: Promise<Outcome<number>> = Promise.resolve(Outcome.ok(1))
++    let parent: Job<number> = new Job(async (job) => Outcome.ok(1))
++
++    try {
++      parent = new Job(async (job) => {
++        child = job.launchAndRun(async (job) => {
++          await job.delay(5000)
++          return Outcome.ok(1)
++        })
++
++        throw new Error('Uh Oh')
++        return Outcome.ok(1)
++      })
++      await parent.run()
++    } catch (e) {
++      // Ignore parent exception
++    } finally {
++      const childResult = await child
++      if (!parent.isCancelled) throw new Error('Parent was not cancelled')
++      if (
++        childResult.isOk() ||
++        !(childResult.error instanceof JobCancellationException)
++      )
++        throw new Error('Child was not cancelled')
++    }
++  })
++
++  test('Add job to cancelled parent', async () => {
++    const parent = new Job(async (job) => Outcome.ok(1))
++    parent.cancel()
++
++    parent.launch(async (job) => Outcome.ok(1))
++    new Job(async (job) => Outcome.ok(1), { parent: parent })
++    expect(parent.childCount).toBe(0)
++  })
++
++  test('External child cancelled if parent completes', async () => {
++    const parentJob = new Job(async (job) => {
++      await job.delay(10)
++      return Outcome.ok(1)
++    })
++
++    const childJob = parentJob.launch(async (job) => {
++      await job.delay(50)
++      return Outcome.ok(1)
++    })
++
++    const parentPromise = parentJob.run()
++    const childResult = await childJob.run()
++    const parentResult = await parentPromise
++    if (parentResult.isError())
++      throw new Error('Parent did not complete successfully')
++    if (!childResult.isError())
++      throw new Error('Child was not cancelled when parent completed')
++  })
++
++  test('Job Returns', async () => {
++    const job = new Job(async (job) => Outcome.ok(1))
++    const value1 = await job.run()
++
++    if (value1.isOk()) {
++      expect(value1.value).toBe(1)
++    } else {
++      throw new Error('Invalid return')
++    }
++
++    const value2 = await new Job(async (job) => Outcome.ok(1)).run()
++    if (value2.isOk()) {
++      expect(value2.value).toBe(1)
++    } else {
++      throw new Error('Invalid return')
++    }
++  })
++
++  test('Job Status', async () => {
++    const job = new Job(async (job) => Outcome.ok(1))
++    expect(job.isActive).toBe(true)
++    expect(job.isCompleted).toBe(false)
++    expect(job.isCancelled).toBe(false)
++    await job.run()
++    expect(job.isActive).toBe(false)
++    expect(job.isCompleted).toBe(true)
++    expect(job.isCancelled).toBe(false)
++
++    const job2 = new Job(async (job) => {
++      await job.delay(500)
++      return Outcome.ok(1)
++    })
++    setTimeout(() => job2.cancel(), 100)
++    await job2.run()
++    expect(job2.isActive).toBe(false)
++    expect(job2.isCompleted).toBe(false)
++    expect(job2.isCancelled).toBe(true)
++  })
++
++  test('Cancellation Reason', async () => {
++    // JobCompleted
++    const alreadyCompleteJob = new Job(async (job) => Outcome.ok(1))
++    await alreadyCompleteJob.run()
++    const alreadyCompleteResult = await alreadyCompleteJob.run()
++    if (
++      alreadyCompleteResult.isOk() ||
++      !(alreadyCompleteResult.error instanceof JobCancellationException) ||
++      (alreadyCompleteResult.error as JobCancellationException).reason !=
++        JobCancellationReason.JobCompleted
++    ) {
++      throw new Error(
++        'Completed: JobCancellationReason.JobCompleted not returned'
++      )
++    }
++
++    // ParentCancelled
++    const parentCancelled = new Job(async (job) => {
++      await job.delay(50)
++      return Outcome.ok(1)
++    })
++
++    const parentCancelledChild = parentCancelled.launch(async (job) => {
++      await job.delay(100)
++      return Outcome.ok(1)
++    })
++
++    setTimeout(() => parentCancelled.cancel(), 25)
++    const childResult = await parentCancelledChild.run()
++
++    if (
++      childResult.isOk() ||
++      !(childResult.error instanceof JobCancellationException) ||
++      (childResult.error as JobCancellationException).reason !=
++        JobCancellationReason.ParentJobCancelled
++    ) {
++      throw new Error(
++        'Parent Cancelled: JobCancellationReason.ParentJobCancelled not returned'
++      )
++    }
++
++    // ParentCompleted
++    const parentCompleted = new Job(async (job) => {
++      await job.delay(10)
++      return Outcome.ok(1)
++    })
++    parentCompleted.run()
++
++    const parentCompletedChild = parentCompleted.launchAndRun(async (job) => {
++      await job.delay(20)
++      return Outcome.ok(1)
++    })
++
++    const parentCompletedChildResult = await parentCompletedChild
++
++    expect(Job.isCancelled(parentCompletedChildResult)).toBe(true)
++    // @ts-ignore
++    expect(parentCompletedChildResult.error.reason).toBe(
++      JobCancellationReason.ParentJobCompleted
++    )
++
++    // JobCancelled
++    const cancelledJob = new Job(async (job) => {
++      await job.delay(50)
++      return Outcome.ok(1)
++    })
++
++    setTimeout(() => cancelledJob.cancel(), 25)
++    const cancelledJobResult = await cancelledJob.run()
++
++    if (
++      cancelledJobResult.isOk() ||
++      !(cancelledJobResult.error instanceof JobCancellationException) ||
++      (cancelledJobResult.error as JobCancellationException).reason !=
++        JobCancellationReason.JobCancelled
++    ) {
++      throw new Error(
++        'Job Cancelled: JobCancellationReason.JobCancelled not returned'
++      )
++    }
++
++    // Launch after parent cancelled
++    const launchAfterCancelledJob = new Job(async (job) => Outcome.ok(1))
++    launchAfterCancelledJob.cancel()
++    const launchAfterCancelledResult =
++      await launchAfterCancelledJob.launchAndRun(async (job) => Outcome.ok(1))
++    if (
++      launchAfterCancelledResult.isOk() ||
++      !(launchAfterCancelledResult.error instanceof JobCancellationException) ||
++      (launchAfterCancelledResult.error as JobCancellationException).reason !=
++        JobCancellationReason.ParentJobCancelled
++    ) {
++      throw new Error(
++        'Launch After Cancelled: JobCancellationReason.ParentJobCancelled not returned'
++      )
++    }
++
++    // Launch after parent completed
++    const launchAfterCompletedJob = new Job(async (job) => Outcome.ok(1))
++    await launchAfterCompletedJob.run()
++    const launchAfterCompletedResult =
++      await launchAfterCompletedJob.launchAndRun(async (job) => Outcome.ok(1))
++    if (
++      launchAfterCompletedResult.isOk() ||
++      !(launchAfterCompletedResult.error instanceof JobCancellationException) ||
++      (launchAfterCompletedResult.error as JobCancellationException).reason !=
++        JobCancellationReason.ParentJobCompleted
++    ) {
++      throw new Error(
++        'Launch After Completed: JobCancellationReason.ParentJobCompleted not returned'
++      )
++    }
++  })
++
++  test('Multiple Job Runs', async () => {
++    const job = new Job(async (job) => {
++      await job.delay(50)
++      return Outcome.ok(1)
++    })
++
++    const result1 = await job.run()
++    const result2 = await job.run()
++    const result3 = await job.run()
++
++    if (result1.isError() || result1.value !== 1)
++      throw new Error('Job did not return value correctly')
++    if (result2.isOk() || !(result2.error instanceof JobCancellationException))
++      throw new Error('Job did not return JobCompletionException')
++    if (result3.isOk() || !(result3.error instanceof JobCancellationException))
++      throw new Error('Job did not return JobCompletionException')
++  })
++
++  test('Job Parent Cancellation', async () => {
++    var childFinished = false
++
++    const parent = new Job(async (job) => {
++      await job.launchAndRun(async (job) => {
++        await job.delay(100)
++        childFinished = true
++        return Outcome.ok(1)
++      })
++
++      return Outcome.ok(null)
++    })
++
++    setTimeout(() => parent.cancel(), 50)
++    const result = await parent.run()
++
++    expect(childFinished).toBe(false)
++    if (result.isError()) {
++      if (!(result.error instanceof JobCancellationException))
++        throw new Error(
++          'Cancelled exception was not sent back in Outcome.Error'
++        )
++    } else {
++      throw new Error('Outcome.Ok was returned instead of Outcome.Error')
++    }
++
++    // Test that child is returned immediately when the parent is cancelled
++    const parent2 = new Job(async (job) => {
++      await job.delay(25)
++      return Outcome.ok(1)
++    })
++
++    const child2 = parent2.launch(async (job) => {
++      await job.delay(200)
++      return Outcome.ok(1)
++    })
++
++    setTimeout(() => parent2.cancel(), 20)
++    const start = performance.now()
++    await child2.run()
++    if (performance.now() - start >= 50)
++      throw new Error('Child did not cancel immediately')
++  })
++
++  test('Job Child Cancellation', async () => {
++    const parent = new Job(async (job) => {
++      const child1 = job.launch(async (job) => {
++        await job.delay(100)
++        return Outcome.ok(1)
++      })
++
++      const child2 = job.launch(async (job) => {
++        await job.delay(50)
++        return Outcome.ok(2)
++      })
++
++      setTimeout(() => child2.cancel(), 25)
++      const results = await Promise.all([child1.run(), child2.run()])
++
++      if (!results[0].isOk() || results[0].value !== 1)
++        throw new Error('Child1 not Ok when expected to be')
++      if (results[1].isOk()) throw new Error('Child2 not cancelled')
++      return Outcome.ok(true)
++    })
++
++    const parentResult = await parent.run()
++    if (parentResult.isError() || parentResult.value != true)
++      throw new Error("Parent didn't complete successfully")
++  })
++
++  test('Job Stream', async () => {
++    var counter = 0
++
++    await new Job(async (job) => {
++      const stream = job.launch(async (job) => {
++        for await (const value of _testStream()) {
++          job.ensureActive()
++          counter = value
++        }
++        return Outcome.ok(1)
++      })
++
++      setTimeout(() => stream.cancel(), 50)
++      const streamResult = await stream.run()
++      if (streamResult.isOk())
++        throw new Error('Stream returned Ok instead of Error')
++      return Outcome.ok(null)
++    }).run()
++
++    expect(counter < 5).toBe(true)
++  })
++
++  test('Job Immediate Cancellation', async () => {
++    let childHasRun: boolean = false
++    const job = new Job(async (job) => {
++      childHasRun = true
++      await job.delay(500)
++      return Outcome.ok(1)
++    })
++
++    job.cancel()
++    const result = await job.run()
++
++    if (
++      result.isOk() ||
++      !(result.error instanceof JobCancellationException) ||
++      (childHasRun as boolean) === true
++    ) {
++      throw new Error(
++        `Job was not immediately cancelled. Result: ${result}. HasRun: ${childHasRun}`
++      )
++    }
++  })
++
++  test('Job Cancellation - After Complete', async () => {
++    const job = new Job(async (job) => Outcome.ok(1))
++    const result = await job.run()
++    job.cancel() // Test that this is a noop
++
++    expect(job.isCompleted).toBe(true)
++    expect(result.isOk()).toBe(true)
++  })
++
++  test('Job Cancellation - Internal', async () => {
++    const result = await new Job(async (job) => {
++      job.cancel()
++      return Outcome.ok(1)
++    }).run()
++
++    expect(Job.isCancelled(result)).toBe(true)
++  })
++
++  test('Job Timeout', async () => {
++    var childHasRun = false
++
++    const result = await new Job(async (job) => {
++      await job.launchAndRun(async (job) => {
++        await job.delay(100)
++        childHasRun = true
++        return Outcome.ok(2)
++      })
++
++      return Outcome.ok(1)
++    }).runWithTimeout(50)
++
++    if (result.isOk() || !(result.error instanceof JobCancellationException)) {
++      throw new Error('Job did not timeout appropriately')
++    }
++
++    await delay(60)
++    if (childHasRun) {
++      throw new Error('Timeout did not cancel child')
++    }
++  })
++
++  test('Job Delay', async () => {
++    const start = performance.now()
++    const expectedTime = 100
++    const result = await new Job(async (job) => {
++      await job.delay(expectedTime)
++      return Outcome.ok(1)
++    }).run()
++
++    const elapsed = performance.now() - start
++
++    if (result.isError() || result.value !== 1) {
++      throw new Error('Invalid Result')
++    } else if (elapsed < expectedTime) {
++      throw new Error('Delay did not work')
++    }
++  })
++
++  test('Cancel Children', async () => {
++    const supervisor = new SupervisorJob()
++    var child1Complete = false
++    var child2Complete = false
++
++    const child1 = supervisor.launchAndRun(async (job) => {
++      await job.delay(120)
++      child1Complete = true
++      return Outcome.ok(1)
++    })
++
++    const child2 = supervisor.launchAndRun(async (job) => {
++      await job.delay(100)
++      child2Complete = true
++      return Outcome.ok(2)
++    })
++
++    await delay(25)
++    supervisor.cancelChildren()
++    const child1Result = await child1
++    const child2Result = await child2
++
++    expect(supervisor.isActive).toBe(true)
++    expect(child1Complete).toBe(false)
++    expect(child2Complete).toBe(false)
++    if (
++      child1Result.isOk() ||
++      !(child1Result.error instanceof JobCancellationException)
++    )
++      throw new Error('Child 1 did not return exception')
++    if (
++      child2Result.isOk() ||
++      !(child2Result.error instanceof JobCancellationException)
++    )
++      throw new Error('Child 2 did not return exception')
++  })
++
++  test('SupervisorJob - Await', async () => {
++    const start = performance.now()
++    const supervisor = new SupervisorJob()
++    const expectedTime = 200
++    await supervisor.runWithTimeout(expectedTime)
++    const elapsed = performance.now() - start
++    if (elapsed < expectedTime)
++      throw new Error(
++        `Supervisor Job finished before it was supposed to (${elapsed}, ${expectedTime})`
++      )
++  })
++
++  test('Child Count', async () => {
++    const supervisor = new SupervisorJob()
++    var jobs: Promise<Outcome<number>>[] = []
++
++    for (var i = 0; i < 100; i++) {
++      jobs.push(
++        supervisor.launchAndRun(async (job) => {
++          await job.delay(Math.random() * 100)
++          return Outcome.ok(1)
++        })
++      )
++    }
++
++    expect(supervisor.childCount).toBe(100)
++    await Promise.all(jobs)
++    expect(supervisor.childCount).toBe(0)
++
++    const noRunChild = supervisor.launch(async (job) => Outcome.ok(1))
++    expect(supervisor.childCount).toBe(1)
++    noRunChild.cancel()
++    expect(supervisor.childCount).toBe(0)
++
++    const runChild = supervisor.launch(async (job) => {
++      await job.delay(50)
++      return Outcome.ok(1)
++    })
++    expect(supervisor.childCount).toBe(1)
++    await runChild.run()
++    expect(supervisor.childCount).toBe(0)
++  })
++})
++
++async function* _testStream() {
++  var i = 0
++  while (true) {
++    yield i++
++    await delay(10)
++  }
++}
+diff --git a/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts b/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
+index 3ceb68f0..195d24e5 100644
+--- a/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
++++ b/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
+@@ -2,7 +2,6 @@ import {
+   configureStore,
+   createAction,
+   createSlice,
+-  Dispatch,
+   isAnyOf,
+ } from '@reduxjs/toolkit'
+ 
+@@ -13,7 +12,6 @@ import {
+   createListenerEntry,
+   addListenerAction,
+   removeListenerAction,
+-  TaskAbortError,
+ } from '../index'
+ 
+ import type {
+@@ -23,6 +21,7 @@ import type {
+   TypedAddListener,
+   Unsubscribe,
+ } from '../index'
++import { JobCancellationException } from '../job'
+ 
+ const middlewareApi = {
+   getState: expect.any(Function),
+@@ -30,41 +29,16 @@ const middlewareApi = {
+   condition: expect.any(Function),
+   extra: undefined,
+   take: expect.any(Function),
+-  signal: expect.any(Object),
+-  fork: expect.any(Function),
+-  delay: expect.any(Function),
+-  pause: expect.any(Function),
+   dispatch: expect.any(Function),
+   currentPhase: expect.stringMatching(/beforeReducer|afterReducer/),
+   unsubscribe: expect.any(Function),
+   subscribe: expect.any(Function),
+   cancelPrevious: expect.any(Function),
++  job: expect.any(Object),
+ }
+ 
+ const noop = () => {}
+ 
+-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+-export interface Deferred<T> extends Promise<T> {
+-  resolve(value?: T | PromiseLike<T>): void
+-  // deno-lint-ignore no-explicit-any
+-  reject(reason?: any): void
+-}
+-
+-/** Creates a Promise with the `reject` and `resolve` functions
+- * placed as methods on the promise object itself. It allows you to do:
+- *
+- *     const p = deferred<number>();
+- *     // ...
+- *     p.resolve(42);
+- */
+-export function deferred<T>(): Deferred<T> {
+-  let methods
+-  const promise = new Promise<T>((resolve, reject): void => {
+-    methods = { resolve, reject }
+-  })
+-  return Object.assign(promise, methods) as Deferred<T>
+-}
+-
+ export declare type IsAny<T, True, False = never> = true | false extends (
+   T extends never ? true : false
+ )
+@@ -896,7 +870,7 @@ describe('createActionListenerMiddleware', () => {
+               // end up hitting this next line
+               jobsContinued++
+             } catch (err) {
+-              if (err instanceof TaskAbortError) {
++              if (err instanceof JobCancellationException) {
+                 jobsCanceled++
+               }
+             }
+diff --git a/packages/action-listener-middleware/src/tests/useCases.test.ts b/packages/action-listener-middleware/src/tests/useCases.test.ts
+index 855d0720..80a40d60 100644
+--- a/packages/action-listener-middleware/src/tests/useCases.test.ts
++++ b/packages/action-listener-middleware/src/tests/useCases.test.ts
+@@ -21,7 +21,8 @@ import type {
+   TypedAddListener,
+   Unsubscribe,
+ } from '../index'
+-import { TaskAbortError } from '../exceptions'
++import { JobCancellationException } from '../job'
++import { Outcome } from '../outcome'
+ 
+ interface CounterState {
+   value: number
+@@ -121,8 +122,8 @@ describe('Saga-style Effects Scenarios', () => {
+       c: 0,
+     }
+ 
+-    let pollingTaskStarted = false
+-    let pollingTaskCanceled = false
++    let pollingJobStarted = false
++    let pollingJobCanceled = false
+ 
+     addListener({
+       actionCreator: eventPollingStarted,
+@@ -130,12 +131,14 @@ describe('Saga-style Effects Scenarios', () => {
+         listenerApi.unsubscribe()
+ 
+         // Start a child job that will infinitely loop receiving messages
+-        const pollingTask = listenerApi.fork(async (forkApi) => {
+-          pollingTaskStarted = true
++        const pollingJob = listenerApi.job.launch(async (handle) => {
++          pollingJobStarted = true
+           try {
+             while (true) {
++              const eventPromise = pollForEvent()
+               // Cancelation-aware pause for a new server message
+-              const serverEvent = await forkApi.pause(pollForEvent())
++              const serverEvent = await handle.pause(eventPromise)
++
+               // Process the message. In this case, just count the times we've seen this message.
+               if (serverEvent.type in receivedMessages) {
+                 receivedMessages[
+@@ -144,22 +147,23 @@ describe('Saga-style Effects Scenarios', () => {
+               }
+             }
+           } catch (err) {
+-            if (err instanceof TaskAbortError) {
+-              pollingTaskCanceled = true
++            if (err instanceof JobCancellationException) {
++              pollingJobCanceled = true
+             }
+           }
+-          return 0
++          return Outcome.ok(0)
+         })
++        pollingJob.run()
+ 
+         // Wait for the "stop polling" action
+         await listenerApi.condition(eventPollingStopped.match)
+-        pollingTask.cancel()
++        pollingJob.cancel()
+       },
+     })
+ 
+     store.dispatch(eventPollingStarted())
+     await delay(5)
+-    expect(pollingTaskStarted).toBe(true)
++    expect(pollingJobStarted).toBe(true)
+ 
+     await delay(5)
+     emitter.emit('serverEvent', 'a')
+@@ -181,6 +185,6 @@ describe('Saga-style Effects Scenarios', () => {
+     // the cancelation took effect, but after another pause, the
+     // cancelation kicked in and the second C is ignored.
+     expect(receivedMessages).toEqual({ a: 1, b: 1, c: 0 })
+-    expect(pollingTaskCanceled).toBe(true)
++    expect(pollingJobCanceled).toBe(true)
+   })
+ })
+diff --git a/packages/action-listener-middleware/src/types.ts b/packages/action-listener-middleware/src/types.ts
+index c854cf5d..dfe62c20 100644
+--- a/packages/action-listener-middleware/src/types.ts
++++ b/packages/action-listener-middleware/src/types.ts
+@@ -7,7 +7,8 @@ import type {
+   Action,
+   ThunkDispatch,
+ } from '@reduxjs/toolkit'
+-import type { TaskAbortError } from './exceptions'
++
++import type { JobHandle, Job } from './job'
+ 
+ /**
+  * Types copied from RTK
+@@ -27,6 +28,7 @@ export interface TypedActionCreator<Type extends string> {
+ /**
+  * Action Listener Options types
+  */
++
+ export type MiddlewarePhase = 'beforeReducer' | 'afterReducer'
+ 
+ export type When = MiddlewarePhase | 'both' | undefined
+@@ -61,65 +63,6 @@ export interface HasMatchFunction<T> {
+   match: MatchFunction<T>
+ }
+ 
+-export interface ForkedTaskAPI {
+-  /**
+-   * Returns a promise that resolves when `waitFor` resolves or
+-   * rejects if the task has been cancelled or completed.
+-   */
+-  pause<W>(waitFor: Promise<W>): Promise<W>
+-  /**
+-   * Returns a promise resolves after `timeoutMs` or
+-   * rejects if the task has been cancelled or is completed.
+-   * @param timeoutMs
+-   */
+-  delay(timeoutMs: number): Promise<void>
+-  /**
+-   * An abort signal whose `aborted` property is set to `true`
+-   * if the task execution is either aborted or completed.
+-   * @see https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal
+-   */
+-  signal: AbortSignal
+-}
+-
+-export interface AsyncTaskExecutor<T> {
+-  (forkApi: ForkedTaskAPI): Promise<T>
+-}
+-
+-export interface SyncTaskExecutor<T> {
+-  (forkApi: ForkedTaskAPI): T
+-}
+-
+-export type ForkedTaskExecutor<T> = AsyncTaskExecutor<T> | SyncTaskExecutor<T>
+-
+-export type TaskResolved<T> = {
+-  readonly status: 'ok'
+-  readonly value: T
+-}
+-
+-export type TaskRejected = {
+-  readonly status: 'rejected'
+-  readonly error: unknown
+-}
+-
+-export type TaskCancelled = {
+-  readonly status: 'cancelled'
+-  readonly error: TaskAbortError
+-}
+-
+-export type TaskResult<Value> =
+-  | TaskResolved<Value>
+-  | TaskRejected
+-  | TaskCancelled
+-
+-export interface ForkedTask<T> {
+-  result: Promise<TaskResult<T>>
+-  /**
+-   * Cancel task if it is in progress or not yet started,
+-   * it is noop otherwise.
+-   */
+-  cancel(): void
+-}
+-
+ /**
+  * @alpha
+  */
+@@ -131,28 +74,7 @@ export interface ActionListenerMiddlewareAPI<S, D extends Dispatch<AnyAction>>
+   condition: ConditionFunction<S>
+   take: TakePattern<S>
+   cancelPrevious: () => void
+-  /**
+-   * An abort signal whose `aborted` property is set to `true`
+-   * if the listener execution is either aborted or completed.
+-   * @see https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal
+-   */
+-  signal: AbortSignal
+-  /**
+-   * Returns a promise resolves after `timeoutMs` or
+-   * rejects if the listener has been cancelled or is completed.
+-   */
+-  delay(timeoutMs: number): Promise<void>
+-  /**
+-   * Queues in the next microtask the execution of a task.
+-   * @param executor
+-   */
+-  fork<T>(executor: ForkedTaskExecutor<T>): ForkedTask<T>
+-  /**
+-   * Returns a promise that resolves when `waitFor` resolves or
+-   * rejects if the listener has been cancelled or is completed.
+-   * @param promise
+-   */
+-  pause<M>(promise: Promise<M>): Promise<M>
++  job: JobHandle
+   currentPhase: MiddlewarePhase
+   // TODO Figure out how to pass this through the other types correctly
+   extra: unknown
+@@ -178,6 +100,7 @@ export interface ActionListenerOptions {
+    * Defaults to 'before'.
+    */
+   when?: When
++  parentJob?: JobHandle
+ }
+ 
+ export interface CreateListenerMiddlewareOptions<ExtraArgument = unknown> {
+@@ -362,9 +285,9 @@ export type ListenerEntry<
+   when: When
+   listener: ActionListener<any, S, D>
+   unsubscribe: () => void
+-  pendingSet: Set<AbortController>
+   type?: string
+   predicate: ListenerPredicate<AnyAction, S>
++  parentJob: JobHandle
+ }
+ 
+ const declaredMiddlewareType: unique symbol = undefined as any
+diff --git a/packages/action-listener-middleware/src/utils.ts b/packages/action-listener-middleware/src/utils.ts
+deleted file mode 100644
+index 631ad078..00000000
+--- a/packages/action-listener-middleware/src/utils.ts
++++ /dev/null
+@@ -1,13 +0,0 @@
+-export const assertFunction: (
+-  func: unknown,
+-  expected: string
+-) => asserts func is (...args: unknown[]) => unknown = (
+-  func: unknown,
+-  expected: string
+-) => {
+-  if (typeof func !== 'function') {
+-    throw new TypeError(`${expected} is not a function`)
+-  }
+-}
+-
+-export const noop = () => {}

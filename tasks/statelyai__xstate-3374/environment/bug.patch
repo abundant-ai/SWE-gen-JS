@@ -1,0 +1,265 @@
+diff --git a/.changeset/twelve-dingos-fold.md b/.changeset/twelve-dingos-fold.md
+deleted file mode 100644
+index bd93b6bdc2..0000000000
+--- a/.changeset/twelve-dingos-fold.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': patch
+----
+-
+-Fixed an issue with actors not being reinstantiated correctly when an actor with the same ID was first stopped and then invoked/spawned again in the same microstep.
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index c620fc9fbc..5c7c4491cc 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -13,8 +13,7 @@ import {
+   resolveMicroTransition,
+   resolveStateValue,
+   toState,
+-  transitionNode,
+-  setChildren
++  transitionNode
+ } from './stateUtils';
+ import type {
+   AreAllImplementationsAssumedToBeProvided,
+@@ -306,8 +305,6 @@ export class StateMachine<
+     preInitial._initial = true;
+     preInitial.actions.unshift(...actions);
+ 
+-    setChildren(preInitial.children, actions);
+-
+     return preInitial;
+   }
+ 
+diff --git a/packages/core/src/actions/invoke.ts b/packages/core/src/actions/invoke.ts
+index 67aa98aa18..f3c9c80297 100644
+--- a/packages/core/src/actions/invoke.ts
++++ b/packages/core/src/actions/invoke.ts
+@@ -62,7 +62,10 @@ export function invoke<
+         type,
+         params: {
+           ...params,
+-          ref: new ObservableActorRef(behavior, id)
++          id: params.id,
++          src: params.src,
++          ref: new ObservableActorRef(behavior, id),
++          meta
+         }
+       } as InvokeActionObject;
+     }
+diff --git a/packages/core/src/actions/stop.ts b/packages/core/src/actions/stop.ts
+index b80a1a762e..587c3bb4e3 100644
+--- a/packages/core/src/actions/stop.ts
++++ b/packages/core/src/actions/stop.ts
+@@ -32,14 +32,14 @@ export function stop<
+     {
+       actor
+     },
+-    ({ params, type }, context, _event, { state }) => {
+-      const actorRef = isFunction(params.actor)
++    ({ params, type }, context, _event) => {
++      const actorRefOrString = isFunction(params.actor)
+         ? params.actor(context, _event.data)
+-        : state.children[params.actor];
++        : params.actor;
+ 
+       return {
+         type,
+-        params: { actor: actorRef }
++        params: { actor: actorRefOrString }
+       } as StopActionObject;
+     }
+   );
+diff --git a/packages/core/src/interpreter.ts b/packages/core/src/interpreter.ts
+index 07a8ac3a77..1a0abb76cb 100644
+--- a/packages/core/src/interpreter.ts
++++ b/packages/core/src/interpreter.ts
+@@ -632,7 +632,7 @@ export class Interpreter<
+         [actionTypes.cancel]: (_ctx, _e, { action }) => {
+           this.cancel((action as CancelActionObject).params.sendId);
+         },
+-        [actionTypes.invoke]: (_ctx, _e, { action }) => {
++        [actionTypes.invoke]: (_ctx, _e, { action, state }) => {
+           const {
+             id,
+             autoForward,
+@@ -651,9 +651,16 @@ export class Interpreter<
+             return;
+           }
+           ref._parent = this; // TODO: fix
+-          // If the actor didn't end up being in the state
+-          // (eg. going through transient states could stop it) don't bother starting the actor.
+-          if (!this.state.children[id]) {
++          // If the actor will be stopped right after it's started
++          // (such as in transient states) don't bother starting the actor.
++          if (
++            state.actions.find((otherAction) => {
++              return (
++                otherAction.type === actionTypes.stop &&
++                (otherAction as StopActionObject).params.actor === id
++              );
++            })
++          ) {
+             return;
+           }
+           try {
+@@ -661,6 +668,9 @@ export class Interpreter<
+               this.forwardTo.add(id);
+             }
+ 
++            // TODO: determine how this can be immutably updated
++            this.state.children[id] = ref;
++
+             ref.start?.();
+           } catch (err) {
+             this.send(error(id, err));
+@@ -669,9 +679,11 @@ export class Interpreter<
+         },
+         [actionTypes.stop]: (_ctx, _e, { action }) => {
+           const { actor } = (action as StopActionObject).params;
++          const actorRef =
++            typeof actor === 'string' ? this.state.children[actor] : actor;
+ 
+-          if (actor) {
+-            this.stopChild(actor);
++          if (actorRef) {
++            this.stopChild(actorRef.name);
+           }
+         },
+         [actionTypes.log]: (_ctx, _e, { action }) => {
+@@ -734,8 +746,16 @@ export class Interpreter<
+     return undefined;
+   }
+ 
+-  private stopChild(child: ActorRef<any, any>): void {
+-    this.forwardTo.delete(child.name);
++  private stopChild(childId: string): void {
++    const child = this.state.children[childId];
++    if (!child) {
++      return;
++    }
++
++    this.forwardTo.delete(childId);
++    // TODO: determine how this can be immutably updated
++    delete this.state.children[childId];
++
+     if (isFunction(child.stop)) {
+       child.stop();
+     }
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index ccbae36a53..8d58d4197a 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -16,7 +16,6 @@ import {
+   BaseActionObject,
+   EventObject,
+   InvokeActionObject,
+-  StopActionObject,
+   StateValue,
+   TransitionConfig,
+   TransitionDefinition,
+@@ -1589,6 +1588,8 @@ export function resolveMicroTransition<
+     return inertState as any;
+   }
+ 
++  const children = { ...currentState.children };
++
+   const resolvedConfiguration = willTransition
+     ? Array.from(resolved.configuration)
+     : !currentState._initial
+@@ -1604,9 +1605,6 @@ export function resolveMicroTransition<
+ 
+   const { context, actions: nonRaisedActions } = resolved;
+ 
+-  const children = { ...currentState.children };
+-  setChildren(children, nonRaisedActions);
+-
+   const nextState = machine.createState({
+     value: getStateValue(machine.root, resolved.configuration),
+     context,
+@@ -1629,14 +1627,7 @@ export function resolveMicroTransition<
+       context !== currentState.context;
+   nextState._internalQueue = resolved.internalQueue;
+ 
+-  return nextState;
+-}
+-
+-export function setChildren<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+->(children: State<TContext, TEvent>['children'], actions: BaseActionObject[]) {
+-  actions.forEach((action) => {
++  nextState.actions.forEach((action) => {
+     if (
+       action.type === actionTypes.invoke &&
+       (action as InvokeActionObject).params.ref
+@@ -1645,13 +1636,10 @@ export function setChildren<
+       if (ref) {
+         children[ref.name] = ref;
+       }
+-    } else if (action.type === actionTypes.stop) {
+-      const ref = (action as StopActionObject).params.actor;
+-      if (ref) {
+-        delete children[ref.name];
+-      }
+     }
+   });
++
++  return nextState;
+ }
+ 
+ function resolveActionsAndContext<
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index dece249e31..aeb7266b7d 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -1209,7 +1209,7 @@ export interface DynamicStopActionObject<
+ export interface StopActionObject {
+   type: ActionTypes.Stop;
+   params: {
+-    actor: ActorRef<any>;
++    actor: string | ActorRef<any>;
+   };
+ }
+ 
+diff --git a/packages/core/test/invoke.test.ts b/packages/core/test/invoke.test.ts
+index dd25d19e45..ef3489b1a4 100644
+--- a/packages/core/test/invoke.test.ts
++++ b/packages/core/test/invoke.test.ts
+@@ -3117,35 +3117,6 @@ describe('invoke', () => {
+       done();
+     }, 100);
+   });
+-
+-  it('should get reinstantiated after reentering the invoking state in a microstep', () => {
+-    let invokeCount = 0;
+-
+-    const machine = createMachine({
+-      initial: 'a',
+-      states: {
+-        a: {
+-          invoke: {
+-            src: () =>
+-              fromCallback(() => {
+-                invokeCount++;
+-              })
+-          },
+-          on: {
+-            GO_AWAY_AND_REENTER: 'b'
+-          }
+-        },
+-        b: {
+-          always: 'a'
+-        }
+-      }
+-    });
+-    const service = interpret(machine).start();
+-
+-    service.send({ type: 'GO_AWAY_AND_REENTER' });
+-
+-    expect(invokeCount).toBe(2);
+-  });
+ });
+ 
+ describe('actors option', () => {

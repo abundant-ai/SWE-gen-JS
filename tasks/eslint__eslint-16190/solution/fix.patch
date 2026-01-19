@@ -1,0 +1,153 @@
+diff --git a/lib/config/flat-config-array.js b/lib/config/flat-config-array.js
+index becf1e10b..ad8986f51 100644
+--- a/lib/config/flat-config-array.js
++++ b/lib/config/flat-config-array.js
+@@ -139,31 +139,72 @@ class FlatConfigArray extends ConfigArray {
+     [ConfigArraySymbol.finalizeConfig](config) {
+ 
+         const { plugins, languageOptions, processor } = config;
++        let parserName, processorName;
++        let invalidParser = false,
++            invalidProcessor = false;
+ 
+         // Check parser value
+-        if (languageOptions && languageOptions.parser && typeof languageOptions.parser === "string") {
+-            const { pluginName, objectName: parserName } = splitPluginIdentifier(languageOptions.parser);
++        if (languageOptions && languageOptions.parser) {
++            if (typeof languageOptions.parser === "string") {
++                const { pluginName, objectName: localParserName } = splitPluginIdentifier(languageOptions.parser);
+ 
+-            if (!plugins || !plugins[pluginName] || !plugins[pluginName].parsers || !plugins[pluginName].parsers[parserName]) {
+-                throw new TypeError(`Key "parser": Could not find "${parserName}" in plugin "${pluginName}".`);
+-            }
++                parserName = languageOptions.parser;
++
++                if (!plugins || !plugins[pluginName] || !plugins[pluginName].parsers || !plugins[pluginName].parsers[localParserName]) {
++                    throw new TypeError(`Key "parser": Could not find "${localParserName}" in plugin "${pluginName}".`);
++                }
+ 
+-            languageOptions.parser = plugins[pluginName].parsers[parserName];
++                languageOptions.parser = plugins[pluginName].parsers[localParserName];
++            } else {
++                invalidParser = true;
++            }
+         }
+ 
+         // Check processor value
+-        if (processor && typeof processor === "string") {
+-            const { pluginName, objectName: processorName } = splitPluginIdentifier(processor);
++        if (processor) {
++            if (typeof processor === "string") {
++                const { pluginName, objectName: localProcessorName } = splitPluginIdentifier(processor);
+ 
+-            if (!plugins || !plugins[pluginName] || !plugins[pluginName].processors || !plugins[pluginName].processors[processorName]) {
+-                throw new TypeError(`Key "processor": Could not find "${processorName}" in plugin "${pluginName}".`);
+-            }
++                processorName = processor;
++
++                if (!plugins || !plugins[pluginName] || !plugins[pluginName].processors || !plugins[pluginName].processors[localProcessorName]) {
++                    throw new TypeError(`Key "processor": Could not find "${localProcessorName}" in plugin "${pluginName}".`);
++                }
+ 
+-            config.processor = plugins[pluginName].processors[processorName];
++                config.processor = plugins[pluginName].processors[localProcessorName];
++            } else {
++                invalidProcessor = true;
++            }
+         }
+ 
+         ruleValidator.validate(config);
+ 
++        // apply special logic for serialization into JSON
++        /* eslint-disable object-shorthand -- shorthand would change "this" value */
++        Object.defineProperty(config, "toJSON", {
++            value: function() {
++
++                if (invalidParser) {
++                    throw new Error("Caching is not supported when parser is an object.");
++                }
++
++                if (invalidProcessor) {
++                    throw new Error("Caching is not supported when processor is an object.");
++                }
++
++                return {
++                    ...this,
++                    plugins: Object.keys(plugins),
++                    languageOptions: {
++                        ...languageOptions,
++                        parser: parserName
++                    },
++                    processor: processorName
++                };
++            }
++        });
++        /* eslint-enable object-shorthand -- ok to enable now */
++
+         return config;
+     }
+     /* eslint-enable class-methods-use-this -- Desired as instance method */
+diff --git a/lib/eslint/eslint-helpers.js b/lib/eslint/eslint-helpers.js
+index bf5c32a64..5818d8d10 100644
+--- a/lib/eslint/eslint-helpers.js
++++ b/lib/eslint/eslint-helpers.js
+@@ -436,9 +436,6 @@ function processOptions({
+     if (typeof cache !== "boolean") {
+         errors.push("'cache' must be a boolean.");
+     }
+-    if (cache) {
+-        errors.push("'cache' option is not yet supported.");
+-    }
+     if (!isNonEmptyString(cacheLocation)) {
+         errors.push("'cacheLocation' must be a non-empty string.");
+     }
+diff --git a/lib/eslint/flat-eslint.js b/lib/eslint/flat-eslint.js
+index 1867050e4..6755356f1 100644
+--- a/lib/eslint/flat-eslint.js
++++ b/lib/eslint/flat-eslint.js
+@@ -30,6 +30,7 @@ const {
+ const {
+     fileExists,
+     findFiles,
++    getCacheFile,
+ 
+     isNonEmptyString,
+     isArrayOfNonEmptyString,
+@@ -41,6 +42,7 @@ const {
+ } = require("./eslint-helpers");
+ const { pathToFileURL } = require("url");
+ const { FlatConfigArray } = require("../config/flat-config-array");
++const LintResultCache = require("../cli-engine/lint-result-cache");
+ 
+ /*
+  * This is necessary to allow overwriting writeFile for testing purposes.
+@@ -606,9 +608,20 @@ class FlatESLint {
+             configType: "flat"
+         });
+ 
++        const cacheFilePath = getCacheFile(
++            processedOptions.cacheLocation,
++            processedOptions.cwd
++        );
++
++        const lintResultCache = processedOptions.cache
++            ? new LintResultCache(cacheFilePath, processedOptions.cacheStrategy)
++            : null;
++
+         privateMembers.set(this, {
+             options: processedOptions,
+             linter,
++            cacheFilePath,
++            lintResultCache,
+             defaultConfigs,
+             defaultIgnores: () => false,
+             configs: null
+@@ -782,6 +795,8 @@ class FlatESLint {
+ 
+         // Delete cache file; should this be done here?
+         if (!cache && cacheFilePath) {
++            debug(`Deleting cache file at ${cacheFilePath}`);
++
+             try {
+                 await fs.unlink(cacheFilePath);
+             } catch (error) {

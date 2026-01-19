@@ -1,0 +1,223 @@
+diff --git a/changelog_unreleased/javascript/18108.md b/changelog_unreleased/javascript/18108.md
+new file mode 100644
+index 000000000..05e03e671
+--- /dev/null
++++ b/changelog_unreleased/javascript/18108.md
+@@ -0,0 +1,25 @@
++#### Improve comment printing around empty statement (#18108 by @fisker)
++
++<!-- prettier-ignore -->
++```jsx
++// Input
++for (
++  index = 0;
++  doSomething(foo[index]) !== bar && doSomething(foo[index]) !== baz;
++  index ++
++) /* No op */;
++
++// Prettier stable
++for (
++  index = 0;
++  doSomething(foo[index]) !== bar && doSomething(foo[index]) !== baz;
++  index++ /* No op */
++);
++
++// Prettier main
++for (
++  index = 0;
++  doSomething(foo[index]) !== bar && doSomething(foo[index]) !== baz;
++  index++
++) /* No op */ ;
++```
+diff --git a/src/language-js/clean.js b/src/language-js/clean.js
+index 6fc821c41..d49d36539 100644
+--- a/src/language-js/clean.js
++++ b/src/language-js/clean.js
+@@ -1,5 +1,6 @@
+ import {
+   isArrayExpression,
++  isMeaningfulEmptyStatement,
+   isNumericLiteral,
+   isStringLiteral,
+ } from "./utils/index.js";
+@@ -26,7 +27,7 @@ const removeTemplateElementsValue = (node) => {
+   }
+ };
+ 
+-function clean(original, cloned) {
++function clean(original, cloned, parent) {
+   if (original.type === "Program") {
+     delete cloned.sourceType;
+   }
+@@ -39,7 +40,10 @@ function clean(original, cloned) {
+   }
+ 
+   // We remove extra `;` and add them when needed
+-  if (original.type === "EmptyStatement") {
++  if (
++    original.type === "EmptyStatement" &&
++    !isMeaningfulEmptyStatement({ node: original, parent })
++  ) {
+     return null;
+   }
+ 
+diff --git a/src/language-js/comments/printer-methods.js b/src/language-js/comments/printer-methods.js
+index daf0ab056..a3bc7f412 100644
+--- a/src/language-js/comments/printer-methods.js
++++ b/src/language-js/comments/printer-methods.js
+@@ -4,6 +4,7 @@ import {
+   getFunctionParameters,
+   hasNodeIgnoreComment,
+   isJsxElement,
++  isMeaningfulEmptyStatement,
+   isMethod,
+   isUnionType,
+ } from "../utils/index.js";
+@@ -14,7 +15,6 @@ import {
+  */
+ 
+ const isNodeCantAttachComment = createTypeCheckFunction([
+-  "EmptyStatement",
+   "TemplateElement",
+   // There is no similar node in Babel AST
+   // ```ts
+@@ -84,12 +84,20 @@ const isClassMethodCantAttachComment = (node, [parent]) =>
+ @returns {boolean}
+ */
+ function canAttachComment(node, ancestors) {
+-  return !(
++  if (
+     isNodeCantAttachComment(node) ||
+     isChildWontPrint(node, ancestors) ||
+     // @ts-expect-error -- safe
+     isClassMethodCantAttachComment(node, ancestors)
+-  );
++  ) {
++    return false;
++  }
++
++  if (node.type === "EmptyStatement") {
++    return isMeaningfulEmptyStatement({ node, parent: ancestors[0] });
++  }
++
++  return true;
+ }
+ 
+ /**
+diff --git a/src/language-js/print/estree.js b/src/language-js/print/estree.js
+index d8dd34d1b..2ccd0309c 100644
+--- a/src/language-js/print/estree.js
++++ b/src/language-js/print/estree.js
+@@ -18,6 +18,7 @@ import {
+   isArrayExpression,
+   isCallExpression,
+   isLiteral,
++  isMeaningfulEmptyStatement,
+   isMemberExpression,
+   isMethod,
+   isNextLineEmpty,
+@@ -101,8 +102,6 @@ function printEstree(path, options, print, args) {
+     // Babel extension.
+     case "File":
+       return printHtmlBinding(path, options, print) ?? print("program");
+-    case "EmptyStatement":
+-      return "";
+     case "ExpressionStatement":
+       return printExpressionStatement(path, options, print);
+ 
+@@ -493,11 +492,11 @@ function printEstree(path, options, print, args) {
+         options.semi ? ";" : "",
+       ];
+     case "LabeledStatement":
+-      if (node.body.type === "EmptyStatement") {
+-        return [print("label"), ":;"];
+-      }
+-
+-      return [print("label"), ": ", print("body")];
++      return [
++        print("label"),
++        `:${node.body.type === "EmptyStatement" && !hasComment(node.body, CommentCheckFlags.Leading) ? "" : " "}`,
++        print("body"),
++      ];
+     case "TryStatement":
+       return [
+         "try ",
+@@ -627,6 +626,11 @@ function printEstree(path, options, print, args) {
+     case "VoidPattern":
+       return "void";
+ 
++    case "EmptyStatement":
++      if (isMeaningfulEmptyStatement(path)) {
++        return ";";
++      }
++    // Fall through
+     case "InterpreterDirective": // Printed as comment
+     default:
+       /* c8 ignore next */
+diff --git a/src/language-js/print/misc.js b/src/language-js/print/misc.js
+index bf08be750..e8ad0e422 100644
+--- a/src/language-js/print/misc.js
++++ b/src/language-js/print/misc.js
+@@ -1,5 +1,10 @@
+ import { indent, line } from "../../document/builders.js";
+-import { isCallExpression, isMemberExpression } from "../utils/index.js";
++import {
++  CommentCheckFlags,
++  hasComment,
++  isCallExpression,
++  isMemberExpression,
++} from "../utils/index.js";
+ import { printTypeAnnotationProperty } from "./type-annotation.js";
+ 
+ /**
+@@ -96,7 +101,7 @@ function printBindExpressionCallee(path, options, print) {
+ 
+ function adjustClause(node, clause, forceSpace) {
+   if (node.type === "EmptyStatement") {
+-    return ";";
++    return hasComment(node, CommentCheckFlags.Leading) ? [" ", clause] : clause;
+   }
+ 
+   if (node.type === "BlockStatement" || forceSpace) {
+diff --git a/src/language-js/utils/index.js b/src/language-js/utils/index.js
+index 61672144d..bbd1bc05b 100644
+--- a/src/language-js/utils/index.js
++++ b/src/language-js/utils/index.js
+@@ -1144,4 +1144,5 @@ export {
+   shouldPrintComma,
+   startsWithNoLookaheadToken,
+ };
++export { default as isMeaningfulEmptyStatement } from "./is-meaningful-empty-statement.js";
+ export { default as isNodeMatches } from "./is-node-matches.js";
+diff --git a/src/language-js/utils/is-meaningful-empty-statement.js b/src/language-js/utils/is-meaningful-empty-statement.js
+new file mode 100644
+index 000000000..e5d1242a2
+--- /dev/null
++++ b/src/language-js/utils/is-meaningful-empty-statement.js
+@@ -0,0 +1,26 @@
++/* The argument is a duck type of AstPath, so we can use it in comment attach and ast massage */
++function isMeaningfulEmptyStatement({ node, parent }) {
++  if (node?.type !== "EmptyStatement") {
++    return false;
++  }
++
++  if (parent.type === "IfStatement") {
++    return parent.consequent === node || parent.alternate === node;
++  }
++
++  if (
++    parent.type === "DoWhileStatement" ||
++    parent.type === "ForInStatement" ||
++    parent.type === "ForOfStatement" ||
++    parent.type === "ForStatement" ||
++    parent.type === "LabeledStatement" ||
++    parent.type === "WithStatement" ||
++    parent.type === "WhileStatement"
++  ) {
++    return parent.body === node;
++  }
++
++  return false;
++}
++
++export default isMeaningfulEmptyStatement;

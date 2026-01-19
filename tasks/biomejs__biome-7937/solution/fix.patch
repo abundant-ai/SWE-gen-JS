@@ -1,0 +1,565 @@
+diff --git a/crates/biome_parser/src/lexer.rs b/crates/biome_parser/src/lexer.rs
+index af08fdbe47..83ce0b3a0a 100644
+--- a/crates/biome_parser/src/lexer.rs
++++ b/crates/biome_parser/src/lexer.rs
+@@ -201,6 +201,8 @@ pub trait Lexer<'src> {
+     }
+ 
+     /// Returns the byte at position `self.position + offset` or `None` if it is out of bounds.
++    ///
++    /// See also: [`Self::prev_byte_at`]
+     #[inline]
+     fn byte_at(&self, offset: usize) -> Option<u8> {
+         self.source()
+@@ -218,6 +220,18 @@ pub trait Lexer<'src> {
+         }
+     }
+ 
++    /// Returns the byte at position `self.position - offset` or `None` if it is out of bounds. Looks backwards instead of forwards.
++    #[inline]
++    fn prev_byte_at(&self, offset: usize) -> Option<u8> {
++        if offset > self.position() {
++            return None;
++        }
++        self.source()
++            .as_bytes()
++            .get(self.position() - offset)
++            .copied()
++    }
++
+     #[inline]
+     fn text_position(&self) -> TextSize {
+         TextSize::try_from(self.position()).expect("Input to be smaller than 4 GB")
+diff --git a/crates/biome_tailwind_factory/src/generated/node_factory.rs b/crates/biome_tailwind_factory/src/generated/node_factory.rs
+index bfde2e40ba..76f7868ee2 100644
+--- a/crates/biome_tailwind_factory/src/generated/node_factory.rs
++++ b/crates/biome_tailwind_factory/src/generated/node_factory.rs
+@@ -99,15 +99,21 @@ pub fn tw_full_candidate(
+     TwFullCandidateBuilder {
+         variants,
+         candidate,
++        negative_token: None,
+         excl_token: None,
+     }
+ }
+ pub struct TwFullCandidateBuilder {
+     variants: TwVariantList,
+     candidate: AnyTwCandidate,
++    negative_token: Option<SyntaxToken>,
+     excl_token: Option<SyntaxToken>,
+ }
+ impl TwFullCandidateBuilder {
++    pub fn with_negative_token(mut self, negative_token: SyntaxToken) -> Self {
++        self.negative_token = Some(negative_token);
++        self
++    }
+     pub fn with_excl_token(mut self, excl_token: SyntaxToken) -> Self {
+         self.excl_token = Some(excl_token);
+         self
+@@ -117,6 +123,7 @@ impl TwFullCandidateBuilder {
+             TailwindSyntaxKind::TW_FULL_CANDIDATE,
+             [
+                 Some(SyntaxElement::Node(self.variants.into_syntax())),
++                self.negative_token.map(|token| SyntaxElement::Token(token)),
+                 Some(SyntaxElement::Node(self.candidate.into_syntax())),
+                 self.excl_token.map(|token| SyntaxElement::Token(token)),
+             ],
+diff --git a/crates/biome_tailwind_factory/src/generated/syntax_factory.rs b/crates/biome_tailwind_factory/src/generated/syntax_factory.rs
+index 6a58941ea6..2af41f08dd 100644
+--- a/crates/biome_tailwind_factory/src/generated/syntax_factory.rs
++++ b/crates/biome_tailwind_factory/src/generated/syntax_factory.rs
+@@ -171,7 +171,7 @@ impl SyntaxFactory for TailwindSyntaxFactory {
+             }
+             TW_FULL_CANDIDATE => {
+                 let mut elements = (&children).into_iter();
+-                let mut slots: RawNodeSlots<3usize> = RawNodeSlots::default();
++                let mut slots: RawNodeSlots<4usize> = RawNodeSlots::default();
+                 let mut current_element = elements.next();
+                 if let Some(element) = &current_element
+                     && TwVariantList::can_cast(element.kind())
+@@ -180,6 +180,13 @@ impl SyntaxFactory for TailwindSyntaxFactory {
+                     current_element = elements.next();
+                 }
+                 slots.next_slot();
++                if let Some(element) = &current_element
++                    && element.kind() == T ! [-]
++                {
++                    slots.mark_present();
++                    current_element = elements.next();
++                }
++                slots.next_slot();
+                 if let Some(element) = &current_element
+                     && AnyTwCandidate::can_cast(element.kind())
+                 {
+diff --git a/crates/biome_tailwind_parser/src/lexer/mod.rs b/crates/biome_tailwind_parser/src/lexer/mod.rs
+index d8f13072b5..8841e454f8 100644
+--- a/crates/biome_tailwind_parser/src/lexer/mod.rs
++++ b/crates/biome_tailwind_parser/src/lexer/mod.rs
+@@ -71,6 +71,21 @@ impl<'src> TailwindLexer<'src> {
+         }
+     }
+ 
++    fn consume_token_saw_negative(&mut self, current: u8) -> TailwindSyntaxKind {
++        match current {
++            b'\n' | b'\r' | b'\t' | b' ' => self.consume_newline_or_whitespaces(),
++            bracket @ (b'[' | b']' | b'(' | b')') => self.consume_bracket(bracket),
++            _ if self.current_kind == T!['['] => self.consume_bracketed_thing(TW_SELECTOR, b']'),
++            _ if self.current_kind == T!['('] => self.consume_bracketed_thing(TW_VALUE, b')'),
++            b':' => self.consume_byte(T![:]),
++            b'-' => self.consume_byte(T![-]),
++            b'!' => self.consume_byte(T![!]),
++            b'/' => self.consume_byte(T![/]),
++            _ if current.is_ascii_alphabetic() => self.consume_base(),
++            _ => self.consume_unexpected_character(),
++        }
++    }
++
+     /// Consume a token in the arbitrary context
+     fn consume_token_arbitrary(&mut self, current: u8) -> TailwindSyntaxKind {
+         match current {
+@@ -252,6 +267,7 @@ impl<'src> Lexer<'src> for TailwindLexer<'src> {
+             match self.current_byte() {
+                 Some(current) => match context {
+                     TailwindLexContext::Regular => self.consume_token(current),
++                    TailwindLexContext::SawNegative => self.consume_token_saw_negative(current),
+                     TailwindLexContext::Arbitrary => self.consume_token_arbitrary(current),
+                     TailwindLexContext::ArbitraryVariant => {
+                         self.consume_token_arbitrary_variant(current)
+diff --git a/crates/biome_tailwind_parser/src/syntax/mod.rs b/crates/biome_tailwind_parser/src/syntax/mod.rs
+index 8184f24b91..12f2c50f34 100644
+--- a/crates/biome_tailwind_parser/src/syntax/mod.rs
++++ b/crates/biome_tailwind_parser/src/syntax/mod.rs
+@@ -56,7 +56,8 @@ impl ParseSeparatedList for CandidateList {
+     ) -> biome_parser::parse_recovery::RecoveryResult {
+         parsed_element.or_recover_with_token_set(
+             p,
+-            &ParseRecoveryTokenSet::new(TW_BOGUS_CANDIDATE, token_set![WHITESPACE, NEWLINE, EOF]),
++            &ParseRecoveryTokenSet::new(TW_BOGUS_CANDIDATE, token_set![WHITESPACE])
++                .enable_recovery_on_line_break(),
+             expected_candidate,
+         )
+     }
+@@ -68,11 +69,16 @@ fn parse_full_candidate(p: &mut TailwindParser) -> ParsedSyntax {
+ 
+     VariantList.parse_list(p);
+ 
++    if p.at(T![-]) {
++        p.bump_with_context(T![-], TailwindLexContext::SawNegative);
++    }
++
+     let candidate = parse_arbitrary_candidate(p)
+         .or_else(|| parse_functional_or_static_candidate(p))
+         .or_recover_with_token_set(
+             p,
+-            &ParseRecoveryTokenSet::new(TW_BOGUS_CANDIDATE, token_set![WHITESPACE, NEWLINE, EOF]),
++            &ParseRecoveryTokenSet::new(TW_BOGUS_CANDIDATE, token_set![WHITESPACE])
++                .enable_recovery_on_line_break(),
+             expected_candidate,
+         );
+ 
+@@ -112,10 +118,11 @@ fn parse_functional_or_static_candidate(p: &mut TailwindParser) -> ParsedSyntax
+         return Present(m.complete(p, TW_STATIC_CANDIDATE));
+     }
+ 
+-    p.bump(DASH);
++    p.expect(T![-]);
+     match parse_value(p).or_recover_with_token_set(
+         p,
+-        &ParseRecoveryTokenSet::new(TW_BOGUS_VALUE, token_set![WHITESPACE, NEWLINE, T![!], EOF]),
++        &ParseRecoveryTokenSet::new(TW_BOGUS_VALUE, token_set![WHITESPACE, T![!]])
++            .enable_recovery_on_line_break(),
+         expected_value,
+     ) {
+         Ok(_) => {}
+@@ -192,10 +199,7 @@ fn parse_modifier(p: &mut TailwindParser) -> ParsedSyntax {
+     }
+     match parse_value(p).or_recover_with_token_set(
+         p,
+-        &ParseRecoveryTokenSet::new(
+-            TW_BOGUS_MODIFIER,
+-            token_set![WHITESPACE, NEWLINE, T![!], EOF],
+-        ),
++        &ParseRecoveryTokenSet::new(TW_BOGUS_MODIFIER, token_set![WHITESPACE, NEWLINE, T![!]]),
+         expected_value,
+     ) {
+         Ok(_) => {}
+diff --git a/crates/biome_tailwind_parser/src/syntax/variant.rs b/crates/biome_tailwind_parser/src/syntax/variant.rs
+index 6aa89da59d..dc0ef03893 100644
+--- a/crates/biome_tailwind_parser/src/syntax/variant.rs
++++ b/crates/biome_tailwind_parser/src/syntax/variant.rs
+@@ -79,6 +79,10 @@ impl ParseSeparatedList for VariantList {
+ }
+ 
+ pub(crate) fn parse_variant(p: &mut TailwindParser) -> ParsedSyntax {
++    if p.at(T![-]) {
++        // variants can't start with a negative sign
++        return Absent;
++    }
+     if p.at(T!['[']) {
+         return parse_arbitrary_variant(p);
+     }
+diff --git a/crates/biome_tailwind_parser/src/token_source.rs b/crates/biome_tailwind_parser/src/token_source.rs
+index da7ac0bc84..f276099a2c 100644
+--- a/crates/biome_tailwind_parser/src/token_source.rs
++++ b/crates/biome_tailwind_parser/src/token_source.rs
+@@ -22,6 +22,8 @@ pub(crate) enum TailwindLexContext {
+     /// The default state.
+     #[default]
+     Regular,
++    /// The parser just encountered a `-` before a basename, e.g. in `-mt-4`. That meant that the next token should be a basename.
++    SawNegative,
+     /// The lexer has encountered a `[` and the parser has yet to encounter the matching `]`.
+     Arbitrary,
+     /// Like Arbitrary, but specifically for arbitrary variants.
+diff --git a/crates/biome_tailwind_syntax/src/generated/nodes.rs b/crates/biome_tailwind_syntax/src/generated/nodes.rs
+index b095df66fe..c9d58e2abf 100644
+--- a/crates/biome_tailwind_syntax/src/generated/nodes.rs
++++ b/crates/biome_tailwind_syntax/src/generated/nodes.rs
+@@ -232,6 +232,7 @@ impl TwFullCandidate {
+     pub fn as_fields(&self) -> TwFullCandidateFields {
+         TwFullCandidateFields {
+             variants: self.variants(),
++            negative_token: self.negative_token(),
+             candidate: self.candidate(),
+             excl_token: self.excl_token(),
+         }
+@@ -239,11 +240,14 @@ impl TwFullCandidate {
+     pub fn variants(&self) -> TwVariantList {
+         support::list(&self.syntax, 0usize)
+     }
++    pub fn negative_token(&self) -> Option<SyntaxToken> {
++        support::token(&self.syntax, 1usize)
++    }
+     pub fn candidate(&self) -> SyntaxResult<AnyTwCandidate> {
+-        support::required_node(&self.syntax, 1usize)
++        support::required_node(&self.syntax, 2usize)
+     }
+     pub fn excl_token(&self) -> Option<SyntaxToken> {
+-        support::token(&self.syntax, 2usize)
++        support::token(&self.syntax, 3usize)
+     }
+ }
+ impl Serialize for TwFullCandidate {
+@@ -257,6 +261,7 @@ impl Serialize for TwFullCandidate {
+ #[derive(Serialize)]
+ pub struct TwFullCandidateFields {
+     pub variants: TwVariantList,
++    pub negative_token: Option<SyntaxToken>,
+     pub candidate: SyntaxResult<AnyTwCandidate>,
+     pub excl_token: Option<SyntaxToken>,
+ }
+@@ -952,6 +957,10 @@ impl std::fmt::Debug for TwFullCandidate {
+             DEPTH.set(current_depth + 1);
+             f.debug_struct("TwFullCandidate")
+                 .field("variants", &self.variants())
++                .field(
++                    "negative_token",
++                    &support::DebugOptionalElement(self.negative_token()),
++                )
+                 .field("candidate", &support::DebugSyntaxResult(self.candidate()))
+                 .field(
+                     "excl_token",
+diff --git a/crates/biome_tailwind_syntax/src/generated/nodes_mut.rs b/crates/biome_tailwind_syntax/src/generated/nodes_mut.rs
+index fe61a4bf4b..94e3652c40 100644
+--- a/crates/biome_tailwind_syntax/src/generated/nodes_mut.rs
++++ b/crates/biome_tailwind_syntax/src/generated/nodes_mut.rs
+@@ -108,16 +108,22 @@ impl TwFullCandidate {
+                 .splice_slots(0usize..=0usize, once(Some(element.into_syntax().into()))),
+         )
+     }
++    pub fn with_negative_token(self, element: Option<SyntaxToken>) -> Self {
++        Self::unwrap_cast(
++            self.syntax
++                .splice_slots(1usize..=1usize, once(element.map(|element| element.into()))),
++        )
++    }
+     pub fn with_candidate(self, element: AnyTwCandidate) -> Self {
+         Self::unwrap_cast(
+             self.syntax
+-                .splice_slots(1usize..=1usize, once(Some(element.into_syntax().into()))),
++                .splice_slots(2usize..=2usize, once(Some(element.into_syntax().into()))),
+         )
+     }
+     pub fn with_excl_token(self, element: Option<SyntaxToken>) -> Self {
+         Self::unwrap_cast(
+             self.syntax
+-                .splice_slots(2usize..=2usize, once(element.map(|element| element.into()))),
++                .splice_slots(3usize..=3usize, once(element.map(|element| element.into()))),
+         )
+     }
+ }
+diff --git a/crates/biome_yaml_parser/src/lexer/mod.rs b/crates/biome_yaml_parser/src/lexer/mod.rs
+index 28d8fb1af8..fee44f6b7b 100644
+--- a/crates/biome_yaml_parser/src/lexer/mod.rs
++++ b/crates/biome_yaml_parser/src/lexer/mod.rs
+@@ -25,7 +25,7 @@ pub(crate) struct YamlLexer<'src> {
+     /// Cache of tokens to be emitted to the parser
+     tokens: LinkedList<LexToken>,
+ 
+-    /// Cache of tokens that should only be emitted after the current scope has been properly closed.
++    /// Cached of tokens that should only be after the current scope has been properly closed.
+     cached_scope_closing_tokens: Option<LinkedList<LexToken>>,
+ }
+ 
+@@ -53,8 +53,12 @@ impl<'src> YamlLexer<'src> {
+     /// ```
+     fn consume_tokens(&mut self) {
+         let Some(current) = self.current_byte() else {
+-            let mut tokens = self.close_all_scopes();
+-            self.tokens.append(&mut tokens);
++            while let Some(scope) = self.scopes.pop() {
++                self.tokens.push_back(LexToken::pseudo(
++                    scope.close_token_kind(),
++                    self.current_coordinate,
++                ));
++            }
+             self.tokens
+                 .push_back(LexToken::pseudo(EOF, self.current_coordinate));
+             return;
+@@ -62,18 +66,17 @@ impl<'src> YamlLexer<'src> {
+ 
+         let start = self.text_position();
+ 
+-        let mut tokens = match current {
+-            c if is_break(c) => self.evaluate_block_scope(),
+-            c if is_space(c) => self.consume_whitespace_token().into(),
+-            b'#' => self.consume_comment().into(),
+-            b'.' if self.is_at_doc_end() => self.consume_doc_end(),
+-            current if maybe_at_mapping_start(current, self.peek_byte()) => {
++        let mut tokens = match (current, self.peek_byte()) {
++            (c, _) if is_space(c) => self.consume_whitespace_token().into(),
++            (b'#', _) => self.consume_comment().into(),
++            (c, _) if is_break(c) => self.evaluate_block_scope(),
++            (current, peek) if maybe_at_mapping_start(current, peek) => {
+                 self.consume_potential_mapping_start(current)
+             }
+             // ':', '?', '-' can be a valid plain token start
+-            b'?' | b':' => self.consume_mapping_key(current),
+-            b'-' => self.consume_sequence_entry(),
+-            b'|' | b'>' => self.consume_block_scalar(current),
++            (b'?' | b':', _) => self.consume_mapping_key(current),
++            (b'-', _) => self.consume_sequence_entry(),
++            (b'|' | b'>', _) => self.consume_block_scalar(current),
+             _ => self.consume_unexpected_token().into(),
+         };
+         self.tokens.append(&mut tokens);
+@@ -213,9 +216,25 @@ impl<'src> YamlLexer<'src> {
+             }
+         }
+ 
+-        let mut trivia = self.consume_trailing_trivia();
++        // The spec only allows trailing trivia followed a block header
++        let mut trivia = self.consume_trivia(true);
+         tokens.append(&mut trivia);
+ 
++        if self.current_byte().is_none_or(is_break) {
++            return tokens;
++        }
++
++        // Consume the rest of the invalid characters so that the block content can cleanly start
++        // at a newline.
++        let start = self.current_coordinate;
++        while let Some(c) = self.current_byte() {
++            if is_break(c) {
++                break;
++            }
++            self.advance_char_unchecked();
++        }
++
++        tokens.push_back(LexToken::new(ERROR_TOKEN, start, self.current_coordinate));
+         tokens
+     }
+ 
+@@ -277,16 +296,13 @@ impl<'src> YamlLexer<'src> {
+         debug_assert!(self.current_byte().is_some_and(is_break));
+         let start = self.current_coordinate;
+         let mut trivia = self.consume_trivia(false);
+-        let mut scope_end_tokens = self.close_breached_scopes(start);
++        let mut scope_end_tokens = self.close_scope(start);
+         scope_end_tokens.append(&mut trivia);
+         scope_end_tokens
+     }
+ 
+     /// Close all violated scopes, and emit closing tokens right after the last non trivia token
+-    fn close_breached_scopes(
+-        &mut self,
+-        scope_end_coordinate: TextCoordinate,
+-    ) -> LinkedList<LexToken> {
++    fn close_scope(&mut self, scope_end_coordinate: TextCoordinate) -> LinkedList<LexToken> {
+         let mut scope_end_tokens = LinkedList::new();
+         while let Some(scope) = self.scopes.pop() {
+             if scope.contains(
+@@ -305,17 +321,6 @@ impl<'src> YamlLexer<'src> {
+         scope_end_tokens
+     }
+ 
+-    fn close_all_scopes(&mut self) -> LinkedList<LexToken> {
+-        let tokens = LinkedList::new();
+-        while let Some(scope) = self.scopes.pop() {
+-            self.tokens.push_back(LexToken::pseudo(
+-                scope.close_token_kind(),
+-                self.current_coordinate,
+-            ));
+-        }
+-        tokens
+-    }
+-
+     /// Consume a YAML flow value that can be used inside an implicit mapping key
+     /// https://yaml.org/spec/1.2.2/#rule-ns-s-block-map-implicit-key
+     fn consume_potential_mapping_key(&mut self, current: u8) -> LinkedList<LexToken> {
+@@ -528,30 +533,6 @@ impl<'src> YamlLexer<'src> {
+         LexToken::new(SINGLE_QUOTED_LITERAL, start, token_end)
+     }
+ 
+-    fn is_at_doc_end(&self) -> bool {
+-        let is_dot = |c: u8| c == b'.';
+-        // A DOC_END token can be evaluated as a plain token if it's not placed at the start of
+-        // line
+-        self.current_coordinate.column == 0
+-            && self.current_byte().is_some_and(is_dot)
+-            && self.peek_byte().is_some_and(is_dot)
+-            && self.byte_at(2).is_some_and(is_dot)
+-    }
+-
+-    fn consume_doc_end(&mut self) -> LinkedList<LexToken> {
+-        self.assert_byte(b'.');
+-        debug_assert_eq!(self.byte_at(1), Some(b'.'));
+-        debug_assert_eq!(self.byte_at(2), Some(b'.'));
+-        let start = self.current_coordinate;
+-        let mut tokens = self.close_all_scopes();
+-        self.advance(3);
+-        tokens.push_back(LexToken::new(DOC_END, start, self.current_coordinate));
+-        let mut trivia = self.consume_trailing_trivia();
+-        tokens.append(&mut trivia);
+-
+-        tokens
+-    }
+-
+     /// Bumps the current byte and creates a lexed token of the passed in kind.
+     #[inline]
+     fn consume_byte_as_token(&mut self, tok: YamlSyntaxKind) -> LexToken {
+@@ -567,7 +548,7 @@ impl<'src> YamlLexer<'src> {
+         let start = self.current_coordinate;
+         let mut trivia = self.consume_trivia(false);
+         if self.breach_parent_scope() {
+-            let mut scope_end_tokens = self.close_breached_scopes(start);
++            let mut scope_end_tokens = self.close_scope(start);
+             scope_end_tokens.append(&mut trivia);
+             self.cached_scope_closing_tokens = Some(scope_end_tokens);
+             None
+@@ -609,7 +590,7 @@ impl<'src> YamlLexer<'src> {
+             }
+         }
+         if self.breach_parent_scope() {
+-            let mut scope_end_tokens = self.close_breached_scopes(start);
++            let mut scope_end_tokens = self.close_scope(start);
+             scope_end_tokens.append(&mut trivia);
+             self.cached_scope_closing_tokens = Some(scope_end_tokens);
+             false
+@@ -652,29 +633,6 @@ impl<'src> YamlLexer<'src> {
+         LexToken::new(ERROR_TOKEN, start, self.current_coordinate)
+     }
+ 
+-    /// Some constructs, like block header or document end (`...`), don't allow any trailing tokens
+-    /// except for trivia.
+-    /// This function is responsible for consuming the trailing trivia and any unexpected tokens
+-    fn consume_trailing_trivia(&mut self) -> LinkedList<LexToken> {
+-        self.assert_current_char_boundary();
+-
+-        let mut tokens = self.consume_trivia(true);
+-
+-        if self.current_byte().is_none_or(is_break) {
+-            return tokens;
+-        }
+-
+-        let start = self.current_coordinate;
+-        while let Some(c) = self.current_byte() {
+-            if is_break(c) {
+-                break;
+-            }
+-            self.advance_char_unchecked();
+-        }
+-        tokens.push_back(LexToken::new(ERROR_TOKEN, start, self.current_coordinate));
+-        tokens
+-    }
+-
+     fn consume_unexpected_character(&mut self) {
+         self.assert_current_char_boundary();
+ 
+diff --git a/crates/biome_yaml_parser/src/parser/document.rs b/crates/biome_yaml_parser/src/parser/document.rs
+index 5358dada7b..62c17a18b6 100644
+--- a/crates/biome_yaml_parser/src/parser/document.rs
++++ b/crates/biome_yaml_parser/src/parser/document.rs
+@@ -13,7 +13,7 @@ use biome_yaml_syntax::{
+ use super::{
+     YamlParser,
+     block::{is_at_any_block_node, parse_any_block_node},
+-    parse_error::{expected_directive, unexpected_token},
++    parse_error::{expected_directive, malformed_document},
+ };
+ 
+ #[derive(Default)]
+@@ -41,7 +41,7 @@ impl ParseNodeList for DocumentList {
+         parsed_element.or_recover_with_token_set(
+             p,
+             &ParseRecoveryTokenSet::new(YamlSyntaxKind::YAML_BOGUS, token_set![EOF]),
+-            unexpected_token,
++            malformed_document,
+         )
+     }
+ }
+diff --git a/crates/biome_yaml_parser/src/parser/parse_error.rs b/crates/biome_yaml_parser/src/parser/parse_error.rs
+index ce7e198b58..2e02ea6b19 100644
+--- a/crates/biome_yaml_parser/src/parser/parse_error.rs
++++ b/crates/biome_yaml_parser/src/parser/parse_error.rs
+@@ -1,11 +1,6 @@
+ use crate::parser::YamlParser;
+-use biome_diagnostics::location::AsSpan;
+-use biome_parser::{
+-    Parser,
+-    diagnostic::{ParseDiagnostic, expected_node},
+-    prelude::TokenSource,
+-};
+-use biome_rowan::{TextLen, TextRange};
++use biome_parser::diagnostic::{ParseDiagnostic, expected_node};
++use biome_rowan::TextRange;
+ 
+ pub(crate) fn expected_block_mapping_entry(p: &YamlParser, range: TextRange) -> ParseDiagnostic {
+     expected_node("block mapping entry", range, p)
+@@ -15,6 +10,11 @@ pub(crate) fn expected_block_sequence_entry(p: &YamlParser, range: TextRange) ->
+     expected_node("block sequence entry", range, p)
+ }
+ 
++// This shouldn't happen that often
++pub(crate) fn malformed_document(_p: &YamlParser, range: TextRange) -> ParseDiagnostic {
++    ParseDiagnostic::new("Malformed document", range)
++}
++
+ pub(crate) fn expected_directive(p: &YamlParser, range: TextRange) -> ParseDiagnostic {
+     expected_node("directive", range, p)
+ }
+@@ -38,12 +38,3 @@ pub(crate) fn expected_flow_sequence_closing_bracket(range: TextRange) -> ParseD
+ pub(crate) fn expected_header(p: &YamlParser, range: TextRange) -> ParseDiagnostic {
+     expected_node("block header", range, p)
+ }
+-
+-pub(crate) fn unexpected_token(p: &YamlParser, range: TextRange) -> ParseDiagnostic {
+-    let msg = if p.source().text().text_len() <= range.start() {
+-        "Unexpected end of file."
+-    } else {
+-        "Unexpected token."
+-    };
+-    ParseDiagnostic::new(msg, range.as_span())
+-}
+diff --git a/xtask/codegen/tailwind.ungram b/xtask/codegen/tailwind.ungram
+index 974fa6898b..2eedcb30f8 100644
+--- a/xtask/codegen/tailwind.ungram
++++ b/xtask/codegen/tailwind.ungram
+@@ -59,6 +59,7 @@ AnyTwFullCandidate = TwFullCandidate | TwBogusCandidate
+ // A Candidate is essentially a CSS class from an end user perspective. It's what the end user puts inside the `class` attribute in their HTML, separated by spaces.
+ TwFullCandidate =
+ 	variants: TwVariantList
++	negative: '-'?
+ 	candidate: AnyTwCandidate
+ 	'!'?
+ 

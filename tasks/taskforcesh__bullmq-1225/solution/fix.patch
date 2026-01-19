@@ -1,0 +1,154 @@
+diff --git a/src/classes/worker.ts b/src/classes/worker.ts
+index 7d078e9b1d..a8ee43202e 100644
+--- a/src/classes/worker.ts
++++ b/src/classes/worker.ts
+@@ -683,7 +683,7 @@ export class Worker<
+             // since we're not waiting for the job to end attach
+             // an error handler to avoid crashing the whole process
+             closePoolPromise?.catch(err => {
+-              console.error(err);
++              console.error(err); // TODO: emit error in next breaking change version
+             });
+             return;
+           }
+diff --git a/src/commands/includes/removeJobsByMaxAge.lua b/src/commands/includes/removeJobsByMaxAge.lua
+new file mode 100644
+index 0000000000..2acd93b11c
+--- /dev/null
++++ b/src/commands/includes/removeJobsByMaxAge.lua
+@@ -0,0 +1,15 @@
++--[[
++  Functions to remove jobs by max age.
++]]
++
++-- Includes
++--- @include "removeJob"
++
++local function removeJobsByMaxAge(timestamp, maxAge, targetSet, prefix)
++  local start = timestamp - maxAge * 1000
++  local jobIds = rcall("ZREVRANGEBYSCORE", targetSet, start, "-inf")
++  for i, jobId in ipairs(jobIds) do
++    removeJob(jobId, false, prefix)
++  end
++  rcall("ZREMRANGEBYSCORE", targetSet, "-inf", start)
++end
+diff --git a/src/commands/includes/removeJobsByMaxCount.lua b/src/commands/includes/removeJobsByMaxCount.lua
+new file mode 100644
+index 0000000000..ae1d256326
+--- /dev/null
++++ b/src/commands/includes/removeJobsByMaxCount.lua
+@@ -0,0 +1,15 @@
++--[[
++  Functions to remove jobs by max count.
++]]
++
++-- Includes
++--- @include "removeJob"
++
++local function removeJobsByMaxCount(timestamp, maxCount, targetSet, prefix)
++  local start = maxCount
++  local jobIds = rcall("ZREVRANGE", targetSet, start, -1)
++  for i, jobId in ipairs(jobIds) do
++    removeJob(jobId, false, prefix)
++  end
++  rcall("ZREMRANGEBYRANK", targetSet, 0, -(maxCount + 1))
++end
+diff --git a/src/commands/moveStalledJobsToWait-8.lua b/src/commands/moveStalledJobsToWait-8.lua
+index b0d67117c4..78bf7ed5d2 100644
+--- a/src/commands/moveStalledJobsToWait-8.lua
++++ b/src/commands/moveStalledJobsToWait-8.lua
+@@ -25,6 +25,9 @@ local rcall = redis.call
+ 
+ -- Includes
+ --- @include "includes/batches"
++--- @include "includes/removeJob"
++--- @include "includes/removeJobsByMaxAge"
++--- @include "includes/removeJobsByMaxCount"
+ --- @include "includes/trimEvents"
+ 
+ -- Check if we need to check for stalled jobs now.
+@@ -67,14 +70,38 @@ if (#stalling > 0) then
+                 local stalledCount = rcall("HINCRBY", jobKey, "stalledCounter",
+                                            1)
+                 if (stalledCount > MAX_STALLED_JOB_COUNT) then
+-                    local failedReason = "job stalled more than allowable limit" 
+-                    rcall("ZADD", KEYS[4], ARGV[3], jobId)
+-                    rcall("HMSET", jobKey, "failedReason",
+-                          failedReason, "finishedOn", ARGV[3])
+-                    rcall("XADD", KEYS[8], "*", "event", "failed", "jobId",
+-                          jobId, 'prev', 'active', 'failedReason',
+-                          failedReason)
+-                    table.insert(failed, jobId)
++                  local rawOpts = rcall("HGET",jobKey, "opts")
++                  local opts = cjson.decode(rawOpts)
++                  local removeOnFailType = type(opts["removeOnFail"])
++                  rcall("ZADD", KEYS[4], ARGV[3], jobId)
++                  local failedReason = "job stalled more than allowable limit" 
++                  rcall("HMSET", jobKey, "failedReason",
++                        failedReason, "finishedOn", ARGV[3])
++                  rcall("XADD", KEYS[8], "*", "event", "failed", "jobId",
++                        jobId, 'prev', 'active', 'failedReason',
++                        failedReason)
++
++                  if removeOnFailType == "number" then
++                    removeJobsByMaxCount(ARGV[3], opts["removeOnFail"], KEYS[4], ARGV[2])
++                  elseif removeOnFailType == "boolean" then
++                    if opts["removeOnFail"] then
++                      removeJob(jobId, false, ARGV[2])
++                      rcall("ZREM", KEYS[4], jobId)
++                    end                  
++                  elseif removeOnFailType ~= "nil" then
++                    local maxAge = opts["removeOnFail"]["age"]
++                    local maxCount = opts["removeOnFail"]["count"]
++
++                    if maxAge ~= nil then
++                      removeJobsByMaxAge(ARGV[3], maxAge, KEYS[4], ARGV[2])
++                    end
++            
++                    if maxCount ~= nil and maxCount > 0 then
++                      removeJobsByMaxCount(ARGV[3], maxCount, KEYS[4], ARGV[2])
++                    end
++                  end
++
++                  table.insert(failed, jobId)                    
+                 else
+                     -- Move the job back to the wait queue, to immediately be picked up by a waiting worker.
+                     rcall("RPUSH", dst, jobId)
+diff --git a/src/commands/moveToFinished-12.lua b/src/commands/moveToFinished-12.lua
+index 96bf4a454a..826f2cd3c0 100644
+--- a/src/commands/moveToFinished-12.lua
++++ b/src/commands/moveToFinished-12.lua
+@@ -57,7 +57,8 @@ local rcall = redis.call
+ --- Includes
+ --- @include "includes/destructureJobKey"
+ --- @include "includes/moveJobFromWaitToActive"
+---- @include "includes/removeJob"
++--- @include "includes/removeJobsByMaxAge"
++--- @include "includes/removeJobsByMaxCount"
+ --- @include "includes/trimEvents"
+ --- @include "includes/updateParentDepsIfNeeded"
+ --- @include "includes/collectMetrics"
+@@ -132,21 +133,11 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+         local prefix = ARGV[8]
+ 
+         if maxAge ~= nil then
+-            local start = timestamp - maxAge * 1000
+-            local jobIds = rcall("ZREVRANGEBYSCORE", targetSet, start, "-inf")
+-            for i, jobId in ipairs(jobIds) do
+-                removeJob(jobId, false, prefix)
+-            end
+-            rcall("ZREMRANGEBYSCORE", targetSet, "-inf", start)
++            removeJobsByMaxAge(timestamp, maxAge, targetSet, prefix)
+         end
+ 
+         if maxCount ~= nil and maxCount > 0 then
+-            local start = maxCount
+-            local jobIds = rcall("ZREVRANGE", targetSet, start, -1)
+-            for i, jobId in ipairs(jobIds) do
+-                removeJob(jobId, false, prefix)
+-            end
+-            rcall("ZREMRANGEBYRANK", targetSet, 0, -(maxCount + 1))
++            removeJobsByMaxCount(timestamp, maxCount, targetSet, prefix)
+         end
+     else
+         rcall("DEL", jobIdKey, jobIdKey .. ':logs', jobIdKey .. ':processed')

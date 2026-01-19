@@ -1,0 +1,440 @@
+diff --git a/.changeset/lucky-crabs-enjoy.md b/.changeset/lucky-crabs-enjoy.md
+deleted file mode 100644
+index bf64d9f35..000000000
+--- a/.changeset/lucky-crabs-enjoy.md
++++ /dev/null
+@@ -1,8 +0,0 @@
+----
+-'@verdaccio/api': patch
+-'@verdaccio/core': patch
+-'@verdaccio/middleware': patch
+-'@verdaccio/proxy': patch
+----
+-
+-fix(middleware): error 404 when getting scoped tarballs
+diff --git a/packages/api/src/index.ts b/packages/api/src/index.ts
+index ec854e708..0be74b836 100644
+--- a/packages/api/src/index.ts
++++ b/packages/api/src/index.ts
+@@ -4,7 +4,6 @@ import { Auth } from '@verdaccio/auth';
+ import {
+   antiLoop,
+   encodeScopePackage,
+-  makeURLrelative,
+   match,
+   validateName,
+   validatePackage,
+@@ -46,7 +45,6 @@ export default function (config: Config, auth: Auth, storage: Storage): Router {
+   app.use(auth.apiJWTmiddleware());
+   app.use(express.json({ strict: false, limit: config.max_body_size || '10mb' }));
+   app.use(antiLoop(config));
+-  app.use(makeURLrelative);
+   // encode / in a scoped package name to be matched as a single parameter in routes
+   app.use(encodeScopePackage);
+   // for "npm whoami"
+diff --git a/packages/core/core/src/constants.ts b/packages/core/core/src/constants.ts
+index e7de7fbb0..6c9da44a6 100644
+--- a/packages/core/core/src/constants.ts
++++ b/packages/core/core/src/constants.ts
+@@ -54,7 +54,6 @@ export const HEADERS = {
+   TEXT_CHARSET: 'text/plain; charset=utf-8',
+   WWW_AUTH: 'WWW-Authenticate',
+   GZIP: 'gzip',
+-  HOST: 'host',
+ };
+ 
+ export const HTTP_STATUS = {
+diff --git a/packages/middleware/src/index.ts b/packages/middleware/src/index.ts
+index 19f659ecd..8aaec3786 100644
+--- a/packages/middleware/src/index.ts
++++ b/packages/middleware/src/index.ts
+@@ -2,7 +2,6 @@ export { match } from './middlewares/match';
+ export { setSecurityWebHeaders } from './middlewares/security-headers';
+ export { validateName, validatePackage } from './middlewares/validation';
+ export { media } from './middlewares/media';
+-export { makeURLrelative } from './middlewares/make-url-relative';
+ export { encodeScopePackage } from './middlewares/encode-pkg';
+ export { expectJson } from './middlewares/json';
+ export { antiLoop } from './middlewares/antiLoop';
+diff --git a/packages/middleware/src/middlewares/encode-pkg.ts b/packages/middleware/src/middlewares/encode-pkg.ts
+index d70bd92a3..ba5ecac35 100644
+--- a/packages/middleware/src/middlewares/encode-pkg.ts
++++ b/packages/middleware/src/middlewares/encode-pkg.ts
+@@ -1,7 +1,5 @@
+ import buildDebug from 'debug';
+ 
+-import { errorUtils } from '@verdaccio/core';
+-
+ import { $NextFunctionVer, $RequestExtend, $ResponseExtend } from '../types';
+ 
+ const debug = buildDebug('verdaccio:middleware:encode');
+@@ -18,22 +16,15 @@ export function encodeScopePackage(
+   next: $NextFunctionVer
+ ): void {
+   const original = req.url;
+-
+-  // Expect relative URLs i.e. should call makeURLrelative before this middleware
+-  if (!req.url.startsWith('/')) {
+-    return next(errorUtils.getBadRequest(`Invalid URL: ${req.url} (must be relative)`));
+-  }
+-
+   // If the @ sign is encoded, we need to decode it first
+   // e.g.: /%40org/pkg/1.2.3 -> /@org/pkg/1.2.3
+-  // For scoped packages, encode the slash to make it a single path segment/parameter
+-  // e.g.: /@org/pkg/1.2.3 -> /@org%2Fpkg/1.2.3, /@org%2Fpkg/1.2.3 -> /@org%2Fpkg/1.2.3
+-  req.url = req.url.replace(/^\/%40/, '/@').replace(/^(\/@[^\/%]+)\/(?!$)/, '$1%2F');
+-
+-  if (original !== req.url) {
+-    debug('encodeScopePackage: %o -> %o', original, req.url);
+-  } else {
+-    debug('encodeScopePackage: %o (unchanged)', original);
++  if (req.url.indexOf('%40') !== -1) {
++    req.url = req.url.replace(/^\/%40/, '/@');
++  }
++  if (req.url.indexOf('@') !== -1) {
++    // e.g.: /@org/pkg/1.2.3 -> /@org%2Fpkg/1.2.3, /@org%2Fpkg/1.2.3 -> /@org%2Fpkg/1.2.3
++    req.url = req.url.replace(/^(\/@[^\/%]+)\/(?!$)/, '$1%2F');
+   }
++  debug('encodeScopePackage: %o -> %o', original, req.url);
+   next();
+ }
+diff --git a/packages/middleware/src/middlewares/make-url-relative.ts b/packages/middleware/src/middlewares/make-url-relative.ts
+deleted file mode 100644
+index 5f1d9290b..000000000
+--- a/packages/middleware/src/middlewares/make-url-relative.ts
++++ /dev/null
+@@ -1,46 +0,0 @@
+-import buildDebug from 'debug';
+-import { URL } from 'node:url';
+-
+-import { errorUtils } from '@verdaccio/core';
+-
+-import { $NextFunctionVer, $RequestExtend, $ResponseExtend } from '../types';
+-
+-const debug = buildDebug('verdaccio:middleware:make-url-relative');
+-
+-/**
+- * Removes the host from the URL and turns it into a relative URL.
+- * @param req
+- * @param res
+- * @param next
+- */
+-export function makeURLrelative(
+-  req: $RequestExtend,
+-  res: $ResponseExtend,
+-  next: $NextFunctionVer
+-): void {
+-  const original = req.url;
+-
+-  // npm requests can contain the full URL, including the hostname, for example:
+-  // tarball downloads. Removing the hostname makes the URL relative and allows
+-  // the application to handle requests in a more consistent way.
+-
+-  let url;
+-  try {
+-    // In productive use, the URL is absolute (and base will be ignored)
+-    // In tests, the URL might brelative (and base will be used)
+-    // https://nodejs.org/docs/latest/api/url.html#new-urlinput-base
+-    url = new URL(req.url, `${req.protocol}://${req.headers.host}/`);
+-  } catch (error) {
+-    return next(errorUtils.getBadRequest(`Invalid URL: ${req.url} (${error})`));
+-  }
+-
+-  // Rebuild the URL without hostname
+-  req.url = url.pathname + url.search + url.hash;
+-
+-  if (original !== req.url) {
+-    debug('makeURLrelative: %o -> %o', original, req.url);
+-  } else {
+-    debug('makeURLrelative: %o (unchanged)', original);
+-  }
+-  next();
+-}
+diff --git a/packages/middleware/test/encode.spec.ts b/packages/middleware/test/encode.spec.ts
+index 18dc3145c..27e04d1c4 100644
+--- a/packages/middleware/test/encode.spec.ts
++++ b/packages/middleware/test/encode.spec.ts
+@@ -1,15 +1,16 @@
+ import request from 'supertest';
+-import { describe, expect, test } from 'vitest';
++import { expect, test } from 'vitest';
+ 
+ import { HTTP_STATUS } from '@verdaccio/core';
+ 
+ import { encodeScopePackage } from '../src';
+ import { getApp } from './helper';
+ 
+-test('encode is json with relative path', async () => {
++test('encode is json', async () => {
+   const app = getApp([]);
+   // @ts-ignore
+   app.use(encodeScopePackage);
++  // @ts-ignore
+   app.get('/:id', (req, res) => {
+     const { id } = req.params;
+     res.status(HTTP_STATUS.OK).json({ id });
+@@ -20,112 +21,84 @@ test('encode is json with relative path', async () => {
+   expect(res.status).toEqual(HTTP_STATUS.OK);
+ });
+ 
+-describe('packages requests', () => {
++test('packages with version/scope', async () => {
+   const app = getApp([]);
+   // @ts-ignore
+   app.use(encodeScopePackage);
++  // @ts-ignore
+   app.get('/:package/:version?', (req, res) => {
+     const { package: pkg, version } = req.params;
+     res.status(HTTP_STATUS.OK).json({ package: pkg, version });
+   });
+ 
+-  test('just package', async () => {
+-    const res = await request(app).get('/foo');
+-    expect(res.body).toEqual({ package: 'foo' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res = await request(app).get('/foo');
++  expect(res.body).toEqual({ package: 'foo' });
++  expect(res.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('package with version', async () => {
+-    const res = await request(app).get('/foo/1.0.0');
+-    expect(res.body).toEqual({ package: 'foo', version: '1.0.0' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res2 = await request(app).get('/foo/1.0.0');
++  expect(res2.body).toEqual({ package: 'foo', version: '1.0.0' });
++  expect(res2.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package', async () => {
+-    const res = await request(app).get('/@scope/foo');
+-    expect(res.body).toEqual({ package: '@scope/foo' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res3 = await request(app).get('/@scope/foo');
++  expect(res3.body).toEqual({ package: '@scope/foo' });
++  expect(res3.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package with version', async () => {
+-    const res = await request(app).get('/@scope/foo/1.0.0');
+-    expect(res.body).toEqual({ package: '@scope/foo', version: '1.0.0' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res4 = await request(app).get('/@scope/foo/1.0.0');
++  expect(res4.body).toEqual({ package: '@scope/foo', version: '1.0.0' });
++  expect(res4.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package with encoded path', async () => {
+-    const res = await request(app).get('/@scope%2ffoo');
+-    expect(res.body).toEqual({ package: '@scope/foo' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res5 = await request(app).get('/@scope%2ffoo');
++  expect(res5.body).toEqual({ package: '@scope/foo' });
++  expect(res5.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package and version with encoded path', async () => {
+-    const res = await request(app).get('/@scope%2ffoo/1.0.0');
+-    expect(res.body).toEqual({ package: '@scope/foo', version: '1.0.0' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res6 = await request(app).get('/@scope%2ffoo/1.0.0');
++  expect(res6.body).toEqual({ package: '@scope/foo', version: '1.0.0' });
++  expect(res6.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package with encoded @ and path ', async () => {
+-    const res = await request(app).get('/%40scope%2ffoo');
+-    expect(res.body).toEqual({ package: '@scope/foo' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res7 = await request(app).get('/%40scope%2ffoo');
++  expect(res7.body).toEqual({ package: '@scope/foo' });
++  expect(res7.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package and version with encoded @ and path', async () => {
+-    const res = await request(app).get('/%40scope%2ffoo/1.0.0');
+-    expect(res.body).toEqual({ package: '@scope/foo', version: '1.0.0' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res8 = await request(app).get('/%40scope%2ffoo/1.0.0');
++  expect(res8.body).toEqual({ package: '@scope/foo', version: '1.0.0' });
++  expect(res8.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package with encoded @', async () => {
+-    const res = await request(app).get('/%40scope/foo');
+-    expect(res.body).toEqual({ package: '@scope/foo' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res9 = await request(app).get('/%40scope/foo');
++  expect(res9.body).toEqual({ package: '@scope/foo' });
++  expect(res9.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package and version with encoded @', async () => {
+-    const res = await request(app).get('/%40scope/foo/1.0.0');
+-    expect(res.body).toEqual({ package: '@scope/foo', version: '1.0.0' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res10 = await request(app).get('/%40scope/foo/1.0.0');
++  expect(res10.body).toEqual({ package: '@scope/foo', version: '1.0.0' });
++  expect(res10.status).toEqual(HTTP_STATUS.OK);
+ });
+ 
+-describe('tarball requests', () => {
++test('tarballs with and without scope', async () => {
+   const app = getApp([]);
+   // @ts-ignore
+   app.use(encodeScopePackage);
++  // @ts-ignore
+   app.get('/:package/-/:filename', (req, res) => {
+     const { package: pkg, filename } = req.params;
+     res.status(HTTP_STATUS.OK).json({ package: pkg, filename });
+   });
+ 
+-  test('just package', async () => {
+-    const res = await request(app).get('/foo/-/foo-1.2.3.tgz');
+-    expect(res.body).toEqual({ package: 'foo', filename: 'foo-1.2.3.tgz' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res = await request(app).get('/foo/-/foo-1.2.3.tgz');
++  expect(res.body).toEqual({ package: 'foo', filename: 'foo-1.2.3.tgz' });
++  expect(res.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package', async () => {
+-    const res = await request(app).get('/@scope/foo/-/foo-1.2.3.tgz');
+-    expect(res.body).toEqual({ package: '@scope/foo', filename: 'foo-1.2.3.tgz' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res2 = await request(app).get('/@scope/foo/-/foo-1.2.3.tgz');
++  expect(res2.body).toEqual({ package: '@scope/foo', filename: 'foo-1.2.3.tgz' });
++  expect(res2.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package with encoded path', async () => {
+-    const res = await request(app).get('/@scope%2ffoo/-/foo-1.2.3.tgz');
+-    expect(res.body).toEqual({ package: '@scope/foo', filename: 'foo-1.2.3.tgz' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res3 = await request(app).get('/@scope%2ffoo/-/foo-1.2.3.tgz');
++  expect(res3.body).toEqual({ package: '@scope/foo', filename: 'foo-1.2.3.tgz' });
++  expect(res3.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package with encoded @ and path', async () => {
+-    const res = await request(app).get('/%40scope%2ffoo/-/foo-1.2.3.tgz');
+-    expect(res.body).toEqual({ package: '@scope/foo', filename: 'foo-1.2.3.tgz' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res4 = await request(app).get('/%40scope%2ffoo/-/foo-1.2.3.tgz');
++  expect(res4.body).toEqual({ package: '@scope/foo', filename: 'foo-1.2.3.tgz' });
++  expect(res4.status).toEqual(HTTP_STATUS.OK);
+ 
+-  test('scoped package with encoded @', async () => {
+-    const res = await request(app).get('/%40scope/foo/-/foo-1.2.3.tgz');
+-    expect(res.body).toEqual({ package: '@scope/foo', filename: 'foo-1.2.3.tgz' });
+-    expect(res.status).toEqual(HTTP_STATUS.OK);
+-  });
++  const res5 = await request(app).get('/%40scope/foo/-/foo-1.2.3.tgz');
++  expect(res5.body).toEqual({ package: '@scope/foo', filename: 'foo-1.2.3.tgz' });
++  expect(res5.status).toEqual(HTTP_STATUS.OK);
+ });
+diff --git a/packages/middleware/test/make-url-relative.spec.ts b/packages/middleware/test/make-url-relative.spec.ts
+deleted file mode 100644
+index 1e390762a..000000000
+--- a/packages/middleware/test/make-url-relative.spec.ts
++++ /dev/null
+@@ -1,42 +0,0 @@
+-import request from 'supertest';
+-import { expect, test } from 'vitest';
+-
+-import { HEADERS, HTTP_STATUS } from '@verdaccio/core';
+-
+-import { makeURLrelative } from '../src';
+-import { getApp } from './helper';
+-
+-const testHosts = [
+-  'localhost:4873', // with port
+-  'myregistry.com', // no port
+-  '42.42.42.42', // ip
+-  '[2001:db8:85a3:8d3:1319:8a2e:370:7348]:443', // ip6
+-];
+-
+-test.each([testHosts])('remove host from url', async (host) => {
+-  const app = getApp([]);
+-  // @ts-ignore
+-  app.use(makeURLrelative);
+-  app.get('/:id', (req, res) => {
+-    const { id } = req.params;
+-    res.status(HTTP_STATUS.OK).json({ id, url: req.url });
+-  });
+-
+-  const res = await request(app).get('/foo').set(HEADERS.HOST, host);
+-  expect(res.body).toEqual({ id: 'foo', url: '/foo' });
+-  expect(res.status).toEqual(HTTP_STATUS.OK);
+-});
+-
+-test('invalid url', async () => {
+-  const app = getApp([]);
+-  // @ts-ignore
+-  app.use(makeURLrelative);
+-  app.get('/:id', (req, res) => {
+-    const { id } = req.params;
+-    res.status(HTTP_STATUS.OK).json({ id });
+-  });
+-
+-  const res = await request(app).get('/foo').set(HEADERS.HOST, 'invalid::host');
+-  expect(res.status).toEqual(HTTP_STATUS.BAD_REQUEST);
+-  expect(res.text).toContain('Invalid URL');
+-});
+diff --git a/packages/proxy/src/proxy.ts b/packages/proxy/src/proxy.ts
+index 9da818131..44108ceca 100644
+--- a/packages/proxy/src/proxy.ts
++++ b/packages/proxy/src/proxy.ts
+@@ -503,10 +503,11 @@ class ProxyStorage implements IProxy {
+    */
+   public async search({ url, abort, retry }: ProxySearchParams): Promise<Stream.Readable> {
+     try {
+-      // Incoming URL is relative ie /-/v1/search...
+-      const uri = new URL(url, this.url).href;
++      const fullURL = new URL(`${this.url}${url}`);
++      // FIXME: a better way to remove duplicate slashes?
++      const uri = fullURL.href.replace(/([^:]\/)\/+/g, '$1');
+       this.logger.http({ uri, uplink: this.upname }, 'search request to uplink @{uplink} - @{uri}');
+-      debug('searching on %o', uri);
++      debug('searching on %s', uri);
+       const response = got(uri, {
+         signal: abort ? abort.signal : {},
+         agent: this.agent,
+@@ -515,8 +516,6 @@ class ProxyStorage implements IProxy {
+       });
+ 
+       const res = await response.text();
+-      const total = JSON.parse(res).total;
+-      debug('number of packages found: %o', total);
+       const streamSearch = new PassThrough({ objectMode: true });
+       const streamResponse = Readable.from(res);
+       // objects is one of the properties on the body, it ignores date and total
+diff --git a/packages/proxy/test/proxy.search.spec.ts b/packages/proxy/test/proxy.search.spec.ts
+index e361f6e82..0978c64c2 100644
+--- a/packages/proxy/test/proxy.search.spec.ts
++++ b/packages/proxy/test/proxy.search.spec.ts
+@@ -55,22 +55,6 @@ describe('proxy', () => {
+       expect(searchResponse).toEqual(searchResponse);
+     });
+ 
+-    test('get response from uplink with trailing slash', async () => {
+-      const response = require('./partials/search-v1.json');
+-      nock(domain + '/')
+-        .get('/-/v1/search?maintenance=1&popularity=1&quality=1&size=10&text=verdaccio')
+-        .reply(200, response);
+-      const prox1 = new ProxyStorage(defaultRequestOptions, conf, logger);
+-      const abort = new AbortController();
+-      const stream = await prox1.search({
+-        abort,
+-        url: queryUrl,
+-      });
+-
+-      const searchResponse = await getStream(stream.pipe(streamUtils.transformObjectToString()));
+-      expect(searchResponse).toEqual(searchResponse);
+-    });
+-
+     test('handle bad response 409', async () => {
+       nock(domain)
+         .get('/-/v1/search?maintenance=1&popularity=1&quality=1&size=10&text=verdaccio')

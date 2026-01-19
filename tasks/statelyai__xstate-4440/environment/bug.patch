@@ -1,0 +1,789 @@
+diff --git a/.changeset/few-monkeys-build.md b/.changeset/few-monkeys-build.md
+deleted file mode 100644
+index d0f3c9cff8..0000000000
+--- a/.changeset/few-monkeys-build.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-`State.from`, `StateMachine#createState` and `StateMachine#resolveStateValue` were removed. They largely served the same purpose as `StateMachine#resolveState` and this is the method that is still available and can be used instead of them.
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index e2c368a46f..a695bd107d 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -97,6 +97,68 @@ export class State<
+    */
+   public children: ComputeChildren<TActor>;
+ 
++  /**
++   * Creates a new State instance for the given `stateValue` and `context`.
++   * @param stateValue
++   * @param context
++   */
++  public static from<
++    TContext extends MachineContext,
++    TEvent extends EventObject = EventObject
++  >(
++    stateValue:
++      | State<
++          TContext,
++          TEvent,
++          TODO,
++          any, // tags
++          any // typegen
++        >
++      | StateValue,
++    context: TContext = {} as TContext,
++    machine: AnyStateMachine
++  ): State<
++    TContext,
++    TEvent,
++    TODO,
++    any, // tags
++    any // typegen
++  > {
++    if (stateValue instanceof State) {
++      if (stateValue.context !== context) {
++        return new State<TContext, TEvent, TODO, any, any>(
++          {
++            value: stateValue.value,
++            context,
++            meta: {},
++            configuration: [], // TODO: fix,
++            children: {},
++            status: 'active'
++          },
++          machine
++        );
++      }
++
++      return stateValue;
++    }
++
++    const configuration = getConfiguration(
++      getStateNodes(machine.root, stateValue)
++    );
++
++    return new State<TContext, TEvent, TODO, any, any>(
++      {
++        value: stateValue,
++        context,
++        meta: undefined,
++        configuration: Array.from(configuration),
++        children: {},
++        status: 'active'
++      },
++      machine
++    );
++  }
++
+   /**
+    * Creates a new `State` instance that represents the current state of a running machine.
+    *
+@@ -109,7 +171,9 @@ export class State<
+     this.context = config.context;
+     this.historyValue = config.historyValue || {};
+     this.matches = this.matches.bind(this);
+-    this.configuration = config.configuration;
++    this.configuration =
++      config.configuration ??
++      Array.from(getConfiguration(getStateNodes(machine.root, config.value)));
+     this.children = config.children as any;
+ 
+     this.value = getStateValue(machine.root, this.configuration);
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index e3505cb48f..21df12d247 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -46,8 +46,7 @@ import type {
+   TODO,
+   SnapshotFrom,
+   Snapshot,
+-  AnyActorLogic,
+-  HistoryValue
++  AnyActorLogic
+ } from './types.ts';
+ import { isErrorActorEvent, resolveReferencedActor } from './utils.ts';
+ import { $$ACTOR_TYPE, createActor } from './interpreter.ts';
+@@ -249,17 +248,15 @@ export class StateMachine<
+     });
+   }
+ 
++  /**
++   * Resolves the given `state` to a new `State` instance relative to this machine.
++   *
++   * This ensures that `.nextEvents` represent the correct values.
++   *
++   * @param state The state to resolve
++   */
+   public resolveState(
+-    config: {
+-      value: StateValue;
+-      context?: TContext;
+-      historyValue?: HistoryValue<TContext, TEvent>;
+-      status?: 'active' | 'done' | 'error' | 'stopped';
+-      output?: TOutput;
+-      error?: unknown;
+-    } & (Equals<TContext, MachineContext> extends false
+-      ? { context: unknown }
+-      : {})
++    state: State<TContext, TEvent, TActor, TTag, TResolvedTypesMeta>
+   ): MachineSnapshot<
+     TContext,
+     TEvent,
+@@ -268,32 +265,38 @@ export class StateMachine<
+     TOutput,
+     TResolvedTypesMeta
+   > {
+-    const resolvedStateValue = resolveStateValue(this.root, config.value);
+     const configurationSet = getConfiguration(
+-      getStateNodes(this.root, resolvedStateValue)
++      getStateNodes(this.root, state.value)
+     );
++    const configuration = Array.from(configurationSet);
++    return this.createState({
++      ...(state as any),
++      value: resolveStateValue(this.root, state.value),
++      configuration,
++      status: isInFinalState(configurationSet, this.root)
++        ? 'done'
++        : state.status
++    });
++  }
+ 
+-    return new State(
+-      {
+-        configuration: [...configurationSet],
+-        context: config.context || ({} as TContext),
+-        children: {},
+-        status: isInFinalState(configurationSet, this.root)
+-          ? 'done'
+-          : config.status || 'active',
+-        output: config.output,
+-        error: config.error,
+-        historyValue: config.historyValue
+-      },
+-      this
+-    ) as MachineSnapshot<
+-      TContext,
+-      TEvent,
+-      TActor,
+-      TTag,
+-      TOutput,
+-      TResolvedTypesMeta
+-    >;
++  public resolveStateValue(
++    stateValue: StateValue,
++    ...[context]: Equals<TContext, MachineContext> extends true
++      ? []
++      : [TContext]
++  ): MachineSnapshot<
++    TContext,
++    TEvent,
++    TActor,
++    TTag,
++    TOutput,
++    TResolvedTypesMeta
++  > {
++    const resolvedStateValue = resolveStateValue(this.root, stateValue);
++
++    return this.resolveState(
++      State.from(resolvedStateValue, context, this) as any
++    );
+   }
+ 
+   /**
+@@ -394,15 +397,16 @@ export class StateMachine<
+   > {
+     const { context } = this.config;
+ 
+-    const preInitial = new State(
+-      {
++    const preInitial = this.resolveState(
++      this.createState({
++        value: {}, // TODO: this is computed in state constructor
+         context:
+           typeof context !== 'function' && context ? context : ({} as TContext),
++        meta: undefined,
+         configuration: getInitialConfiguration(this.root),
+         children: {},
+         status: 'active'
+-      },
+-      this
++      })
+     );
+ 
+     if (typeof context === 'function') {
+@@ -417,7 +421,7 @@ export class StateMachine<
+       ) as SnapshotFrom<this>;
+     }
+ 
+-    return preInitial as SnapshotFrom<this>;
++    return preInitial;
+   }
+ 
+   /**
+@@ -536,6 +540,30 @@ export class StateMachine<
+     return getPersistedState(state, options);
+   }
+ 
++  public createState(
++    stateConfig:
++      | MachineSnapshot<
++          TContext,
++          TEvent,
++          TActor,
++          TTag,
++          TOutput,
++          TResolvedTypesMeta
++        >
++      | StateConfig<TContext, TEvent>
++  ): MachineSnapshot<
++    TContext,
++    TEvent,
++    TActor,
++    TTag,
++    TOutput,
++    TResolvedTypesMeta
++  > {
++    return stateConfig instanceof State
++      ? (stateConfig as any)
++      : new State(stateConfig, this);
++  }
++
+   public restoreState(
+     snapshot: Snapshot<unknown>,
+     _actorScope: ActorScope<
+@@ -593,23 +621,9 @@ export class StateMachine<
+       children[actorId] = actorRef;
+     });
+ 
+-    const restoredSnapshot = new State(
+-      {
+-        ...(snapshot as any),
+-        children,
+-        configuration: Array.from(
+-          getConfiguration(getStateNodes(this.root, (snapshot as any).value))
+-        )
+-      },
+-      this
+-    ) as MachineSnapshot<
+-      TContext,
+-      TEvent,
+-      TActor,
+-      TTag,
+-      TOutput,
+-      TResolvedTypesMeta
+-    >;
++    const restoredSnapshot = this.createState(
++      new State({ ...(snapshot as any), children }, this) as any
++    );
+ 
+     let seen = new Set();
+ 
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index a774423409..9484619a35 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1209,7 +1209,7 @@ function enterStates(
+           nextState,
+           event,
+           actorScope,
+-          nextState.machine.root,
++          currentState.configuration[0].machine.root,
+           rootCompletionNode
+         )
+       });
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 2ae4a39ec1..71dd71c524 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -1655,13 +1655,16 @@ export interface StateConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+ > {
++  value: StateValue;
+   context: TContext;
+   historyValue?: HistoryValue<TContext, TEvent>;
+-  configuration: Array<StateNode<TContext, TEvent>>;
++  meta?: any;
++  configuration?: Array<StateNode<TContext, TEvent>>;
+   children: Record<string, ActorRef<any, any>>;
+   status: 'active' | 'done' | 'error' | 'stopped';
+   output?: any;
+   error?: unknown;
++  tags?: Set<string>;
+   machine?: StateMachine<TContext, TEvent, any, any, any, any, any, any, any>;
+ }
+ 
+diff --git a/packages/core/test/deterministic.test.ts b/packages/core/test/deterministic.test.ts
+index 0a6911fd01..8fbf880a98 100644
+--- a/packages/core/test/deterministic.test.ts
++++ b/packages/core/test/deterministic.test.ts
+@@ -66,7 +66,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+         lightMachine.transition(
+-          lightMachine.resolveState({ value: 'green' }),
++          lightMachine.resolveStateValue('green'),
+           {
+             type: 'TIMER'
+           },
+@@ -102,7 +102,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(() =>
+         lightMachine.transition(
+-          testMachine.resolveState({ value: 'red' }),
++          testMachine.resolveStateValue('red'),
+           undefined as any,
+           actorScope
+         )
+@@ -113,7 +113,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+         testMachine.transition(
+-          testMachine.resolveState({ value: 'a' }),
++          testMachine.resolveStateValue('a'),
+           { type: 'T' },
+           actorScope
+         ).value
+@@ -126,7 +126,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(() =>
+         testMachine.transition(
+-          testMachine.resolveState({ value: 'fake' }),
++          testMachine.resolveStateValue('fake'),
+           { type: 'T' },
+           actorScope
+         )
+@@ -137,7 +137,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(() =>
+         testMachine.transition(
+-          testMachine.resolveState({ value: 'a.fake' }),
++          testMachine.resolveStateValue('a.fake'),
+           {
+             type: 'T'
+           },
+@@ -175,7 +175,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+         lightMachine.transition(
+-          lightMachine.resolveState({ value: { red: 'walk' } }),
++          lightMachine.resolveStateValue({ red: 'walk' }),
+           { type: 'PED_COUNTDOWN' },
+           actorScope
+         ).value
+@@ -186,7 +186,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+         lightMachine.transition(
+-          lightMachine.resolveState({ value: 'red' }),
++          lightMachine.resolveStateValue('red'),
+           {
+             type: 'PED_COUNTDOWN'
+           },
+@@ -201,7 +201,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+         lightMachine.transition(
+-          lightMachine.resolveState({ value: 'red' }),
++          lightMachine.resolveStateValue('red'),
+           {
+             type: 'PED_COUNTDOWN'
+           },
+@@ -216,7 +216,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+         lightMachine.transition(
+-          lightMachine.resolveState({ value: { red: 'stop' } }),
++          lightMachine.resolveStateValue({ red: 'stop' }),
+           { type: 'TIMER' },
+           actorScope
+         ).value
+@@ -255,7 +255,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+         lightMachine.transition(
+-          lightMachine.resolveState({ value: 'yellow' }),
++          lightMachine.resolveStateValue('yellow'),
+           {
+             type: 'TIMER'
+           },
+@@ -327,7 +327,7 @@ describe('deterministic machine', () => {
+       const actorScope = null as any; // TODO: figure out the simulation API
+ 
+       const walkState = lightMachine.transition(
+-        lightMachine.resolveState({ value: { red: 'walk' } }),
++        lightMachine.resolveStateValue({ red: 'walk' }),
+         { type: 'TIMER' },
+         actorScope
+       );
+diff --git a/packages/core/test/interpreter.test.ts b/packages/core/test/interpreter.test.ts
+index 0538e8c7aa..e0f88c5f4d 100644
+--- a/packages/core/test/interpreter.test.ts
++++ b/packages/core/test/interpreter.test.ts
+@@ -1054,7 +1054,7 @@ describe('interpreter', () => {
+         }
+       });
+       const actor = createActor(machine, {
+-        state: machine.resolveState({ value: 'bar' })
++        state: State.from('bar', undefined, machine)
+       });
+ 
+       expect(actor.getSnapshot().matches('bar')).toBeTruthy();
+@@ -1071,7 +1071,7 @@ describe('interpreter', () => {
+         }
+       });
+       const actor = createActor(machine, {
+-        state: machine.resolveState({ value: 'bar' })
++        state: machine.resolveStateValue('bar')
+       });
+ 
+       expect(actor.getSnapshot().matches('bar')).toBeTruthy();
+@@ -1094,7 +1094,7 @@ describe('interpreter', () => {
+         }
+       });
+       const actor = createActor(machine, {
+-        state: machine.resolveState({ value: 'foo' })
++        state: machine.resolveStateValue('foo')
+       });
+ 
+       expect(actor.getSnapshot().matches({ foo: 'one' })).toBeTruthy();
+diff --git a/packages/core/test/invalid.test.ts b/packages/core/test/invalid.test.ts
+index 8813657b00..5b993d0264 100644
+--- a/packages/core/test/invalid.test.ts
++++ b/packages/core/test/invalid.test.ts
+@@ -23,7 +23,7 @@ describe('invalid or resolved states', () => {
+     });
+     expect(
+       machine.transition(
+-        machine.resolveState({ value: 'A' }),
++        machine.resolveStateValue('A'),
+         { type: 'E' },
+         {} as any // TODO: figure out the simulation API
+       ).value
+@@ -55,7 +55,7 @@ describe('invalid or resolved states', () => {
+     });
+     expect(
+       machine.transition(
+-        machine.resolveState({ value: { A: {}, B: {} } }),
++        machine.resolveStateValue({ A: {}, B: {} }),
+         { type: 'E' },
+         {} as any // TODO: figure out the simulation API
+       ).value
+@@ -86,7 +86,7 @@ describe('invalid or resolved states', () => {
+       }
+     });
+     machine.transition(
+-      machine.resolveState({ value: { A: 'A1', B: 'B1' } }),
++      machine.resolveStateValue({ A: 'A1', B: 'B1' }),
+       { type: 'E' },
+       {} as any // TODO: figure out the simulation API
+     );
+@@ -114,7 +114,7 @@ describe('invalid or resolved states', () => {
+     });
+     expect(() =>
+       machine.transition(
+-        machine.resolveState({ value: { A: 'A3', B: 'B3' } }),
++        machine.resolveStateValue({ A: 'A3', B: 'B3' }),
+         { type: 'E' },
+         {} as any // TODO: figure out the simulation API
+       )
+@@ -143,7 +143,7 @@ describe('invalid or resolved states', () => {
+     });
+     expect(
+       machine.transition(
+-        machine.resolveState({ value: { A: 'A1', B: {} } }),
++        machine.resolveStateValue({ A: 'A1', B: {} }),
+         { type: 'E' },
+         {} as any // TODO: figure out the simulation API
+       ).value
+diff --git a/packages/core/test/machine.test.ts b/packages/core/test/machine.test.ts
+index 81fc43bb6b..98e2403a31 100644
+--- a/packages/core/test/machine.test.ts
++++ b/packages/core/test/machine.test.ts
+@@ -242,7 +242,7 @@ describe('machine', () => {
+     });
+   });
+ 
+-  describe('machine.resolveStateValue()', () => {
++  describe('machine.resolveState()', () => {
+     const resolveMachine = createMachine({
+       id: 'resolve',
+       initial: 'foo',
+@@ -283,7 +283,9 @@ describe('machine', () => {
+     });
+ 
+     it('should resolve the state value', () => {
+-      const resolvedState = resolveMachine.resolveState({ value: 'foo' });
++      const tempState = State.from('foo', undefined, resolveMachine);
++
++      const resolvedState = resolveMachine.resolveState(tempState);
+ 
+       expect(resolvedState.value).toEqual({
+         foo: { one: { a: 'aa', b: 'bb' } }
+@@ -291,7 +293,9 @@ describe('machine', () => {
+     });
+ 
+     it('should resolve the state configuration (implicit via events)', () => {
+-      const resolvedState = resolveMachine.resolveState({ value: 'foo' });
++      const tempState = State.from('foo', undefined, resolveMachine);
++
++      const resolvedState = resolveMachine.resolveState(tempState);
+ 
+       expect(resolvedState.nextEvents.sort()).toEqual(['TO_BAR', 'TO_TWO']);
+     });
+@@ -308,11 +312,61 @@ describe('machine', () => {
+           }
+         }
+       });
++      const tempState = State.from('bar', undefined, machine);
+ 
+-      const resolvedState = machine.resolveState({ value: 'bar' });
++      const resolvedState = machine.resolveState(tempState as any);
+ 
+       expect(resolvedState.status).toBe('done');
+     });
++
++    it('should resolve from a state config object', () => {
++      const machine = createMachine({
++        initial: 'foo',
++        states: {
++          foo: {
++            on: { NEXT: 'bar' }
++          },
++          bar: {
++            type: 'final'
++          }
++        }
++      });
++
++      const actorRef = createActor(machine).start();
++      actorRef.send({ type: 'NEXT' });
++      const barState = actorRef.getSnapshot();
++
++      const jsonBarState = JSON.parse(JSON.stringify(barState));
++
++      expect(machine.resolveState(jsonBarState).matches('bar')).toBeTruthy();
++    });
++
++    it('should terminate on a resolved final state', () => {
++      const machine = createMachine({
++        initial: 'foo',
++        states: {
++          foo: {
++            on: { NEXT: 'bar' }
++          },
++          bar: {
++            type: 'final'
++          }
++        }
++      });
++
++      const actorRef = createActor(machine).start();
++      actorRef.send({ type: 'NEXT' });
++      const persistedState = actorRef.getPersistedState();
++
++      const spy = jest.fn();
++      const actorRef2 = createActor(machine, { state: persistedState });
++      actorRef2.subscribe({
++        complete: spy
++      });
++
++      actorRef2.start();
++      expect(spy).toHaveBeenCalled();
++    });
+   });
+ 
+   describe('initial state', () => {
+diff --git a/packages/core/test/meta.test.ts b/packages/core/test/meta.test.ts
+index 776d92e5df..98c24fcda4 100644
+--- a/packages/core/test/meta.test.ts
++++ b/packages/core/test/meta.test.ts
+@@ -125,7 +125,7 @@ describe('state meta data', () => {
+     });
+ 
+     const actor = createActor(machine, {
+-      state: machine.resolveState({ value: 'second' })
++      state: machine.resolveStateValue('second')
+     });
+     actor.start();
+ 
+diff --git a/packages/core/test/microstep.test.ts b/packages/core/test/microstep.test.ts
+index a18a367d3a..f81622258d 100644
+--- a/packages/core/test/microstep.test.ts
++++ b/packages/core/test/microstep.test.ts
+@@ -58,7 +58,7 @@ describe('machine.microstep()', () => {
+ 
+     const actorScope = null as any; // TODO: figure out the simulation API
+     const states = machine.microstep(
+-      machine.resolveState({ value: 'first' }),
++      machine.resolveStateValue('first'),
+       { type: 'TRIGGER' },
+       actorScope
+     );
+@@ -89,7 +89,7 @@ describe('machine.microstep()', () => {
+ 
+     const actorScope = null as any; // TODO: figure out the simulation API
+     const states = machine.microstep(
+-      machine.resolveState({ value: 'first' }),
++      machine.resolveStateValue('first'),
+       { type: 'TRIGGER' },
+       actorScope
+     );
+diff --git a/packages/core/test/rehydration.test.ts b/packages/core/test/rehydration.test.ts
+index a6e8f52202..8ca699842c 100644
+--- a/packages/core/test/rehydration.test.ts
++++ b/packages/core/test/rehydration.test.ts
+@@ -81,7 +81,7 @@ describe('rehydration', () => {
+         }
+       });
+ 
+-      const activeState = machine.resolveState({ value: 'active' });
++      const activeState = machine.resolveStateValue('active');
+       const service = createActor(machine, {
+         state: activeState
+       });
+@@ -107,7 +107,7 @@ describe('rehydration', () => {
+       });
+ 
+       createActor(machine, {
+-        state: machine.resolveState({ value: 'active' })
++        state: machine.resolveStateValue('active')
+       })
+         .start()
+         .stop();
+@@ -288,31 +288,4 @@ describe('rehydration', () => {
+     expect(Object.keys(persistedChildren).length).toBe(1);
+     expect((Object.values(persistedChildren)[0] as any).src).toBe('foo');
+   });
+-
+-  it('should complete on a rehydrated final state', () => {
+-    const machine = createMachine({
+-      initial: 'foo',
+-      states: {
+-        foo: {
+-          on: { NEXT: 'bar' }
+-        },
+-        bar: {
+-          type: 'final'
+-        }
+-      }
+-    });
+-
+-    const actorRef = createActor(machine).start();
+-    actorRef.send({ type: 'NEXT' });
+-    const persistedState = actorRef.getPersistedState();
+-
+-    const spy = jest.fn();
+-    const actorRef2 = createActor(machine, { state: persistedState });
+-    actorRef2.subscribe({
+-      complete: spy
+-    });
+-
+-    actorRef2.start();
+-    expect(spy).toHaveBeenCalled();
+-  });
+ });
+diff --git a/packages/core/test/state.test.ts b/packages/core/test/state.test.ts
+index 69b6fd6a66..3921f53694 100644
+--- a/packages/core/test/state.test.ts
++++ b/packages/core/test/state.test.ts
+@@ -176,6 +176,41 @@ describe('State', () => {
+     });
+   });
+ 
++  describe('machine.createState()', () => {
++    it('should be able to create a state from a JSON config', () => {
++      const initialState = createActor(exampleMachine).getSnapshot();
++      const jsonInitialState = JSON.parse(JSON.stringify(initialState));
++
++      const stateFromConfig = exampleMachine.createState(jsonInitialState);
++
++      const actorRef = createActor(exampleMachine, {
++        state: stateFromConfig
++      }).start();
++
++      actorRef.send({
++        type: 'TO_TWO',
++        foo: 'test'
++      });
++
++      expect(actorRef.getSnapshot().value).toEqual({
++        two: { deep: 'foo' }
++      });
++    });
++
++    it('should preserve state.nextEvents using machine.resolveState', () => {
++      const actorRef = createActor(exampleMachine);
++      const initialState = actorRef.getSnapshot();
++      const { nextEvents } = initialState;
++      const jsonInitialState = JSON.parse(JSON.stringify(initialState));
++
++      const stateFromConfig = exampleMachine.createState(jsonInitialState);
++
++      expect(
++        exampleMachine.resolveState(stateFromConfig).nextEvents.sort()
++      ).toEqual(nextEvents.sort());
++    });
++  });
++
+   describe('State.prototype.matches', () => {
+     it('should keep reference to state instance after destructuring', () => {
+       const { matches } = createActor(exampleMachine).getSnapshot();
+@@ -566,11 +601,9 @@ describe('State', () => {
+       });
+ 
+       const actorRef = createActor(machine).start();
+-      const persistedState = actorRef.getPersistedState();
++      const persistedState = JSON.stringify(actorRef.getPersistedState());
+       actorRef.stop();
+-      const restoredSnapshot = createActor(machine, {
+-        state: persistedState
+-      }).getSnapshot();
++      const restoredSnapshot = machine.createState(JSON.parse(persistedState));
+ 
+       expect(restoredSnapshot.hasTag('foo')).toBe(true);
+     });
+diff --git a/packages/core/test/utils.ts b/packages/core/test/utils.ts
+index 943cb3e885..c9057ca429 100644
+--- a/packages/core/test/utils.ts
++++ b/packages/core/test/utils.ts
+@@ -11,8 +11,8 @@ const resolveSerializedStateValue = (
+   serialized: string
+ ) =>
+   serialized[0] === '{'
+-    ? machine.resolveState({ value: JSON.parse(serialized), context: {} })
+-    : machine.resolveState({ value: serialized, context: {} });
++    ? machine.resolveStateValue(JSON.parse(serialized), {})
++    : machine.resolveStateValue(serialized, {});
+ 
+ export function testMultiTransition(
+   machine: AnyStateMachine,
+diff --git a/packages/xstate-graph/test/graph.test.ts b/packages/xstate-graph/test/graph.test.ts
+index 4c0f6d07d5..d0ecddb870 100644
+--- a/packages/xstate-graph/test/graph.test.ts
++++ b/packages/xstate-graph/test/graph.test.ts
+@@ -477,7 +477,9 @@ describe('@xstate/graph', () => {
+ 
+     it('should return a path from a specified from-state', () => {
+       const path = getPathsFromEvents(lightMachine, [{ type: 'TIMER' }], {
+-        fromState: lightMachine.resolveState({ value: 'yellow' })
++        fromState: lightMachine.resolveState(
++          lightMachine.resolveStateValue('yellow')
++        )
+       })[0];
+ 
+       expect(path).toBeDefined();
+@@ -655,7 +657,7 @@ it.each([getShortestPaths, getSimplePaths])(
+     });
+ 
+     const paths = pathGetter(machine, {
+-      fromState: machine.resolveState({ value: 'b' })
++      fromState: machine.resolveState(machine.resolveStateValue('b'))
+     });
+ 
+     // Instead of taking 2 steps to reach state 'b' (A, B),

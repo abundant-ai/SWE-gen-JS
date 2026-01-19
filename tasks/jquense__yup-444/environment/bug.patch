@@ -1,0 +1,256 @@
+diff --git a/README.md b/README.md
+index 7b9d6f3..ec15a98 100644
+--- a/README.md
++++ b/README.md
+@@ -56,6 +56,7 @@ json separate from validating it, via the `cast` method.
+     - [`mixed.transform((currentValue: any, originalValue: any) => any): Schema`](#mixedtransformcurrentvalue-any-originalvalue-any--any-schema)
+   - [string](#string)
+     - [`string.required(message?: string | function): Schema`](#stringrequiredmessage-string--function-schema)
++    - [`string.length(limit: number | Ref, message?: string | function): Schema`](#stringlengthlimit-number--ref-message-string--function-schema)
+     - [`string.min(limit: number | Ref, message?: string | function): Schema`](#stringminlimit-number--ref-message-string--function-schema)
+     - [`string.max(limit: number | Ref, message?: string | function): Schema`](#stringmaxlimit-number--ref-message-string--function-schema)
+     - [`string.matches(regex: Regex, message?: string | function): Schema`](#stringmatchesregex-regex-message-string--function-schema)
+@@ -523,7 +524,7 @@ object()
+ Sets a default value to use when the value is `undefined`.
+ Defaults are created after transformations are executed, but before validations, to help ensure that safe
+ defaults are specified. The default value will be cloned on each use, which can incur performance penalty
+-for objects and arrays. To avoid this overhead you can also pass a function that returns an new default.
++for objects and arrays. To avoid this overhead you can also pass a function that returns a new default.
+ Note that `null` is considered a separate non-empty value.
+ 
+ ```js
+@@ -778,13 +779,17 @@ Failed casts return the input value.
+ 
+ The same as the `mixed()` schema required, except that empty strings are also considered 'missing' values.
+ 
++#### `string.length(limit: number | Ref, message?: string | function): Schema`
++
++Set a required length for the string value. The `${length}` interpolation can be used in the `message` argument
++
+ #### `string.min(limit: number | Ref, message?: string | function): Schema`
+ 
+-Set an minimum length limit for the string value. The `${min}` interpolation can be used in the `message` argument
++Set a minimum length limit for the string value. The `${min}` interpolation can be used in the `message` argument
+ 
+ #### `string.max(limit: number | Ref, message?: string | function): Schema`
+ 
+-Set an maximum length limit for the string value. The `${max}` interpolation can be used in the `message` argument
++Set a maximum length limit for the string value. The `${max}` interpolation can be used in the `message` argument
+ 
+ #### `string.matches(regex: Regex, message?: string | function): Schema`
+ 
+@@ -966,11 +971,11 @@ The same as the `mixed()` schema required, except that empty arrays are also con
+ 
+ #### `array.min(limit: number | Ref, message?: string | function): Schema`
+ 
+-Set an minimum length limit for the array. The `${min}` interpolation can be used in the `message` argument.
++Set a minimum length limit for the array. The `${min}` interpolation can be used in the `message` argument.
+ 
+ #### `array.max(limit: number | Ref, message?: string | function): Schema`
+ 
+-Set an maximum length limit for the array. The `${max}` interpolation can be used in the `message` argument.
++Set a maximum length limit for the array. The `${max}` interpolation can be used in the `message` argument.
+ 
+ #### `array.ensure(): Schema`
+ 
+diff --git a/src/mixed.js b/src/mixed.js
+index 540057e..ac45454 100644
+--- a/src/mixed.js
++++ b/src/mixed.js
+@@ -5,7 +5,7 @@ import toArray from 'lodash/toArray';
+ import { mixed as locale } from './locale';
+ import Condition from './Condition';
+ import runValidations from './util/runValidations';
+-import prependDeep from './util/prependDeep';
++import merge from './util/merge';
+ import isSchema from './util/isSchema';
+ import isAbsent from './util/isAbsent';
+ import createValidation from './util/createValidation';
+@@ -103,7 +103,7 @@ const proto = (SchemaType.prototype = {
+   },
+ 
+   concat(schema) {
+-    if (!schema || schema === this) return this;
++    if (!schema) return this;
+ 
+     if (schema._type !== this._type && this._type !== 'mixed')
+       throw new TypeError(
+@@ -111,14 +111,14 @@ const proto = (SchemaType.prototype = {
+           this._type
+         } and ${schema._type}`,
+       );
++    var cloned = this.clone();
++    var next = merge(this.clone(), schema.clone());
+ 
+-    var next = prependDeep(schema.clone(), this);
+-
+-    // new undefined default is overriden by old non-undefined one, revert
++    // undefined isn't merged over, but is a valid value for default
+     if (has(schema, '_default')) next._default = schema._default;
+ 
+-    next.tests = this.tests;
+-    next._exclusive = this._exclusive;
++    next.tests = cloned.tests;
++    next._exclusive = cloned._exclusive;
+ 
+     // manually add the new tests to ensure
+     // the deduping logic is consistent
+@@ -126,6 +126,8 @@ const proto = (SchemaType.prototype = {
+       next = next.test(fn.OPTIONS);
+     });
+ 
++    next._type = schema._type;
++
+     return next;
+   },
+ 
+diff --git a/src/util/merge.js b/src/util/merge.js
+new file mode 100644
+index 0000000..79ab8a2
+--- /dev/null
++++ b/src/util/merge.js
+@@ -0,0 +1,30 @@
++import has from 'lodash/has';
++import isSchema from './isSchema';
++
++let isObject = obj => Object.prototype.toString.call(obj) === '[object Object]';
++
++export default function merge(target, source) {
++  for (var key in source)
++    if (has(source, key)) {
++      var targetVal = target[key],
++        sourceVal = source[key];
++
++      if (sourceVal === undefined) continue;
++
++      if (isSchema(sourceVal)) {
++        target[key] = isSchema(targetVal)
++          ? targetVal.concat(sourceVal)
++          : sourceVal;
++      } else if (isObject(sourceVal)) {
++        target[key] = isObject(targetVal)
++          ? merge(targetVal, sourceVal)
++          : sourceVal;
++      } else if (Array.isArray(sourceVal)) {
++        target[key] = Array.isArray(targetVal)
++          ? targetVal.concat(sourceVal)
++          : sourceVal;
++      } else target[key] = source[key];
++    }
++
++  return target;
++}
+diff --git a/src/util/prependDeep.js b/src/util/prependDeep.js
+deleted file mode 100644
+index 6d00e75..0000000
+--- a/src/util/prependDeep.js
++++ /dev/null
+@@ -1,27 +0,0 @@
+-import has from 'lodash/has';
+-import isSchema from './isSchema';
+-
+-let isObject = obj => Object.prototype.toString.call(obj) === '[object Object]';
+-
+-export default function prependDeep(target, source) {
+-  for (var key in source)
+-    if (has(source, key)) {
+-      var sourceVal = source[key],
+-        targetVal = target[key];
+-
+-      if (targetVal === undefined) {
+-        target[key] = sourceVal;
+-      } else if (targetVal === sourceVal) {
+-        continue;
+-      } else if (isSchema(targetVal)) {
+-        if (isSchema(sourceVal)) target[key] = sourceVal.concat(targetVal);
+-      } else if (isObject(targetVal)) {
+-        if (isObject(sourceVal))
+-          target[key] = prependDeep(targetVal, sourceVal);
+-      } else if (Array.isArray(targetVal)) {
+-        if (Array.isArray(sourceVal)) target[key] = sourceVal.concat(targetVal);
+-      }
+-    }
+-
+-  return target;
+-}
+diff --git a/test/mixed.js b/test/mixed.js
+index a71efe8..153f79e 100644
+--- a/test/mixed.js
++++ b/test/mixed.js
+@@ -1,15 +1,4 @@
+-import {
+-  array,
+-  mixed,
+-  string,
+-  number,
+-  object,
+-  ref,
+-  reach,
+-  bool,
+-  ValidationError,
+-} from '../src';
+-
++import { array, mixed, string, number, object, ref, reach, bool } from '../src';
+ let noop = () => {};
+ 
+ function ensureSync(fn) {
+@@ -596,14 +585,6 @@ describe('Mixed Types ', () => {
+     }.should.not.throw(TypeError));
+   });
+ 
+-  it('concat should validate with mixed and other type', async function() {
+-    let inst = mixed().concat(number());
+-
+-    await inst
+-      .validate([])
+-      .should.be.rejected(ValidationError, /should be a `number`/);
+-  });
+-
+   it('concat should maintain undefined defaults', function() {
+     let inst = string().default('hi');
+ 
+diff --git a/test/yup.js b/test/yup.js
+index 9ec8d51..51f54e5 100644
+--- a/test/yup.js
++++ b/test/yup.js
+@@ -1,5 +1,5 @@
+ import reach, { getIn } from '../src/util/reach';
+-import prependDeep from '../src/util/prependDeep';
++import merge from '../src/util/merge';
+ import { settled } from '../src/util/runValidations';
+ 
+ import { object, array, string, lazy, number } from '../src';
+@@ -36,11 +36,11 @@ describe('Yup', function() {
+     ]);
+   });
+ 
+-  it('should prepend deeply', function() {
+-    var a = { a: 4, c: [4, 5, 3], d: { b: 'hello' }, f: { c: 5 }, g: null };
+-    var b = { a: 1, b: 'hello', c: [1, 2, 3], d: { a: /hi/ }, e: { b: 5 } };
++  it('should merge', function() {
++    var a = { a: 1, b: 'hello', c: [1, 2, 3], d: { a: /hi/ }, e: { b: 5 } };
++    var b = { a: 4, c: [4, 5, 3], d: { b: 'hello' }, f: { c: 5 }, g: null };
+ 
+-    prependDeep(a, b).should.deep.eql({
++    merge(a, b).should.deep.eql({
+       a: 4,
+       b: 'hello',
+       c: [1, 2, 3, 4, 5, 3],
+@@ -54,17 +54,6 @@ describe('Yup', function() {
+     });
+   });
+ 
+-  it('should not prepend needlesly', function() {
+-    var schema = string();
+-    var spy = sinon.spy(schema, 'concat');
+-    var a = { schema };
+-    var b = { schema };
+-    var c = prependDeep(a, b);
+-
+-    c.schema.should.equal(schema);
+-    spy.should.not.have.been.called();
+-  });
+-
+   it('should getIn correctly', async () => {
+     var num = number(),
+       inst = object().shape({

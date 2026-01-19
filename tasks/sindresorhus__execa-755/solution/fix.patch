@@ -1,0 +1,143 @@
+diff --git a/lib/stdio/duplex.js b/lib/stdio/duplex.js
+deleted file mode 100644
+index 550751e..0000000
+--- a/lib/stdio/duplex.js
++++ /dev/null
+@@ -1,59 +0,0 @@
+-import {Duplex, Readable, PassThrough, getDefaultHighWaterMark} from 'node:stream';
+-
+-/*
+-Transform an array of generator functions into a `Duplex`.
+-
+-The `Duplex` is created by `Duplex.from()` made of a writable stream and a readable stream, piped to each other.
+-- The writable stream is a simple `PassThrough`, so it only forwards data to the readable part.
+-- The `PassThrough` is read as an iterable using `passThrough.iterator()`.
+-- This iterable is transformed to another iterable, by applying the encoding generators.
+-	Those convert the chunk type from `Buffer` to `string | Uint8Array` depending on the encoding option.
+-- This new iterable is transformed again to another one, this time by applying the user-supplied generator.
+-- Finally, `Readable.from()` is used to convert this final iterable to a `Readable` stream.
+-*/
+-export const generatorsToDuplex = (generators, {writableObjectMode, readableObjectMode}) => {
+-	const passThrough = new PassThrough({
+-		objectMode: writableObjectMode,
+-		highWaterMark: getDefaultHighWaterMark(writableObjectMode),
+-		destroy: destroyPassThrough,
+-	});
+-	let iterable = passThrough.iterator();
+-
+-	for (const generator of generators) {
+-		iterable = applyGenerator(generator, iterable);
+-	}
+-
+-	const readableStream = Readable.from(iterable, {
+-		objectMode: readableObjectMode,
+-		highWaterMark: getDefaultHighWaterMark(readableObjectMode),
+-	});
+-	const duplexStream = Duplex.from({writable: passThrough, readable: readableStream});
+-	return duplexStream;
+-};
+-
+-const applyGenerator = async function * ({transform, final}, chunks) {
+-	for await (const chunk of chunks) {
+-		yield * transform(chunk);
+-	}
+-
+-	if (final !== undefined) {
+-		yield * final();
+-	}
+-};
+-
+-/*
+-When an error is thrown in a generator, the PassThrough is aborted.
+-
+-This creates a race condition for which error is propagated, due to the Duplex throwing twice:
+-- The writable side is aborted (PassThrough)
+-- The readable side propagate the generator's error
+-
+-In order for the later to win that race, we need to wait one microtask.
+-- However we wait one macrotask instead to be on the safe side
+-- See https://github.com/sindresorhus/execa/pull/693#discussion_r1453809450
+-*/
+-const destroyPassThrough = (error, done) => {
+-	setImmediate(() => {
+-		done(error);
+-	});
+-};
+diff --git a/lib/stdio/generator.js b/lib/stdio/generator.js
+index 4d04704..aa8b2a8 100644
+--- a/lib/stdio/generator.js
++++ b/lib/stdio/generator.js
+@@ -1,4 +1,4 @@
+-import {generatorsToDuplex} from './duplex.js';
++import {generatorsToTransform} from './transform.js';
+ import {getEncodingStartGenerator} from './encoding.js';
+ import {getLinesGenerator} from './lines.js';
+ import {isGeneratorOptions} from './type.js';
+@@ -77,7 +77,7 @@ export const generatorToDuplexStream = ({
+ 		{transform, final},
+ 		{transform: getValidateTransformReturn(readableObjectMode, optionName)},
+ 	].filter(Boolean);
+-	const duplexStream = generatorsToDuplex(generators, {writableObjectMode, readableObjectMode});
++	const duplexStream = generatorsToTransform(generators, {writableObjectMode, readableObjectMode});
+ 	return {value: duplexStream};
+ };
+ 
+diff --git a/lib/stdio/transform.js b/lib/stdio/transform.js
+new file mode 100644
+index 0000000..67439a2
+--- /dev/null
++++ b/lib/stdio/transform.js
+@@ -0,0 +1,53 @@
++import {Transform, getDefaultHighWaterMark} from 'node:stream';
++import {callbackify} from 'node:util';
++
++// Transform an array of generator functions into a `Transform` stream.
++// `Duplex.from(generator)` cannot be used because it does not allow setting the `objectMode` and `highWaterMark`.
++export const generatorsToTransform = (generators, {writableObjectMode, readableObjectMode}) => new Transform({
++	writableObjectMode,
++	writableHighWaterMark: getDefaultHighWaterMark(writableObjectMode),
++	readableObjectMode,
++	readableHighWaterMark: getDefaultHighWaterMark(readableObjectMode),
++	transform(chunk, encoding, done) {
++		pushChunks(transformChunk.bind(undefined, chunk, generators, 0), this, done);
++	},
++	flush(done) {
++		pushChunks(finalChunks.bind(undefined, generators), this, done);
++	},
++});
++
++const pushChunks = callbackify(async (getChunks, transformStream) => {
++	for await (const chunk of getChunks()) {
++		transformStream.push(chunk);
++	}
++});
++
++// For each new chunk, apply each `transform()` method
++const transformChunk = async function * (chunk, generators, index) {
++	if (index === generators.length) {
++		yield chunk;
++		return;
++	}
++
++	const {transform} = generators[index];
++	for await (const transformedChunk of transform(chunk)) {
++		yield * transformChunk(transformedChunk, generators, index + 1);
++	}
++};
++
++// At the end, apply each `final()` method, followed by the `transform()` method of the next transforms
++const finalChunks = async function * (generators) {
++	for (const [index, {final}] of Object.entries(generators)) {
++		yield * generatorFinalChunks(final, Number(index), generators);
++	}
++};
++
++const generatorFinalChunks = async function * (final, index, generators) {
++	if (final === undefined) {
++		return;
++	}
++
++	for await (const finalChunk of final()) {
++		yield * transformChunk(finalChunk, generators, index + 1);
++	}
++};

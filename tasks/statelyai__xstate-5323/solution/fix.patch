@@ -1,0 +1,174 @@
+diff --git a/.changeset/proud-bananas-do.md b/.changeset/proud-bananas-do.md
+new file mode 100644
+index 0000000000..a719a87afa
+--- /dev/null
++++ b/.changeset/proud-bananas-do.md
+@@ -0,0 +1,30 @@
++---
++'@xstate/store': minor
++---
++
++Added support for effect-only transitions that don't trigger state updates. Now, when a transition returns the same state but includes effects, subscribers won't be notified of a state change, but the effects will still be executed. This helps prevent unnecessary re-renders while maintaining side effect functionality.
++
++```ts
++it('should not trigger update if the snapshot is the same even if there are effects', () => {
++  const store = createStore({
++    context: { count: 0 },
++    on: {
++      doNothing: (ctx, _, enq) => {
++        enq.effect(() => {
++          // …
++        });
++        return ctx; // Context is the same, so no update is triggered
++        // This is the same as not returning anything (void)
++      }
++    }
++  });
++
++  const spy = vi.fn();
++  store.subscribe(spy);
++
++  store.trigger.doNothing();
++  store.trigger.doNothing();
++
++  expect(spy).toHaveBeenCalledTimes(0);
++});
++```
+diff --git a/packages/xstate-store/src/store.ts b/packages/xstate-store/src/store.ts
+index f620b0f0eb..1836b14e77 100644
+--- a/packages/xstate-store/src/store.ts
++++ b/packages/xstate-store/src/store.ts
+@@ -7,7 +7,6 @@ import {
+   ExtractEvents,
+   InteropSubscribable,
+   Observer,
+-  Recipe,
+   Store,
+   StoreAssigner,
+   StoreContext,
+@@ -29,20 +28,6 @@ const symbolObservable: typeof Symbol.observable = (() =>
+   (typeof Symbol === 'function' && Symbol.observable) ||
+   '@@observable')() as any;
+ 
+-/**
+- * Updates a context object using a recipe function.
+- *
+- * @param context - The current context
+- * @param recipe - A function that describes how to update the context
+- * @returns The updated context
+- */
+-function setter<TContext extends StoreContext>(
+-  context: TContext,
+-  recipe: Recipe<TContext, TContext>
+-): TContext {
+-  return recipe(context);
+-}
+-
+ const inspectionObservers = new WeakMap<
+   Store<any, any, any>,
+   Set<Observer<StoreInspectionEvent>>
+@@ -77,20 +62,20 @@ function createStoreCore<
+   const transition = logic.transition;
+ 
+   function receive(event: StoreEvent) {
+-    let effects: StoreEffect<TEmitted>[];
+-    [currentSnapshot, effects] = transition(currentSnapshot, event);
++    const [nextSnapshot, effects] = transition(currentSnapshot, event);
++    currentSnapshot = nextSnapshot;
+ 
+     inspectionObservers.get(store)?.forEach((observer) => {
+       observer.next?.({
+         type: '@xstate.snapshot',
+         event,
+-        snapshot: currentSnapshot,
++        snapshot: nextSnapshot,
+         actorRef: store,
+         rootId: store.sessionId
+       });
+     });
+ 
+-    atom.set(currentSnapshot);
++    atom.set(nextSnapshot);
+ 
+     for (const effect of effects) {
+       if (typeof effect === 'function') {
+@@ -422,7 +407,7 @@ export function createStoreTransition<
+     event: ExtractEvents<TEventPayloadMap>
+   ): [StoreSnapshot<TContext>, StoreEffect<TEmitted>[]] => {
+     type StoreEvent = ExtractEvents<TEventPayloadMap>;
+-    let currentContext = snapshot.context;
++    const currentContext = snapshot.context;
+     const assigner = transitions?.[event.type as StoreEvent['type']];
+     const effects: StoreEffect<TEmitted>[] = [];
+ 
+@@ -446,43 +431,22 @@ export function createStoreTransition<
+       return [snapshot, effects];
+     }
+ 
+-    if (typeof assigner === 'function') {
+-      currentContext = producer
+-        ? producer(currentContext, (draftContext) =>
+-            (assigner as StoreProducerAssigner<TContext, StoreEvent, TEmitted>)(
+-              draftContext,
+-              event,
+-              enqueue
+-            )
++    const nextContext = producer
++      ? producer(currentContext, (draftContext) =>
++          (assigner as StoreProducerAssigner<TContext, StoreEvent, TEmitted>)(
++            draftContext,
++            event,
++            enqueue
+           )
+-        : setter(currentContext, (draftContext) =>
+-            Object.assign(
+-              {},
+-              currentContext,
+-              assigner?.(
+-                draftContext,
+-                event as any, // TODO: help me
+-                enqueue
+-              )
+-            )
+-          );
+-    } else {
+-      const partialUpdate: Record<string, unknown> = {};
+-      for (const key of Object.keys(assigner)) {
+-        const propAssignment = assigner[key];
+-        partialUpdate[key] =
+-          typeof propAssignment === 'function'
+-            ? (propAssignment as StoreAssigner<TContext, StoreEvent, TEmitted>)(
+-                currentContext,
+-                event,
+-                enqueue
+-              )
+-            : propAssignment;
+-      }
+-      currentContext = Object.assign({}, currentContext, partialUpdate);
+-    }
++        )
++      : (assigner(currentContext, event as any, enqueue) ?? currentContext);
+ 
+-    return [{ ...snapshot, context: currentContext }, effects];
++    return [
++      nextContext === currentContext
++        ? snapshot
++        : { ...snapshot, context: nextContext },
++      effects
++    ];
+   };
+ }
+ 
+diff --git a/packages/xstate-store/src/types.ts b/packages/xstate-store/src/types.ts
+index 017b75c2ff..df7c45d65e 100644
+--- a/packages/xstate-store/src/types.ts
++++ b/packages/xstate-store/src/types.ts
+@@ -6,8 +6,6 @@ export type ExtractEvents<T extends EventPayloadMap> = Values<{
+   [K in keyof T & string]: T[K] & { type: K };
+ }>;
+ 
+-export type Recipe<T, TReturn> = (state: T) => TReturn;
+-
+ type AllKeys<T> = T extends any ? keyof T : never;
+ 
+ type EmitterFunction<TEmittedEvent extends EventObject> = (

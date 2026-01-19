@@ -1,0 +1,150 @@
+diff --git a/readme.md b/readme.md
+index 4d296f0..92a4499 100644
+--- a/readme.md
++++ b/readme.md
+@@ -333,6 +333,47 @@ The generated patches are similar (but not the same) to the [RFC-6902 JSON patch
+ ]
+ ```
+ 
++### `produceWithPatches`
++
++Instead of setting up a patch listener, an easier way to obtain the patches is to use `produceWithPatches`, which has the same signature as `produce`, except that it doesn't return just the next state, but a tuple consisting of `[nextState, patches, inversePatches]`. Like `produce`, `produceWithPatches` supports currying as well.
++
++```javascript
++import {produceWithPatches} from "immer"
++
++const [nextState, patches, inversePatches] = produceWithPatches(
++	{
++		age: 33
++	},
++	draft => {
++		draft.age++
++	}
++)
++```
++
++Which produces:
++
++```javascript
++;[
++	{
++		age: 34
++	},
++	[
++		{
++			op: "replace",
++			path: ["age"],
++			value: 34
++		}
++	],
++	[
++		{
++			op: "replace",
++			path: ["age"],
++			value: 33
++		}
++	]
++]
++```
++
+ For a more in-depth study, see [Distributing patches and rebasing actions using Immer](https://medium.com/@mweststrate/distributing-state-changes-using-snapshots-patches-and-actions-part-2-2f50d8363988)
+ 
+ Tip: Check this trick to [compress patches](https://medium.com/@david.b.edelstein/using-immer-to-compress-immer-patches-f382835b6c69) produced over time.
+diff --git a/src/immer.d.ts b/src/immer.d.ts
+index a3f5fff..8f1c9c8 100644
+--- a/src/immer.d.ts
++++ b/src/immer.d.ts
+@@ -109,6 +109,49 @@ export interface IProduce {
+ export const produce: IProduce
+ export default produce
+ 
++/**
++ * Like `produce`, but instead of just returning the new state,
++ * a tuple is returned with [nextState, patches, inversePatches]
++ *
++ * Like produce, this function supports currying
++ */
++export interface IProduceWithPatches {
++	/** Curried producer */
++	<
++		Recipe extends (...args: any[]) => any,
++		Params extends any[] = Parameters<Recipe>,
++		T = Params[0]
++	>(
++		recipe: Recipe
++	): <Base extends Immutable<T>>(
++		base: Base,
++		...rest: Tail<Params>
++	) => [Produced<Base, ReturnType<Recipe>>, Patch[], Patch[]]
++	//   ^ by making the returned type generic, the actual type of the passed in object is preferred
++	//     over the type used in the recipe. However, it does have to satisfy the immutable version used in the recipe
++	//     Note: the type of S is the widened version of T, so it can have more props than T, but that is technically actually correct!
++
++	/** Curried producer with initial state */
++	<
++		Recipe extends (...args: any[]) => any,
++		Params extends any[] = Parameters<Recipe>,
++		T = Params[0]
++	>(
++		recipe: Recipe,
++		initialState: Immutable<T>
++	): <Base extends Immutable<T>>(
++		base?: Base,
++		...rest: Tail<Params>
++	) => [Produced<Base, ReturnType<Recipe>>, Patch[], Patch[]]
++
++	/** Normal producer */
++	<Base, D = Draft<Base>, Return = void>(
++		base: Base,
++		recipe: (draft: D) => Return
++	): [Produced<Base, Return>, Patch[], Patch[]]
++}
++export const produceWithPatches: IProduceWithPatches
++
+ /** Use a class type for `nothing` so its type is unique */
+ declare class Nothing {
+ 	// This lets us do `Exclude<T, Nothing>`
+diff --git a/src/immer.js b/src/immer.js
+index f0c7a89..2159bbc 100644
+--- a/src/immer.js
++++ b/src/immer.js
+@@ -91,6 +91,22 @@ export class Immer {
+ 			return result !== NOTHING ? result : undefined
+ 		}
+ 	}
++	produceWithPatches(arg1, arg2, arg3) {
++		if (typeof arg1 === "function") {
++			const self = this
++			return (state, ...args) =>
++				this.produceWithPatches(state, draft => arg1(draft, ...args))
++		}
++		// non-curried form
++		if (arg3)
++			throw new Error("A patch listener cannot be passed to produceWithPatches")
++		let patches, inversePatches
++		const nextState = this.produce(arg1, arg2, (p, ip) => {
++			patches = p
++			inversePatches = ip
++		})
++		return [nextState, patches, inversePatches]
++	}
+ 	createDraft(base) {
+ 		if (!isDraftable(base)) {
+ 			throw new Error("First argument to `createDraft` must be a plain object, an array, or an immerable object") // prettier-ignore
+diff --git a/src/index.js b/src/index.js
+index 0d170ff..52cd323 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -24,6 +24,12 @@ const immer = new Immer()
+ export const produce = immer.produce
+ export default produce
+ 
++/**
++ * Like `produce`, but `produceWithPatches` always returns a tuple
++ * [nextState, patches, inversePatches] (instead of just the next state)
++ */
++export const produceWithPatches = immer.produceWithPatches.bind(immer)
++
+ /**
+  * Pass true to automatically freeze all copies created by Immer.
+  *

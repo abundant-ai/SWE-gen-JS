@@ -1,0 +1,743 @@
+diff --git a/.changeset/light-spiders-attend.md b/.changeset/light-spiders-attend.md
+deleted file mode 100644
+index 778204cbce..0000000000
+--- a/.changeset/light-spiders-attend.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-"xstate": patch
+----
+-
+-Remove `State['changed']`. A new instance of `State` is being created if there are matching transitions for the received event. If there are no matching transitions then the current state is being returned.
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index 5a53ede5b1..1e1c17717a 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -56,6 +56,15 @@ export class State<
+   public historyValue: Readonly<HistoryValue<TContext, TEvent>> = {};
+   public _internalQueue: Array<TEvent>;
+   public _initial: boolean = false;
++  /**
++   * Indicates whether the state has changed from the previous state. A state is considered "changed" if:
++   *
++   * - Its value is not equal to its previous value, or:
++   * - It has any new actions (side-effects) to execute.
++   *
++   * An initial state (with no history) will return `undefined`.
++   */
++  public changed: boolean | undefined;
+   /**
+    * The enabled state nodes representative of the state value.
+    */
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index b793831a5b..a56ae32dee 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -292,7 +292,7 @@ export class StateMachine<
+     preInitial._initial = true;
+ 
+     if (actorCtx) {
+-      const nextState = resolveActionsAndContext(
++      const [nextState] = resolveActionsAndContext(
+         actions,
+         initEvent as TEvent,
+         preInitial,
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index e82fd6f537..e414329342 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1039,10 +1039,13 @@ export function microstep<
+   const mutConfiguration = new Set(currentState.configuration);
+ 
+   if (!currentState._initial && !willTransition) {
+-    return currentState;
++    const inertState = cloneState(currentState, {});
++
++    inertState.changed = false;
++    return inertState;
+   }
+ 
+-  const microstate = microstepProcedure(
++  const [microstate, actions] = microstepProcedure(
+     currentState._initial
+       ? [
+           {
+@@ -1061,9 +1064,19 @@ export function microstep<
+     actorCtx
+   );
+ 
+-  return cloneState(microstate, {
++  const { context } = microstate;
++
++  const nextState = cloneState(microstate, {
+     value: {} // TODO: make optional
+   });
++
++  nextState.changed = currentState._initial
++    ? undefined
++    : !stateValuesEqual(nextState.value, currentState.value) ||
++      actions.length > 0 ||
++      context !== currentState.context;
++
++  return nextState;
+ }
+ 
+ function microstepProcedure(
+@@ -1072,7 +1085,7 @@ function microstepProcedure(
+   mutConfiguration: Set<AnyStateNode>,
+   event: AnyEventObject,
+   actorCtx: AnyActorContext
+-): typeof currentState {
++): [typeof currentState, BaseActionObject[]] {
+   const actions: BaseActionObject[] = [];
+   const historyValue = {
+     ...currentState.historyValue
+@@ -1117,7 +1130,7 @@ function microstepProcedure(
+   }
+ 
+   try {
+-    const nextState = resolveActionsAndContext(
++    const [nextState, resolvedActions] = resolveActionsAndContext(
+       actions,
+       event,
+       currentState,
+@@ -1130,15 +1143,18 @@ function microstepProcedure(
+ 
+     internalQueue.push(...nextState._internalQueue);
+ 
+-    return cloneState(currentState, {
+-      configuration: nextConfiguration,
+-      historyValue,
+-      _internalQueue: internalQueue,
+-      context: nextState.context,
+-      done,
+-      output,
+-      children: nextState.children
+-    });
++    return [
++      cloneState(currentState, {
++        configuration: nextConfiguration,
++        historyValue,
++        _internalQueue: internalQueue,
++        context: nextState.context,
++        done,
++        output,
++        children: nextState.children
++      }),
++      resolvedActions
++    ];
+   } catch (e) {
+     // TODO: Refactor this once proper error handling is implemented.
+     // See https://github.com/statelyai/rfcs/pull/4
+@@ -1418,12 +1434,14 @@ export function resolveActionsAndContext<
+   event: TEvent,
+   currentState: State<TContext, TEvent, any>,
+   actorCtx: AnyActorContext | undefined
+-): AnyState {
++): [AnyState, BaseActionObject[]] {
+   const { machine } = currentState;
++  const resolvedActions: BaseActionObject[] = [];
+   const raiseActions: Array<RaiseActionObject<TContext, TEvent>> = [];
+   let intermediateState = currentState;
+ 
+   function handleAction(action: BaseActionObject): void {
++    resolvedActions.push(action);
+     if (actorCtx?.self.status === ActorStatus.Running) {
+       action.execute?.(actorCtx!);
+     } else {
+@@ -1476,9 +1494,12 @@ export function resolveActionsAndContext<
+     resolveAction(actionObject);
+   }
+ 
+-  return cloneState(intermediateState, {
+-    _internalQueue: raiseActions.map((a) => a.params.event)
+-  });
++  return [
++    cloneState(intermediateState, {
++      _internalQueue: raiseActions.map((a) => a.params.event)
++    }),
++    resolvedActions
++  ];
+ }
+ 
+ export function macrostep(
+@@ -1498,7 +1519,7 @@ export function macrostep(
+ 
+   // Handle stop event
+   if (event.type === stopSignalType) {
+-    nextState = stopStep(event, nextState, actorCtx);
++    nextState = stopStep(event, nextState, actorCtx)[0];
+     states.push(nextState);
+ 
+     return {
+diff --git a/packages/core/test/deterministic.test.ts b/packages/core/test/deterministic.test.ts
+index 6d8c0a4a3e..282770cdb1 100644
+--- a/packages/core/test/deterministic.test.ts
++++ b/packages/core/test/deterministic.test.ts
+@@ -87,14 +87,12 @@ describe('deterministic machine', () => {
+ 
+       const actor = interpret(machine).start();
+ 
+-      const previousSnapshot = actor.getSnapshot();
+-
+       actor.send({
+         type: 'FAKE'
+       });
+ 
+       expect(actor.getSnapshot().value).toBe('a');
+-      expect(actor.getSnapshot()).toBe(previousSnapshot);
++      expect(actor.getSnapshot().changed).toBe(false);
+     });
+ 
+     it('should throw an error if not given an event', () => {
+@@ -234,14 +232,12 @@ describe('deterministic machine', () => {
+ 
+       const actor = interpret(machine).start();
+ 
+-      const previousSnapshot = actor.getSnapshot();
+-
+       actor.send({
+         type: 'FAKE'
+       });
+ 
+       expect(actor.getSnapshot().value).toEqual({ a: 'b' });
+-      expect(actor.getSnapshot()).toBe(previousSnapshot);
++      expect(actor.getSnapshot().changed).toBe(false);
+     });
+ 
+     it('should transition to the deepest initial state', () => {
+@@ -258,7 +254,7 @@ describe('deterministic machine', () => {
+       });
+     });
+ 
+-    it('should return the same state if no transition occurs', () => {
++    it('should return the equivalent state if no transition occurs', () => {
+       const initialState = lightMachine.transition(
+         lightMachine.getInitialState(
+           undefined as any // TODO: figure out the simulation API
+@@ -277,7 +273,7 @@ describe('deterministic machine', () => {
+       );
+ 
+       expect(initialState.value).toEqual(nextState.value);
+-      expect(nextState).toBe(initialState);
++      expect(nextState.changed).toBe(false);
+     });
+   });
+ 
+diff --git a/packages/core/test/examples/6.16.test.ts b/packages/core/test/examples/6.16.test.ts
+index 280729cc2c..f836e8873d 100644
+--- a/packages/core/test/examples/6.16.test.ts
++++ b/packages/core/test/examples/6.16.test.ts
+@@ -32,17 +32,17 @@ describe('Example 6.16', () => {
+   });
+ 
+   const expected: Record<string, Record<string, StateValue | undefined>> = {
+-    '{"A":"D","B":"F"}': {
++    '{"A":"D", "B":"F"}': {
+       1: { A: 'C', B: 'E' },
+       2: undefined,
+       '1, 5, 3': { A: 'C', B: 'F' }
+     },
+-    '{"A":"C","B":"E"}': {
++    '{"A":"C", "B":"E"}': {
+       1: undefined,
+       2: { A: 'D', B: 'E' },
+       5: { A: 'C', B: 'G' }
+     },
+-    '{"A":"C","B":"G"}': {
++    '{"A":"C", "B":"G"}': {
+       1: undefined,
+       2: undefined,
+       3: { A: 'C', B: 'F' }
+diff --git a/packages/core/test/interpreter.test.ts b/packages/core/test/interpreter.test.ts
+index dfedf8ee63..cb4f30f150 100644
+--- a/packages/core/test/interpreter.test.ts
++++ b/packages/core/test/interpreter.test.ts
+@@ -458,72 +458,54 @@ describe('interpreter', () => {
+   });
+ 
+   describe('activities (deprecated)', () => {
+-    it('should start activities', () => {
+-      const spy = jest.fn();
++    let activityState = 'off';
+ 
+-      const activityMachine = createMachine(
+-        {
+-          id: 'activity',
+-          initial: 'on',
+-          states: {
++    const activityMachine = createMachine(
++      {
++        id: 'activity',
++        initial: 'on',
++        states: {
++          on: {
++            invoke: 'myActivity',
+             on: {
+-              invoke: 'myActivity',
+-              on: {
+-                TURN_OFF: 'off'
+-              }
+-            },
+-            off: {}
+-          }
+-        },
+-        {
+-          actors: {
+-            myActivity: fromCallback(spy)
+-          }
++              TURN_OFF: 'off'
++            }
++          },
++          off: {}
+         }
+-      );
++      },
++      {
++        actors: {
++          myActivity: fromCallback(() => {
++            activityState = 'on';
++            return () => (activityState = 'off');
++          })
++        }
++      }
++    );
++
++    it('should start activities', () => {
+       const service = interpret(activityMachine);
+ 
+       service.start();
+ 
+-      expect(spy).toHaveBeenCalled();
++      expect(activityState).toEqual('on');
+     });
+ 
+     it('should stop activities', () => {
+-      const spy = jest.fn();
+-
+-      const activityMachine = createMachine(
+-        {
+-          id: 'activity',
+-          initial: 'on',
+-          states: {
+-            on: {
+-              invoke: 'myActivity',
+-              on: {
+-                TURN_OFF: 'off'
+-              }
+-            },
+-            off: {}
+-          }
+-        },
+-        {
+-          actors: {
+-            myActivity: fromCallback(() => spy)
+-          }
+-        }
+-      );
+       const service = interpret(activityMachine);
+ 
+       service.start();
+ 
+-      expect(spy).not.toHaveBeenCalled();
++      expect(activityState).toEqual('on');
+ 
+       service.send({ type: 'TURN_OFF' });
+ 
+-      expect(spy).toHaveBeenCalled();
++      expect(activityState).toEqual('off');
+     });
+ 
+     it('should stop activities upon stopping the service', () => {
+-      const spy = jest.fn();
++      let stopActivityState: string;
+ 
+       const stopActivityMachine = createMachine(
+         {
+@@ -541,18 +523,21 @@ describe('interpreter', () => {
+         },
+         {
+           actors: {
+-            myActivity: fromCallback(() => spy)
++            myActivity: fromCallback(() => {
++              stopActivityState = 'on';
++              return () => (stopActivityState = 'off');
++            })
+           }
+         }
+       );
+ 
+       const stopActivityService = interpret(stopActivityMachine).start();
+ 
+-      expect(spy).not.toHaveBeenCalled();
++      expect(stopActivityState!).toEqual('on');
+ 
+       stopActivityService.stop();
+ 
+-      expect(spy).toHaveBeenCalled();
++      expect(stopActivityState!).toEqual('off');
+     });
+ 
+     it('should restart activities from a compound state', () => {
+diff --git a/packages/core/test/state.test.ts b/packages/core/test/state.test.ts
+index a3b4be3331..43ed60b39d 100644
+--- a/packages/core/test/state.test.ts
++++ b/packages/core/test/state.test.ts
+@@ -103,6 +103,181 @@ const exampleMachine = createMachine<any, Events>({
+ });
+ 
+ describe('State', () => {
++  describe('.changed', () => {
++    it('should indicate that it is not changed if initial state', () => {
++      const actorRef = interpret(exampleMachine);
++      expect(actorRef.getSnapshot().changed).not.toBeDefined();
++    });
++
++    it('states from reentering transitions with entry actions should be changed', () => {
++      const actorRef = interpret(exampleMachine).start();
++      actorRef.send({ type: 'EXTERNAL' });
++      expect(actorRef.getSnapshot().changed).toBe(true);
++    });
++
++    it('states from internal transitions with no actions should be unchanged', () => {
++      const actorRef = interpret(exampleMachine).start();
++      actorRef.send({ type: 'EXTERNAL' });
++      actorRef.send({ type: 'INERT' });
++      expect(actorRef.getSnapshot().changed).toBe(false);
++    });
++
++    it('states from internal transitions with actions should be changed', () => {
++      const actorRef = interpret(exampleMachine).start();
++      actorRef.send({ type: 'INTERNAL' });
++      expect(actorRef.getSnapshot().changed).toBe(true);
++    });
++
++    it('normal state transitions should be changed (initial state)', () => {
++      const actorRef = interpret(exampleMachine).start();
++      actorRef.send({ type: 'TO_TWO', foo: 'test' });
++      expect(actorRef.getSnapshot().changed).toBe(true);
++    });
++
++    it('normal state transitions should be changed', () => {
++      const actorRef = interpret(exampleMachine).start();
++      actorRef.send({
++        type: 'TO_TWO',
++        foo: 'test'
++      });
++      actorRef.send({
++        type: 'FOO_EVENT'
++      });
++      expect(actorRef.getSnapshot().changed).toBe(true);
++    });
++
++    it('normal state transitions with unknown event should be unchanged', () => {
++      const actorRef = interpret(exampleMachine).start();
++      actorRef.send({
++        type: 'TO_TWO',
++        foo: 'test'
++      });
++      actorRef.send({
++        // @ts-expect-error
++        type: 'UNKNOWN_EVENT'
++      });
++      expect(actorRef.getSnapshot().changed).toBe(false);
++    });
++
++    it('should report entering a final state as changed', () => {
++      const finalMachine = createMachine({
++        id: 'final',
++        initial: 'one',
++        states: {
++          one: {
++            on: {
++              DONE: 'two'
++            }
++          },
++
++          two: {
++            type: 'final'
++          }
++        }
++      });
++
++      const actorRef = interpret(finalMachine).start();
++      actorRef.send({ type: 'DONE' });
++
++      expect(actorRef.getSnapshot().changed).toBe(true);
++    });
++
++    it('should report any internal transition assignments as changed', () => {
++      const assignMachine = createMachine<{ count: number }>({
++        id: 'assign',
++        initial: 'same',
++        context: {
++          count: 0
++        },
++        states: {
++          same: {
++            on: {
++              EVENT: {
++                actions: assign({ count: ({ context }) => context.count + 1 })
++              }
++            }
++          }
++        }
++      });
++
++      const actorRef = interpret(assignMachine);
++      const initialSnapshot = actorRef.getSnapshot();
++      actorRef.start();
++      actorRef.send({
++        type: 'EVENT'
++      });
++      const snapshot = actorRef.getSnapshot();
++      expect(snapshot.changed).toBe(true);
++      expect(initialSnapshot.value).toEqual(snapshot.value);
++    });
++
++    it('should not escape targetless child state nodes', () => {
++      interface Ctx {
++        value: string;
++      }
++      type ToggleEvents =
++        | {
++            type: 'CHANGE';
++            value: string;
++          }
++        | {
++            type: 'SAVE';
++          };
++      const toggleMachine = createMachine<Ctx, ToggleEvents>({
++        id: 'input',
++        context: {
++          value: ''
++        },
++        type: 'parallel',
++        states: {
++          edit: {
++            on: {
++              CHANGE: {
++                actions: assign({
++                  value: ({ event }) => {
++                    return event.value;
++                  }
++                })
++              }
++            }
++          },
++          validity: {
++            initial: 'invalid',
++            states: {
++              invalid: {},
++              valid: {}
++            },
++            on: {
++              CHANGE: [
++                {
++                  target: '.valid',
++                  guard: () => true
++                },
++                {
++                  target: '.invalid'
++                }
++              ]
++            }
++          }
++        }
++      });
++
++      const actorRef = interpret(toggleMachine).start();
++      actorRef.send({
++        type: 'CHANGE',
++        value: 'whatever'
++      });
++
++      const snapshot = actorRef.getSnapshot();
++
++      expect(snapshot.changed).toBe(true);
++      expect(snapshot.value).toEqual({
++        edit: {},
++        validity: 'valid'
++      });
++    });
++  });
++
+   describe('.nextEvents', () => {
+     it('returns the next possible events for the current state', () => {
+       const actorRef = interpret(exampleMachine);
+diff --git a/packages/core/test/utils.ts b/packages/core/test/utils.ts
+index 3c4e61210c..cad431b6ac 100644
+--- a/packages/core/test/utils.ts
++++ b/packages/core/test/utils.ts
+@@ -7,14 +7,6 @@ import {
+   StateValue
+ } from '../src/index.ts';
+ 
+-const resolveSerializedStateValue = (
+-  machine: AnyStateMachine,
+-  serialized: string
+-) =>
+-  serialized[0] === '{'
+-    ? machine.resolveStateValue(JSON.parse(serialized))
+-    : machine.resolveStateValue(serialized);
+-
+ export function testMultiTransition(
+   machine: AnyStateMachine,
+   fromState: string,
+@@ -22,7 +14,10 @@ export function testMultiTransition(
+ ): AnyState {
+   const computeNext = (state: AnyState | string, eventType: string) => {
+     if (typeof state === 'string') {
+-      state = resolveSerializedStateValue(machine, state);
++      state =
++        state[0] === '{'
++          ? machine.resolveStateValue(JSON.parse(state))
++          : machine.resolveStateValue(state);
+     }
+     const nextState = machine.transition(
+       state,
+@@ -57,9 +52,7 @@ export function testAll(
+ 
+         if (toState === undefined) {
+           // undefined means that the state didn't transition
+-          expect(resultState.value).toEqual(
+-            resolveSerializedStateValue(machine, fromState).value
+-          );
++          expect(resultState.changed).toBe(false);
+         } else if (typeof toState === 'string') {
+           expect(matchesState(toState, resultState.value)).toBeTruthy();
+         } else {
+diff --git a/packages/xstate-inspect/test/inspect.test.ts b/packages/xstate-inspect/test/inspect.test.ts
+index dba912b2c7..bc3dae68d7 100644
+--- a/packages/xstate-inspect/test/inspect.test.ts
++++ b/packages/xstate-inspect/test/inspect.test.ts
+@@ -148,7 +148,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:0",
+-          "state": "{"value":"active","done":false,"context":{},"historyValue":{},"_initial":false,"children":{},"tags":[]}",
++          "state": "{"value":"active","done":false,"context":{},"historyValue":{},"_initial":false,"changed":false,"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+@@ -215,7 +215,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:0",
+-          "state": "{"value":"active","done":false,"context":{"map":"map","deep":{"map":"map"}},"historyValue":{},"_initial":false,"children":{},"tags":[]}",
++          "state": "{"value":"active","done":false,"context":{"map":"map","deep":{"map":"map"}},"historyValue":{},"_initial":false,"changed":false,"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+@@ -324,7 +324,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:0",
+-          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"_initial":false,"children":{},"tags":[]}",
++          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"_initial":false,"changed":true,"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+@@ -346,7 +346,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:0",
+-          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"_initial":false,"children":{},"tags":[]}",
++          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"_initial":false,"changed":false,"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+diff --git a/packages/xstate-react/src/useActor.ts b/packages/xstate-react/src/useActor.ts
+index f136bbac75..f713995d0a 100644
+--- a/packages/xstate-react/src/useActor.ts
++++ b/packages/xstate-react/src/useActor.ts
+@@ -1,9 +1,10 @@
+ import isDevelopment from '#is-development';
+ import { useCallback, useEffect } from 'react';
+-import { useSyncExternalStore } from 'use-sync-external-store/shim';
++import { useSyncExternalStoreWithSelector } from 'use-sync-external-store/shim/with-selector';
+ import {
+   ActorRefFrom,
+   AnyActorLogic,
++  AnyState,
+   InterpreterOptions,
+   InterpreterStatus,
+   SnapshotFrom
+@@ -11,6 +12,14 @@ import {
+ import { useIdleInterpreter } from './useActorRef.ts';
+ import { isActorRef } from 'xstate/actors';
+ 
++function identity<T>(a: T): T {
++  return a;
++}
++
++const isEqual = (prevState: AnyState, nextState: AnyState) => {
++  return prevState === nextState || nextState.changed === false;
++};
++
+ export function useActor<TLogic extends AnyActorLogic>(
+   logic: TLogic,
+   options: InterpreterOptions<TLogic> = {}
+@@ -35,10 +44,12 @@ export function useActor<TLogic extends AnyActorLogic>(
+     [actorRef]
+   );
+ 
+-  const actorSnapshot = useSyncExternalStore(
++  const actorSnapshot = useSyncExternalStoreWithSelector(
+     subscribe,
+     getSnapshot,
+-    getSnapshot
++    getSnapshot,
++    identity,
++    isEqual
+   );
+ 
+   useEffect(() => {
+diff --git a/packages/xstate-svelte/src/useMachine.ts b/packages/xstate-svelte/src/useMachine.ts
+index 85c1428ef4..ee56633213 100644
+--- a/packages/xstate-svelte/src/useMachine.ts
++++ b/packages/xstate-svelte/src/useMachine.ts
+@@ -62,13 +62,10 @@ export function useMachine<TMachine extends AnyStateMachine>(
+ 
+   onDestroy(() => service.stop());
+ 
+-  let snapshot = service.getSnapshot();
+-
+-  const state = readable(snapshot, (set) => {
+-    return service.subscribe((nextSnapshot) => {
+-      if (snapshot !== nextSnapshot) {
+-        snapshot = nextSnapshot;
+-        set(snapshot);
++  const state = readable(service.getSnapshot(), (set) => {
++    return service.subscribe((state) => {
++      if (state.changed) {
++        set(state);
+       }
+     }).unsubscribe;
+   });
+diff --git a/packages/xstate-vue/src/useMachine.ts b/packages/xstate-vue/src/useMachine.ts
+index 9fc6435dbc..264eae25bd 100644
+--- a/packages/xstate-vue/src/useMachine.ts
++++ b/packages/xstate-vue/src/useMachine.ts
+@@ -45,17 +45,15 @@ export function useMachine<TMachine extends AnyStateMachine>(
+   getMachine: MaybeLazy<TMachine>,
+   ...[options = {}]: RestParams<TMachine>
+ ): UseMachineReturn<TMachine> {
+-  function listener(nextSnapshot: StateFrom<TMachine>) {
+-    if (nextSnapshot !== snapshot) {
+-      snapshot = nextSnapshot;
+-      state.value = snapshot;
++  function listener(nextState: StateFrom<TMachine>) {
++    if (nextState.changed) {
++      state.value = nextState;
+     }
+   }
+ 
+   const service = useInterpret(getMachine, options, listener);
+ 
+-  let snapshot = service.getSnapshot();
+-  const state = shallowRef(snapshot);
++  const state = shallowRef(service.getSnapshot());
+ 
+   return { state, send: service.send, service } as any;
+ }

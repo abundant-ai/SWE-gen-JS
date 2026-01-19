@@ -1,0 +1,203 @@
+diff --git a/README.md b/README.md
+index 6f1f55a..2ae9b8b 100644
+--- a/README.md
++++ b/README.md
+@@ -1209,7 +1209,7 @@ let schema = yup.string().test({
+ });
+ ```
+ 
+-#### `Schema.transform((currentValue: any, originalValue: any, schema: Schema,  options: object) => any): Schema`
++#### `Schema.transform((currentValue: any, originalValue: any) => any): Schema`
+ 
+ Adds a transformation to the transform chain. Transformations are central to the casting process,
+ default transforms for each type coerce values to the specific type (as verified by [`isType()`](#schemaistypevalue-any-value-is-infertypeschema)). transforms are run before validations and only applied when the schema is not marked as `strict` (the default). Some types have built in transformations.
+diff --git a/docs/extending.md b/docs/extending.md
+index 330c5fa..ef0ed1a 100644
+--- a/docs/extending.md
++++ b/docs/extending.md
+@@ -9,8 +9,8 @@ import * as yup from 'yup';
+ const requiredString = yup.string().required().default('');
+ 
+ const momentDate = (parseFormats = ['MMM dd, yyy']) =>
+-  yup.date().transform((value, originalValue, schema) => {
+-    if (schema.isType(value)) return value;
++  yup.date().transform(function (value, originalValue) {
++    if (this.isType(value)) return value;
+ 
+     // the default coercion transform failed so let's try it with Moment instead
+     value = Moment(originalValue, parseFormats);
+@@ -28,8 +28,8 @@ Schema are immutable so each can be configured further without changing the orig
+ 
+ ```js
+ function parseDateFromFormats(formats, parseStrict) {
+-  return this.transform((value, originalValue, schema) => {
+-    if (schema.isType(value)) return value;
++  return this.transform(function (value, originalValue) {
++    if (this.isType(value)) return value;
+ 
+     value = Moment(originalValue, formats, parseStrict);
+ 
+@@ -75,7 +75,7 @@ class MomentDateSchema extends DateSchema {
+     this._validFormats = [];
+ 
+     this.withMutation(() => {
+-      this.transform(function (value, originalValue) {
++      this.transform(function (value, originalvalue) {
+         if (this.isType(value))
+           // we have a valid value
+           return value;
+diff --git a/src/boolean.ts b/src/boolean.ts
+index c47c788..181f74a 100644
+--- a/src/boolean.ts
++++ b/src/boolean.ts
+@@ -39,8 +39,8 @@ export default class BooleanSchema<
+     });
+ 
+     this.withMutation(() => {
+-      this.transform((value, _raw) => {
+-        if (this.spec.coerce && !this.isType(value)) {
++      this.transform((value, _raw, ctx) => {
++        if (ctx.spec.coerce && !ctx.isType(value)) {
+           if (/^(true|1)$/i.test(String(value))) return true;
+           if (/^(false|0)$/i.test(String(value))) return false;
+         }
+diff --git a/src/date.ts b/src/date.ts
+index 8152e9a..8d23601 100644
+--- a/src/date.ts
++++ b/src/date.ts
+@@ -44,10 +44,10 @@ export default class DateSchema<
+     });
+ 
+     this.withMutation(() => {
+-      this.transform((value, _raw) => {
++      this.transform((value, _raw, ctx) => {
+         // null -> InvalidDate isn't useful; treat all nulls as null and let it fail on
+         // nullability check vs TypeErrors
+-        if (!this.spec.coerce || this.isType(value) || value === null)
++        if (!ctx.spec.coerce || ctx.isType(value) || value === null)
+           return value;
+ 
+         value = parseIsoDate(value);
+diff --git a/src/number.ts b/src/number.ts
+index 29de764..91c0932 100644
+--- a/src/number.ts
++++ b/src/number.ts
+@@ -42,8 +42,8 @@ export default class NumberSchema<
+     });
+ 
+     this.withMutation(() => {
+-      this.transform((value, _raw) => {
+-        if (!this.spec.coerce) return value;
++      this.transform((value, _raw, ctx) => {
++        if (!ctx.spec.coerce) return value;
+ 
+         let parsed = value;
+         if (typeof parsed === 'string') {
+@@ -55,7 +55,7 @@ export default class NumberSchema<
+ 
+         // null -> NaN isn't useful; treat all nulls as null and let it fail on
+         // nullability check vs TypeErrors
+-        if (this.isType(parsed) || parsed === null) return parsed;
++        if (ctx.isType(parsed) || parsed === null) return parsed;
+ 
+         return parseFloat(parsed);
+       });
+diff --git a/src/schema.ts b/src/schema.ts
+index 2d20330..4b2bd6e 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -173,7 +173,7 @@ export default abstract class Schema<
+   readonly deps: readonly string[] = [];
+ 
+   tests: Test[];
+-  transforms: TransformFunction<AnySchema, TContext>[];
++  transforms: TransformFunction<AnySchema>[];
+ 
+   private conditions: Condition[] = [];
+ 
+@@ -415,7 +415,7 @@ export default abstract class Schema<
+       rawValue === undefined
+         ? rawValue
+         : this.transforms.reduce(
+-            (prevValue, fn) => fn.call(this, prevValue, rawValue, this, options),
++            (prevValue, fn) => fn.call(this, prevValue, rawValue, this),
+             rawValue,
+           );
+ 
+diff --git a/src/string.ts b/src/string.ts
+index 84ddb88..c193d00 100644
+--- a/src/string.ts
++++ b/src/string.ts
+@@ -82,8 +82,8 @@ export default class StringSchema<
+     });
+ 
+     this.withMutation(() => {
+-      this.transform((value, _raw) => {
+-        if (!this.spec.coerce || this.isType(value)) return value;
++      this.transform((value, _raw, ctx) => {
++        if (!ctx.spec.coerce || ctx.isType(value)) return value;
+ 
+         // don't ever convert arrays
+         if (Array.isArray(value)) return value;
+diff --git a/src/types.ts b/src/types.ts
+index 9d64abf..3fa8d5d 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -33,12 +33,11 @@ export type DefaultThunk<T, C = any> = T | ((options?: ResolveOptions<C>) => T);
+ 
+ export type InferType<T extends ISchema<any, any>> = T['__outputType'];
+ 
+-export type TransformFunction<T extends AnySchema, C = any> = (
++export type TransformFunction<T extends AnySchema> = (
+   this: T,
+   value: any,
+   originalValue: any,
+   schema: T,
+-  options: CastOptions<C>,
+ ) => any;
+ 
+ export interface Ancester<TContext> {
+diff --git a/src/util/parseJson.ts b/src/util/parseJson.ts
+index bf54a22..068db4b 100644
+--- a/src/util/parseJson.ts
++++ b/src/util/parseJson.ts
+@@ -1,6 +1,6 @@
+ import type { AnySchema, TransformFunction } from '../types';
+ 
+-const parseJson: TransformFunction<any> = (value, _, schema: AnySchema<any>) => {
++const parseJson: TransformFunction<any> = (value, _, ctx: AnySchema<any>) => {
+   if (typeof value !== 'string') {
+     return value;
+   }
+@@ -11,7 +11,7 @@ const parseJson: TransformFunction<any> = (value, _, schema: AnySchema<any>) =>
+   } catch (err) {
+     /* */
+   }
+-  return schema.isType(parsed) ? parsed : value;
++  return ctx.isType(parsed) ? parsed : value;
+ };
+ 
+ export default parseJson;
+diff --git a/test/array.ts b/test/array.ts
+index 9bdd909..00caa3d 100644
+--- a/test/array.ts
++++ b/test/array.ts
+@@ -46,16 +46,10 @@ describe('Array types', () => {
+         expect(val).toEqual(parent[idx]);
+         expect(originalValue).toEqual(parent[idx]);
+ 
+-        return string().transform((value, _originalValue, _schema, options: any) => {
+-          expect(parent).toEqual(options.parent);
+-          expect(typeof options.index).toBe('number');
+-          expect(val).toEqual(value);
+-
+-          return value;
+-        });
++        return string();
+       });
+ 
+-      await array().of(itemSchema).validate(value, { context: { name: 'test'} });
++      await array().of(itemSchema).validate(value);
+     });
+   });
+ 

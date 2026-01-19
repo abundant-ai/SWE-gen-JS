@@ -1,0 +1,356 @@
+diff --git a/src/commands/includes/moveChildFromDependenciesIfNeeded.lua b/src/commands/includes/moveChildFromDependenciesIfNeeded.lua
+index 797d7524a0..2450c5fe09 100644
+--- a/src/commands/includes/moveChildFromDependenciesIfNeeded.lua
++++ b/src/commands/includes/moveChildFromDependenciesIfNeeded.lua
+@@ -6,6 +6,7 @@
+ --- @include "moveParentToWaitIfNoPendingDependencies"
+ --- @include "moveParentToWaitIfNeeded"
+ --- @include "moveParentToWait"
++--- @include "removeDeduplicationKeyIfNeeded"
+ --- @include "removeJobsOnFail"
+ 
+ local moveParentToFailedIfNeeded
+diff --git a/src/commands/includes/removeDeduplicationKey.lua b/src/commands/includes/removeDeduplicationKey.lua
+new file mode 100644
+index 0000000000..a4b2a461d7
+--- /dev/null
++++ b/src/commands/includes/removeDeduplicationKey.lua
+@@ -0,0 +1,11 @@
++--[[
++  Function to remove deduplication key.
++]]
++
++local function removeDeduplicationKey(prefixKey, jobKey)
++  local deduplicationId = rcall("HGET", jobKey, "deid")
++  if deduplicationId then
++    local deduplicationKey = prefixKey .. "de:" .. deduplicationId
++    rcall("DEL", deduplicationKey)
++  end
++end
+diff --git a/src/commands/includes/removeDeduplicationKeyIfNeeded.lua b/src/commands/includes/removeDeduplicationKeyIfNeeded.lua
+new file mode 100644
+index 0000000000..ff475ae155
+--- /dev/null
++++ b/src/commands/includes/removeDeduplicationKeyIfNeeded.lua
+@@ -0,0 +1,14 @@
++--[[
++  Function to remove deduplication key if needed.
++]]
++
++local function removeDeduplicationKeyIfNeeded(prefixKey, deduplicationId)
++  if deduplicationId then
++    local deduplicationKey = prefixKey .. "de:" .. deduplicationId
++    local pttl = rcall("PTTL", deduplicationKey)
++
++    if pttl == 0 or pttl == -1 then
++      rcall("DEL", deduplicationKey)
++    end
++  end
++end
+diff --git a/src/commands/includes/removeDeduplicationKeyIfNeededOnFinalization.lua b/src/commands/includes/removeDeduplicationKeyIfNeededOnFinalization.lua
+deleted file mode 100644
+index 8fc6409ba1..0000000000
+--- a/src/commands/includes/removeDeduplicationKeyIfNeededOnFinalization.lua
++++ /dev/null
+@@ -1,23 +0,0 @@
+---[[
+-  Function to remove deduplication key if needed
+-  when a job is moved to completed or failed states.
+-]]
+-
+-local function removeDeduplicationKeyIfNeededOnFinalization(prefixKey,
+-  deduplicationId, jobId)
+-  if deduplicationId then
+-    local deduplicationKey = prefixKey .. "de:" .. deduplicationId
+-    local pttl = rcall("PTTL", deduplicationKey)
+-
+-    if pttl == 0 then
+-      return rcall("DEL", deduplicationKey)
+-    end
+-
+-    if pttl == -1 then
+-      local currentJobId = rcall('GET', deduplicationKey)
+-      if currentJobId and currentJobId == jobId then
+-        return rcall("DEL", deduplicationKey)
+-      end
+-    end
+-  end
+-end
+diff --git a/src/commands/includes/removeDeduplicationKeyIfNeededOnRemoval.lua b/src/commands/includes/removeDeduplicationKeyIfNeededOnRemoval.lua
+deleted file mode 100644
+index 21c51bcb73..0000000000
+--- a/src/commands/includes/removeDeduplicationKeyIfNeededOnRemoval.lua
++++ /dev/null
+@@ -1,16 +0,0 @@
+---[[
+-  Function to remove deduplication key if needed
+-  when a job is being removed.
+-]]
+-
+-local function removeDeduplicationKeyIfNeededOnRemoval(prefixKey,
+-  jobKey, jobId)
+-  local deduplicationId = rcall("HGET", jobKey, "deid")
+-  if deduplicationId then
+-    local deduplicationKey = prefixKey .. "de:" .. deduplicationId
+-    local currentJobId = rcall('GET', deduplicationKey)
+-    if currentJobId and currentJobId == jobId then
+-      return rcall("DEL", deduplicationKey)
+-    end
+-  end
+-end
+diff --git a/src/commands/includes/removeJob.lua b/src/commands/includes/removeJob.lua
+index ac2fb52137..0a205a19d3 100644
+--- a/src/commands/includes/removeJob.lua
++++ b/src/commands/includes/removeJob.lua
+@@ -3,7 +3,7 @@
+ ]]
+ 
+ -- Includes
+---- @include "removeDeduplicationKeyIfNeededOnRemoval"
++--- @include "removeDeduplicationKey"
+ --- @include "removeJobKeys"
+ --- @include "removeParentDependencyKey"
+ 
+@@ -11,7 +11,7 @@ local function removeJob(jobId, hard, baseKey, shouldRemoveDeduplicationKey)
+   local jobKey = baseKey .. jobId
+   removeParentDependencyKey(jobKey, hard, nil, baseKey)
+   if shouldRemoveDeduplicationKey then
+-    removeDeduplicationKeyIfNeededOnRemoval(baseKey, jobKey, jobId)
++    removeDeduplicationKey(baseKey, jobKey)
+   end
+   removeJobKeys(jobKey)
+ end
+diff --git a/src/commands/includes/removeJobWithChildren.lua b/src/commands/includes/removeJobWithChildren.lua
+index fa60600944..b08ed9ae49 100644
+--- a/src/commands/includes/removeJobWithChildren.lua
++++ b/src/commands/includes/removeJobWithChildren.lua
+@@ -12,7 +12,7 @@ local rcall = redis.call
+ --- @include "destructureJobKey"
+ --- @include "getOrSetMaxEvents"
+ --- @include "isJobSchedulerJob"
+---- @include "removeDeduplicationKeyIfNeededOnRemoval"
++--- @include "removeDeduplicationKey"
+ --- @include "removeJobFromAnyState"
+ --- @include "removeJobKeys"
+ --- @include "removeParentDependencyKey"
+@@ -84,7 +84,7 @@ removeJobWithChildren = function(prefix, meta, jobId, parentKey, options)
+         end
+ 
+         local prev = removeJobFromAnyState(prefix, jobId)
+-        removeDeduplicationKeyIfNeededOnRemoval(prefix, jobKey, jobId)
++        removeDeduplicationKey(prefix, jobKey)
+         if removeJobKeys(jobKey) > 0 then
+             local maxEvents = getOrSetMaxEvents(meta)
+             rcall("XADD", prefix .. "events", "MAXLEN", "~", maxEvents, "*", "event", "removed",
+diff --git a/src/commands/moveStalledJobsToWait-9.lua b/src/commands/moveStalledJobsToWait-9.lua
+index 84aa5d0b38..99f7970ed0 100644
+--- a/src/commands/moveStalledJobsToWait-9.lua
++++ b/src/commands/moveStalledJobsToWait-9.lua
+@@ -27,7 +27,7 @@ local rcall = redis.call
+ --- @include "includes/batches"
+ --- @include "includes/getTargetQueueList"
+ --- @include "includes/moveChildFromDependenciesIfNeeded"
+---- @include "includes/removeDeduplicationKeyIfNeededOnFinalization"
++--- @include "includes/removeDeduplicationKeyIfNeeded"
+ --- @include "includes/removeJobsOnFail"
+ --- @include "includes/trimEvents"
+ 
+@@ -84,7 +84,7 @@ if (#stalling > 0) then
+                         local rawParentData = jobAttributes[2]
+                         local opts = cjson.decode(rawOpts)
+                         rcall("ZADD", failedKey, timestamp, jobId)
+-                        removeDeduplicationKeyIfNeededOnFinalization(queueKeyPrefix, jobAttributes[3], jobId)
++                        removeDeduplicationKeyIfNeeded(queueKeyPrefix, jobAttributes[3])
+ 
+                         local failedReason = "job stalled more than allowable limit"
+                         rcall("HMSET", jobKey, "failedReason", failedReason, "finishedOn", timestamp)
+diff --git a/src/commands/moveToFinished-14.lua b/src/commands/moveToFinished-14.lua
+index 049884a759..cd8274f163 100644
+--- a/src/commands/moveToFinished-14.lua
++++ b/src/commands/moveToFinished-14.lua
+@@ -67,7 +67,7 @@ local rcall = redis.call
+ --- @include "includes/moveChildFromDependenciesIfNeeded"
+ --- @include "includes/prepareJobForProcessing"
+ --- @include "includes/promoteDelayedJobs"
+---- @include "includes/removeDeduplicationKeyIfNeededOnFinalization"
++--- @include "includes/removeDeduplicationKeyIfNeeded"
+ --- @include "includes/removeJobKeys"
+ --- @include "includes/removeJobsByMaxAge"
+ --- @include "includes/removeJobsByMaxCount"
+@@ -130,7 +130,7 @@ if rcall("EXISTS", jobIdKey) == 1 then -- Make sure job exists
+ 
+     local prefix = ARGV[7]
+ 
+-    removeDeduplicationKeyIfNeededOnFinalization(prefix, jobAttributes[3], jobId)
++    removeDeduplicationKeyIfNeeded(prefix, jobAttributes[3])
+ 
+     -- If job has a parent we need to
+     -- 1) remove this job id from parents dependencies
+diff --git a/src/commands/moveToWaitingChildren-8.lua b/src/commands/moveToWaitingChildren-8.lua
+index 0bbe5a9b5e..a2b74e0df4 100644
+--- a/src/commands/moveToWaitingChildren-8.lua
++++ b/src/commands/moveToWaitingChildren-8.lua
+@@ -37,7 +37,7 @@ local jobId = ARGV[4]
+ 
+ --- Includes
+ --- @include "includes/moveChildFromDependenciesIfNeeded"
+---- @include "includes/removeDeduplicationKeyIfNeededOnFinalization"
++--- @include "includes/removeDeduplicationKeyIfNeeded"
+ --- @include "includes/removeJobsOnFail"
+ --- @include "includes/removeLock"
+ 
+@@ -61,7 +61,7 @@ if rcall("EXISTS", jobKey) == 1 then
+     -- TODO: refactor this logic in an include later
+     local jobAttributes = rcall("HMGET", jobKey, "parent", "deid", "opts")
+ 
+-    removeDeduplicationKeyIfNeededOnFinalization(ARGV[5], jobAttributes[2], jobId)
++    removeDeduplicationKeyIfNeeded(ARGV[5], jobAttributes[2])
+   
+     local failedReason = "children are failed"
+     rcall("ZADD", failedKey, timestamp, jobId)
+diff --git a/tests/test_events.ts b/tests/test_events.ts
+index 3c3aecf812..4ed3cf061b 100644
+--- a/tests/test_events.ts
++++ b/tests/test_events.ts
+@@ -511,70 +511,6 @@ describe('events', function () {
+ 
+           expect(debouncedCounter).to.be.equal(2);
+         });
+-
+-        describe('when manual removal on a deduplicated job in finished state', function () {
+-          it('does not remove deduplication key', async function () {
+-            const testName = 'test';
+-
+-            const job = await queue.add(
+-              testName,
+-              { foo: 'bar' },
+-              { deduplication: { id: 'a1', ttl: 200 } },
+-            );
+-
+-            const worker = new Worker(
+-              queueName,
+-              async () => {
+-                await delay(200);
+-              },
+-              {
+-                autorun: false,
+-                connection,
+-                prefix,
+-              },
+-            );
+-
+-            await worker.waitUntilReady();
+-
+-            const completion = new Promise<void>(resolve => {
+-              worker.once('completed', () => {
+-                resolve();
+-              });
+-            });
+-
+-            worker.run();
+-
+-            await completion;
+-
+-            let deduplicatedCounter = 0;
+-            const deduplication = new Promise<void>(resolve => {
+-              queueEvents.on('deduplicated', () => {
+-                deduplicatedCounter++;
+-                if (deduplicatedCounter == 1) {
+-                  resolve();
+-                }
+-              });
+-            });
+-
+-            await queue.add(
+-              testName,
+-              { foo: 'bar' },
+-              { deduplication: { id: 'a1', ttl: 200 } },
+-            );
+-
+-            await job.remove();
+-
+-            await queue.add(
+-              testName,
+-              { foo: 'bar' },
+-              { deduplication: { id: 'a1', ttl: 200 } },
+-            );
+-
+-            await deduplication;
+-
+-            expect(deduplicatedCounter).to.be.equal(1);
+-          });
+-        });
+       });
+     });
+ 
+@@ -932,70 +868,6 @@ describe('events', function () {
+ 
+           expect(deduplicatedCounter).to.be.equal(2);
+         });
+-
+-        describe('when manual removal on a deduplicated job in finished state', function () {
+-          it('does not remove deduplication key', async function () {
+-            const testName = 'test';
+-
+-            const job = await queue.add(
+-              testName,
+-              { foo: 'bar' },
+-              { deduplication: { id: 'a1' } },
+-            );
+-
+-            const worker = new Worker(
+-              queueName,
+-              async () => {
+-                await delay(100);
+-              },
+-              {
+-                autorun: false,
+-                connection,
+-                prefix,
+-              },
+-            );
+-
+-            await worker.waitUntilReady();
+-
+-            const completion = new Promise<void>(resolve => {
+-              worker.once('completed', () => {
+-                resolve();
+-              });
+-            });
+-
+-            worker.run();
+-
+-            await completion;
+-
+-            let deduplicatedCounter = 0;
+-            const deduplication = new Promise<void>(resolve => {
+-              queueEvents.on('deduplicated', () => {
+-                deduplicatedCounter++;
+-                if (deduplicatedCounter == 1) {
+-                  resolve();
+-                }
+-              });
+-            });
+-
+-            await queue.add(
+-              testName,
+-              { foo: 'bar' },
+-              { deduplication: { id: 'a1' } },
+-            );
+-
+-            await job.remove();
+-
+-            await queue.add(
+-              testName,
+-              { foo: 'bar' },
+-              { deduplication: { id: 'a1' } },
+-            );
+-
+-            await deduplication;
+-
+-            expect(deduplicatedCounter).to.be.equal(1);
+-          });
+-        });
+       });
+     });
+   });

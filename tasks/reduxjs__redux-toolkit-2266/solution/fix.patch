@@ -1,0 +1,235 @@
+diff --git a/packages/toolkit/src/query/core/buildInitiate.ts b/packages/toolkit/src/query/core/buildInitiate.ts
+index 6014feea..0f801232 100644
+--- a/packages/toolkit/src/query/core/buildInitiate.ts
++++ b/packages/toolkit/src/query/core/buildInitiate.ts
+@@ -13,7 +13,7 @@ import { QueryStatus } from './apiState'
+ import type { InternalSerializeQueryArgs } from '../defaultSerializeQueryArgs'
+ import type { Api, ApiContext } from '../apiTypes'
+ import type { ApiEndpointQuery } from './module'
+-import type { BaseQueryError } from '../baseQueryTypes'
++import type { BaseQueryError, QueryReturnValue } from '../baseQueryTypes'
+ import type { QueryResultSelectorResult } from './buildSelectors'
+ 
+ declare module './module' {
+@@ -34,10 +34,13 @@ declare module './module' {
+   }
+ }
+ 
++export const forceQueryFnSymbol = Symbol('forceQueryFn')
++
+ export interface StartQueryActionCreatorOptions {
+   subscribe?: boolean
+   forceRefetch?: boolean | number
+   subscriptionOptions?: SubscriptionOptions
++  [forceQueryFnSymbol]?: () => QueryReturnValue
+ }
+ 
+ type StartQueryActionCreator<
+@@ -259,7 +262,15 @@ Features like automatic cache collection, automatic refetching etc. will not be
+     endpointDefinition: QueryDefinition<any, any, any, any>
+   ) {
+     const queryAction: StartQueryActionCreator<any> =
+-      (arg, { subscribe = true, forceRefetch, subscriptionOptions } = {}) =>
++      (
++        arg,
++        {
++          subscribe = true,
++          forceRefetch,
++          subscriptionOptions,
++          [forceQueryFnSymbol]: forceQueryFn,
++        } = {}
++      ) =>
+       (dispatch, getState) => {
+         const queryCacheKey = serializeQueryArgs({
+           queryArgs: arg,
+@@ -274,6 +285,7 @@ Features like automatic cache collection, automatic refetching etc. will not be
+           endpointName,
+           originalArgs: arg,
+           queryCacheKey,
++          [forceQueryFnSymbol]: forceQueryFn,
+         })
+         const selector = (
+           api.endpoints[endpointName] as ApiEndpointQuery<any, any>
+diff --git a/packages/toolkit/src/query/core/buildSlice.ts b/packages/toolkit/src/query/core/buildSlice.ts
+index cdfa6625..c9db2acb 100644
+--- a/packages/toolkit/src/query/core/buildSlice.ts
++++ b/packages/toolkit/src/query/core/buildSlice.ts
+@@ -157,7 +157,14 @@ export function buildSlice({
+             draft,
+             meta.arg.queryCacheKey,
+             (substate) => {
+-              if (substate.requestId !== meta.requestId) return
++              if (substate.requestId !== meta.requestId) {
++                if (
++                  substate.fulfilledTimeStamp &&
++                  meta.fulfilledTimeStamp < substate.fulfilledTimeStamp
++                ) {
++                  return
++                }
++              }
+               const { merge } = definitions[
+                 meta.arg.endpointName
+               ] as QueryDefinition<any, any, any, any>
+diff --git a/packages/toolkit/src/query/core/buildThunks.ts b/packages/toolkit/src/query/core/buildThunks.ts
+index e873bde3..e912922d 100644
+--- a/packages/toolkit/src/query/core/buildThunks.ts
++++ b/packages/toolkit/src/query/core/buildThunks.ts
+@@ -7,7 +7,11 @@ import type {
+ } from '../baseQueryTypes'
+ import type { RootState, QueryKeys, QuerySubstateIdentifier } from './apiState'
+ import { QueryStatus } from './apiState'
+-import type { StartQueryActionCreatorOptions } from './buildInitiate'
++import {
++  forceQueryFnSymbol,
++  StartQueryActionCreatorOptions,
++  QueryActionCreatorResult,
++} from './buildInitiate'
+ import type {
+   AssertTagTypes,
+   EndpointDefinition,
+@@ -144,6 +148,9 @@ function defaultTransformResponse(baseQueryReturnValue: unknown) {
+ 
+ export type MaybeDrafted<T> = T | Draft<T>
+ export type Recipe<T> = (data: MaybeDrafted<T>) => void | MaybeDrafted<T>
++export type UpsertRecipe<T> = (
++  data: MaybeDrafted<T> | undefined
++) => void | MaybeDrafted<T>
+ 
+ export type PatchQueryDataThunk<
+   Definitions extends EndpointDefinitions,
+@@ -163,6 +170,24 @@ export type UpdateQueryDataThunk<
+   updateRecipe: Recipe<ResultTypeFrom<Definitions[EndpointName]>>
+ ) => ThunkAction<PatchCollection, PartialState, any, AnyAction>
+ 
++export type UpsertQueryDataThunk<
++  Definitions extends EndpointDefinitions,
++  PartialState
++> = <EndpointName extends QueryKeys<Definitions>>(
++  endpointName: EndpointName,
++  args: QueryArgFrom<Definitions[EndpointName]>,
++  value: ResultTypeFrom<Definitions[EndpointName]>
++) => ThunkAction<
++  QueryActionCreatorResult<
++    Definitions[EndpointName] extends QueryDefinition<any, any, any, any>
++      ? Definitions[EndpointName]
++      : never
++  >,
++  PartialState,
++  any,
++  AnyAction
++>
++
+ /**
+  * An object returned from dispatching a `api.util.updateQueryData` call.
+  */
+@@ -255,6 +280,24 @@ export function buildThunks<
+       return ret
+     }
+ 
++  const upsertQueryData: UpsertQueryDataThunk<Definitions, State> =
++    (endpointName, args, value) => (dispatch) => {
++      return dispatch(
++        (
++          api.endpoints[endpointName] as ApiEndpointQuery<
++            QueryDefinition<any, any, any, any, any>,
++            Definitions
++          >
++        ).initiate(args, {
++          subscribe: false,
++          forceRefetch: true,
++          [forceQueryFnSymbol]: () => ({
++            data: value,
++          }),
++        })
++      )
++    }
++
+   const executeEndpoint: AsyncThunkPayloadCreator<
+     ThunkResult,
+     QueryThunkArg | MutationThunkArg,
+@@ -291,7 +334,12 @@ export function buildThunks<
+         forced:
+           arg.type === 'query' ? isForcedQuery(arg, getState()) : undefined,
+       }
+-      if (endpointDefinition.query) {
++
++      const forceQueryFn =
++        arg.type === 'query' ? arg[forceQueryFnSymbol] : undefined
++      if (forceQueryFn) {
++        result = forceQueryFn()
++      } else if (endpointDefinition.query) {
+         result = await baseQuery(
+           endpointDefinition.query(arg.originalArgs),
+           baseQueryApi,
+@@ -431,12 +479,17 @@ In the case of an unhandled error, no tags will be "provided" or "invalidated".`
+       const requestState = state[reducerPath]?.queries?.[arg.queryCacheKey]
+       const fulfilledVal = requestState?.fulfilledTimeStamp
+ 
+-      // Don't retry a request that's currently in-flight
+-      if (requestState?.status === 'pending') return false
++      // Order of these checks matters.
++      // In order for `upsertQueryData` to successfully run while an existing request is
++      /// in flight, we have to check `isForcedQuery` before `status === 'pending'`,
++      // otherwise `queryThunk` will bail out and not run at all.
+ 
+       // if this is forced, continue
+       if (isForcedQuery(arg, state)) return true
+ 
++      // Don't retry a request that's currently in-flight
++      if (requestState?.status === 'pending') return false
++
+       // Pull from the cache unless we explicitly force refetch or qualify based on time
+       if (fulfilledVal)
+         // Value is cached and we didn't specify to refresh, skip it.
+@@ -527,6 +580,7 @@ In the case of an unhandled error, no tags will be "provided" or "invalidated".`
+     mutationThunk,
+     prefetch,
+     updateQueryData,
++    upsertQueryData,
+     patchQueryData,
+     buildMatchThunkActions,
+   }
+diff --git a/packages/toolkit/src/query/core/module.ts b/packages/toolkit/src/query/core/module.ts
+index d419d868..c0c58582 100644
+--- a/packages/toolkit/src/query/core/module.ts
++++ b/packages/toolkit/src/query/core/module.ts
+@@ -1,7 +1,11 @@
+ /**
+  * Note: this file should import all other files for type discovery and declaration merging
+  */
+-import type { PatchQueryDataThunk, UpdateQueryDataThunk } from './buildThunks'
++import type {
++  PatchQueryDataThunk,
++  UpdateQueryDataThunk,
++  UpsertQueryDataThunk,
++} from './buildThunks'
+ import { buildThunks } from './buildThunks'
+ import type {
+   ActionCreatorWithPayload,
+@@ -210,6 +214,10 @@ declare module '../apiTypes' {
+           Definitions,
+           RootState<Definitions, string, ReducerPath>
+         >
++        upsertQueryData: UpsertQueryDataThunk<
++          Definitions,
++          RootState<Definitions, string, ReducerPath>
++        >
+         /**
+          * A Redux thunk that applies a JSON diff/patch array to the cached data for a given query result. This immediately updates the Redux state with those changes.
+          *
+@@ -416,6 +424,7 @@ export const coreModule = (): Module<CoreModule> => ({
+       mutationThunk,
+       patchQueryData,
+       updateQueryData,
++      upsertQueryData,
+       prefetch,
+       buildMatchThunkActions,
+     } = buildThunks({
+@@ -444,6 +453,7 @@ export const coreModule = (): Module<CoreModule> => ({
+     safeAssign(api.util, {
+       patchQueryData,
+       updateQueryData,
++      upsertQueryData,
+       prefetch,
+       resetApiState: sliceActions.resetApiState,
+     })

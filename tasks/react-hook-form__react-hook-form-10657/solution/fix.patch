@@ -1,0 +1,319 @@
+diff --git a/package.json b/package.json
+index cbebd436..27d1e817 100644
+--- a/package.json
++++ b/package.json
+@@ -118,7 +118,7 @@
+     "files": [
+       {
+         "path": "./dist/index.cjs.js",
+-        "maxSize": "10 kB"
++        "maxSize": "10.1 kB"
+       }
+     ]
+   },
+diff --git a/reports/api-extractor.md b/reports/api-extractor.md
+index cf3ad16a..e47bcefe 100644
+--- a/reports/api-extractor.md
++++ b/reports/api-extractor.md
+@@ -91,6 +91,7 @@ export type ControllerFieldState = {
+     invalid: boolean;
+     isTouched: boolean;
+     isDirty: boolean;
++    isValidating: boolean;
+     error?: FieldError;
+ };
+ 
+@@ -307,6 +308,7 @@ export type FormState<TFieldValues extends FieldValues> = {
+     defaultValues?: undefined | Readonly<DeepPartial<TFieldValues>>;
+     dirtyFields: Partial<Readonly<FieldNamesMarkedBoolean<TFieldValues>>>;
+     touchedFields: Partial<Readonly<FieldNamesMarkedBoolean<TFieldValues>>>;
++    validatingFields: Partial<Readonly<FieldNamesMarkedBoolean<TFieldValues>>>;
+     errors: FieldErrors<TFieldValues>;
+ };
+ 
+@@ -316,6 +318,7 @@ export type FormStateProxy<TFieldValues extends FieldValues = FieldValues> = {
+     isValidating: boolean;
+     dirtyFields: FieldNamesMarkedBoolean<TFieldValues>;
+     touchedFields: FieldNamesMarkedBoolean<TFieldValues>;
++    validatingFields: FieldNamesMarkedBoolean<TFieldValues>;
+     errors: boolean;
+     isValid: boolean;
+ };
+@@ -384,6 +387,7 @@ export type KeepStateOptions = Partial<{
+     keepIsSubmitted: boolean;
+     keepIsSubmitSuccessful: boolean;
+     keepTouched: boolean;
++    keepIsValidating: boolean;
+     keepIsValid: boolean;
+     keepSubmitCount: boolean;
+ }>;
+@@ -660,6 +664,7 @@ export type UseFormGetFieldState<TFieldValues extends FieldValues> = <TFieldName
+     invalid: boolean;
+     isDirty: boolean;
+     isTouched: boolean;
++    isValidating: boolean;
+     error?: FieldError;
+ };
+ 
+@@ -866,7 +871,7 @@ export type WatchObserver<TFieldValues extends FieldValues> = (value: DeepPartia
+ 
+ // Warnings were encountered during analysis:
+ //
+-// src/types/form.ts:440:3 - (ae-forgotten-export) The symbol "Subscription" needs to be exported by the entry point index.d.ts
++// src/types/form.ts:444:3 - (ae-forgotten-export) The symbol "Subscription" needs to be exported by the entry point index.d.ts
+ 
+ // (No @packageDocumentation comment for this package)
+ 
+diff --git a/src/__typetest__/form.test-d.ts b/src/__typetest__/form.test-d.ts
+index b795c3e2..8b153da9 100644
+--- a/src/__typetest__/form.test-d.ts
++++ b/src/__typetest__/form.test-d.ts
+@@ -40,6 +40,7 @@ import { useForm } from '../useForm';
+       invalid: boolean;
+       isDirty: boolean;
+       isTouched: boolean;
++      isValidating: boolean;
+       error?: FieldError;
+     }>(getFieldState('test'));
+   }
+@@ -56,6 +57,7 @@ import { useForm } from '../useForm';
+       invalid: boolean;
+       isDirty: boolean;
+       isTouched: boolean;
++      isValidating: boolean;
+       error?: FieldError;
+     }>(getFieldState('test', formState));
+   }
+diff --git a/src/logic/createFormControl.ts b/src/logic/createFormControl.ts
+index 3b6e48a5..e43a7b45 100644
+--- a/src/logic/createFormControl.ts
++++ b/src/logic/createFormControl.ts
+@@ -19,6 +19,7 @@ import {
+   Names,
+   Path,
+   PathValue,
++  ReadFormState,
+   Ref,
+   SetFieldValue,
+   SetValueConfig,
+@@ -63,6 +64,7 @@ import isString from '../utils/isString';
+ import isUndefined from '../utils/isUndefined';
+ import isWeb from '../utils/isWeb';
+ import live from '../utils/live';
++import objectHasTruthyValue from '../utils/objectHasTruthyValue';
+ import set from '../utils/set';
+ import unset from '../utils/unset';
+ 
+@@ -111,6 +113,7 @@ export function createFormControl<
+     isValid: false,
+     touchedFields: {},
+     dirtyFields: {},
++    validatingFields: {},
+     errors: _options.errors || {},
+     disabled: _options.disabled || false,
+   };
+@@ -135,9 +138,10 @@ export function createFormControl<
+   };
+   let delayErrorCallback: DelayCallback | null;
+   let timer = 0;
+-  const _proxyFormState = {
++  const _proxyFormState: ReadFormState = {
+     isDirty: false,
+     dirtyFields: false,
++    validatingFields: false,
+     touchedFields: false,
+     isValidating: false,
+     isValid: false,
+@@ -174,11 +178,19 @@ export function createFormControl<
+     }
+   };
+ 
+-  const _updateIsValidating = (value: boolean) =>
+-    _proxyFormState.isValidating &&
++  const _updateIsValidating = (isValidating: boolean, names: string[]) => {
++    if (!(_proxyFormState.isValidating || _proxyFormState.validatingFields)) {
++      return;
++    }
++    names.forEach((name) => {
++      set(_formState.validatingFields, name, isValidating);
++    });
++    _formState.isValidating = objectHasTruthyValue(_formState.validatingFields);
+     _subjects.state.next({
+-      isValidating: value,
++      validatingFields: _formState.validatingFields,
++      isValidating: _formState.isValidating,
+     });
++  };
+ 
+   const _updateFieldArray: BatchFieldArrayUpdate = (
+     name,
+@@ -385,7 +397,10 @@ export function createFormControl<
+       _subjects.state.next(updatedFormState);
+     }
+ 
+-    _updateIsValidating(false);
++    _updateIsValidating(
++      false,
++      Object.keys(_formState.validatingFields).filter((key) => key === name),
++    );
+   };
+ 
+   const _executeSchema = async (name?: InternalFieldName[]) =>
+@@ -663,7 +678,7 @@ export function createFormControl<
+ 
+   const onChange: ChangeHandler = async (event) => {
+     const target = event.target;
+-    let name = target.name;
++    let name = target.name as string;
+     let isFieldValueUpdated = true;
+     const field: Field = get(_fields, name);
+     const getCurrentFieldValue = () =>
+@@ -730,7 +745,7 @@ export function createFormControl<
+ 
+       !isBlurEvent && watched && _subjects.state.next({ ..._formState });
+ 
+-      _updateIsValidating(true);
++      _updateIsValidating(true, [name]);
+ 
+       if (_options.resolver) {
+         const { errors } = await _executeSchema([name]);
+@@ -755,7 +770,6 @@ export function createFormControl<
+           isValid = isEmptyObject(errors);
+         }
+       } else {
+-        _updateIsFieldValueUpdated(fieldValue);
+         error = (
+           await validateField(
+             field,
+@@ -765,6 +779,8 @@ export function createFormControl<
+           )
+         )[name];
+ 
++        _updateIsFieldValueUpdated(fieldValue);
++
+         if (isFieldValueUpdated) {
+           if (error) {
+             isValid = false;
+@@ -799,7 +815,7 @@ export function createFormControl<
+     let validationResult;
+     const fieldNames = convertToArrayPayload(name) as InternalFieldName[];
+ 
+-    _updateIsValidating(true);
++    _updateIsValidating(true, fieldNames);
+ 
+     if (_options.resolver) {
+       const errors = await executeSchemaAndUpdateState(
+@@ -871,6 +887,7 @@ export function createFormControl<
+     invalid: !!get((formState || _formState).errors, name),
+     isDirty: !!get((formState || _formState).dirtyFields, name),
+     isTouched: !!get((formState || _formState).touchedFields, name),
++    isValidating: !!get((formState || _formState).validatingFields, name),
+     error: get((formState || _formState).errors, name),
+   });
+ 
+@@ -940,6 +957,8 @@ export function createFormControl<
+       !options.keepError && unset(_formState.errors, fieldName);
+       !options.keepDirty && unset(_formState.dirtyFields, fieldName);
+       !options.keepTouched && unset(_formState.touchedFields, fieldName);
++      !options.keepIsValidating &&
++        unset(_formState.validatingFields, fieldName);
+       !_options.shouldUnregister &&
+         !options.keepDefaultValue &&
+         unset(_defaultValues, fieldName);
+diff --git a/src/types/controller.ts b/src/types/controller.ts
+index e8b96996..58a58a7a 100644
+--- a/src/types/controller.ts
++++ b/src/types/controller.ts
+@@ -16,6 +16,7 @@ export type ControllerFieldState = {
+   invalid: boolean;
+   isTouched: boolean;
+   isDirty: boolean;
++  isValidating: boolean;
+   error?: FieldError;
+ };
+ 
+diff --git a/src/types/form.ts b/src/types/form.ts
+index b93b742a..ba3b7e0c 100644
+--- a/src/types/form.ts
++++ b/src/types/form.ts
+@@ -135,6 +135,7 @@ export type FormStateProxy<TFieldValues extends FieldValues = FieldValues> = {
+   isValidating: boolean;
+   dirtyFields: FieldNamesMarkedBoolean<TFieldValues>;
+   touchedFields: FieldNamesMarkedBoolean<TFieldValues>;
++  validatingFields: FieldNamesMarkedBoolean<TFieldValues>;
+   errors: boolean;
+   isValid: boolean;
+ };
+@@ -154,6 +155,7 @@ export type FormState<TFieldValues extends FieldValues> = {
+   defaultValues?: undefined | Readonly<DeepPartial<TFieldValues>>;
+   dirtyFields: Partial<Readonly<FieldNamesMarkedBoolean<TFieldValues>>>;
+   touchedFields: Partial<Readonly<FieldNamesMarkedBoolean<TFieldValues>>>;
++  validatingFields: Partial<Readonly<FieldNamesMarkedBoolean<TFieldValues>>>;
+   errors: FieldErrors<TFieldValues>;
+ };
+ 
+@@ -166,6 +168,7 @@ export type KeepStateOptions = Partial<{
+   keepIsSubmitted: boolean;
+   keepIsSubmitSuccessful: boolean;
+   keepTouched: boolean;
++  keepIsValidating: boolean;
+   keepIsValid: boolean;
+   keepSubmitCount: boolean;
+ }>;
+@@ -358,6 +361,7 @@ export type UseFormGetFieldState<TFieldValues extends FieldValues> = <
+   invalid: boolean;
+   isDirty: boolean;
+   isTouched: boolean;
++  isValidating: boolean;
+   error?: FieldError;
+ };
+ 
+diff --git a/src/useController.ts b/src/useController.ts
+index cc2b06ae..9f81698a 100644
+--- a/src/useController.ts
++++ b/src/useController.ts
+@@ -181,6 +181,10 @@ export function useController<
+           enumerable: true,
+           get: () => !!get(formState.touchedFields, name),
+         },
++        isValidating: {
++          enumerable: true,
++          get: () => !!get(formState.validatingFields, name),
++        },
+         error: {
+           enumerable: true,
+           get: () => get(formState.errors, name),
+diff --git a/src/useForm.ts b/src/useForm.ts
+index 58dbccaa..b873c230 100644
+--- a/src/useForm.ts
++++ b/src/useForm.ts
+@@ -65,6 +65,7 @@ export function useForm<
+     submitCount: 0,
+     dirtyFields: {},
+     touchedFields: {},
++    validatingFields: {},
+     errors: props.errors || {},
+     disabled: props.disabled || false,
+     defaultValues: isFunction(props.defaultValues)
+diff --git a/src/useFormState.ts b/src/useFormState.ts
+index 0f5424fa..a1379d45 100644
+--- a/src/useFormState.ts
++++ b/src/useFormState.ts
+@@ -55,6 +55,7 @@ function useFormState<TFieldValues extends FieldValues = FieldValues>(
+     isLoading: false,
+     dirtyFields: false,
+     touchedFields: false,
++    validatingFields: false,
+     isValidating: false,
+     isValid: false,
+     errors: false,
+diff --git a/src/utils/objectHasTruthyValue.ts b/src/utils/objectHasTruthyValue.ts
+new file mode 100644
+index 00000000..362f2520
+--- /dev/null
++++ b/src/utils/objectHasTruthyValue.ts
+@@ -0,0 +1,4 @@
++import isObject from './isObject';
++
++export default (value: unknown): value is object =>
++  isObject(value) && Object.values(value).some((val) => val);

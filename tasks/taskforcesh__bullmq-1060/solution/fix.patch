@@ -1,0 +1,139 @@
+diff --git a/src/commands/includes/removeJob.lua b/src/commands/includes/removeJob.lua
+index 6f4c3b4c38..114ecc55d4 100644
+--- a/src/commands/includes/removeJob.lua
++++ b/src/commands/includes/removeJob.lua
+@@ -7,7 +7,7 @@
+ 
+ local function removeJob(key, hard, baseKey)
+   local jobKey = baseKey .. key
+-  removeParentDependencyKey(jobKey, hard, baseKey)
++  removeParentDependencyKey(jobKey, hard, nil, baseKey)
+   rcall("DEL", jobKey, jobKey .. ':logs',
+     jobKey .. ':dependencies', jobKey .. ':processed')
+ end
+diff --git a/src/commands/includes/removeParentDependencyKey.lua b/src/commands/includes/removeParentDependencyKey.lua
+index 39800bd006..c1b240d948 100644
+--- a/src/commands/includes/removeParentDependencyKey.lua
++++ b/src/commands/includes/removeParentDependencyKey.lua
+@@ -19,9 +19,10 @@ local function moveParentToWait(parentPrefix, parentId, emitEvent)
+   end
+ end
+ 
+-local function removeParentDependencyKey(jobKey, hard, baseKey)
+-  local parentKey = rcall("HGET", jobKey, "parentKey")
+-  if( (type(parentKey) == "string") and parentKey ~= "" and (rcall("EXISTS", parentKey) == 1)) then
++local function removeParentDependencyKey(jobKey, hard, parentKey, baseKey)
++  if parentKey then
++    local parentProcessedKey = parentKey .. ":processed"
++    rcall("HDEL", parentProcessedKey, jobKey)
+     local parentDependenciesKey = parentKey .. ":dependencies"
+     local result = rcall("SREM", parentDependenciesKey, jobKey)
+     if result > 0 then
+@@ -34,7 +35,7 @@ local function removeParentDependencyKey(jobKey, hard, baseKey)
+ 
+         if hard then  
+           if parentPrefix == baseKey then
+-            removeParentDependencyKey(parentKey, hard, baseKey)
++            removeParentDependencyKey(parentKey, hard, nil, baseKey)
+             rcall("DEL", parentKey, parentKey .. ':logs',
+               parentKey .. ':dependencies', parentKey .. ':processed')
+           else
+@@ -45,6 +46,34 @@ local function removeParentDependencyKey(jobKey, hard, baseKey)
+         end
+       end
+     end
++  else
++    local missedParentKey = rcall("HGET", jobKey, "parentKey")
++    if( (type(missedParentKey) == "string") and missedParentKey ~= "" and (rcall("EXISTS", missedParentKey) == 1)) then
++      local parentProcessedKey = missedParentKey .. ":processed"
++      rcall("HDEL", parentProcessedKey, jobKey)
++      local parentDependenciesKey = missedParentKey .. ":dependencies"
++      local result = rcall("SREM", parentDependenciesKey, jobKey)
++      if result > 0 then
++        local pendingDependencies = rcall("SCARD", parentDependenciesKey)
++        if pendingDependencies == 0 then
++          local parentId = getJobIdFromKey(missedParentKey)
++          local parentPrefix = getJobKeyPrefix(missedParentKey, parentId)
++
++          rcall("ZREM", parentPrefix .. "waiting-children", parentId)
++
++          if hard then  
++            if parentPrefix == baseKey then
++              removeParentDependencyKey(missedParentKey, hard, nil, baseKey)
++              rcall("DEL", missedParentKey, missedParentKey .. ':logs',
++                missedParentKey .. ':dependencies', missedParentKey .. ':processed')
++            else
++              moveParentToWait(parentPrefix, parentId)
++            end
++          else
++            moveParentToWait(parentPrefix, parentId, true)
++          end
++        end
++      end
++    end  
+   end
+ end
+-
+diff --git a/src/commands/removeJob-1.lua b/src/commands/removeJob-1.lua
+index 2dfc16a4bf..df64400be7 100644
+--- a/src/commands/removeJob-1.lua
++++ b/src/commands/removeJob-1.lua
+@@ -42,35 +42,44 @@ local function isLocked( prefix, jobId)
+     return true
+ end
+ 
+-local function removeJob( prefix, jobId)
++local function removeJob( prefix, jobId, parentKey)
+     local jobKey = prefix .. jobId;
+ 
+-    removeParentDependencyKey(jobKey)
+-
+-    rcall("LREM", prefix .. "active", 0, jobId)
+-    rcall("LREM", prefix .. "wait", 0, jobId)
+-    rcall("ZREM", prefix .. "delayed", jobId)
+-    rcall("LREM", prefix .. "paused", 0, jobId)
+-    rcall("ZREM", prefix .. "completed", jobId)
+-    rcall("ZREM", prefix .. "failed", jobId)
+-    rcall("ZREM", prefix .. "priority", jobId)
+-    rcall("ZREM", prefix .. "waiting-children", jobId)
+-    rcall("DEL", jobKey, jobKey .. ":logs", jobKey .. ":processed")
++    removeParentDependencyKey(jobKey, false, parentKey)
+ 
+     -- Check if this job has children
+     -- If so, we are going to try to remove the children recursively in deep first way because
+     -- if some job is locked we must exit with and error.
++    --local countProcessed = rcall("HLEN", jobKey .. ":processed")
++    local processed = rcall("HGETALL", jobKey .. ":processed")
++
++    if (#processed > 0) then
++        for i = 1, #processed, 2 do
++            local childJobId = getJobIdFromKey(processed[i])
++            local childJobPrefix = getJobKeyPrefix(processed[i], childJobId)
++            removeJob( childJobPrefix, childJobId, jobKey )
++        end
++    end
++
+     local dependencies = rcall("SMEMBERS", jobKey .. ":dependencies")
+     if (#dependencies > 0) then
+         for i, childJobKey in ipairs(dependencies) do
+             -- We need to get the jobId for this job.
+             local childJobId = getJobIdFromKey(childJobKey)
+             local childJobPrefix = getJobKeyPrefix(childJobKey, childJobId)
+-            removeJob( childJobPrefix, childJobId )
++            removeJob( childJobPrefix, childJobId, jobKey )
+         end
+     end
+ 
+-    rcall("DEL", jobKey .. ":dependencies")
++    rcall("LREM", prefix .. "active", 0, jobId)
++    rcall("LREM", prefix .. "wait", 0, jobId)
++    rcall("ZREM", prefix .. "delayed", jobId)
++    rcall("LREM", prefix .. "paused", 0, jobId)
++    rcall("ZREM", prefix .. "completed", jobId)
++    rcall("ZREM", prefix .. "failed", jobId)
++    rcall("ZREM", prefix .. "priority", jobId)
++    rcall("ZREM", prefix .. "waiting-children", jobId)
++    rcall("DEL", jobKey, jobKey .. ":logs", jobKey .. ":dependencies", jobKey .. ":processed")
+ 
+     -- -- delete keys related to rate limiter
+         -- local limiterIndexTable = KEYS[10] .. ":index"

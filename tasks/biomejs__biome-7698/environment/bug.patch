@@ -1,0 +1,2924 @@
+diff --git a/.changeset/eager-suns-smoke.md b/.changeset/eager-suns-smoke.md
+deleted file mode 100644
+index 76dabb768b..0000000000
+--- a/.changeset/eager-suns-smoke.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-"@biomejs/biome": patch
+----
+-
+-Fixed an issue where the JUnit reporter returned a zero-based location. Now the location returned is one-based.
+diff --git a/.changeset/gentle-pots-hunt.md b/.changeset/gentle-pots-hunt.md
+deleted file mode 100644
+index d8582ffb6f..0000000000
+--- a/.changeset/gentle-pots-hunt.md
++++ /dev/null
+@@ -1,64 +0,0 @@
+----
+-"@biomejs/biome": minor
+----
+-
+-Added a new reporter named `rdjson`. This reporter prints diagnostics following the [RDJSON format](https://deepwiki.com/reviewdog/reviewdog/3.2-reviewdog-diagnostic-format):
+-
+-The following command:
+-
+-```shell
+-biome check --reporter=rdjson
+-```
+-
+-Will emit diagnostics in the following format:
+-
+-```json
+-{
+-  "source": {
+-    "name": "Biome",
+-    "url": "https://biomejs.dev"
+-  },
+-  "diagnostics": [
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 0
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 0
+-          }
+-        }
+-      },
+-      "message": "This import is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 10,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 9,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "Several of these imports are unused."
+-    }
+-  ]
+-}
+-```
+diff --git a/crates/biome_cli/src/cli_options.rs b/crates/biome_cli/src/cli_options.rs
+index 79ad1001d0..5e315ec8fb 100644
+--- a/crates/biome_cli/src/cli_options.rs
++++ b/crates/biome_cli/src/cli_options.rs
+@@ -56,7 +56,7 @@ pub struct CliOptions {
+     /// Allows to change how diagnostics and summary are reported.
+     #[bpaf(
+         long("reporter"),
+-        argument("json|json-pretty|github|junit|summary|gitlab|checkstyle|rdjson"),
++        argument("json|json-pretty|github|junit|summary|gitlab|checkstyle"),
+         fallback(CliReporter::default())
+     )]
+     pub reporter: CliReporter,
+@@ -154,14 +154,12 @@ pub enum CliReporter {
+     GitHub,
+     /// Diagnostics and summary are printed in JUnit format
+     Junit,
+-    /// Reports diagnostics grouped by category and number of hits. Reports formatter diagnostics grouped by file.
++    /// Reports linter diagnostics grouped by category and number of hits. Reports formatter diagnostics grouped by file.
+     Summary,
+-    /// Reports diagnostics using the [GitLab Code Quality report](https://docs.gitlab.com/ee/ci/testing/code_quality.html#implement-a-custom-tool).
++    /// Reports linter diagnostics using the [GitLab Code Quality report](https://docs.gitlab.com/ee/ci/testing/code_quality.html#implement-a-custom-tool).
+     GitLab,
+     /// Reports diagnostics in Checkstyle XML format
+     Checkstyle,
+-    /// Reports diagnostics using the [Reviewdog JSON format](https://deepwiki.com/reviewdog/reviewdog/3.2-reviewdog-diagnostic-format)
+-    RdJson,
+ }
+ 
+ impl CliReporter {
+@@ -182,7 +180,6 @@ impl FromStr for CliReporter {
+             "junit" => Ok(Self::Junit),
+             "gitlab" => Ok(Self::GitLab),
+             "checkstyle" => Ok(Self::Checkstyle),
+-            "rdjson" => Ok(Self::RdJson),
+             _ => Err(format!(
+                 "value {s:?} is not valid for the --reporter argument"
+             )),
+@@ -201,7 +198,6 @@ impl Display for CliReporter {
+             Self::Junit => f.write_str("junit"),
+             Self::GitLab => f.write_str("gitlab"),
+             Self::Checkstyle => f.write_str("checkstyle"),
+-            Self::RdJson => f.write_str("rdjson"),
+         }
+     }
+ }
+diff --git a/crates/biome_cli/src/execute/mod.rs b/crates/biome_cli/src/execute/mod.rs
+index 16c3c1ca05..347ce5cebf 100644
+--- a/crates/biome_cli/src/execute/mod.rs
++++ b/crates/biome_cli/src/execute/mod.rs
+@@ -14,7 +14,6 @@ use crate::reporter::github::{GithubReporter, GithubReporterVisitor};
+ use crate::reporter::gitlab::{GitLabReporter, GitLabReporterVisitor};
+ use crate::reporter::json::{JsonReporter, JsonReporterVisitor};
+ use crate::reporter::junit::{JunitReporter, JunitReporterVisitor};
+-use crate::reporter::rdjson::{RdJsonReporter, RdJsonReporterVisitor};
+ use crate::reporter::summary::{SummaryReporter, SummaryReporterVisitor};
+ use crate::reporter::terminal::{ConsoleReporter, ConsoleReporterVisitor};
+ use crate::{
+@@ -250,8 +249,6 @@ pub enum ReportMode {
+     GitLab,
+     /// Reports diagnostics in [Checkstyle XML format](https://checkstyle.org/).
+     Checkstyle,
+-    /// Reports information in [reviewdog JSON format](https://deepwiki.com/reviewdog/reviewdog/3.2-reviewdog-diagnostic-format)
+-    RdJson,
+ }
+ 
+ impl Default for ReportMode {
+@@ -275,7 +272,6 @@ impl From<CliReporter> for ReportMode {
+             CliReporter::Junit => Self::Junit,
+             CliReporter::GitLab => Self::GitLab {},
+             CliReporter::Checkstyle => Self::Checkstyle,
+-            CliReporter::RdJson => Self::RdJson,
+         }
+     }
+ }
+@@ -722,15 +718,6 @@ pub fn execute_mode(
+             reporter
+                 .write(&mut crate::reporter::checkstyle::CheckstyleReporterVisitor::new(console))?;
+         }
+-        ReportMode::RdJson => {
+-            let reporter = RdJsonReporter {
+-                diagnostics_payload,
+-                execution: execution.clone(),
+-                verbose: cli_options.verbose,
+-                working_directory: fs.working_directory().clone(),
+-            };
+-            reporter.write(&mut RdJsonReporterVisitor(console))?;
+-        }
+     }
+ 
+     // Processing emitted error diagnostics, exit with a non-zero code
+diff --git a/crates/biome_cli/src/reporter/junit.rs b/crates/biome_cli/src/reporter/junit.rs
+index bf42ea8988..2b6aeddb28 100644
+--- a/crates/biome_cli/src/reporter/junit.rs
++++ b/crates/biome_cli/src/reporter/junit.rs
+@@ -90,8 +90,8 @@ impl ReporterVisitor for JunitReporterVisitor<'_> {
+ 
+                 status.set_description(format!(
+                     "line {row:?}, col {col:?}, {body}",
+-                    row = start.line_number.get(),
+-                    col = start.column_number.get(),
++                    row = start.line_number.to_zero_indexed(),
++                    col = start.column_number.to_zero_indexed(),
+                     body = message
+                 ));
+                 let mut case = TestCase::new(
+diff --git a/crates/biome_cli/src/reporter/mod.rs b/crates/biome_cli/src/reporter/mod.rs
+index fc78cb510a..1ed2d9341d 100644
+--- a/crates/biome_cli/src/reporter/mod.rs
++++ b/crates/biome_cli/src/reporter/mod.rs
+@@ -3,7 +3,6 @@ pub(crate) mod github;
+ pub(crate) mod gitlab;
+ pub(crate) mod json;
+ pub(crate) mod junit;
+-pub(crate) mod rdjson;
+ pub(crate) mod summary;
+ pub(crate) mod terminal;
+ 
+diff --git a/crates/biome_cli/src/reporter/rdjson.rs b/crates/biome_cli/src/reporter/rdjson.rs
+deleted file mode 100644
+index 0ec9f288d3..0000000000
+--- a/crates/biome_cli/src/reporter/rdjson.rs
++++ /dev/null
+@@ -1,254 +0,0 @@
+-use crate::{DiagnosticsPayload, Execution, Reporter, ReporterVisitor, TraversalSummary};
+-use biome_console::fmt::{Display, Formatter};
+-use biome_console::{Console, ConsoleExt, MarkupBuf, markup};
+-use biome_diagnostics::display::{SourceFile, markup_to_string};
+-use biome_diagnostics::{Error, Location, LogCategory, PrintDescription, Visit};
+-use camino::{Utf8Path, Utf8PathBuf};
+-use serde::Serialize;
+-
+-pub(crate) struct RdJsonReporter {
+-    pub(crate) diagnostics_payload: DiagnosticsPayload,
+-    pub(crate) execution: Execution,
+-    pub(crate) verbose: bool,
+-    pub(crate) working_directory: Option<Utf8PathBuf>,
+-}
+-
+-impl Reporter for RdJsonReporter {
+-    fn write(self, visitor: &mut dyn ReporterVisitor) -> std::io::Result<()> {
+-        visitor.report_diagnostics(
+-            &self.execution,
+-            self.diagnostics_payload,
+-            self.verbose,
+-            self.working_directory.as_deref(),
+-        )?;
+-        Ok(())
+-    }
+-}
+-
+-pub(crate) struct RdJsonReporterVisitor<'a>(pub(crate) &'a mut dyn Console);
+-
+-impl ReporterVisitor for RdJsonReporterVisitor<'_> {
+-    fn report_summary(
+-        &mut self,
+-        _execution: &Execution,
+-        _summary: TraversalSummary,
+-        _verbose: bool,
+-    ) -> std::io::Result<()> {
+-        Ok(())
+-    }
+-
+-    fn report_diagnostics(
+-        &mut self,
+-        _execution: &Execution,
+-        payload: DiagnosticsPayload,
+-        verbose: bool,
+-        _working_directory: Option<&Utf8Path>,
+-    ) -> std::io::Result<()> {
+-        let rdjson_diagnostics: Vec<_> = payload
+-            .diagnostics
+-            .iter()
+-            .filter_map(|diagnostic| {
+-                if diagnostic.severity() >= payload.diagnostic_level {
+-                    if diagnostic.tags().is_verbose() {
+-                        if verbose {
+-                            diagnostic_to_rdjson(diagnostic)
+-                        } else {
+-                            None
+-                        }
+-                    } else {
+-                        diagnostic_to_rdjson(diagnostic)
+-                    }
+-                } else {
+-                    None
+-                }
+-            })
+-            .collect();
+-
+-        let report = RdJsonReport {
+-            source: RdJsonSource {
+-                name: "Biome",
+-                url: "https://biomejs.dev",
+-            },
+-            diagnostics: rdjson_diagnostics,
+-        };
+-
+-        let result = serde_json::to_string_pretty(&report)?;
+-
+-        self.0.log(markup! {
+-            {result}
+-        });
+-
+-        Ok(())
+-    }
+-}
+-
+-fn diagnostic_to_rdjson<'a>(diagnostic: &'a Error) -> Option<RdJsonDiagnostic<'a>> {
+-    let message = PrintDescription(diagnostic).to_string();
+-    let location = diagnostic.location();
+-    let location = to_rdjson_location(&location);
+-
+-    let suggestions = to_rdjson_suggetions(diagnostic);
+-    let category = diagnostic.category()?;
+-    let code = RdJsonCode {
+-        url: category.link().map(String::from),
+-        value: category.name(),
+-    };
+-
+-    Some(RdJsonDiagnostic {
+-        code,
+-        location,
+-        message,
+-        suggestions,
+-    })
+-}
+-
+-fn to_rdjson_location(location: &Location<'_>) -> Option<RdJsonLocation> {
+-    let (Some(span), Some(source_code), Some(resource)) =
+-        (location.span, location.source_code, location.resource)
+-    else {
+-        return None;
+-    };
+-    let resource = resource.as_file()?;
+-    let source = SourceFile::new(source_code);
+-    let start = source.location(span.start()).ok()?;
+-    let end = source.location(span.end()).ok()?;
+-    Some(RdJsonLocation {
+-        path: resource.to_string(),
+-        range: Some(RdJsonRange {
+-            start: RdJsonLineColumn {
+-                column: start.column_number.get(),
+-                line: start.line_number.get(),
+-            },
+-            end: RdJsonLineColumn {
+-                column: end.column_number.get(),
+-                line: end.line_number.get(),
+-            },
+-        }),
+-    })
+-}
+-
+-struct SuggestionsVisitor {
+-    suggestions: Vec<RdJsonSuggestion>,
+-    current_message: Option<String>,
+-    last_diagnostic_length: usize,
+-}
+-
+-impl Visit for SuggestionsVisitor {
+-    fn record_log(&mut self, _category: LogCategory, text: &dyn Display) -> std::io::Result<()> {
+-        let message = {
+-            let mut message = MarkupBuf::default();
+-            let mut fmt = Formatter::new(&mut message);
+-            fmt.write_markup(markup!({ { text } }))?;
+-            markup_to_string(&message).expect("Invalid markup")
+-        };
+-        let current_diagnostic_length = self.suggestions.len();
+-
+-        if self.last_diagnostic_length != current_diagnostic_length {
+-            let last_suggestion = self
+-                .suggestions
+-                .last_mut()
+-                .expect("No suggestions to append to");
+-            last_suggestion.text = message;
+-        } else if let Some(current_message) = self.current_message.as_mut() {
+-            current_message.push_str(&message);
+-        } else {
+-            self.current_message = Some(message);
+-        }
+-
+-        Ok(())
+-    }
+-
+-    fn record_frame(&mut self, location: Location<'_>) -> std::io::Result<()> {
+-        let range = if let (Some(span), Some(source_code)) = (location.span, location.source_code) {
+-            let source = SourceFile::new(source_code);
+-            let start = source.location(span.start()).expect("Invalid span");
+-            let end = source.location(span.end()).expect("Invalid span");
+-
+-            RdJsonRange {
+-                end: RdJsonLineColumn {
+-                    line: end.line_number.get(),
+-                    column: end.column_number.get(),
+-                },
+-                start: RdJsonLineColumn {
+-                    line: start.line_number.get(),
+-                    column: start.column_number.get(),
+-                },
+-            }
+-        } else {
+-            RdJsonRange::default()
+-        };
+-
+-        self.last_diagnostic_length = self.suggestions.len();
+-        self.suggestions.push(RdJsonSuggestion {
+-            text: self.current_message.take().unwrap_or_default(),
+-            range,
+-        });
+-
+-        Ok(())
+-    }
+-}
+-
+-fn to_rdjson_suggetions(diagnostic: &Error) -> Vec<RdJsonSuggestion> {
+-    let mut visitor = SuggestionsVisitor {
+-        suggestions: vec![],
+-        last_diagnostic_length: 0,
+-        current_message: None,
+-    };
+-
+-    diagnostic.advices(&mut visitor).unwrap();
+-
+-    visitor.suggestions
+-}
+-
+-#[derive(Serialize)]
+-pub struct RdJsonReport<'a> {
+-    source: RdJsonSource,
+-    diagnostics: Vec<RdJsonDiagnostic<'a>>,
+-}
+-
+-#[derive(Serialize)]
+-struct RdJsonSource {
+-    name: &'static str,
+-    url: &'static str,
+-}
+-
+-#[derive(Serialize)]
+-struct RdJsonDiagnostic<'a> {
+-    code: RdJsonCode<'a>,
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    location: Option<RdJsonLocation>,
+-    message: String,
+-    #[serde(skip_serializing_if = "Vec::is_empty")]
+-    suggestions: Vec<RdJsonSuggestion>,
+-}
+-
+-#[derive(Serialize)]
+-struct RdJsonCode<'a> {
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    url: Option<String>,
+-    value: &'a str,
+-}
+-#[derive(Serialize)]
+-struct RdJsonLocation {
+-    path: String,
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    range: Option<RdJsonRange>,
+-}
+-
+-#[derive(Default, Serialize)]
+-struct RdJsonRange {
+-    end: RdJsonLineColumn,
+-    start: RdJsonLineColumn,
+-}
+-
+-#[derive(Serialize)]
+-pub struct RdJsonSuggestion {
+-    range: RdJsonRange,
+-    text: String,
+-}
+-
+-#[derive(Default, Serialize)]
+-pub struct RdJsonLineColumn {
+-    column: usize,
+-    line: usize,
+-}
+diff --git a/crates/biome_cli/tests/cases/mod.rs b/crates/biome_cli/tests/cases/mod.rs
+index a4d40d957a..b86c262153 100644
+--- a/crates/biome_cli/tests/cases/mod.rs
++++ b/crates/biome_cli/tests/cases/mod.rs
+@@ -29,7 +29,6 @@ mod reporter_checkstyle;
+ mod reporter_github;
+ mod reporter_gitlab;
+ mod reporter_junit;
+-mod reporter_rdjson;
+ mod reporter_summary;
+ mod reporter_terminal;
+ mod rules_via_dependencies;
+diff --git a/crates/biome_cli/tests/cases/reporter_rdjson.rs b/crates/biome_cli/tests/cases/reporter_rdjson.rs
+deleted file mode 100644
+index 455f9db20f..0000000000
+--- a/crates/biome_cli/tests/cases/reporter_rdjson.rs
++++ /dev/null
+@@ -1,170 +0,0 @@
+-use crate::run_cli;
+-use crate::snap_test::{SnapshotPayload, assert_cli_snapshot};
+-use biome_console::BufferConsole;
+-use biome_fs::MemoryFileSystem;
+-use bpaf::Args;
+-use camino::Utf8Path;
+-
+-const MAIN_1: &str = r#"import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;"#;
+-
+-const MAIN_2: &str = r#"import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;"#;
+-
+-#[test]
+-fn reports_diagnostics_rdjson_check_command() {
+-    let fs = MemoryFileSystem::default();
+-    let mut console = BufferConsole::default();
+-
+-    let file_path1 = Utf8Path::new("main.ts");
+-    fs.insert(file_path1.into(), MAIN_1.as_bytes());
+-
+-    let file_path2 = Utf8Path::new("index.ts");
+-    fs.insert(file_path2.into(), MAIN_2.as_bytes());
+-
+-    let (fs, result) = run_cli(
+-        fs,
+-        &mut console,
+-        Args::from(
+-            [
+-                "check",
+-                "--reporter=rdjson",
+-                file_path1.as_str(),
+-                file_path2.as_str(),
+-            ]
+-            .as_slice(),
+-        ),
+-    );
+-
+-    assert!(result.is_err(), "run_cli returned {result:?}");
+-
+-    assert_cli_snapshot(SnapshotPayload::new(
+-        module_path!(),
+-        "reports_diagnostics_rdjson_check_command",
+-        fs,
+-        console,
+-        result,
+-    ));
+-}
+-
+-#[test]
+-fn reports_diagnostics_rdjson_ci_command() {
+-    let fs = MemoryFileSystem::default();
+-    let mut console = BufferConsole::default();
+-
+-    let file_path1 = Utf8Path::new("main.ts");
+-    fs.insert(file_path1.into(), MAIN_1.as_bytes());
+-
+-    let file_path2 = Utf8Path::new("index.ts");
+-    fs.insert(file_path2.into(), MAIN_2.as_bytes());
+-
+-    let (fs, result) = run_cli(
+-        fs,
+-        &mut console,
+-        Args::from(
+-            [
+-                "ci",
+-                "--reporter=rdjson",
+-                file_path1.as_str(),
+-                file_path2.as_str(),
+-            ]
+-            .as_slice(),
+-        ),
+-    );
+-
+-    assert!(result.is_err(), "run_cli returned {result:?}");
+-
+-    assert_cli_snapshot(SnapshotPayload::new(
+-        module_path!(),
+-        "reports_diagnostics_rdjson_ci_command",
+-        fs,
+-        console,
+-        result,
+-    ));
+-}
+-
+-#[test]
+-fn reports_diagnostics_rdjson_lint_command() {
+-    let fs = MemoryFileSystem::default();
+-    let mut console = BufferConsole::default();
+-
+-    let file_path1 = Utf8Path::new("main.ts");
+-    fs.insert(file_path1.into(), MAIN_1.as_bytes());
+-
+-    let file_path2 = Utf8Path::new("index.ts");
+-    fs.insert(file_path2.into(), MAIN_2.as_bytes());
+-
+-    let (fs, result) = run_cli(
+-        fs,
+-        &mut console,
+-        Args::from(
+-            [
+-                "lint",
+-                "--reporter=rdjson",
+-                file_path1.as_str(),
+-                file_path2.as_str(),
+-            ]
+-            .as_slice(),
+-        ),
+-    );
+-
+-    assert!(result.is_err(), "run_cli returned {result:?}");
+-
+-    assert_cli_snapshot(SnapshotPayload::new(
+-        module_path!(),
+-        "reports_diagnostics_rdjson_lint_command",
+-        fs,
+-        console,
+-        result,
+-    ));
+-}
+-
+-#[test]
+-fn reports_diagnostics_rdjson_format_command() {
+-    let fs = MemoryFileSystem::default();
+-    let mut console = BufferConsole::default();
+-
+-    let file_path1 = Utf8Path::new("main.ts");
+-    fs.insert(file_path1.into(), MAIN_1.as_bytes());
+-
+-    let file_path2 = Utf8Path::new("index.ts");
+-    fs.insert(file_path2.into(), MAIN_2.as_bytes());
+-
+-    let (fs, result) = run_cli(
+-        fs,
+-        &mut console,
+-        Args::from(
+-            [
+-                "format",
+-                "--reporter=rdjson",
+-                file_path1.as_str(),
+-                file_path2.as_str(),
+-            ]
+-            .as_slice(),
+-        ),
+-    );
+-
+-    assert!(result.is_err(), "run_cli returned {result:?}");
+-
+-    assert_cli_snapshot(SnapshotPayload::new(
+-        module_path!(),
+-        "reports_diagnostics_rdjson_format_command",
+-        fs,
+-        console,
+-        result,
+-    ));
+-}
+diff --git a/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_check_command.snap b/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_check_command.snap
+index 032483e606..71bf4ba399 100644
+--- a/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_check_command.snap
++++ b/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_check_command.snap
+@@ -48,112 +48,112 @@ check ━━━━━━━━━━━━━━━━━━━━━━━━
+ <testsuites name="Biome" tests="22" failures="22" errors="16" time="<TIME>">
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="1" column="8">
+-            <failure message="This import is unused.">line 1, col 8, This import is unused.</failure>
++            <failure message="This import is unused.">line 0, col 7, This import is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="2" column="10">
+-            <failure message="Several of these imports are unused.">line 2, col 10, Several of these imports are unused.</failure>
++            <failure message="Several of these imports are unused.">line 1, col 9, Several of these imports are unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="8" column="5">
+-            <failure message="This variable f is unused.">line 8, col 5, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 7, col 4, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="9" column="7">
+-            <failure message="This variable f is unused.">line 9, col 7, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 8, col 6, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="1" column="8">
+-            <failure message="This import is unused.">line 1, col 8, This import is unused.</failure>
++            <failure message="This import is unused.">line 0, col 7, This import is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="2" column="10">
+-            <failure message="Several of these imports are unused.">line 2, col 10, Several of these imports are unused.</failure>
++            <failure message="Several of these imports are unused.">line 1, col 9, Several of these imports are unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="8" column="5">
+-            <failure message="This variable f is unused.">line 8, col 5, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 7, col 4, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="9" column="7">
+-            <failure message="This variable f is unused.">line 9, col 7, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 8, col 6, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.assist.source.organizeImports" line="1" column="1">
+-            <failure message="The imports and exports are not sorted.">line 1, col 1, The imports and exports are not sorted.</failure>
++            <failure message="The imports and exports are not sorted.">line 0, col 0, The imports and exports are not sorted.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDoubleEquals" line="4" column="3">
+-            <failure message="Using == may be unsafe if you are relying on type coercion.">line 4, col 3, Using == may be unsafe if you are relying on type coercion.</failure>
++            <failure message="Using == may be unsafe if you are relying on type coercion.">line 3, col 2, Using == may be unsafe if you are relying on type coercion.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDebugger" line="6" column="1">
+-            <failure message="This is an unexpected use of the debugger statement.">line 6, col 1, This is an unexpected use of the debugger statement.</failure>
++            <failure message="This is an unexpected use of the debugger statement.">line 5, col 0, This is an unexpected use of the debugger statement.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="8" column="5">
+-            <failure message="This variable implicitly has the any type.">line 8, col 5, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 7, col 4, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="9" column="7">
+-            <failure message="This variable implicitly has the any type.">line 9, col 7, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 8, col 6, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="2" column="10">
+-            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 2, col 10, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 1, col 9, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="9" column="7">
+-            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 9, col 7, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 8, col 6, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.assist.source.organizeImports" line="1" column="1">
+-            <failure message="The imports and exports are not sorted.">line 1, col 1, The imports and exports are not sorted.</failure>
++            <failure message="The imports and exports are not sorted.">line 0, col 0, The imports and exports are not sorted.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDoubleEquals" line="4" column="3">
+-            <failure message="Using == may be unsafe if you are relying on type coercion.">line 4, col 3, Using == may be unsafe if you are relying on type coercion.</failure>
++            <failure message="Using == may be unsafe if you are relying on type coercion.">line 3, col 2, Using == may be unsafe if you are relying on type coercion.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDebugger" line="6" column="1">
+-            <failure message="This is an unexpected use of the debugger statement.">line 6, col 1, This is an unexpected use of the debugger statement.</failure>
++            <failure message="This is an unexpected use of the debugger statement.">line 5, col 0, This is an unexpected use of the debugger statement.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="8" column="5">
+-            <failure message="This variable implicitly has the any type.">line 8, col 5, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 7, col 4, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="9" column="7">
+-            <failure message="This variable implicitly has the any type.">line 9, col 7, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 8, col 6, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="2" column="10">
+-            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 2, col 10, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 1, col 9, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="9" column="7">
+-            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 9, col 7, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 8, col 6, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+ </testsuites>
+diff --git a/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_ci_command.snap b/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_ci_command.snap
+index 4d0ce7d234..4d045861c6 100644
+--- a/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_ci_command.snap
++++ b/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_ci_command.snap
+@@ -48,112 +48,112 @@ ci ━━━━━━━━━━━━━━━━━━━━━━━━━
+ <testsuites name="Biome" tests="22" failures="22" errors="16" time="<TIME>">
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="1" column="8">
+-            <failure message="This import is unused.">line 1, col 8, This import is unused.</failure>
++            <failure message="This import is unused.">line 0, col 7, This import is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="2" column="10">
+-            <failure message="Several of these imports are unused.">line 2, col 10, Several of these imports are unused.</failure>
++            <failure message="Several of these imports are unused.">line 1, col 9, Several of these imports are unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="8" column="5">
+-            <failure message="This variable f is unused.">line 8, col 5, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 7, col 4, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="9" column="7">
+-            <failure message="This variable f is unused.">line 9, col 7, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 8, col 6, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="1" column="8">
+-            <failure message="This import is unused.">line 1, col 8, This import is unused.</failure>
++            <failure message="This import is unused.">line 0, col 7, This import is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="2" column="10">
+-            <failure message="Several of these imports are unused.">line 2, col 10, Several of these imports are unused.</failure>
++            <failure message="Several of these imports are unused.">line 1, col 9, Several of these imports are unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="8" column="5">
+-            <failure message="This variable f is unused.">line 8, col 5, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 7, col 4, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="9" column="7">
+-            <failure message="This variable f is unused.">line 9, col 7, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 8, col 6, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.assist.source.organizeImports" line="1" column="1">
+-            <failure message="The imports and exports are not sorted.">line 1, col 1, The imports and exports are not sorted.</failure>
++            <failure message="The imports and exports are not sorted.">line 0, col 0, The imports and exports are not sorted.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDoubleEquals" line="4" column="3">
+-            <failure message="Using == may be unsafe if you are relying on type coercion.">line 4, col 3, Using == may be unsafe if you are relying on type coercion.</failure>
++            <failure message="Using == may be unsafe if you are relying on type coercion.">line 3, col 2, Using == may be unsafe if you are relying on type coercion.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDebugger" line="6" column="1">
+-            <failure message="This is an unexpected use of the debugger statement.">line 6, col 1, This is an unexpected use of the debugger statement.</failure>
++            <failure message="This is an unexpected use of the debugger statement.">line 5, col 0, This is an unexpected use of the debugger statement.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="8" column="5">
+-            <failure message="This variable implicitly has the any type.">line 8, col 5, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 7, col 4, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="9" column="7">
+-            <failure message="This variable implicitly has the any type.">line 9, col 7, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 8, col 6, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="2" column="10">
+-            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 2, col 10, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 1, col 9, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="9" column="7">
+-            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 9, col 7, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 8, col 6, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.assist.source.organizeImports" line="1" column="1">
+-            <failure message="The imports and exports are not sorted.">line 1, col 1, The imports and exports are not sorted.</failure>
++            <failure message="The imports and exports are not sorted.">line 0, col 0, The imports and exports are not sorted.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDoubleEquals" line="4" column="3">
+-            <failure message="Using == may be unsafe if you are relying on type coercion.">line 4, col 3, Using == may be unsafe if you are relying on type coercion.</failure>
++            <failure message="Using == may be unsafe if you are relying on type coercion.">line 3, col 2, Using == may be unsafe if you are relying on type coercion.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDebugger" line="6" column="1">
+-            <failure message="This is an unexpected use of the debugger statement.">line 6, col 1, This is an unexpected use of the debugger statement.</failure>
++            <failure message="This is an unexpected use of the debugger statement.">line 5, col 0, This is an unexpected use of the debugger statement.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="8" column="5">
+-            <failure message="This variable implicitly has the any type.">line 8, col 5, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 7, col 4, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="9" column="7">
+-            <failure message="This variable implicitly has the any type.">line 9, col 7, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 8, col 6, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="2" column="10">
+-            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 2, col 10, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 1, col 9, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="9" column="7">
+-            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 9, col 7, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 8, col 6, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+ </testsuites>
+diff --git a/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_lint_command.snap b/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_lint_command.snap
+index 64cee2656e..1f68608af5 100644
+--- a/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_lint_command.snap
++++ b/crates/biome_cli/tests/snapshots/main_cases_reporter_junit/reports_diagnostics_junit_lint_command.snap
+@@ -48,102 +48,102 @@ lint ━━━━━━━━━━━━━━━━━━━━━━━━━
+ <testsuites name="Biome" tests="20" failures="20" errors="12" time="<TIME>">
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="1" column="8">
+-            <failure message="This import is unused.">line 1, col 8, This import is unused.</failure>
++            <failure message="This import is unused.">line 0, col 7, This import is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="2" column="10">
+-            <failure message="Several of these imports are unused.">line 2, col 10, Several of these imports are unused.</failure>
++            <failure message="Several of these imports are unused.">line 1, col 9, Several of these imports are unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="8" column="5">
+-            <failure message="This variable f is unused.">line 8, col 5, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 7, col 4, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="9" column="7">
+-            <failure message="This variable f is unused.">line 9, col 7, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 8, col 6, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="1" column="8">
+-            <failure message="This import is unused.">line 1, col 8, This import is unused.</failure>
++            <failure message="This import is unused.">line 0, col 7, This import is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedImports" line="2" column="10">
+-            <failure message="Several of these imports are unused.">line 2, col 10, Several of these imports are unused.</failure>
++            <failure message="Several of these imports are unused.">line 1, col 9, Several of these imports are unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="8" column="5">
+-            <failure message="This variable f is unused.">line 8, col 5, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 7, col 4, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.correctness.noUnusedVariables" line="9" column="7">
+-            <failure message="This variable f is unused.">line 9, col 7, This variable f is unused.</failure>
++            <failure message="This variable f is unused.">line 8, col 6, This variable f is unused.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDoubleEquals" line="4" column="3">
+-            <failure message="Using == may be unsafe if you are relying on type coercion.">line 4, col 3, Using == may be unsafe if you are relying on type coercion.</failure>
++            <failure message="Using == may be unsafe if you are relying on type coercion.">line 3, col 2, Using == may be unsafe if you are relying on type coercion.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDebugger" line="6" column="1">
+-            <failure message="This is an unexpected use of the debugger statement.">line 6, col 1, This is an unexpected use of the debugger statement.</failure>
++            <failure message="This is an unexpected use of the debugger statement.">line 5, col 0, This is an unexpected use of the debugger statement.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="8" column="5">
+-            <failure message="This variable implicitly has the any type.">line 8, col 5, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 7, col 4, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="9" column="7">
+-            <failure message="This variable implicitly has the any type.">line 9, col 7, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 8, col 6, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="2" column="10">
+-            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 2, col 10, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 1, col 9, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="index.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="9" column="7">
+-            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 9, col 7, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 8, col 6, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDoubleEquals" line="4" column="3">
+-            <failure message="Using == may be unsafe if you are relying on type coercion.">line 4, col 3, Using == may be unsafe if you are relying on type coercion.</failure>
++            <failure message="Using == may be unsafe if you are relying on type coercion.">line 3, col 2, Using == may be unsafe if you are relying on type coercion.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noDebugger" line="6" column="1">
+-            <failure message="This is an unexpected use of the debugger statement.">line 6, col 1, This is an unexpected use of the debugger statement.</failure>
++            <failure message="This is an unexpected use of the debugger statement.">line 5, col 0, This is an unexpected use of the debugger statement.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="8" column="5">
+-            <failure message="This variable implicitly has the any type.">line 8, col 5, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 7, col 4, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noImplicitAnyLet" line="9" column="7">
+-            <failure message="This variable implicitly has the any type.">line 9, col 7, This variable implicitly has the any type.</failure>
++            <failure message="This variable implicitly has the any type.">line 8, col 6, This variable implicitly has the any type.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="2" column="10">
+-            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 2, col 10, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.">line 1, col 9, Shouldn&apos;t redeclare &apos;z&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+     <testsuite name="main.ts" tests="1" disabled="0" errors="0" failures="1" package="org.biome">
+         <testcase name="org.biome.lint.suspicious.noRedeclare" line="9" column="7">
+-            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 9, col 7, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
++            <failure message="Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.">line 8, col 6, Shouldn&apos;t redeclare &apos;f&apos;. Consider to delete it or rename it.</failure>
+         </testcase>
+     </testsuite>
+ </testsuites>
+diff --git a/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_check_command.snap b/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_check_command.snap
+deleted file mode 100644
+index 1d5dea9804..0000000000
+--- a/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_check_command.snap
++++ /dev/null
+@@ -1,567 +0,0 @@
+----
+-source: crates/biome_cli/tests/snap_test.rs
+-expression: redactor(content)
+----
+-## `index.ts`
+-
+-```ts
+-import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;
+-```
+-
+-## `main.ts`
+-
+-```ts
+-import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;
+-```
+-
+-# Termination Message
+-
+-```block
+-check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  × Some errors were emitted while running checks.
+-  
+-
+-
+-```
+-
+-# Emitted Messages
+-
+-```block
+-{
+-  "source": {
+-    "name": "Biome",
+-    "url": "https://biomejs.dev"
+-  },
+-  "diagnostics": [
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 12,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 8,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "This import is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Several of these imports are unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 12,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 8,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "This import is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Several of these imports are unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/assist/actions/organize-imports",
+-        "value": "assist/source/organizeImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 21,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "The imports and exports are not sorted."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-double-equals",
+-        "value": "lint/suspicious/noDoubleEquals"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 5,
+-            "line": 4
+-          },
+-          "start": {
+-            "column": 3,
+-            "line": 4
+-          }
+-        }
+-      },
+-      "message": "Using == may be unsafe if you are relying on type coercion."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-debugger",
+-        "value": "lint/suspicious/noDebugger"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 9,
+-            "line": 6
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 6
+-          }
+-        }
+-      },
+-      "message": "This is an unexpected use of the debugger statement."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'z'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 11,
+-              "line": 1
+-            },
+-            "start": {
+-              "column": 10,
+-              "line": 1
+-            }
+-          },
+-          "text": "'z' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'f'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 6,
+-              "line": 8
+-            },
+-            "start": {
+-              "column": 5,
+-              "line": 8
+-            }
+-          },
+-          "text": "'f' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "value": "format"
+-      },
+-      "message": "Formatter would have printed the following content:"
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/assist/actions/organize-imports",
+-        "value": "assist/source/organizeImports"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 21,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "The imports and exports are not sorted."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-double-equals",
+-        "value": "lint/suspicious/noDoubleEquals"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 5,
+-            "line": 4
+-          },
+-          "start": {
+-            "column": 3,
+-            "line": 4
+-          }
+-        }
+-      },
+-      "message": "Using == may be unsafe if you are relying on type coercion."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-debugger",
+-        "value": "lint/suspicious/noDebugger"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 9,
+-            "line": 6
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 6
+-          }
+-        }
+-      },
+-      "message": "This is an unexpected use of the debugger statement."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'z'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 11,
+-              "line": 1
+-            },
+-            "start": {
+-              "column": 10,
+-              "line": 1
+-            }
+-          },
+-          "text": "'z' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'f'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 6,
+-              "line": 8
+-            },
+-            "start": {
+-              "column": 5,
+-              "line": 8
+-            }
+-          },
+-          "text": "'f' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "value": "format"
+-      },
+-      "message": "Formatter would have printed the following content:"
+-    }
+-  ]
+-}
+-```
+diff --git a/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_ci_command.snap b/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_ci_command.snap
+deleted file mode 100644
+index 76260abd86..0000000000
+--- a/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_ci_command.snap
++++ /dev/null
+@@ -1,567 +0,0 @@
+----
+-source: crates/biome_cli/tests/snap_test.rs
+-expression: redactor(content)
+----
+-## `index.ts`
+-
+-```ts
+-import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;
+-```
+-
+-## `main.ts`
+-
+-```ts
+-import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;
+-```
+-
+-# Termination Message
+-
+-```block
+-ci ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  × Some errors were emitted while running checks.
+-  
+-
+-
+-```
+-
+-# Emitted Messages
+-
+-```block
+-{
+-  "source": {
+-    "name": "Biome",
+-    "url": "https://biomejs.dev"
+-  },
+-  "diagnostics": [
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 12,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 8,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "This import is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Several of these imports are unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 12,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 8,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "This import is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Several of these imports are unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/assist/actions/organize-imports",
+-        "value": "assist/source/organizeImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 21,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "The imports and exports are not sorted."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-double-equals",
+-        "value": "lint/suspicious/noDoubleEquals"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 5,
+-            "line": 4
+-          },
+-          "start": {
+-            "column": 3,
+-            "line": 4
+-          }
+-        }
+-      },
+-      "message": "Using == may be unsafe if you are relying on type coercion."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-debugger",
+-        "value": "lint/suspicious/noDebugger"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 9,
+-            "line": 6
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 6
+-          }
+-        }
+-      },
+-      "message": "This is an unexpected use of the debugger statement."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'z'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 11,
+-              "line": 1
+-            },
+-            "start": {
+-              "column": 10,
+-              "line": 1
+-            }
+-          },
+-          "text": "'z' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'f'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 6,
+-              "line": 8
+-            },
+-            "start": {
+-              "column": 5,
+-              "line": 8
+-            }
+-          },
+-          "text": "'f' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "value": "format"
+-      },
+-      "message": "File content differs from formatting output"
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/assist/actions/organize-imports",
+-        "value": "assist/source/organizeImports"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 21,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "The imports and exports are not sorted."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-double-equals",
+-        "value": "lint/suspicious/noDoubleEquals"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 5,
+-            "line": 4
+-          },
+-          "start": {
+-            "column": 3,
+-            "line": 4
+-          }
+-        }
+-      },
+-      "message": "Using == may be unsafe if you are relying on type coercion."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-debugger",
+-        "value": "lint/suspicious/noDebugger"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 9,
+-            "line": 6
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 6
+-          }
+-        }
+-      },
+-      "message": "This is an unexpected use of the debugger statement."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'z'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 11,
+-              "line": 1
+-            },
+-            "start": {
+-              "column": 10,
+-              "line": 1
+-            }
+-          },
+-          "text": "'z' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'f'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 6,
+-              "line": 8
+-            },
+-            "start": {
+-              "column": 5,
+-              "line": 8
+-            }
+-          },
+-          "text": "'f' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "value": "format"
+-      },
+-      "message": "File content differs from formatting output"
+-    }
+-  ]
+-}
+-```
+diff --git a/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_format_command.snap b/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_format_command.snap
+deleted file mode 100644
+index a9cd97d40c..0000000000
+--- a/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_format_command.snap
++++ /dev/null
+@@ -1,67 +0,0 @@
+----
+-source: crates/biome_cli/tests/snap_test.rs
+-expression: redactor(content)
+----
+-## `index.ts`
+-
+-```ts
+-import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;
+-```
+-
+-## `main.ts`
+-
+-```ts
+-import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;
+-```
+-
+-# Termination Message
+-
+-```block
+-format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  × Some errors were emitted while running checks.
+-  
+-
+-
+-```
+-
+-# Emitted Messages
+-
+-```block
+-{
+-  "source": {
+-    "name": "Biome",
+-    "url": "https://biomejs.dev"
+-  },
+-  "diagnostics": [
+-    {
+-      "code": {
+-        "value": "format"
+-      },
+-      "message": "Formatter would have printed the following content:"
+-    },
+-    {
+-      "code": {
+-        "value": "format"
+-      },
+-      "message": "Formatter would have printed the following content:"
+-    }
+-  ]
+-}
+-```
+diff --git a/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_lint_command.snap b/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_lint_command.snap
+deleted file mode 100644
+index 5ee56beb8a..0000000000
+--- a/crates/biome_cli/tests/snapshots/main_cases_reporter_rdjson/reports_diagnostics_rdjson_lint_command.snap
++++ /dev/null
+@@ -1,515 +0,0 @@
+----
+-source: crates/biome_cli/tests/snap_test.rs
+-expression: redactor(content)
+----
+-## `index.ts`
+-
+-```ts
+-import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;
+-```
+-
+-## `main.ts`
+-
+-```ts
+-import { z} from "z"
+-import { z, b , a} from "lodash"
+-
+-a ==b
+-
+-debugger
+-
+-let f;
+-		let f;
+-```
+-
+-# Termination Message
+-
+-```block
+-lint ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  × Some errors were emitted while running checks.
+-  
+-
+-
+-```
+-
+-# Emitted Messages
+-
+-```block
+-{
+-  "source": {
+-    "name": "Biome",
+-    "url": "https://biomejs.dev"
+-  },
+-  "diagnostics": [
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 12,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 8,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "This import is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Several of these imports are unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 12,
+-            "line": 1
+-          },
+-          "start": {
+-            "column": 8,
+-            "line": 1
+-          }
+-        }
+-      },
+-      "message": "This import is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
+-        "value": "lint/correctness/noUnusedImports"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Several of these imports are unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-unused-variables",
+-        "value": "lint/correctness/noUnusedVariables"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable f is unused."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-double-equals",
+-        "value": "lint/suspicious/noDoubleEquals"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 5,
+-            "line": 4
+-          },
+-          "start": {
+-            "column": 3,
+-            "line": 4
+-          }
+-        }
+-      },
+-      "message": "Using == may be unsafe if you are relying on type coercion."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-debugger",
+-        "value": "lint/suspicious/noDebugger"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 9,
+-            "line": 6
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 6
+-          }
+-        }
+-      },
+-      "message": "This is an unexpected use of the debugger statement."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'z'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 11,
+-              "line": 1
+-            },
+-            "start": {
+-              "column": 10,
+-              "line": 1
+-            }
+-          },
+-          "text": "'z' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "index.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'f'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 6,
+-              "line": 8
+-            },
+-            "start": {
+-              "column": 5,
+-              "line": 8
+-            }
+-          },
+-          "text": "'f' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-double-equals",
+-        "value": "lint/suspicious/noDoubleEquals"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 5,
+-            "line": 4
+-          },
+-          "start": {
+-            "column": 3,
+-            "line": 4
+-          }
+-        }
+-      },
+-      "message": "Using == may be unsafe if you are relying on type coercion."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-debugger",
+-        "value": "lint/suspicious/noDebugger"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 9,
+-            "line": 6
+-          },
+-          "start": {
+-            "column": 1,
+-            "line": 6
+-          }
+-        }
+-      },
+-      "message": "This is an unexpected use of the debugger statement."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 6,
+-            "line": 8
+-          },
+-          "start": {
+-            "column": 5,
+-            "line": 8
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-implicit-any-let",
+-        "value": "lint/suspicious/noImplicitAnyLet"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "This variable implicitly has the any type."
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 11,
+-            "line": 2
+-          },
+-          "start": {
+-            "column": 10,
+-            "line": 2
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'z'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 11,
+-              "line": 1
+-            },
+-            "start": {
+-              "column": 10,
+-              "line": 1
+-            }
+-          },
+-          "text": "'z' is defined here:"
+-        }
+-      ]
+-    },
+-    {
+-      "code": {
+-        "url": "https://biomejs.dev/linter/rules/no-redeclare",
+-        "value": "lint/suspicious/noRedeclare"
+-      },
+-      "location": {
+-        "path": "main.ts",
+-        "range": {
+-          "end": {
+-            "column": 8,
+-            "line": 9
+-          },
+-          "start": {
+-            "column": 7,
+-            "line": 9
+-          }
+-        }
+-      },
+-      "message": "Shouldn't redeclare 'f'. Consider to delete it or rename it.",
+-      "suggestions": [
+-        {
+-          "range": {
+-            "end": {
+-              "column": 6,
+-              "line": 8
+-            },
+-            "start": {
+-              "column": 5,
+-              "line": 8
+-            }
+-          },
+-          "text": "'f' is defined here:"
+-        }
+-      ]
+-    }
+-  ]
+-}
+-```
+diff --git a/crates/biome_cli/tests/snapshots/main_commands_check/check_help.snap b/crates/biome_cli/tests/snapshots/main_commands_check/check_help.snap
+index 415475f4bd..668b9c869c 100644
+--- a/crates/biome_cli/tests/snapshots/main_commands_check/check_help.snap
++++ b/crates/biome_cli/tests/snapshots/main_commands_check/check_help.snap
+@@ -212,8 +212,8 @@ Global options applied to all commands
+                               processed during the execution of the command.
+         --error-on-warnings   Tell Biome to exit with an error code if some diagnostics emit
+                               warnings.
+-        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle|rdjson>  Allows to
+-                              change how diagnostics and summary are reported.
++        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle>  Allows to change how
++                              diagnostics and summary are reported.
+         --log-file=ARG        Optional path to redirect log messages to.
+                               If omitted, logs are printed to stdout.
+         --log-level=<none|debug|info|warn|error>  The level of logging. In order, from the most
+diff --git a/crates/biome_cli/tests/snapshots/main_commands_ci/ci_help.snap b/crates/biome_cli/tests/snapshots/main_commands_ci/ci_help.snap
+index 2e6d46ead2..f33680fd9d 100644
+--- a/crates/biome_cli/tests/snapshots/main_commands_ci/ci_help.snap
++++ b/crates/biome_cli/tests/snapshots/main_commands_ci/ci_help.snap
+@@ -213,8 +213,8 @@ Global options applied to all commands
+                               processed during the execution of the command.
+         --error-on-warnings   Tell Biome to exit with an error code if some diagnostics emit
+                               warnings.
+-        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle|rdjson>  Allows to
+-                              change how diagnostics and summary are reported.
++        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle>  Allows to change how
++                              diagnostics and summary are reported.
+         --log-file=ARG        Optional path to redirect log messages to.
+                               If omitted, logs are printed to stdout.
+         --log-level=<none|debug|info|warn|error>  The level of logging. In order, from the most
+diff --git a/crates/biome_cli/tests/snapshots/main_commands_format/format_help.snap b/crates/biome_cli/tests/snapshots/main_commands_format/format_help.snap
+index a0ecf98519..3fab8689b3 100644
+--- a/crates/biome_cli/tests/snapshots/main_commands_format/format_help.snap
++++ b/crates/biome_cli/tests/snapshots/main_commands_format/format_help.snap
+@@ -118,8 +118,8 @@ Global options applied to all commands
+                               processed during the execution of the command.
+         --error-on-warnings   Tell Biome to exit with an error code if some diagnostics emit
+                               warnings.
+-        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle|rdjson>  Allows to
+-                              change how diagnostics and summary are reported.
++        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle>  Allows to change how
++                              diagnostics and summary are reported.
+         --log-file=ARG        Optional path to redirect log messages to.
+                               If omitted, logs are printed to stdout.
+         --log-level=<none|debug|info|warn|error>  The level of logging. In order, from the most
+diff --git a/crates/biome_cli/tests/snapshots/main_commands_lint/lint_help.snap b/crates/biome_cli/tests/snapshots/main_commands_lint/lint_help.snap
+index 3e017ad935..d6e8031e9a 100644
+--- a/crates/biome_cli/tests/snapshots/main_commands_lint/lint_help.snap
++++ b/crates/biome_cli/tests/snapshots/main_commands_lint/lint_help.snap
+@@ -59,8 +59,8 @@ Global options applied to all commands
+                               processed during the execution of the command.
+         --error-on-warnings   Tell Biome to exit with an error code if some diagnostics emit
+                               warnings.
+-        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle|rdjson>  Allows to
+-                              change how diagnostics and summary are reported.
++        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle>  Allows to change how
++                              diagnostics and summary are reported.
+         --log-file=ARG        Optional path to redirect log messages to.
+                               If omitted, logs are printed to stdout.
+         --log-level=<none|debug|info|warn|error>  The level of logging. In order, from the most
+diff --git a/crates/biome_cli/tests/snapshots/main_commands_migrate/migrate_help.snap b/crates/biome_cli/tests/snapshots/main_commands_migrate/migrate_help.snap
+index 9ca49d02bc..845db98476 100644
+--- a/crates/biome_cli/tests/snapshots/main_commands_migrate/migrate_help.snap
++++ b/crates/biome_cli/tests/snapshots/main_commands_migrate/migrate_help.snap
+@@ -30,8 +30,8 @@ Global options applied to all commands
+                               processed during the execution of the command.
+         --error-on-warnings   Tell Biome to exit with an error code if some diagnostics emit
+                               warnings.
+-        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle|rdjson>  Allows to
+-                              change how diagnostics and summary are reported.
++        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle>  Allows to change how
++                              diagnostics and summary are reported.
+         --log-file=ARG        Optional path to redirect log messages to.
+                               If omitted, logs are printed to stdout.
+         --log-level=<none|debug|info|warn|error>  The level of logging. In order, from the most
+diff --git a/crates/biome_cli/tests/snapshots/main_commands_rage/rage_help.snap b/crates/biome_cli/tests/snapshots/main_commands_rage/rage_help.snap
+index 33a5f3dbe8..30d2b36b75 100644
+--- a/crates/biome_cli/tests/snapshots/main_commands_rage/rage_help.snap
++++ b/crates/biome_cli/tests/snapshots/main_commands_rage/rage_help.snap
+@@ -30,8 +30,8 @@ Global options applied to all commands
+                               processed during the execution of the command.
+         --error-on-warnings   Tell Biome to exit with an error code if some diagnostics emit
+                               warnings.
+-        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle|rdjson>  Allows to
+-                              change how diagnostics and summary are reported.
++        --reporter=<json|json-pretty|github|junit|summary|gitlab|checkstyle>  Allows to change how
++                              diagnostics and summary are reported.
+         --log-file=ARG        Optional path to redirect log messages to.
+                               If omitted, logs are printed to stdout.
+         --log-level=<none|debug|info|warn|error>  The level of logging. In order, from the most
+diff --git a/crates/biome_diagnostics/src/display.rs b/crates/biome_diagnostics/src/display.rs
+index 2114a0d024..c9949cfca2 100644
+--- a/crates/biome_diagnostics/src/display.rs
++++ b/crates/biome_diagnostics/src/display.rs
+@@ -688,15 +688,6 @@ fn is_terminal_program(name: &str) -> bool {
+     }
+ }
+ 
+-/// Prints [MarkupBuf] to a [String]
+-pub fn markup_to_string(markup: &MarkupBuf) -> Option<String> {
+-    let mut buffer = Vec::new();
+-    let mut write = fmt::Termcolor(termcolor::NoColor::new(&mut buffer));
+-    let mut fmt = fmt::Formatter::new(&mut write);
+-    fmt.write_markup(markup! { {markup} }).ok()?;
+-    String::from_utf8(buffer).ok()
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use std::io;
+diff --git a/crates/biome_diagnostics/src/display_github.rs b/crates/biome_diagnostics/src/display_github.rs
+index d4fc52611a..98dfcec8af 100644
+--- a/crates/biome_diagnostics/src/display_github.rs
++++ b/crates/biome_diagnostics/src/display_github.rs
+@@ -1,5 +1,4 @@
+ use crate::display::frame::SourceFile;
+-use crate::display::markup_to_string;
+ use crate::{Diagnostic, Resource, Severity, diagnostic::internal::AsDiagnostic};
+ use biome_console::{MarkupBuf, fmt, markup};
+ use biome_text_size::{TextRange, TextSize};
+@@ -120,3 +119,11 @@ fn escape_property<S: AsRef<str>>(value: S) -> String {
+     }
+     result
+ }
++
++fn markup_to_string(markup: &MarkupBuf) -> Option<String> {
++    let mut buffer = Vec::new();
++    let mut write = fmt::Termcolor(termcolor::NoColor::new(&mut buffer));
++    let mut fmt = fmt::Formatter::new(&mut write);
++    fmt.write_markup(markup! { {markup} }).ok()?;
++    String::from_utf8(buffer).ok()
++}

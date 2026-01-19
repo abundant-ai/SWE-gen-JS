@@ -1,0 +1,225 @@
+diff --git a/packages/solid-query-persist-client/src/__tests__/PersistQueryClientProvider.test.tsx b/packages/solid-query-persist-client/src/__tests__/PersistQueryClientProvider.test.tsx
+index 94fc511ae..8438a425c 100644
+--- a/packages/solid-query-persist-client/src/__tests__/PersistQueryClientProvider.test.tsx
++++ b/packages/solid-query-persist-client/src/__tests__/PersistQueryClientProvider.test.tsx
+@@ -557,7 +557,7 @@ describe('PersistQueryClientProvider', () => {
+     expect(queryFn2).toHaveBeenCalledTimes(1)
+     expect(onSuccess).toHaveBeenCalledTimes(1)
+ 
+-    expect(states).toHaveLength(4)
++    expect(states).toHaveLength(3)
+ 
+     expect(states[0]).toMatchObject({
+       status: 'pending',
+@@ -566,18 +566,12 @@ describe('PersistQueryClientProvider', () => {
+     })
+ 
+     expect(states[1]).toMatchObject({
+-      status: 'pending',
+-      fetchStatus: 'idle',
+-      data: undefined,
+-    })
+-
+-    expect(states[2]).toMatchObject({
+       status: 'success',
+       fetchStatus: 'fetching',
+       data: 'hydrated',
+     })
+ 
+-    expect(states[3]).toMatchObject({
++    expect(states[2]).toMatchObject({
+       status: 'success',
+       fetchStatus: 'idle',
+       data: 'queryFn2',
+diff --git a/packages/solid-query/package.json b/packages/solid-query/package.json
+index f07c7131b..d4ef8a672 100644
+--- a/packages/solid-query/package.json
++++ b/packages/solid-query/package.json
+@@ -39,6 +39,9 @@
+       "default": "./build/index.cjs"
+     }
+   },
++  "sideEffects": [
++    "./src/setBatchUpdatesFn.ts"
++  ],
+   "scripts": {
+     "clean": "rimraf ./build && rimraf ./coverage",
+     "test:eslint": "eslint --ext .ts,.tsx ./src",
+diff --git a/packages/solid-query/src/createBaseQuery.ts b/packages/solid-query/src/createBaseQuery.ts
+index 4f80daae0..9621271a9 100644
+--- a/packages/solid-query/src/createBaseQuery.ts
++++ b/packages/solid-query/src/createBaseQuery.ts
+@@ -16,7 +16,7 @@ import { useQueryClient } from './QueryClientProvider'
+ import { shouldThrowError } from './utils'
+ import { useIsRestoring } from './isRestoring'
+ import type { CreateBaseQueryOptions } from './types'
+-import type { Accessor, Signal } from 'solid-js'
++import type { Accessor } from 'solid-js'
+ import type { QueryClient } from './QueryClient'
+ import type {
+   InfiniteQueryObserverResult,
+@@ -144,9 +144,9 @@ export function createBaseQuery<
+     new Observer(client(), defaultedOptions()),
+   )
+ 
+-  let observerResult = observer().getOptimisticResult(defaultedOptions())
+-  const [state, setState] =
+-    createStore<QueryObserverResult<TData, TError>>(observerResult)
++  const [state, setState] = createStore<QueryObserverResult<TData, TError>>(
++    observer().getOptimisticResult(defaultedOptions()),
++  )
+ 
+   const createServerSubscriber = (
+     resolve: (
+@@ -180,35 +180,39 @@ export function createBaseQuery<
+   const createClientSubscriber = () => {
+     const obs = observer()
+     return obs.subscribe((result) => {
+-      observerResult = result
+-      queueMicrotask(() => refetch())
+-    })
+-  }
+-
+-  function setStateWithReconciliation(res: typeof observerResult) {
+-    // @ts-expect-error - Reconcile option is not correctly typed internally
+-    const reconcileOptions = observer().options.reconcile
+-
+-    setState((store) => {
+-      return reconcileFn(
+-        store,
+-        res,
+-        reconcileOptions === undefined ? false : reconcileOptions,
+-      )
+-    })
+-  }
++      notifyManager.batchCalls(() => {
++        // @ts-expect-error - This will error because the reconcile option does not
++        // exist on the query-core QueryObserverResult type
++        const reconcileOptions = obs.options.reconcile
+ 
+-  function createDeepSignal<T>(): Signal<T> {
+-    return [
+-      () => state,
+-      (v: T) => {
+-        const unwrapped = unwrap(state)
+-        if (typeof v === 'function') {
+-          v = v(unwrapped)
++        // If the query has data we don't suspend but instead mutate the resource
++        // This could happen when placeholderData/initialData is defined
++        if (
++          !queryResource.error &&
++          queryResource()?.data &&
++          result.data &&
++          !queryResource.loading
++        ) {
++          setState((store) => {
++            return reconcileFn(
++              store,
++              result,
++              reconcileOptions === undefined ? false : reconcileOptions,
++            )
++          })
++          mutate(state)
++        } else {
++          setState((store) => {
++            return reconcileFn(
++              store,
++              result,
++              reconcileOptions === undefined ? false : reconcileOptions,
++            )
++          })
++          refetch()
+         }
+-        setStateWithReconciliation(v as any)
+-      },
+-    ] as Signal<T>
++      })()
++    })
+   }
+ 
+   /**
+@@ -216,7 +220,9 @@ export function createBaseQuery<
+    */
+   let unsubscribe: (() => void) | null = null
+ 
+-  const [queryResource, { refetch }] = createResource<ResourceData | undefined>(
++  const [queryResource, { refetch, mutate }] = createResource<
++    ResourceData | undefined
++  >(
+     () => {
+       const obs = observer()
+       return new Promise((resolve, reject) => {
+@@ -227,16 +233,19 @@ export function createBaseQuery<
+         }
+         obs.updateResult()
+ 
+-        if (!observerResult.isLoading) {
++        if (!state.isLoading) {
+           const query = obs.getCurrentQuery()
+-          resolve(hydratableObserverResult(query, observerResult))
+-        } else {
+-          setStateWithReconciliation(observerResult)
++          resolve(hydratableObserverResult(query, state))
+         }
+       })
+     },
+     {
+-      storage: createDeepSignal,
++      initialValue: state,
++
++      // If initialData is provided, we resolve the resource immediately
++      get ssrLoadFrom() {
++        return options().initialData ? 'initial' : 'server'
++      },
+ 
+       get deferStream() {
+         return options().deferStream
+@@ -329,7 +338,7 @@ export function createBaseQuery<
+       [observer, defaultedOptions],
+       ([obs, opts]) => {
+         obs.setOptions(opts)
+-        setStateWithReconciliation(obs.getOptimisticResult(opts))
++        setState(obs.getOptimisticResult(opts))
+       },
+       { defer: true },
+     ),
+@@ -360,14 +369,8 @@ export function createBaseQuery<
+       target: QueryObserverResult<TData, TError>,
+       prop: keyof QueryObserverResult<TData, TError>,
+     ): any {
+-      if (prop === 'data') {
+-        const opts = observer().options
+-        if (opts.placeholderData) {
+-          return queryResource.latest?.data
+-        }
+-        return queryResource()?.data
+-      }
+-      return Reflect.get(target, prop)
++      const val = queryResource()?.[prop]
++      return val !== undefined ? val : Reflect.get(target, prop)
+     },
+   }
+ 
+diff --git a/packages/solid-query/src/index.ts b/packages/solid-query/src/index.ts
+index 9d894999b..b6045df6d 100644
+--- a/packages/solid-query/src/index.ts
++++ b/packages/solid-query/src/index.ts
+@@ -1,5 +1,8 @@
+ /* istanbul ignore file */
+ 
++// Side Effects
++import './setBatchUpdatesFn'
++
+ // Re-export core
+ export * from '@tanstack/query-core'
+ 
+diff --git a/packages/solid-query/src/setBatchUpdatesFn.ts b/packages/solid-query/src/setBatchUpdatesFn.ts
+new file mode 100644
+index 000000000..f53c35720
+--- /dev/null
++++ b/packages/solid-query/src/setBatchUpdatesFn.ts
+@@ -0,0 +1,4 @@
++import { notifyManager } from '@tanstack/query-core'
++import { batch } from 'solid-js'
++
++notifyManager.setBatchNotifyFunction(batch)

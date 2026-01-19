@@ -1,0 +1,363 @@
+diff --git a/changelog_unreleased/typescript/17785.md b/changelog_unreleased/typescript/17785.md
+new file mode 100644
+index 000000000..7b33d71d3
+--- /dev/null
++++ b/changelog_unreleased/typescript/17785.md
+@@ -0,0 +1,13 @@
++#### Fix `TSMappedType` format (#17785 by @fisker)
++
++<!-- prettier-ignore -->
++```tsx
++// Input (--parser=babel-ts)
++export type A = B extends { C?: { [D in infer E]?: F } } ? G : H
++
++// Prettier stable
++TypeError: Cannot read properties of undefined (reading 'startsWith')
++
++// Prettier main
++export type A = B extends { C?: { [D in infer E]?: F } } ? G : H;
++```
+diff --git a/src/language-js/parse/postprocess/index.js b/src/language-js/parse/postprocess/index.js
+index abdf2d40a..746ed47c9 100644
+--- a/src/language-js/parse/postprocess/index.js
++++ b/src/language-js/parse/postprocess/index.js
+@@ -46,159 +46,164 @@ function postprocess(ast, options) {
+ 
+   let typeCastCommentsEnds;
+ 
+-  ast = visitNode(ast, (node) => {
+-    switch (node.type) {
+-      case "ParenthesizedExpression": {
+-        const { expression } = node;
+-        const start = locStart(node);
+-
+-        // Align range with `flow`
+-        if (expression.type === "TypeCastExpression") {
+-          expression.range = [start, locEnd(node)];
+-          return expression;
+-        }
++  ast = visitNode(ast, {
++    onEnter(node) {
++      switch (node.type) {
++        // Remove this when update `@babel/parser` to v8
++        // https://github.com/typescript-eslint/typescript-eslint/pull/7065
++        case "TSMappedType":
++          if (!node.constraint && !node.key) {
++            const { name: key, constraint } = fixBabelTSTypeParameter(
++              node.typeParameter,
++            );
++            node.constraint = constraint;
++            node.key = key;
++            delete node.typeParameter;
++          }
++          break;
++      }
++    },
++    onLeave(node) {
++      switch (node.type) {
++        case "ParenthesizedExpression": {
++          const { expression } = node;
++          const start = locStart(node);
++
++          // Align range with `flow`
++          if (expression.type === "TypeCastExpression") {
++            expression.range = [start, locEnd(node)];
++            return expression;
++          }
+ 
+-        let keepTypeCast = false;
+-        if (!isOxcTs) {
+-          if (!typeCastCommentsEnds) {
+-            typeCastCommentsEnds = [];
++          let keepTypeCast = false;
++          if (!isOxcTs) {
++            if (!typeCastCommentsEnds) {
++              typeCastCommentsEnds = [];
+ 
+-            for (const comment of comments) {
+-              if (isTypeCastComment(comment)) {
+-                typeCastCommentsEnds.push(locEnd(comment));
++              for (const comment of comments) {
++                if (isTypeCastComment(comment)) {
++                  typeCastCommentsEnds.push(locEnd(comment));
++                }
+               }
+             }
++
++            // Keep ParenthesizedExpression nodes only if they have Closure-style type cast comments.
++            const previousCommentEnd = typeCastCommentsEnds.findLast(
++              (end) => end <= start,
++            );
++            keepTypeCast =
++              previousCommentEnd &&
++              // check that there are only white spaces between the comment and the parenthesis
++              text.slice(previousCommentEnd, start).trim().length === 0;
+           }
+ 
+-          // Keep ParenthesizedExpression nodes only if they have Closure-style type cast comments.
+-          const previousCommentEnd = typeCastCommentsEnds.findLast(
+-            (end) => end <= start,
+-          );
+-          keepTypeCast =
+-            previousCommentEnd &&
+-            // check that there are only white spaces between the comment and the parenthesis
+-            text.slice(previousCommentEnd, start).trim().length === 0;
++          if (!keepTypeCast) {
++            expression.extra = { ...expression.extra, parenthesized: true };
++            return expression;
++          }
++          break;
+         }
+ 
+-        if (!keepTypeCast) {
+-          expression.extra = { ...expression.extra, parenthesized: true };
+-          return expression;
+-        }
+-        break;
+-      }
++        case "LogicalExpression":
++          // We remove unneeded parens around same-operator LogicalExpressions
++          if (isUnbalancedLogicalTree(node)) {
++            return rebalanceLogicalTree(node);
++          }
++          break;
++
++        // This happens when use `oxc-parser` to parse `` `${foo satisfies bar}`; ``
++        // https://github.com/oxc-project/oxc/issues/11313
++        case "TemplateLiteral":
++          /* c8 ignore next 3 */
++          if (node.expressions.length !== node.quasis.length - 1) {
++            throw new Error("Malformed template literal.");
++          }
++          break;
++
++        case "TemplateElement":
++          // `flow`, `hermes`, `typescript`, and `oxc`(with `{astType: 'ts'}`) follows the `espree` style positions
++          // https://github.com/eslint/js/blob/5826877f7b33548e5ba984878dd4a8eac8448f87/packages/espree/lib/espree.js#L213
++          if (
++            parser === "flow" ||
++            parser === "hermes" ||
++            parser === "espree" ||
++            parser === "typescript" ||
++            isOxcTs
++          ) {
++            const start = locStart(node) + 1;
++            const end = locEnd(node) - (node.tail ? 1 : 2);
++
++            node.range = [start, end];
++          }
++          break;
+ 
+-      case "LogicalExpression":
+-        // We remove unneeded parens around same-operator LogicalExpressions
+-        if (isUnbalancedLogicalTree(node)) {
+-          return rebalanceLogicalTree(node);
+-        }
+-        break;
+-
+-      // This happens when use `oxc-parser` to parse `` `${foo satisfies bar}`; ``
+-      // https://github.com/oxc-project/oxc/issues/11313
+-      case "TemplateLiteral":
+-        /* c8 ignore next 3 */
+-        if (node.expressions.length !== node.quasis.length - 1) {
+-          throw new Error("Malformed template literal.");
+-        }
+-        break;
+-
+-      case "TemplateElement":
+-        // `flow`, `hermes`, `typescript`, and `oxc`(with `{astType: 'ts'}`) follows the `espree` style positions
+-        // https://github.com/eslint/js/blob/5826877f7b33548e5ba984878dd4a8eac8448f87/packages/espree/lib/espree.js#L213
+-        if (
+-          parser === "flow" ||
+-          parser === "hermes" ||
+-          parser === "espree" ||
+-          parser === "typescript" ||
+-          isOxcTs
+-        ) {
+-          const start = locStart(node) + 1;
+-          const end = locEnd(node) - (node.tail ? 1 : 2);
+-
+-          node.range = [start, end];
++        // fix unexpected locEnd caused by --no-semi style
++        case "VariableDeclaration": {
++          const lastDeclaration = node.declarations.at(-1);
++          if (lastDeclaration?.init && text[locEnd(lastDeclaration)] !== ";") {
++            node.range = [locStart(node), locEnd(lastDeclaration)];
++          }
++          break;
+         }
+-        break;
++        // remove redundant TypeScript nodes
++        case "TSParenthesizedType":
++          return node.typeAnnotation;
++
++        case "TSTypeParameter":
++          // babel-ts
++          fixBabelTSTypeParameter(node);
++          break;
++
++        // For hack-style pipeline
++        case "TopicReference":
++          ast.extra = { ...ast.extra, __isUsingHackPipeline: true };
++          break;
++
++        // In Flow parser, it doesn't generate union/intersection types for single type
++        case "TSUnionType":
++        case "TSIntersectionType":
++          if (node.types.length === 1) {
++            return node.types[0];
++          }
++          break;
++
++        // Remove this when update `@babel/parser` to v8
++        // https://github.com/typescript-eslint/typescript-eslint/pull/8920
++        case "TSEnumDeclaration":
++          if (!node.body) {
++            const idEnd = locEnd(node.id);
++            const { members } = node;
++            const textWithoutComments = getTextWithoutComments(
++              {
++                originalText: text,
++                [Symbol.for("comments")]: comments,
++              },
++              idEnd,
++              members[0] ? locStart(members[0]) : locEnd(node),
++            );
++            const start = idEnd + textWithoutComments.indexOf("{");
++            node.body = {
++              type: "TSEnumBody",
++              members,
++              range: [start, locEnd(node)],
++            };
++            delete node.members;
++          }
++          break;
+ 
+-      // fix unexpected locEnd caused by --no-semi style
+-      case "VariableDeclaration": {
+-        const lastDeclaration = node.declarations.at(-1);
+-        if (lastDeclaration?.init && text[locEnd(lastDeclaration)] !== ";") {
+-          node.range = [locStart(node), locEnd(lastDeclaration)];
+-        }
+-        break;
++        // https://github.com/facebook/hermes/issues/1712
++        case "ImportExpression":
++          if (parser === "hermes" && node.attributes && !node.options) {
++            node.options = node.attributes;
++          }
++          break;
+       }
+-      // remove redundant TypeScript nodes
+-      case "TSParenthesizedType":
+-        return node.typeAnnotation;
+-
+-      case "TSTypeParameter":
+-        // babel-ts
+-        fixBabelTSTypeParameter(node);
+-        break;
+-
+-      // For hack-style pipeline
+-      case "TopicReference":
+-        ast.extra = { ...ast.extra, __isUsingHackPipeline: true };
+-        break;
+-
+-      // In Flow parser, it doesn't generate union/intersection types for single type
+-      case "TSUnionType":
+-      case "TSIntersectionType":
+-        if (node.types.length === 1) {
+-          return node.types[0];
+-        }
+-        break;
+-
+-      // Remove this when update `@babel/parser` to v8
+-      // https://github.com/typescript-eslint/typescript-eslint/pull/7065
+-      case "TSMappedType":
+-        if (!node.constraint && !node.key) {
+-          const { name: key, constraint } = fixBabelTSTypeParameter(
+-            node.typeParameter,
+-          );
+-          node.constraint = constraint;
+-          node.key = key;
+-          delete node.typeParameter;
+-        }
+-        break;
+-
+-      // Remove this when update `@babel/parser` to v8
+-      // https://github.com/typescript-eslint/typescript-eslint/pull/8920
+-      case "TSEnumDeclaration":
+-        if (!node.body) {
+-          const idEnd = locEnd(node.id);
+-          const { members } = node;
+-          const textWithoutComments = getTextWithoutComments(
+-            {
+-              originalText: text,
+-              [Symbol.for("comments")]: comments,
+-            },
+-            idEnd,
+-            members[0] ? locStart(members[0]) : locEnd(node),
+-          );
+-          const start = idEnd + textWithoutComments.indexOf("{");
+-          node.body = {
+-            type: "TSEnumBody",
+-            members,
+-            range: [start, locEnd(node)],
+-          };
+-          delete node.members;
+-        }
+-        break;
+-
+-      // https://github.com/facebook/hermes/issues/1712
+-      case "ImportExpression":
+-        if (parser === "hermes" && node.attributes && !node.options) {
+-          node.options = node.attributes;
+-        }
+-        break;
+-    }
+ 
+-    /* c8 ignore next 3 */
+-    if (process.env.NODE_ENV !== "production") {
+-      assertRaw(node, text);
+-    }
++      /* c8 ignore next 3 */
++      if (process.env.NODE_ENV !== "production") {
++        assertRaw(node, text);
++      }
++    },
+   });
+ 
+   // `InterpreterDirective` from babel parser and flow parser
+diff --git a/src/language-js/parse/postprocess/visit-node.js b/src/language-js/parse/postprocess/visit-node.js
+index 57c0d722e..e29fe0a6d 100644
+--- a/src/language-js/parse/postprocess/visit-node.js
++++ b/src/language-js/parse/postprocess/visit-node.js
+@@ -1,6 +1,6 @@
+ import getVisitorKeys from "../../traverse/get-visitor-keys.js";
+ 
+-function visitNode(node, fn) {
++function visitNode(node, options) {
+   if (!(node !== null && typeof node === "object")) {
+     return node;
+   }
+@@ -10,17 +10,19 @@ function visitNode(node, fn) {
+     // measurable difference in performance. Array.entries returns an iterator
+     // of arrays.
+     for (let i = 0; i < node.length; i++) {
+-      node[i] = visitNode(node[i], fn);
++      node[i] = visitNode(node[i], options);
+     }
+     return node;
+   }
+ 
++  node = options.onEnter(node) || node;
++
+   const keys = getVisitorKeys(node);
+   for (let i = 0; i < keys.length; i++) {
+-    node[keys[i]] = visitNode(node[keys[i]], fn);
++    node[keys[i]] = visitNode(node[keys[i]], options);
+   }
+ 
+-  return fn(node) || node;
++  return options.onLeave(node) || node;
+ }
+ 
+ export default visitNode;

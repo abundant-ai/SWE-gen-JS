@@ -1,0 +1,225 @@
+diff --git a/packages/toolkit/src/createAsyncThunk.ts b/packages/toolkit/src/createAsyncThunk.ts
+index 5a805ebc..58df87bb 100644
+--- a/packages/toolkit/src/createAsyncThunk.ts
++++ b/packages/toolkit/src/createAsyncThunk.ts
+@@ -590,10 +590,18 @@ If you want to use the AbortController to react to \`abort\` events, please cons
+         const abortController = new AC()
+         let abortReason: string | undefined
+ 
++        const abortedPromise = new Promise<never>((_, reject) =>
++          abortController.signal.addEventListener('abort', () =>
++            reject({ name: 'AbortError', message: abortReason || 'Aborted' })
++          )
++        )
++
+         let started = false
+         function abort(reason?: string) {
+-          abortReason = reason
+-          abortController.abort()
++          if (started) {
++            abortReason = reason
++            abortController.abort()
++          }
+         }
+ 
+         const promise = (async function () {
+@@ -603,8 +611,7 @@ If you want to use the AbortController to react to \`abort\` events, please cons
+             if (isThenable(conditionResult)) {
+               conditionResult = await conditionResult
+             }
+-
+-            if (conditionResult === false || abortController.signal.aborted) {
++            if (conditionResult === false) {
+               // eslint-disable-next-line no-throw-literal
+               throw {
+                 name: 'ConditionError',
+@@ -612,15 +619,6 @@ If you want to use the AbortController to react to \`abort\` events, please cons
+               }
+             }
+             started = true
+-
+-            const abortedPromise = new Promise<never>((_, reject) =>
+-              abortController.signal.addEventListener('abort', () =>
+-                reject({
+-                  name: 'AbortError',
+-                  message: abortReason || 'Aborted',
+-                })
+-              )
+-            )
+             dispatch(
+               pending(
+                 requestId,
+diff --git a/packages/toolkit/src/query/core/buildSlice.ts b/packages/toolkit/src/query/core/buildSlice.ts
+index 3343b6dc..ef4fc26f 100644
+--- a/packages/toolkit/src/query/core/buildSlice.ts
++++ b/packages/toolkit/src/query/core/buildSlice.ts
+@@ -181,8 +181,6 @@ export function buildSlice({
+ 
+               if (merge) {
+                 if (substate.data !== undefined) {
+-                  const { fulfilledTimeStamp, arg, baseQueryMeta, requestId } =
+-                    meta
+                   // There's existing cache data. Let the user merge it in themselves.
+                   // We're already inside an Immer-powered reducer, and the user could just mutate `substate.data`
+                   // themselves inside of `merge()`. But, they might also want to return a new value.
+@@ -191,12 +189,7 @@ export function buildSlice({
+                     substate.data,
+                     (draftSubstateData) => {
+                       // As usual with Immer, you can mutate _or_ return inside here, but not both
+-                      return merge(draftSubstateData, payload, {
+-                        arg: arg.originalArgs,
+-                        baseQueryMeta,
+-                        fulfilledTimeStamp,
+-                        requestId,
+-                      })
++                      return merge(draftSubstateData, payload)
+                     }
+                   )
+                   substate.data = newData
+diff --git a/packages/toolkit/src/query/endpointDefinitions.ts b/packages/toolkit/src/query/endpointDefinitions.ts
+index 5ace421d..f5243f29 100644
+--- a/packages/toolkit/src/query/endpointDefinitions.ts
++++ b/packages/toolkit/src/query/endpointDefinitions.ts
+@@ -445,13 +445,7 @@ export interface QueryExtraOptions<
+    */
+   merge?(
+     currentCacheData: ResultType,
+-    responseData: ResultType,
+-    otherArgs: {
+-      arg: QueryArg
+-      baseQueryMeta: BaseQueryMeta<BaseQuery>
+-      requestId: string
+-      fulfilledTimeStamp: number
+-    }
++    responseData: ResultType
+   ): ResultType | void
+ 
+   /**
+diff --git a/packages/toolkit/src/query/tests/createApi.test.ts b/packages/toolkit/src/query/tests/createApi.test.ts
+index 75d7690a..37c1f52c 100644
+--- a/packages/toolkit/src/query/tests/createApi.test.ts
++++ b/packages/toolkit/src/query/tests/createApi.test.ts
+@@ -35,11 +35,6 @@ afterAll(() => {
+   spy.mockRestore()
+ })
+ 
+-function paginate<T>(array: T[], page_size: number, page_number: number) {
+-  // human-readable page numbers usually start with 1, so we reduce 1 in the first argument
+-  return array.slice((page_number - 1) * page_size, page_number * page_size)
+-}
+-
+ test('sensible defaults', () => {
+   const api = createApi({
+     baseQuery: fetchBaseQuery(),
+@@ -928,22 +923,6 @@ describe('custom serializeQueryArgs per endpoint', () => {
+           return currentArg !== previousArg
+         },
+       }),
+-      listItems2: build.query<{ items: string[]; meta?: any }, number>({
+-        query: (pageNumber) => `/listItems2?page=${pageNumber}`,
+-        serializeQueryArgs: ({ endpointName }) => {
+-          return endpointName
+-        },
+-        transformResponse(items: string[]) {
+-          return { items }
+-        },
+-        merge: (currentCache, newData, meta) => {
+-          currentCache.items.push(...newData.items)
+-          currentCache.meta = meta
+-        },
+-        forceRefetch({ currentArg, previousArg }) {
+-          return currentArg !== previousArg
+-        },
+-      }),
+     }),
+   })
+ 
+@@ -1031,6 +1010,11 @@ describe('custom serializeQueryArgs per endpoint', () => {
+     const allItems = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'i']
+     const PAGE_SIZE = 3
+ 
++    function paginate<T>(array: T[], page_size: number, page_number: number) {
++      // human-readable page numbers usually start with 1, so we reduce 1 in the first argument
++      return array.slice((page_number - 1) * page_size, page_number * page_size)
++    }
++
+     server.use(
+       rest.get('https://example.com/listItems', (req, res, ctx) => {
+         const pageString = req.url.searchParams.get('page')
+@@ -1054,33 +1038,4 @@ describe('custom serializeQueryArgs per endpoint', () => {
+     const updatedEntry = selectListItems(storeRef.store.getState())
+     expect(updatedEntry.data).toEqual(['a', 'b', 'c', 'd', 'e', 'f'])
+   })
+-
+-  test('merge receives a meta object as an argument', async () => {
+-    const allItems = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'i']
+-    const PAGE_SIZE = 3
+-
+-    server.use(
+-      rest.get('https://example.com/listItems2', (req, res, ctx) => {
+-        const pageString = req.url.searchParams.get('page')
+-        const pageNum = parseInt(pageString || '0')
+-
+-        const results = paginate(allItems, PAGE_SIZE, pageNum)
+-        return res(ctx.json(results))
+-      })
+-    )
+-
+-    const selectListItems = api.endpoints.listItems2.select(0)
+-
+-    await storeRef.store.dispatch(api.endpoints.listItems2.initiate(1))
+-    await storeRef.store.dispatch(api.endpoints.listItems2.initiate(2))
+-    const cacheEntry = selectListItems(storeRef.store.getState())
+-
+-    // Should have passed along the third arg from `merge` containing these fields
+-    expect(cacheEntry.data?.meta).toEqual({
+-      requestId: expect.any(String),
+-      fulfilledTimeStamp: expect.any(Number),
+-      arg: 2,
+-      baseQueryMeta: expect.any(Object),
+-    })
+-  })
+ })
+diff --git a/packages/toolkit/src/tests/createAsyncThunk.test.ts b/packages/toolkit/src/tests/createAsyncThunk.test.ts
+index 26550c93..611d0581 100644
+--- a/packages/toolkit/src/tests/createAsyncThunk.test.ts
++++ b/packages/toolkit/src/tests/createAsyncThunk.test.ts
+@@ -13,7 +13,6 @@ import {
+   getLog,
+ } from 'console-testing-library/pure'
+ import { expectType } from './helpers'
+-import { delay } from '../utils'
+ 
+ declare global {
+   interface Window {
+@@ -622,21 +621,6 @@ describe('conditional skipping of asyncThunks', () => {
+     )
+   })
+ 
+-  test('async condition with AbortController signal first', async () => {
+-    const condition = async () => {
+-      await delay(25)
+-      return true
+-    }
+-    const asyncThunk = createAsyncThunk('test', payloadCreator, { condition })
+-
+-    try {
+-      const thunkPromise = asyncThunk(arg)(dispatch, getState, extra)
+-      thunkPromise.abort()
+-      await thunkPromise
+-    } catch (err) {}
+-    expect(dispatch).toHaveBeenCalledTimes(0)
+-  })
+-
+   test('rejected action is not dispatched by default', async () => {
+     const asyncThunk = createAsyncThunk('test', payloadCreator, { condition })
+     await asyncThunk(arg)(dispatch, getState, extra)
+@@ -646,7 +630,7 @@ describe('conditional skipping of asyncThunks', () => {
+ 
+   test('does not fail when attempting to abort a canceled promise', async () => {
+     const asyncPayloadCreator = jest.fn(async (x: typeof arg) => {
+-      await delay(200)
++      await new Promise((resolve) => setTimeout(resolve, 2000))
+       return 10
+     })
+ 

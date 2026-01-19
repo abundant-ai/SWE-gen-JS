@@ -1,0 +1,422 @@
+diff --git a/crates/turbo-trace/src/lib.rs b/crates/turbo-trace/src/lib.rs
+index c37074f75f..b8f162159e 100644
+--- a/crates/turbo-trace/src/lib.rs
++++ b/crates/turbo-trace/src/lib.rs
+@@ -2,4 +2,4 @@
+ mod import_finder;
+ mod tracer;
+ 
+-pub use tracer::{TraceError, TraceResult, Tracer};
++pub use tracer::{TraceError, Tracer};
+diff --git a/crates/turbo-trace/src/tracer.rs b/crates/turbo-trace/src/tracer.rs
+index bab720d626..2d236fc9ef 100644
+--- a/crates/turbo-trace/src/tracer.rs
++++ b/crates/turbo-trace/src/tracer.rs
+@@ -48,18 +48,18 @@ impl Tracer {
+         cwd: AbsoluteSystemPathBuf,
+         files: Vec<AbsoluteSystemPathBuf>,
+         ts_config: Option<Utf8PathBuf>,
+-    ) -> Self {
++    ) -> Result<Self, PathError> {
+         let ts_config =
+             ts_config.map(|ts_config| AbsoluteSystemPathBuf::from_unknown(&cwd, ts_config));
+ 
+         let seen = HashSet::new();
+ 
+-        Self {
++        Ok(Self {
+             files,
+             seen,
+             ts_config,
+             source_map: Rc::new(SourceMap::default()),
+-        }
++        })
+     }
+ 
+     pub fn trace(mut self) -> TraceResult {
+diff --git a/crates/turborepo-lib/src/query/file.rs b/crates/turborepo-lib/src/query/file.rs
+index b24e28508a..717f4d136f 100644
+--- a/crates/turborepo-lib/src/query/file.rs
++++ b/crates/turborepo-lib/src/query/file.rs
+@@ -1,14 +1,11 @@
+ use std::sync::Arc;
+ 
+-use async_graphql::{Object, SimpleObject};
++use async_graphql::Object;
+ use itertools::Itertools;
+ use turbo_trace::Tracer;
+ use turbopath::AbsoluteSystemPathBuf;
+ 
+-use crate::{
+-    query::{Array, Error},
+-    run::Run,
+-};
++use crate::{query::Error, run::Run};
+ 
+ pub struct File {
+     run: Arc<Run>,
+@@ -21,66 +18,6 @@ impl File {
+     }
+ }
+ 
+-#[derive(SimpleObject, Debug)]
+-pub struct TraceError {
+-    message: String,
+-    path: Option<String>,
+-    start: Option<usize>,
+-    end: Option<usize>,
+-}
+-
+-impl From<turbo_trace::TraceError> for TraceError {
+-    fn from(error: turbo_trace::TraceError) -> Self {
+-        let message = error.to_string();
+-        match error {
+-            turbo_trace::TraceError::FileNotFound(file) => TraceError {
+-                message,
+-                path: Some(file.to_string()),
+-                start: None,
+-                end: None,
+-            },
+-            turbo_trace::TraceError::PathEncoding(_) => TraceError {
+-                message,
+-                path: None,
+-                start: None,
+-                end: None,
+-            },
+-            turbo_trace::TraceError::RootFile(path) => TraceError {
+-                message,
+-                path: Some(path.to_string()),
+-                start: None,
+-                end: None,
+-            },
+-            turbo_trace::TraceError::Resolve { span, text } => TraceError {
+-                message,
+-                path: Some(text.name().to_string()),
+-                start: Some(span.offset()),
+-                end: Some(span.offset() + span.len()),
+-            },
+-        }
+-    }
+-}
+-
+-#[derive(SimpleObject)]
+-struct TraceResult {
+-    files: Array<File>,
+-    errors: Array<TraceError>,
+-}
+-
+-impl TraceResult {
+-    fn new(result: turbo_trace::TraceResult, run: Arc<Run>) -> Self {
+-        Self {
+-            files: result
+-                .files
+-                .into_iter()
+-                .sorted()
+-                .map(|path| File::new(run.clone(), path))
+-                .collect(),
+-            errors: result.errors.into_iter().map(|e| e.into()).collect(),
+-        }
+-    }
+-}
+-
+ #[Object]
+ impl File {
+     async fn contents(&self) -> Result<String, Error> {
+@@ -100,16 +37,25 @@ impl File {
+         Ok(self.path.to_string())
+     }
+ 
+-    async fn dependencies(&self) -> TraceResult {
++    async fn dependencies(&self) -> Result<Vec<File>, Error> {
+         let tracer = Tracer::new(
+             self.run.repo_root().to_owned(),
+             vec![self.path.clone()],
+             None,
+-        );
++        )?;
++
++        let result = tracer.trace();
++        if !result.errors.is_empty() {
++            return Err(Error::Trace(result.errors));
++        }
+ 
+-        let mut result = tracer.trace();
+-        // Remove the file itself from the result
+-        result.files.remove(&self.path);
+-        TraceResult::new(result, self.run.clone())
++        Ok(result
++            .files
++            .into_iter()
++            // Filter out the file we're looking at
++            .filter(|file| file != &self.path)
++            .map(|path| File::new(self.run.clone(), path))
++            .sorted_by(|a, b| a.path.cmp(&b.path))
++            .collect())
+     }
+ }
+diff --git a/crates/turborepo-lib/src/query/mod.rs b/crates/turborepo-lib/src/query/mod.rs
+index fa61ea6180..91338601cc 100644
+--- a/crates/turborepo-lib/src/query/mod.rs
++++ b/crates/turborepo-lib/src/query/mod.rs
+@@ -65,8 +65,6 @@ impl RepositoryQuery {
+ #[graphql(concrete(name = "RepositoryTasks", params(RepositoryTask)))]
+ #[graphql(concrete(name = "Packages", params(Package)))]
+ #[graphql(concrete(name = "ChangedPackages", params(ChangedPackage)))]
+-#[graphql(concrete(name = "Files", params(File)))]
+-#[graphql(concrete(name = "TraceErrors", params(file::TraceError)))]
+ pub struct Array<T: OutputType> {
+     items: Vec<T>,
+     length: usize,
+diff --git a/packages/create-turbo/package.json b/packages/create-turbo/package.json
+index 3d956ffbd5..f784e27d8a 100644
+--- a/packages/create-turbo/package.json
++++ b/packages/create-turbo/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "create-turbo",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "Create a new Turborepo",
+   "homepage": "https://turbo.build/repo",
+   "license": "MIT",
+diff --git a/packages/eslint-config-turbo/package.json b/packages/eslint-config-turbo/package.json
+index 99a281fdf5..2ac5d494c2 100644
+--- a/packages/eslint-config-turbo/package.json
++++ b/packages/eslint-config-turbo/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "eslint-config-turbo",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "ESLint config for Turborepo",
+   "repository": {
+     "type": "git",
+diff --git a/packages/eslint-plugin-turbo/package.json b/packages/eslint-plugin-turbo/package.json
+index b5cf9b1758..8206d87775 100644
+--- a/packages/eslint-plugin-turbo/package.json
++++ b/packages/eslint-plugin-turbo/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "eslint-plugin-turbo",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "ESLint plugin for Turborepo",
+   "keywords": [
+     "turbo",
+diff --git a/packages/turbo-codemod/package.json b/packages/turbo-codemod/package.json
+index 2650daddfa..26f9166177 100644
+--- a/packages/turbo-codemod/package.json
++++ b/packages/turbo-codemod/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@turbo/codemod",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "Provides Codemod transformations to help upgrade your Turborepo codebase when a feature is deprecated.",
+   "homepage": "https://turbo.build/repo",
+   "license": "MIT",
+diff --git a/packages/turbo-gen/package.json b/packages/turbo-gen/package.json
+index a7bbb3d56d..5b7c193111 100644
+--- a/packages/turbo-gen/package.json
++++ b/packages/turbo-gen/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@turbo/gen",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "Extend a Turborepo",
+   "homepage": "https://turbo.build/repo",
+   "license": "MIT",
+diff --git a/packages/turbo-ignore/package.json b/packages/turbo-ignore/package.json
+index d1d1c8f7bd..0eb64b79a1 100644
+--- a/packages/turbo-ignore/package.json
++++ b/packages/turbo-ignore/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "turbo-ignore",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "",
+   "homepage": "https://turbo.build/repo",
+   "keywords": [],
+diff --git a/packages/turbo-types/package.json b/packages/turbo-types/package.json
+index 22f16a346c..0d4346babe 100644
+--- a/packages/turbo-types/package.json
++++ b/packages/turbo-types/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@turbo/types",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "Turborepo types",
+   "homepage": "https://turbo.build/repo",
+   "license": "MIT",
+diff --git a/packages/turbo-workspaces/package.json b/packages/turbo-workspaces/package.json
+index 1628111b09..1fe50e23c6 100644
+--- a/packages/turbo-workspaces/package.json
++++ b/packages/turbo-workspaces/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@turbo/workspaces",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "Tools for working with package managers",
+   "homepage": "https://turbo.build/repo",
+   "license": "MIT",
+diff --git a/packages/turbo/package.json b/packages/turbo/package.json
+index 47bcbc5201..e236735d99 100644
+--- a/packages/turbo/package.json
++++ b/packages/turbo/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "turbo",
+-  "version": "2.1.4-canary.2",
++  "version": "2.1.4-canary.3",
+   "description": "Turborepo is a high-performance build system for JavaScript and TypeScript codebases.",
+   "repository": "https://github.com/vercel/turborepo",
+   "bugs": "https://github.com/vercel/turborepo/issues",
+@@ -17,11 +17,11 @@
+     "bin"
+   ],
+   "optionalDependencies": {
+-    "turbo-darwin-64": "2.1.4-canary.2",
+-    "turbo-darwin-arm64": "2.1.4-canary.2",
+-    "turbo-linux-64": "2.1.4-canary.2",
+-    "turbo-linux-arm64": "2.1.4-canary.2",
+-    "turbo-windows-64": "2.1.4-canary.2",
+-    "turbo-windows-arm64": "2.1.4-canary.2"
++    "turbo-darwin-64": "2.1.4-canary.3",
++    "turbo-darwin-arm64": "2.1.4-canary.3",
++    "turbo-linux-64": "2.1.4-canary.3",
++    "turbo-linux-arm64": "2.1.4-canary.3",
++    "turbo-windows-64": "2.1.4-canary.3",
++    "turbo-windows-arm64": "2.1.4-canary.3"
+   }
+ }
+diff --git a/turborepo-tests/integration/fixtures/turbo_trace/invalid.ts b/turborepo-tests/integration/fixtures/turbo_trace/invalid.ts
+deleted file mode 100644
+index 0dd0d047bd..0000000000
+--- a/turborepo-tests/integration/fixtures/turbo_trace/invalid.ts
++++ /dev/null
+@@ -1,2 +0,0 @@
+-import foo from "./non-existent-file.js";
+-import { Button } from "./button.tsx";
+diff --git a/turborepo-tests/integration/tests/turbo-trace.t b/turborepo-tests/integration/tests/turbo-trace.t
+index 24569c5c76..c40b5a913e 100644
+--- a/turborepo-tests/integration/tests/turbo-trace.t
++++ b/turborepo-tests/integration/tests/turbo-trace.t
+@@ -11,88 +11,49 @@ Setup
+     }
+   }
+ 
+-  $ ${TURBO} query "query { file(path: \"main.ts\") { path, dependencies { files { items { path } } } } }"
++  $ ${TURBO} query "query { file(path: \"main.ts\") { path, dependencies { path } } }"
+    WARNING  query command is experimental and may change in the future
+   {
+     "data": {
+       "file": {
+         "path": "main.ts",
+-        "dependencies": {
+-          "files": {
+-            "items": [
+-              {
+-                "path": "button.tsx"
+-              },
+-              {
+-                "path": "foo.js"
+-              },
+-              {
+-                "path": "node_modules(\/|\\\\)repeat-string(\/|\\\\)index.js" (re)
+-              }
+-            ]
++        "dependencies": [
++          {
++            "path": "button.tsx"
++          },
++          {
++            "path": "foo.js"
++          },
++          {
++            "path": "node_modules(\/|\\\\)repeat-string(\/|\\\\)index.js" (re)
+           }
+-        }
++        ]
+       }
+     }
+   }
+ 
+-  $ ${TURBO} query "query { file(path: \"button.tsx\") { path, dependencies { files { items { path } } } } }"
++  $ ${TURBO} query "query { file(path: \"button.tsx\") { path, dependencies { path } } }"
+    WARNING  query command is experimental and may change in the future
+   {
+     "data": {
+       "file": {
+         "path": "button.tsx",
+-        "dependencies": {
+-          "files": {
+-            "items": []
+-          }
+-        }
++        "dependencies": []
+       }
+     }
+   }
+ 
+-  $ ${TURBO} query "query { file(path: \"circular.ts\") { path dependencies { files { items { path } } } } }"
++  $ ${TURBO} query "query { file(path: \"circular.ts\") { path, dependencies { path } } }"
+    WARNING  query command is experimental and may change in the future
+   {
+     "data": {
+       "file": {
+         "path": "circular.ts",
+-        "dependencies": {
+-          "files": {
+-            "items": [
+-              {
+-                "path": "circular2.ts"
+-              }
+-            ]
+-          }
+-        }
+-      }
+-    }
+-  }
+-
+-Trace file with invalid import
+-  $ ${TURBO} query "query { file(path: \"invalid.ts\") { path dependencies { files { items { path } } errors { items { message } } } } }"
+-   WARNING  query command is experimental and may change in the future
+-  {
+-    "data": {
+-      "file": {
+-        "path": "invalid.ts",
+-        "dependencies": {
+-          "files": {
+-            "items": [
+-              {
+-                "path": "button.tsx"
+-              }
+-            ]
+-          },
+-          "errors": {
+-            "items": [
+-              {
+-                "message": "failed to resolve import"
+-              }
+-            ]
++        "dependencies": [
++          {
++            "path": "circular2.ts"
+           }
+-        }
++        ]
+       }
+     }
+   }
+diff --git a/version.txt b/version.txt
+index a0e657a8b3..52e00c20df 100644
+--- a/version.txt
++++ b/version.txt
+@@ -1,2 +1,2 @@
+-2.1.4-canary.2
++2.1.4-canary.3
+ canary

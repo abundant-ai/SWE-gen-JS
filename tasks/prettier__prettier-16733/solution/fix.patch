@@ -1,0 +1,206 @@
+diff --git a/changelog_unreleased/vue/16733.md b/changelog_unreleased/vue/16733.md
+new file mode 100644
+index 000000000..8068d7e13
+--- /dev/null
++++ b/changelog_unreleased/vue/16733.md
+@@ -0,0 +1,22 @@
++#### Fix extra semicolon inserted in Vue event binding with non-ascii characters (#16733 by @fisker)
++
++<!-- prettier-ignore -->
++```vue
++<!-- Input -->
++<template>
++  <button @click="点击事件">点击!</button>
++  <button @click="onClick">Click!</button>
++</template>
++
++<!-- Prettier stable -->
++<template>
++  <button @click="点击事件;">点击!</button>
++  <button @click="onClick">Click!</button>
++</template>
++
++<!-- Prettier main -->
++<template>
++  <button @click="点击事件">点击!</button>
++  <button @click="onClick">Click!</button>
++</template>
++```
+diff --git a/src/language-html/embed/vue-attributes.js b/src/language-html/embed/vue-attributes.js
+index 6867f1e90..f82bb4f69 100644
+--- a/src/language-html/embed/vue-attributes.js
++++ b/src/language-html/embed/vue-attributes.js
+@@ -7,10 +7,7 @@ import {
+ import isVueSfcWithTypescriptScript from "../utils/is-vue-sfc-with-typescript-script.js";
+ import { printVueScriptGenericAttributeValue } from "./print-vue-script-generic-attribute-value.js";
+ import { formatAttributeValue, shouldHugJsExpression } from "./utils.js";
+-import {
+-  isVueEventBindingExpression,
+-  printVueBindings,
+-} from "./vue-bindings.js";
++import { printVueBindings } from "./vue-bindings.js";
+ import { printVueVForDirective } from "./vue-v-for-directive.js";
+ 
+ /**
+@@ -71,15 +68,22 @@ function printVueAttribute(path, options) {
+ /**
+  * @returns {Promise<Doc>}
+  */
+-function printVueVOnDirective(text, textToDoc, { parseWithTs }) {
+-  if (isVueEventBindingExpression(text)) {
+-    return printExpression(text, textToDoc, { parseWithTs });
++async function printVueVOnDirective(text, textToDoc, { parseWithTs }) {
++  try {
++    return await printExpression(text, textToDoc, { parseWithTs });
++  } catch (error) {
++    // @ts-expect-error -- expected
++    if (error.cause?.code !== "BABEL_PARSER_SYNTAX_ERROR") {
++      throw error;
++    }
+   }
+ 
+   return formatAttributeValue(
+     text,
+     textToDoc,
+-    { parser: parseWithTs ? "__vue_ts_event_binding" : "__vue_event_binding" },
++    {
++      parser: parseWithTs ? "__vue_ts_event_binding" : "__vue_event_binding",
++    },
+     shouldHugJsExpression,
+   );
+ }
+diff --git a/src/language-html/embed/vue-bindings.js b/src/language-html/embed/vue-bindings.js
+index fadba6f0c..2ca9907a0 100644
+--- a/src/language-html/embed/vue-bindings.js
++++ b/src/language-html/embed/vue-bindings.js
+@@ -14,18 +14,4 @@ function printVueBindings(text, textToDoc, { parseWithTs }) {
+   });
+ }
+ 
+-function isVueEventBindingExpression(eventBindingValue) {
+-  // https://github.com/vuejs/vue/blob/v2.5.17/src/compiler/codegen/events.js#L3-L4
+-  // arrow function or anonymous function
+-  const fnExpRE = /^(?:[\w$]+|\([^)]*\))\s*=>|^function\s*\(/u;
+-  // simple member expression chain (a, a.b, a['b'], a["b"], a[0], a[b])
+-  const simplePathRE =
+-    /^[$_a-z][\w$]*(?:\.[$_a-z][\w$]*|\['[^']*'\]|\["[^"]*"\]|\[\d+\]|\[[$_a-z][\w$]*\])*$/iu;
+-
+-  // https://github.com/vuejs/vue/blob/v2.5.17/src/compiler/helpers.js#L104
+-  const value = eventBindingValue.trim();
+-
+-  return fnExpRE.test(value) || simplePathRE.test(value);
+-}
+-
+-export { isVueEventBindingExpression, printVueBindings };
++export { printVueBindings };
+diff --git a/src/language-js/print/expression-statement.js b/src/language-js/print/expression-statement.js
+index 006d6c643..97de0d7d7 100644
+--- a/src/language-js/print/expression-statement.js
++++ b/src/language-js/print/expression-statement.js
+@@ -1,14 +1,22 @@
++import {
++  isVueEventBindingFunctionExpression,
++  isVueEventBindingMemberExpression,
++  unwrapVueEventBindingTsNode,
++} from "../utils/vue-event-binding.js";
+ import {
+   isSingleJsxExpressionStatementInMarkdown,
+   isSingleVueEventBindingExpressionStatement,
+-  isVueEventBindingExpression,
+ } from "./semicolon.js";
+ 
+ function printExpressionStatement(path, options, print) {
+   const parts = [print("expression")];
+ 
+   if (isSingleVueEventBindingExpressionStatement(path, options)) {
+-    if (isVueEventBindingExpression(path.node.expression)) {
++    const expression = unwrapVueEventBindingTsNode(path.node.expression);
++    if (
++      isVueEventBindingFunctionExpression(expression) ||
++      isVueEventBindingMemberExpression(expression)
++    ) {
+       parts.push(";");
+     }
+   } else if (isSingleJsxExpressionStatementInMarkdown(path, options)) {
+diff --git a/src/language-js/print/semicolon.js b/src/language-js/print/semicolon.js
+index 30a2c234c..76b1f0b7a 100644
+--- a/src/language-js/print/semicolon.js
++++ b/src/language-js/print/semicolon.js
+@@ -99,24 +99,6 @@ function isSingleJsxExpressionStatementInMarkdown({ node, parent }, options) {
+   );
+ }
+ 
+-// based on /src/language-html/syntax-vue.js isVueEventBindingExpression()
+-function isVueEventBindingExpression(node) {
+-  switch (node.type) {
+-    case "MemberExpression":
+-      switch (node.property.type) {
+-        case "Identifier":
+-        case "NumericLiteral":
+-        case "StringLiteral":
+-          return isVueEventBindingExpression(node.object);
+-      }
+-      return false;
+-    case "Identifier":
+-      return true;
+-    default:
+-      return false;
+-  }
+-}
+-
+ function isSingleVueEventBindingExpressionStatement({ node, parent }, options) {
+   return (
+     (options.parser === "__vue_event_binding" ||
+@@ -130,6 +112,5 @@ function isSingleVueEventBindingExpressionStatement({ node, parent }, options) {
+ export {
+   isSingleJsxExpressionStatementInMarkdown,
+   isSingleVueEventBindingExpressionStatement,
+-  isVueEventBindingExpression,
+   shouldPrintLeadingSemicolon,
+ };
+diff --git a/src/language-js/utils/vue-event-binding.js b/src/language-js/utils/vue-event-binding.js
+new file mode 100644
+index 000000000..1477ff1da
+--- /dev/null
++++ b/src/language-js/utils/vue-event-binding.js
+@@ -0,0 +1,40 @@
++import createTypeCheckFunction from "./create-type-check-function.js";
++
++// https://github.com/vuejs/core/blob/35785f3cd7bd86cbec3f8324022491da2d088b61/packages/compiler-core/src/babelUtils.ts#L498
++const isVueEventBindingTsNode = createTypeCheckFunction([
++  "TSAsExpression", // `foo as number`
++  "TSTypeAssertion", // `(<number>foo)`
++  "TSNonNullExpression", // `foo!`
++  "TSInstantiationExpression", // `foo<string>`
++  "TSSatisfiesExpression", // `foo satisfies T`
++]);
++
++// https://github.com/vuejs/core/blob/35785f3cd7bd86cbec3f8324022491da2d088b61/packages/compiler-core/src/babelUtils.ts#L506C8-L512C2
++function unwrapVueEventBindingTsNode(node) {
++  if (isVueEventBindingTsNode(node)) {
++    return unwrapVueEventBindingTsNode(node.expression);
++  }
++
++  return node;
++}
++
++// https://github.com/vuejs/core/blob/35785f3cd7bd86cbec3f8324022491da2d088b61/packages/compiler-core/src/utils.ts#L197
++const isVueEventBindingFunctionExpression = createTypeCheckFunction([
++  "FunctionExpression",
++  "ArrowFunctionExpression",
++]);
++
++// https://github.com/vuejs/core/blob/35785f3cd7bd86cbec3f8324022491da2d088b61/packages/compiler-core/src/utils.ts#L161
++function isVueEventBindingMemberExpression(node) {
++  return (
++    node.type === "MemberExpression" ||
++    node.type === "OptionalMemberExpression" ||
++    (node.type === "Identifier" && node.name !== "undefined")
++  );
++}
++
++export {
++  isVueEventBindingFunctionExpression,
++  isVueEventBindingMemberExpression,
++  unwrapVueEventBindingTsNode,
++};

@@ -1,0 +1,295 @@
+diff --git a/.changeset/dull-actors-suffer.md b/.changeset/dull-actors-suffer.md
+deleted file mode 100644
+index 6bc15d53a1..0000000000
+--- a/.changeset/dull-actors-suffer.md
++++ /dev/null
+@@ -1,33 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-Partial event descriptors are now type-safe:
+-
+-```ts
+-createMachine({
+-  types: {} as {
+-    events:
+-      | { type: 'mouse.click.up'; direction: 'up' }
+-      | { type: 'mouse.click.down'; direction: 'down' }
+-      | { type: 'mouse.move' }
+-      | { type: 'keypress' };
+-  },
+-  on: {
+-    'mouse.click.*': {
+-      actions: ({ event }) => {
+-        event.type;
+-        // 'mouse.click.up' | 'mouse.click.down'
+-        event.direction;
+-        // 'up' | 'down'
+-      }
+-    },
+-    'mouse.*': {
+-      actions: ({ event }) => {
+-        event.type;
+-        // 'mouse.click.up' | 'mouse.click.down' | 'mouse.move'
+-      }
+-    }
+-  }
+-});
+-```
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index ae0f93b276..fb3c2382d7 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -22,8 +22,7 @@ import type {
+   StateValue,
+   TODO,
+   AnyActorRef,
+-  Compute,
+-  EventDescriptor
++  Compute
+ } from './types.ts';
+ import { flatten, matchesState } from './utils.ts';
+ 
+@@ -258,7 +257,7 @@ export class State<
+   /**
+    * The next events that will cause a transition from the current state.
+    */
+-  public get nextEvents(): Array<EventDescriptor<TEvent>> {
++  public get nextEvents(): Array<string> {
+     return memo(this, 'nextEvents', () => {
+       return [
+         ...new Set(flatten([...this.configuration.map((sn) => sn.ownEvents)]))
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 711f675bb7..b1db2ccf05 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -472,9 +472,18 @@ export type TransitionsConfig<
+   TAction extends ParameterizedObject,
+   TGuard extends ParameterizedObject,
+   TDelay extends string
+-> =
+-  | {
+-      [K in EventDescriptor<TEvent>]?: TransitionConfigOrTarget<
++> = {
++  // TODO: this doesn't support partial descriptors
++  [K in TEvent['type'] | '*']?: K extends '*'
++    ? TransitionConfigOrTarget<
++        TContext,
++        TEvent,
++        TEvent,
++        TAction,
++        TGuard,
++        TDelay
++      >
++    : TransitionConfigOrTarget<
+         TContext,
+         ExtractEvent<TEvent, K>,
+         TEvent,
+@@ -482,23 +491,7 @@ export type TransitionsConfig<
+         TGuard,
+         TDelay
+       >;
+-    };
+-
+-type PartialEventDescriptor<TEventType extends string> =
+-  TEventType extends `${infer TLeading}.${infer TTail}`
+-    ? `${TLeading}.*` | `${TLeading}.${PartialEventDescriptor<TTail>}`
+-    : never;
+-
+-export type EventDescriptor<TEvent extends EventObject> =
+-  | TEvent['type']
+-  | PartialEventDescriptor<TEvent['type']>
+-  | '*';
+-
+-type NormalizeDescriptor<TDescriptor extends string> = TDescriptor extends '*'
+-  ? string
+-  : TDescriptor extends `${infer TLeading}.*`
+-  ? `${TLeading}.${string}`
+-  : TDescriptor;
++};
+ 
+ type IsLiteralString<T extends string> = string extends T ? false : true;
+ 
+@@ -1562,13 +1555,13 @@ export interface TransitionDefinition<
+   actions: readonly UnknownAction[];
+   reenter: boolean;
+   guard?: UnknownGuard;
+-  eventType: EventDescriptor<TEvent>;
++  eventType: TEvent['type'] | '*';
+   toJSON: () => {
+     target: string[] | undefined;
+     source: string;
+     actions: readonly UnknownAction[];
+     guard?: UnknownGuard;
+-    eventType: EventDescriptor<TEvent>;
++    eventType: TEvent['type'] | '*';
+     meta?: Record<string, any>;
+   };
+ }
+@@ -1587,8 +1580,11 @@ export type TransitionDefinitionMap<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+ > = {
+-  [K in EventDescriptor<TEvent>]: Array<
+-    TransitionDefinition<TContext, ExtractEvent<TEvent, K>>
++  [K in TEvent['type'] | '*']: Array<
++    TransitionDefinition<
++      TContext,
++      K extends TEvent['type'] ? Extract<TEvent, { type: K }> : EventObject
++    >
+   >;
+ };
+ 
+@@ -1709,14 +1705,10 @@ export interface Subscribable<T> extends InteropSubscribable<T> {
+ 
+ export type ExtractEvent<
+   TEvent extends EventObject,
+-  TDescriptor extends EventDescriptor<TEvent>
+-> = string extends TEvent['type']
+-  ? TEvent
+-  : NormalizeDescriptor<TDescriptor> extends infer TNormalizedDescriptor
+-  ? TEvent extends any
+-    ? TEvent['type'] extends TNormalizedDescriptor
+-      ? TEvent
+-      : never
++  TEventType extends TEvent['type']
++> = TEvent extends any
++  ? TEventType extends TEvent['type']
++    ? TEvent
+     : never
+   : never;
+ 
+diff --git a/packages/core/test/types.test.ts b/packages/core/test/types.test.ts
+index a2b04d8e81..0fbcea9124 100644
+--- a/packages/core/test/types.test.ts
++++ b/packages/core/test/types.test.ts
+@@ -528,128 +528,6 @@ describe('events', () => {
+     });
+   });
+ 
+-  it('should infer inline function parameter with a partial transition descriptor matching multiple events with the matching count of segments', () => {
+-    createMachine({
+-      types: {} as {
+-        events:
+-          | { type: 'mouse.click.up'; direction: 'up' }
+-          | { type: 'mouse.click.down'; direction: 'down' }
+-          | { type: 'mouse.move' }
+-          | { type: 'mouse' }
+-          | { type: 'keypress' };
+-      },
+-      on: {
+-        'mouse.click.*': {
+-          actions: ({ event }) => {
+-            ((_accept: 'mouse.click.up' | 'mouse.click.down') => {})(
+-              event.type
+-            );
+-            ((_accept: 'up' | 'down') => {})(event.direction);
+-            // @ts-expect-error
+-            ((_accept: 'not any') => {})(event.type);
+-          }
+-        }
+-      }
+-    });
+-  });
+-
+-  it('should infer inline function parameter with a partial transition descriptor matching multiple events with the same count of segments or more', () => {
+-    createMachine({
+-      types: {} as {
+-        events:
+-          | { type: 'mouse.click.up'; direction: 'up' }
+-          | { type: 'mouse.click.down'; direction: 'down' }
+-          | { type: 'mouse.move' }
+-          | { type: 'mouse' }
+-          | { type: 'keypress' };
+-      },
+-      on: {
+-        'mouse.*': {
+-          actions: ({ event }) => {
+-            ((
+-              _accept: 'mouse.click.up' | 'mouse.click.down' | 'mouse.move'
+-            ) => {})(event.type);
+-            // @ts-expect-error
+-            ((_accept: 'not any') => {})(event.type);
+-          }
+-        }
+-      }
+-    });
+-  });
+-
+-  it('should not allow a transition using an event type matching the possible prefix but one that is outside of the defines ones', () => {
+-    createMachine({
+-      types: {} as {
+-        events:
+-          | { type: 'mouse.click.up'; direction: 'up' }
+-          | { type: 'mouse.click.down'; direction: 'down' }
+-          | { type: 'mouse.move' }
+-          | { type: 'mouse' }
+-          | { type: 'keypress' };
+-      },
+-      on: {
+-        // @ts-expect-error
+-        'mouse.doubleClick': {}
+-      }
+-    });
+-  });
+-
+-  it('should not allow a transition using an event type matching the possible prefix but one that is outside of the defines ones', () => {
+-    createMachine({
+-      types: {} as {
+-        events:
+-          | { type: 'mouse.click.up'; direction: 'up' }
+-          | { type: 'mouse.click.down'; direction: 'down' }
+-          | { type: 'mouse.move' }
+-          | { type: 'mouse' }
+-          | { type: 'keypress' };
+-      },
+-      on: {
+-        // @ts-expect-error
+-        'mouse.doubleClick': {}
+-      }
+-    });
+-  });
+-
+-  it(`should infer inline function parameter only using a direct match when the transition descriptor doesn't has a trailing wildcard`, () => {
+-    createMachine({
+-      types: {} as {
+-        events:
+-          | { type: 'mouse.click.up'; direction: 'up' }
+-          | { type: 'mouse.click.down'; direction: 'down' }
+-          | { type: 'mouse.move' }
+-          | { type: 'mouse' }
+-          | { type: 'keypress' };
+-      },
+-      on: {
+-        mouse: {
+-          actions: ({ event }) => {
+-            ((_accept: 'mouse') => {})(event.type);
+-            // @ts-expect-error
+-            ((_accept: 'not any') => {})(event.type);
+-          }
+-        }
+-      }
+-    });
+-  });
+-
+-  it('should not allow a transition using a partial descriptor related to an event type that is only defined exxactly', () => {
+-    createMachine({
+-      types: {} as {
+-        events:
+-          | { type: 'mouse.click.up'; direction: 'up' }
+-          | { type: 'mouse.click.down'; direction: 'down' }
+-          | { type: 'mouse.move' }
+-          | { type: 'mouse' }
+-          | { type: 'keypress' };
+-      },
+-      on: {
+-        // @ts-expect-error
+-        'keypress.*': {}
+-      }
+-    });
+-  });
+-
+   it('action objects used within implementations parameter should get access to the provided event type', () => {
+     createMachine(
+       {

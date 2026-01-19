@@ -1,0 +1,212 @@
+diff --git a/packages/microservices/constants.ts b/packages/microservices/constants.ts
+index 35b6af94e..3d295b03a 100644
+--- a/packages/microservices/constants.ts
++++ b/packages/microservices/constants.ts
+@@ -71,5 +71,3 @@ export const EADDRINUSE = 'EADDRINUSE';
+ 
+ export const CONNECTION_FAILED_MESSAGE =
+   'Connection to transport failed. Trying to reconnect...';
+-
+-export const NATS_DEFAULT_GRACE_PERIOD = 10000;
+diff --git a/packages/microservices/external/nats-client.interface.ts b/packages/microservices/external/nats-client.interface.ts
+index 931f1233c..637883a42 100644
+--- a/packages/microservices/external/nats-client.interface.ts
++++ b/packages/microservices/external/nats-client.interface.ts
+@@ -50,7 +50,7 @@ interface Sub<T> extends AsyncIterable<T> {
+   getMax(): number | undefined;
+ }
+ 
+-export declare type Subscription = Sub<NatsMsg>;
++declare type Subscription = Sub<NatsMsg>;
+ 
+ declare enum Events {
+   Disconnect = 'disconnect',
+diff --git a/packages/microservices/interfaces/microservice-configuration.interface.ts b/packages/microservices/interfaces/microservice-configuration.interface.ts
+index 607f48bb2..32f6513ee 100644
+--- a/packages/microservices/interfaces/microservice-configuration.interface.ts
++++ b/packages/microservices/interfaces/microservice-configuration.interface.ts
+@@ -193,8 +193,6 @@ export interface NatsOptions {
+     token?: string;
+     yieldTime?: number;
+     tokenHandler?: any;
+-    gracefulShutdown?: boolean;
+-    gracePeriod?: number;
+     [key: string]: any;
+   };
+ }
+diff --git a/packages/microservices/server/server-nats.ts b/packages/microservices/server/server-nats.ts
+index a62b6c8d1..e9c376b12 100644
+--- a/packages/microservices/server/server-nats.ts
++++ b/packages/microservices/server/server-nats.ts
+@@ -1,17 +1,9 @@
+ import { isUndefined, isObject } from '@nestjs/common/utils/shared.utils';
+-import {
+-  NATS_DEFAULT_GRACE_PERIOD,
+-  NATS_DEFAULT_URL,
+-  NO_MESSAGE_HANDLER,
+-} from '../constants';
++import { NATS_DEFAULT_URL, NO_MESSAGE_HANDLER } from '../constants';
+ import { NatsContext } from '../ctx-host/nats.context';
+ import { NatsRequestJSONDeserializer } from '../deserializers/nats-request-json.deserializer';
+ import { Transport } from '../enums';
+-import {
+-  Client,
+-  NatsMsg,
+-  Subscription,
+-} from '../external/nats-client.interface';
++import { Client, NatsMsg } from '../external/nats-client.interface';
+ import { CustomTransportStrategy } from '../interfaces';
+ import { NatsOptions } from '../interfaces/microservice-configuration.interface';
+ import { IncomingRequest } from '../interfaces/packet.interface';
+@@ -29,10 +21,6 @@ export class ServerNats extends Server implements CustomTransportStrategy {
+ 
+   private natsClient: Client;
+ 
+-  private readonly subscriptions: Subscription[] = [];
+-
+-  private readonly gracePeriod: number;
+-
+   constructor(private readonly options: NatsOptions['options']) {
+     super();
+ 
+@@ -40,10 +28,6 @@ export class ServerNats extends Server implements CustomTransportStrategy {
+       require('nats'),
+     );
+ 
+-    this.gracePeriod =
+-      this.getOptionsProp(this.options, 'gracePeriod') ||
+-      NATS_DEFAULT_GRACE_PERIOD;
+-
+     this.initializeSerializer(options);
+     this.initializeDeserializer(options);
+   }
+@@ -76,30 +60,12 @@ export class ServerNats extends Server implements CustomTransportStrategy {
+       });
+ 
+     const registeredPatterns = [...this.messageHandlers.keys()];
+-    for (const channel of registeredPatterns) {
+-      const sub = subscribe(channel);
+-      this.subscriptions.push(sub);
+-    }
+-  }
+-
+-  private async waitForGracePeriod() {
+-    await new Promise<void>(res => {
+-      setTimeout(() => {
+-        res();
+-      }, this.gracePeriod);
+-    });
++    registeredPatterns.forEach(channel => subscribe(channel));
+   }
+ 
+   public async close() {
+-    if (this.natsClient) {
+-      const graceful = this.getOptionsProp(this.options, 'gracefulShutdown');
+-      if (graceful) {
+-        this.subscriptions.forEach(sub => sub.unsubscribe());
+-        await this.waitForGracePeriod();
+-      }
+-      await this.natsClient?.close();
+-      this.natsClient = null;
+-    }
++    await this.natsClient?.close();
++    this.natsClient = null;
+   }
+ 
+   public createNatsClient(): Promise<Client> {
+diff --git a/packages/microservices/test/server/server-nats.spec.ts b/packages/microservices/test/server/server-nats.spec.ts
+index 586b9ed5b..c91975210 100644
+--- a/packages/microservices/test/server/server-nats.spec.ts
++++ b/packages/microservices/test/server/server-nats.spec.ts
+@@ -41,64 +41,13 @@ describe('ServerNats', () => {
+     beforeEach(() => {
+       untypedServer.natsClient = natsClient;
+     });
+-    it('should close natsClient', async () => {
+-      await server.close();
++    it('should close natsClient', () => {
++      server.close();
+       expect(natsClient.close.called).to.be.true;
+     });
+-
+-    describe('when "gracefulShutdown" is true', () => {
+-      const waitForGracePeriod = sinon.spy();
+-      const subscriptions = [
+-        { unsubscribe: sinon.spy() },
+-        { unsubscribe: sinon.spy() },
+-      ];
+-      beforeEach(() => {
+-        (server as any).subscriptions = subscriptions;
+-        (server as any).waitForGracePeriod = waitForGracePeriod;
+-        (server as any).options.gracefulShutdown = true;
+-      });
+-
+-      it('should unsubscribe all subscriptions', async () => {
+-        await server.close();
+-        for (const subscription of subscriptions) {
+-          expect(subscription.unsubscribe.calledOnce).to.be.true;
+-        }
+-      });
+-
+-      it('should call "waitForGracePeriod"', async () => {
+-        await server.close();
+-        expect(waitForGracePeriod.called).to.be.true;
+-      });
+-    });
+-
+-    describe('when "gracefulShutdown" is false', () => {
+-      const waitForGracePeriod = sinon.spy();
+-      const subscriptions = [
+-        { unsubscribe: sinon.spy() },
+-        { unsubscribe: sinon.spy() },
+-      ];
+-      beforeEach(() => {
+-        (server as any).subscriptions = subscriptions;
+-        (server as any).waitForGracePeriod = waitForGracePeriod;
+-        (server as any).options.gracefulShutdown = false;
+-      });
+-      it('should not unsubscribe all subscriptions', async () => {
+-        await server.close();
+-        for (const subscription of subscriptions) {
+-          expect(subscription.unsubscribe.called).to.be.false;
+-        }
+-      });
+-
+-      it('should not call "waitForGracePeriod"', async () => {
+-        await server.close();
+-        expect(waitForGracePeriod.called).to.be.false;
+-      });
+-    });
+   });
+   describe('bindEvents', () => {
+     let onSpy: sinon.SinonSpy, subscribeSpy: sinon.SinonSpy, natsClient;
+-    const pattern = 'test';
+-    const messageHandler = sinon.spy();
+ 
+     beforeEach(() => {
+       onSpy = sinon.spy();
+@@ -107,19 +56,16 @@ describe('ServerNats', () => {
+         on: onSpy,
+         subscribe: subscribeSpy,
+       };
+-      untypedServer.messageHandlers = objectToMap({
+-        [pattern]: messageHandler
+-      });
+     });
+     it('should subscribe to each acknowledge patterns', () => {
++      const pattern = 'test';
++      const handler = sinon.spy();
++      untypedServer.messageHandlers = objectToMap({
++        [pattern]: handler,
++      });
+       server.bindEvents(natsClient);
+       expect(subscribeSpy.calledWith(pattern)).to.be.true;
+     });
+-
+-    it('should fill the subscriptions array properly', () => {
+-      server.bindEvents(natsClient);
+-      expect(server['subscriptions'].length).to.be.equals(1);
+-    });
+   });
+   describe('getMessageHandler', () => {
+     it(`should return function`, () => {

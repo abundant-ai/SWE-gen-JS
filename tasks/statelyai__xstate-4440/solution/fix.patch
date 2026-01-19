@@ -1,0 +1,320 @@
+diff --git a/.changeset/few-monkeys-build.md b/.changeset/few-monkeys-build.md
+new file mode 100644
+index 0000000000..d0f3c9cff8
+--- /dev/null
++++ b/.changeset/few-monkeys-build.md
+@@ -0,0 +1,5 @@
++---
++'xstate': minor
++---
++
++`State.from`, `StateMachine#createState` and `StateMachine#resolveStateValue` were removed. They largely served the same purpose as `StateMachine#resolveState` and this is the method that is still available and can be used instead of them.
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index a695bd107d..e2c368a46f 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -97,68 +97,6 @@ export class State<
+    */
+   public children: ComputeChildren<TActor>;
+ 
+-  /**
+-   * Creates a new State instance for the given `stateValue` and `context`.
+-   * @param stateValue
+-   * @param context
+-   */
+-  public static from<
+-    TContext extends MachineContext,
+-    TEvent extends EventObject = EventObject
+-  >(
+-    stateValue:
+-      | State<
+-          TContext,
+-          TEvent,
+-          TODO,
+-          any, // tags
+-          any // typegen
+-        >
+-      | StateValue,
+-    context: TContext = {} as TContext,
+-    machine: AnyStateMachine
+-  ): State<
+-    TContext,
+-    TEvent,
+-    TODO,
+-    any, // tags
+-    any // typegen
+-  > {
+-    if (stateValue instanceof State) {
+-      if (stateValue.context !== context) {
+-        return new State<TContext, TEvent, TODO, any, any>(
+-          {
+-            value: stateValue.value,
+-            context,
+-            meta: {},
+-            configuration: [], // TODO: fix,
+-            children: {},
+-            status: 'active'
+-          },
+-          machine
+-        );
+-      }
+-
+-      return stateValue;
+-    }
+-
+-    const configuration = getConfiguration(
+-      getStateNodes(machine.root, stateValue)
+-    );
+-
+-    return new State<TContext, TEvent, TODO, any, any>(
+-      {
+-        value: stateValue,
+-        context,
+-        meta: undefined,
+-        configuration: Array.from(configuration),
+-        children: {},
+-        status: 'active'
+-      },
+-      machine
+-    );
+-  }
+-
+   /**
+    * Creates a new `State` instance that represents the current state of a running machine.
+    *
+@@ -171,9 +109,7 @@ export class State<
+     this.context = config.context;
+     this.historyValue = config.historyValue || {};
+     this.matches = this.matches.bind(this);
+-    this.configuration =
+-      config.configuration ??
+-      Array.from(getConfiguration(getStateNodes(machine.root, config.value)));
++    this.configuration = config.configuration;
+     this.children = config.children as any;
+ 
+     this.value = getStateValue(machine.root, this.configuration);
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 21df12d247..e3505cb48f 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -46,7 +46,8 @@ import type {
+   TODO,
+   SnapshotFrom,
+   Snapshot,
+-  AnyActorLogic
++  AnyActorLogic,
++  HistoryValue
+ } from './types.ts';
+ import { isErrorActorEvent, resolveReferencedActor } from './utils.ts';
+ import { $$ACTOR_TYPE, createActor } from './interpreter.ts';
+@@ -248,15 +249,17 @@ export class StateMachine<
+     });
+   }
+ 
+-  /**
+-   * Resolves the given `state` to a new `State` instance relative to this machine.
+-   *
+-   * This ensures that `.nextEvents` represent the correct values.
+-   *
+-   * @param state The state to resolve
+-   */
+   public resolveState(
+-    state: State<TContext, TEvent, TActor, TTag, TResolvedTypesMeta>
++    config: {
++      value: StateValue;
++      context?: TContext;
++      historyValue?: HistoryValue<TContext, TEvent>;
++      status?: 'active' | 'done' | 'error' | 'stopped';
++      output?: TOutput;
++      error?: unknown;
++    } & (Equals<TContext, MachineContext> extends false
++      ? { context: unknown }
++      : {})
+   ): MachineSnapshot<
+     TContext,
+     TEvent,
+@@ -265,38 +268,32 @@ export class StateMachine<
+     TOutput,
+     TResolvedTypesMeta
+   > {
++    const resolvedStateValue = resolveStateValue(this.root, config.value);
+     const configurationSet = getConfiguration(
+-      getStateNodes(this.root, state.value)
++      getStateNodes(this.root, resolvedStateValue)
+     );
+-    const configuration = Array.from(configurationSet);
+-    return this.createState({
+-      ...(state as any),
+-      value: resolveStateValue(this.root, state.value),
+-      configuration,
+-      status: isInFinalState(configurationSet, this.root)
+-        ? 'done'
+-        : state.status
+-    });
+-  }
+-
+-  public resolveStateValue(
+-    stateValue: StateValue,
+-    ...[context]: Equals<TContext, MachineContext> extends true
+-      ? []
+-      : [TContext]
+-  ): MachineSnapshot<
+-    TContext,
+-    TEvent,
+-    TActor,
+-    TTag,
+-    TOutput,
+-    TResolvedTypesMeta
+-  > {
+-    const resolvedStateValue = resolveStateValue(this.root, stateValue);
+ 
+-    return this.resolveState(
+-      State.from(resolvedStateValue, context, this) as any
+-    );
++    return new State(
++      {
++        configuration: [...configurationSet],
++        context: config.context || ({} as TContext),
++        children: {},
++        status: isInFinalState(configurationSet, this.root)
++          ? 'done'
++          : config.status || 'active',
++        output: config.output,
++        error: config.error,
++        historyValue: config.historyValue
++      },
++      this
++    ) as MachineSnapshot<
++      TContext,
++      TEvent,
++      TActor,
++      TTag,
++      TOutput,
++      TResolvedTypesMeta
++    >;
+   }
+ 
+   /**
+@@ -397,16 +394,15 @@ export class StateMachine<
+   > {
+     const { context } = this.config;
+ 
+-    const preInitial = this.resolveState(
+-      this.createState({
+-        value: {}, // TODO: this is computed in state constructor
++    const preInitial = new State(
++      {
+         context:
+           typeof context !== 'function' && context ? context : ({} as TContext),
+-        meta: undefined,
+         configuration: getInitialConfiguration(this.root),
+         children: {},
+         status: 'active'
+-      })
++      },
++      this
+     );
+ 
+     if (typeof context === 'function') {
+@@ -421,7 +417,7 @@ export class StateMachine<
+       ) as SnapshotFrom<this>;
+     }
+ 
+-    return preInitial;
++    return preInitial as SnapshotFrom<this>;
+   }
+ 
+   /**
+@@ -540,30 +536,6 @@ export class StateMachine<
+     return getPersistedState(state, options);
+   }
+ 
+-  public createState(
+-    stateConfig:
+-      | MachineSnapshot<
+-          TContext,
+-          TEvent,
+-          TActor,
+-          TTag,
+-          TOutput,
+-          TResolvedTypesMeta
+-        >
+-      | StateConfig<TContext, TEvent>
+-  ): MachineSnapshot<
+-    TContext,
+-    TEvent,
+-    TActor,
+-    TTag,
+-    TOutput,
+-    TResolvedTypesMeta
+-  > {
+-    return stateConfig instanceof State
+-      ? (stateConfig as any)
+-      : new State(stateConfig, this);
+-  }
+-
+   public restoreState(
+     snapshot: Snapshot<unknown>,
+     _actorScope: ActorScope<
+@@ -621,9 +593,23 @@ export class StateMachine<
+       children[actorId] = actorRef;
+     });
+ 
+-    const restoredSnapshot = this.createState(
+-      new State({ ...(snapshot as any), children }, this) as any
+-    );
++    const restoredSnapshot = new State(
++      {
++        ...(snapshot as any),
++        children,
++        configuration: Array.from(
++          getConfiguration(getStateNodes(this.root, (snapshot as any).value))
++        )
++      },
++      this
++    ) as MachineSnapshot<
++      TContext,
++      TEvent,
++      TActor,
++      TTag,
++      TOutput,
++      TResolvedTypesMeta
++    >;
+ 
+     let seen = new Set();
+ 
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 9484619a35..a774423409 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1209,7 +1209,7 @@ function enterStates(
+           nextState,
+           event,
+           actorScope,
+-          currentState.configuration[0].machine.root,
++          nextState.machine.root,
+           rootCompletionNode
+         )
+       });
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 71dd71c524..2ae4a39ec1 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -1655,16 +1655,13 @@ export interface StateConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+ > {
+-  value: StateValue;
+   context: TContext;
+   historyValue?: HistoryValue<TContext, TEvent>;
+-  meta?: any;
+-  configuration?: Array<StateNode<TContext, TEvent>>;
++  configuration: Array<StateNode<TContext, TEvent>>;
+   children: Record<string, ActorRef<any, any>>;
+   status: 'active' | 'done' | 'error' | 'stopped';
+   output?: any;
+   error?: unknown;
+-  tags?: Set<string>;
+   machine?: StateMachine<TContext, TEvent, any, any, any, any, any, any, any>;
+ }
+ 

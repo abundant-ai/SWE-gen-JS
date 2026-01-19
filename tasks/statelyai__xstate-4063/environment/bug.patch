@@ -1,0 +1,335 @@
+diff --git a/.changeset/new-gorillas-visit.md b/.changeset/new-gorillas-visit.md
+deleted file mode 100644
+index 883a7b3c9f..0000000000
+--- a/.changeset/new-gorillas-visit.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-"xstate": major
+----
+-
+-Removed `State['transitions']`.
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index 1e3746ffce..80501fe083 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -17,7 +17,8 @@ import type {
+   PersistedMachineState,
+   Prop,
+   StateConfig,
+-  StateValue
++  StateValue,
++  TransitionDefinition
+ } from './types.ts';
+ import { flatten, isString, matchesState } from './utils.ts';
+ 
+@@ -69,6 +70,10 @@ export class State<
+    * The enabled state nodes representative of the state value.
+    */
+   public configuration: Array<StateNode<TContext, TEvent>>;
++  /**
++   * The transition definitions that resulted in this state.
++   */
++  public transitions: Array<TransitionDefinition<TContext, TEvent>>;
+   /**
+    * An object mapping actor names to spawned/invoked actors.
+    */
+@@ -114,6 +119,7 @@ export class State<
+         context,
+         meta: undefined,
+         configuration: Array.from(configuration),
++        transitions: [],
+         children: {}
+       },
+       machine
+@@ -137,6 +143,7 @@ export class State<
+     this.configuration =
+       config.configuration ??
+       Array.from(getConfiguration(getStateNodes(machine.root, config.value)));
++    this.transitions = config.transitions as any;
+     this.children = config.children;
+ 
+     this.value = getStateValue(machine.root, this.configuration);
+@@ -169,7 +176,7 @@ export class State<
+   }
+ 
+   public toJSON() {
+-    const { configuration, tags, machine, ...jsonValues } = this;
++    const { configuration, transitions, tags, machine, ...jsonValues } = this;
+ 
+     return { ...jsonValues, tags: Array.from(tags), meta: this.meta };
+   }
+@@ -256,7 +263,8 @@ export function cloneState<TState extends AnyState>(
+ export function getPersistedState<TState extends AnyState>(
+   state: TState
+ ): PersistedMachineState<TState> {
+-  const { configuration, tags, machine, children, ...jsonValues } = state;
++  const { configuration, transitions, tags, machine, children, ...jsonValues } =
++    state;
+ 
+   const childrenJson: Partial<PersistedMachineState<any>['children']> = {};
+ 
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index ec11633258..e9c5602f59 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1039,7 +1039,9 @@ export function microstep<
+   const mutConfiguration = new Set(currentState.configuration);
+ 
+   if (!currentState._initial && !willTransition) {
+-    const inertState = cloneState(currentState, {});
++    const inertState = cloneState(currentState, {
++      transitions: []
++    });
+ 
+     inertState.changed = false;
+     return inertState;
+@@ -1543,6 +1545,15 @@ export function macrostep(
+     let enabledTransitions = selectEventlessTransitions(nextState, nextEvent);
+ 
+     if (!enabledTransitions.length) {
++      // TODO: this is a bit of a hack, we need to review this
++      // this matches the behavior from v4 for eventless transitions
++      // where for `hasAlwaysTransitions` we were always trying to resolve with a NULL event
++      // and if a transition was not selected the `state.transitions` stayed empty
++      // without this we get into an infinite loop in the dieHard test in `@xstate/test` for the `simplePathsTo`
++      if (nextState.configuration.some((state) => state.always)) {
++        nextState.transitions = [];
++      }
++
+       if (!nextState._internalQueue.length) {
+         break;
+       } else {
+diff --git a/packages/core/test/meta.test.ts b/packages/core/test/meta.test.ts
+index e3008bdb2f..284f93d8e8 100644
+--- a/packages/core/test/meta.test.ts
++++ b/packages/core/test/meta.test.ts
+@@ -137,6 +137,39 @@ describe('state meta data', () => {
+   });
+ });
+ 
++describe('transition meta data', () => {
++  it('should show meta data in transitions', () => {
++    const machine = createMachine({
++      initial: 'inactive',
++      states: {
++        inactive: {
++          on: {
++            EVENT: {
++              target: 'active',
++              meta: {
++                description: 'Going from inactive to active'
++              }
++            }
++          }
++        },
++        active: {}
++      }
++    });
++
++    const actorRef = interpret(machine).start();
++    actorRef.send({ type: 'EVENT' });
++
++    expect(actorRef.getSnapshot().transitions.map((t) => t.meta))
++      .toMatchInlineSnapshot(`
++      [
++        {
++          "description": "Going from inactive to active",
++        },
++      ]
++    `);
++  });
++});
++
+ describe('state description', () => {
+   it('state node should have its description', () => {
+     const machine = createMachine({
+diff --git a/packages/core/test/state.test.ts b/packages/core/test/state.test.ts
+index 43ed60b39d..0186772c73 100644
+--- a/packages/core/test/state.test.ts
++++ b/packages/core/test/state.test.ts
+@@ -383,6 +383,34 @@ describe('State', () => {
+     });
+   });
+ 
++  describe('.transitions', () => {
++    it('should have no transitions for the initial state', () => {
++      expect(interpret(exampleMachine).getSnapshot().transitions).toHaveLength(
++        0
++      );
++    });
++
++    it('should have transitions for the sent event', () => {
++      const actorRef = interpret(exampleMachine).start();
++      actorRef.send({ type: 'TO_TWO', foo: 'test' });
++      expect(actorRef.getSnapshot().transitions).toContainEqual(
++        expect.objectContaining({ eventType: 'TO_TWO' })
++      );
++    });
++
++    it('should have condition in the transition', () => {
++      const actorRef = interpret(exampleMachine).start();
++      actorRef.send({ type: 'TO_TWO_MAYBE' });
++
++      expect(actorRef.getSnapshot().transitions).toContainEqual(
++        expect.objectContaining({
++          eventType: 'TO_TWO_MAYBE',
++          guard: expect.objectContaining({ type: 'maybe' })
++        })
++      );
++    });
++  });
++
+   describe('State.prototype.matches', () => {
+     it('should keep reference to state instance after destructuring', () => {
+       const { matches } = interpret(exampleMachine).getSnapshot();
+diff --git a/packages/xstate-inspect/test/inspect.test.ts b/packages/xstate-inspect/test/inspect.test.ts
+index bc3dae68d7..c39d7b85e9 100644
+--- a/packages/xstate-inspect/test/inspect.test.ts
++++ b/packages/xstate-inspect/test/inspect.test.ts
+@@ -97,7 +97,7 @@ describe('@xstate/inspect', () => {
+           "machine": "{"context":{"cycle":"[Circular]"},"id":"whatever","key":"whatever","type":"compound","initial":{"target":["#whatever.active"],"source":"#whatever","actions":[],"eventType":null},"history":false,"states":{"active":{"id":"whatever.active","key":"active","type":"atomic","initial":{"target":[],"source":"#whatever.active","actions":[],"eventType":null},"history":false,"states":{},"on":{},"transitions":[],"entry":[],"exit":[],"order":1,"invoke":[],"tags":[]}},"on":{},"transitions":[],"entry":[],"exit":[],"order":-1,"invoke":[],"tags":[]}",
+           "parent": undefined,
+           "sessionId": "x:0",
+-          "state": "{"value":"active","done":false,"context":{"cycle":"[Circular]"},"historyValue":{},"_initial":false,"children":{},"tags":[]}",
++          "state": "{"value":"active","done":false,"context":{"cycle":"[Circular]"},"historyValue":{},"_initial":false,"transitions":[],"children":{},"tags":[]}",
+           "type": "service.register",
+         },
+       ]
+@@ -148,7 +148,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:0",
+-          "state": "{"value":"active","done":false,"context":{},"historyValue":{},"_initial":false,"changed":false,"children":{},"tags":[]}",
++          "state": "{"value":"active","done":false,"context":{},"historyValue":{},"_initial":false,"changed":false,"transitions":[],"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+@@ -205,7 +205,7 @@ describe('@xstate/inspect', () => {
+           "machine": "{"context":{"map":"map","deep":{"map":"map"}},"id":"(machine)","key":"(machine)","type":"compound","initial":{"target":["#(machine).active"],"source":"#(machine)","actions":[],"eventType":null},"history":false,"states":{"active":{"id":"(machine).active","key":"active","type":"atomic","initial":{"target":[],"source":"#(machine).active","actions":[],"eventType":null},"history":false,"states":{},"on":{},"transitions":[],"entry":[],"exit":[],"order":1,"invoke":[],"tags":[]}},"on":{},"transitions":[],"entry":[],"exit":[],"order":-1,"invoke":[],"tags":[]}",
+           "parent": undefined,
+           "sessionId": "x:0",
+-          "state": "{"value":"active","done":false,"context":{"map":"map","deep":{"map":"map"}},"historyValue":{},"_initial":false,"children":{},"tags":[]}",
++          "state": "{"value":"active","done":false,"context":{"map":"map","deep":{"map":"map"}},"historyValue":{},"_initial":false,"transitions":[],"children":{},"tags":[]}",
+           "type": "service.register",
+         },
+         {
+@@ -215,7 +215,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:0",
+-          "state": "{"value":"active","done":false,"context":{"map":"map","deep":{"map":"map"}},"historyValue":{},"_initial":false,"changed":false,"children":{},"tags":[]}",
++          "state": "{"value":"active","done":false,"context":{"map":"map","deep":{"map":"map"}},"historyValue":{},"_initial":false,"changed":false,"transitions":[],"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+@@ -324,7 +324,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:0",
+-          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"_initial":false,"changed":true,"children":{},"tags":[]}",
++          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"_initial":false,"changed":true,"transitions":[{"actions":[{"type":"xstate.assign","params":{"assignment":{}}}],"event":"EV","source":"#(machine)","reenter":false,"eventType":"EV"}],"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+@@ -346,7 +346,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:0",
+-          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"_initial":false,"changed":false,"children":{},"tags":[]}",
++          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"_initial":false,"changed":false,"transitions":[],"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+diff --git a/packages/xstate-solid/test/useMachine.test.tsx b/packages/xstate-solid/test/useMachine.test.tsx
+index 2b65d83d57..3dec4ee264 100644
+--- a/packages/xstate-solid/test/useMachine.test.tsx
++++ b/packages/xstate-solid/test/useMachine.test.tsx
+@@ -349,17 +349,13 @@ describe('useMachine hook', () => {
+ 
+     const machine = createMachine<any, { type: 'EVENT' }>({
+       initial: 'active',
+-      context: { count: 0 },
+       states: {
+         active: {
+           on: {
+             EVENT: {
+-              actions: [
+-                () => {
+-                  count++;
+-                },
+-                assign({ count: ({ context }) => context.count + 1 })
+-              ]
++              actions: () => {
++                count++;
++              }
+             }
+           }
+         }
+@@ -371,7 +367,7 @@ describe('useMachine hook', () => {
+       const [state, send] = useMachine(machine);
+       createEffect(
+         on(
+-          () => state.context.count,
++          () => state.transitions[0],
+           () => {
+             setStateCount((c) => c + 1);
+           }
+diff --git a/packages/xstate-test/src/machine.ts b/packages/xstate-test/src/machine.ts
+index 10cb42205b..b502c4eb20 100644
+--- a/packages/xstate-test/src/machine.ts
++++ b/packages/xstate-test/src/machine.ts
+@@ -9,8 +9,7 @@ import {
+   StateFrom,
+   TypegenConstraint,
+   TypegenDisabled,
+-  MachineContext,
+-  StateValue
++  MachineContext
+ } from 'xstate';
+ import { TestModel } from './TestModel.ts';
+ import {
+@@ -41,40 +40,15 @@ export function createTestMachine<
+   return createMachine(config, options as any);
+ }
+ 
+-function stateValuesEqual(
+-  a: StateValue | undefined,
+-  b: StateValue | undefined
+-): boolean {
+-  if (a === b) {
+-    return true;
+-  }
+-
+-  if (a === undefined || b === undefined) {
+-    return false;
+-  }
+-
+-  if (typeof a === 'string' || typeof b === 'string') {
+-    return a === b;
+-  }
+-
+-  const aKeys = Object.keys(a);
+-  const bKeys = Object.keys(b);
+-
+-  return (
+-    aKeys.length === bKeys.length &&
+-    aKeys.every((key) => stateValuesEqual(a[key], b[key]))
+-  );
+-}
+-
+ function serializeMachineTransition(
+   state: AnyState,
+   event: AnyEventObject | undefined,
+   prevState: AnyState | undefined,
+   { serializeEvent }: { serializeEvent: (event: AnyEventObject) => string }
+ ): string {
+-  // TODO: the stateValuesEqual check here is very likely not exactly correct
+-  // but I'm not sure what the correct check is and what this is trying to do
+-  if (!event || (prevState && stateValuesEqual(prevState.value, state.value))) {
++  // Only consider the transition via the serialized event if there actually
++  // was a defined transition for the event
++  if (!event || state.transitions.length === 0) {
+     return '';
+   }
+ 

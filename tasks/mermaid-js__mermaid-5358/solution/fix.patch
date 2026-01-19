@@ -1,0 +1,168 @@
+diff --git a/docs/syntax/gantt.md b/docs/syntax/gantt.md
+index eeabfd370..dddb67cad 100644
+--- a/docs/syntax/gantt.md
++++ b/docs/syntax/gantt.md
+@@ -167,6 +167,38 @@ gantt
+ 
+ The `title` is an _optional_ string to be displayed at the top of the Gantt chart to describe the chart as a whole.
+ 
++### Excludes
++
++The `excludes` is an _optional_ attribute that accepts specific dates in YYYY-MM-DD format, days of the week ("sunday") or "weekends", but not the word "weekdays".
++These date will be marked on the graph, and be excluded from the duration calculation of tasks. Meaning that if there are excluded dates during a task interval, the number of 'skipped' days will be added to the end of the task to ensure the duration is as specified in the code.
++
++#### Weekend (v\<MERMAID_RELEASE_VERSION>+)
++
++When excluding weekends, it is possible to configure the weekends to be either Friday and Saturday or Saturday and Sunday. By default weekends are Saturday and Sunday.
++To define the weekend start day, there is an _optional_ attribute `weekend` that can be added in a new line followed by either `friday` or `saturday`.
++
++```mermaid-example
++gantt
++    title A Gantt Diagram Excluding Fri - Sat weekends
++    dateFormat YYYY-MM-DD
++    excludes weekends
++    weekend friday
++    section Section
++        A task          :a1, 2024-01-01, 30d
++        Another task    :after a1, 20d
++```
++
++```mermaid
++gantt
++    title A Gantt Diagram Excluding Fri - Sat weekends
++    dateFormat YYYY-MM-DD
++    excludes weekends
++    weekend friday
++    section Section
++        A task          :a1, 2024-01-01, 30d
++        Another task    :after a1, 20d
++```
++
+ ### Section statements
+ 
+ You can divide the chart into various sections, for example to separate different parts of a project like development and documentation.
+diff --git a/packages/mermaid/src/diagrams/gantt/ganttDb.js b/packages/mermaid/src/diagrams/gantt/ganttDb.js
+index b0058ff8d..27d622eeb 100644
+--- a/packages/mermaid/src/diagrams/gantt/ganttDb.js
++++ b/packages/mermaid/src/diagrams/gantt/ganttDb.js
+@@ -21,6 +21,7 @@ dayjs.extend(dayjsIsoWeek);
+ dayjs.extend(dayjsCustomParseFormat);
+ dayjs.extend(dayjsAdvancedFormat);
+ 
++const WEEKEND_START_DAY = { friday: 5, saturday: 6 };
+ let dateFormat = '';
+ let axisFormat = '';
+ let tickInterval = undefined;
+@@ -37,6 +38,7 @@ let funs = [];
+ let inclusiveEndDates = false;
+ let topAxis = false;
+ let weekday = 'sunday';
++let weekend = 'saturday';
+ 
+ // The serial order of the task in the script
+ let lastOrder = 0;
+@@ -63,6 +65,7 @@ export const clear = function () {
+   links = {};
+   commonClear();
+   weekday = 'sunday';
++  weekend = 'saturday';
+ };
+ 
+ export const setAxisFormat = function (txt) {
+@@ -167,7 +170,11 @@ export const isInvalidDate = function (date, dateFormat, excludes, includes) {
+   if (includes.includes(date.format(dateFormat.trim()))) {
+     return false;
+   }
+-  if (date.isoWeekday() >= 6 && excludes.includes('weekends')) {
++  if (
++    excludes.includes('weekends') &&
++    (date.isoWeekday() === WEEKEND_START_DAY[weekend] ||
++      date.isoWeekday() === WEEKEND_START_DAY[weekend] + 1)
++  ) {
+     return true;
+   }
+   if (excludes.includes(date.format('dddd').toLowerCase())) {
+@@ -184,6 +191,10 @@ export const getWeekday = function () {
+   return weekday;
+ };
+ 
++export const setWeekend = function (startDay) {
++  weekend = startDay;
++};
++
+ /**
+  * TODO: fully document what this function does and what types it accepts
+  *
+@@ -781,6 +792,7 @@ export default {
+   isInvalidDate,
+   setWeekday,
+   getWeekday,
++  setWeekend,
+ };
+ 
+ /**
+diff --git a/packages/mermaid/src/diagrams/gantt/parser/gantt.jison b/packages/mermaid/src/diagrams/gantt/parser/gantt.jison
+index d6027fee9..f2333ff84 100644
+--- a/packages/mermaid/src/diagrams/gantt/parser/gantt.jison
++++ b/packages/mermaid/src/diagrams/gantt/parser/gantt.jison
+@@ -84,6 +84,8 @@ weekday\s+thursday              return 'weekday_thursday'
+ weekday\s+friday                return 'weekday_friday'
+ weekday\s+saturday              return 'weekday_saturday'
+ weekday\s+sunday                return 'weekday_sunday'
++weekend\s+friday                return 'weekend_friday'
++weekend\s+saturday              return 'weekend_saturday'
+ \d\d\d\d"-"\d\d"-"\d\d          return 'date';
+ "title"\s[^\n]+               return 'title';
+ "accDescription"\s[^#\n;]+      return 'accDescription'
+@@ -128,6 +130,11 @@ weekday
+   | weekday_sunday { yy.setWeekday("sunday");}
+   ;
+ 
++weekend
++  : weekend_friday { yy.setWeekend("friday");}
++  | weekend_saturday { yy.setWeekend("saturday");}
++  ;
++
+ statement
+   : dateFormat {yy.setDateFormat($1.substr(11));$$=$1.substr(11);}
+   | inclusiveEndDates {yy.enableInclusiveEndDates();$$=$1.substr(18);}
+@@ -138,6 +145,7 @@ statement
+   | includes {yy.setIncludes($1.substr(9));$$=$1.substr(9);}
+   | todayMarker {yy.setTodayMarker($1.substr(12));$$=$1.substr(12);}
+   | weekday
++  | weekend
+   | title {yy.setDiagramTitle($1.substr(6));$$=$1.substr(6);}
+   | acc_title acc_title_value { $$=$2.trim();yy.setAccTitle($$); }
+   | acc_descr acc_descr_value { $$=$2.trim();yy.setAccDescription($$); }
+diff --git a/packages/mermaid/src/docs/syntax/gantt.md b/packages/mermaid/src/docs/syntax/gantt.md
+index 4fd896d3c..8497b96a1 100644
+--- a/packages/mermaid/src/docs/syntax/gantt.md
++++ b/packages/mermaid/src/docs/syntax/gantt.md
+@@ -109,6 +109,27 @@ gantt
+ 
+ The `title` is an _optional_ string to be displayed at the top of the Gantt chart to describe the chart as a whole.
+ 
++### Excludes
++
++The `excludes` is an _optional_ attribute that accepts specific dates in YYYY-MM-DD format, days of the week ("sunday") or "weekends", but not the word "weekdays".
++These date will be marked on the graph, and be excluded from the duration calculation of tasks. Meaning that if there are excluded dates during a task interval, the number of 'skipped' days will be added to the end of the task to ensure the duration is as specified in the code.
++
++#### Weekend (v\<MERMAID_RELEASE_VERSION>+)
++
++When excluding weekends, it is possible to configure the weekends to be either Friday and Saturday or Saturday and Sunday. By default weekends are Saturday and Sunday.
++To define the weekend start day, there is an _optional_ attribute `weekend` that can be added in a new line followed by either `friday` or `saturday`.
++
++```mermaid-example
++gantt
++    title A Gantt Diagram Excluding Fri - Sat weekends
++    dateFormat YYYY-MM-DD
++    excludes weekends
++    weekend friday
++    section Section
++        A task          :a1, 2024-01-01, 30d
++        Another task    :after a1, 20d
++```
++
+ ### Section statements
+ 
+ You can divide the chart into various sections, for example to separate different parts of a project like development and documentation.

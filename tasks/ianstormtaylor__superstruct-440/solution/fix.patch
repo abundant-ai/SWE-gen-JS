@@ -1,0 +1,1374 @@
+diff --git a/docs/reference.md b/docs/reference.md
+index fc6484e..bff1403 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -546,17 +546,17 @@ The error class that Superstruct uses for its validation errors. This is exposed
+ 
+ Each error thrown includes the following properties:
+ 
+-| **Property** | **Type**                  | **Example**             | **Description**                                                                                                                                                                                                        |
+-| ------------ | ------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+-| `branch`     | `Array<any>`              | `[{...}, false]`        | An array of the values being validated at every layer. The first element in the array is the root value, and the last element is the current value that failed. This allows you to inspect the entire validation tree. |
+-| `path`       | `Array<string \| number>` | `['address', 'street']` | The path to the invalid value relative to the root value.                                                                                                                                                              |
+-| `value`      | `any`                     | `false`                 | The invalid value.                                                                                                                                                                                                     |
+-| `type`       | `string`                  | `'string'`              | The expected type of the invalid value.                                                                                                                                                                                |
+-| `failures`   | `Array<StructFailure>`    | `[{...}]`               | All the validation failures that were encountered. The error object always represents the first failure, but you can write more complex logic involving other failures if you need to.                                 |
++| **Property** | **Type**                     | **Example**             | **Description**                                                                                                                                                                                                        |
++| ------------ | ---------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| `branch`     | `Array<any>`                 | `[{...}, false]`        | An array of the values being validated at every layer. The first element in the array is the root value, and the last element is the current value that failed. This allows you to inspect the entire validation tree. |
++| `path`       | `Array<string \| number>`    | `['address', 'street']` | The path to the invalid value relative to the root value.                                                                                                                                                              |
++| `value`      | `any`                        | `false`                 | The invalid value.                                                                                                                                                                                                     |
++| `type`       | `string`                     | `'string'`              | The expected type of the invalid value.                                                                                                                                                                                |
++| `failures`   | `() => Array<StructFailure>` |                         | A function that returns all the validation failures that were encountered. The error object always represents the first failure, but you can write more complex logic involving other failures if you need to.         |
+ 
+ ### Multiple Errors
+ 
+-The error thrown by Superstruct is always the first validation failure that was encountered, because this makes for convenient and simple logic in the majority of cases. However, the `failures` property is available with a list of all of the validation failures that occurred in case you want to add support for multiple error handling.
++The error thrown by Superstruct is always the first validation failure that was encountered, because this makes for convenient and simple logic in the majority of cases. However, the `failures` method will return a list of all of the validation failures that occurred in case you want to add support for multiple error handling.
+ 
+ ## Utilities
+ 
+diff --git a/src/struct.ts b/src/struct.ts
+index 379dbb4..619551f 100644
+--- a/src/struct.ts
++++ b/src/struct.ts
+@@ -1,4 +1,4 @@
+-import { toFailures } from './utils'
++import { toFailures, iteratorShift } from './utils'
+ 
+ /**
+  * `Struct` objects encapsulate the schema for a specific data type (with
+@@ -47,18 +47,24 @@ export class StructError extends TypeError {
+   type: string
+   path: Array<number | string>
+   branch: Array<any>
+-  failures: () => Iterable<StructFailure>;
++  failures: () => Array<StructFailure>;
+   [key: string]: any
+ 
+-  constructor(failure: StructFailure, iterable: Iterable<StructFailure>) {
++  constructor(
++    failure: StructFailure,
++    moreFailures: IterableIterator<StructFailure>
++  ) {
+     const { path, value, type, branch, ...rest } = failure
+     const message = `Expected a value of type \`${type}\`${
+       path.length ? ` for \`${path.join('.')}\`` : ''
+     } but received \`${JSON.stringify(value)}\`.`
+ 
+-    function* failures(): Iterable<StructFailure> {
+-      yield failure
+-      yield* iterable
++    let failuresResult: Array<StructFailure> | undefined
++    function failures(): Array<StructFailure> {
++      if (!failuresResult) {
++        failuresResult = [failure, ...moreFailures]
++      }
++      return failuresResult
+     }
+ 
+     super(message)
+@@ -89,7 +95,7 @@ export type StructContext = {
+     struct: Struct<any> | Struct<never>,
+     parent?: any,
+     key?: string | number
+-  ) => Iterable<StructFailure>
++  ) => IterableIterator<StructFailure>
+ }
+ 
+ /**
+@@ -163,11 +169,11 @@ export function validate<T>(
+     value = struct.coercer(value)
+   }
+ 
+-  const iterable = check(value, struct)
+-  const [failure] = iterable
++  const failures = check(value, struct)
++  const failure = iteratorShift(failures)
+ 
+   if (failure) {
+-    const error = new StructError(failure, iterable)
++    const error = new StructError(failure, failures)
+     return [error, undefined]
+   } else {
+     return [undefined, value as T]
+@@ -183,7 +189,7 @@ function* check<T>(
+   struct: Struct<T>,
+   path: any[] = [],
+   branch: any[] = []
+-): Iterable<StructFailure> {
++): IterableIterator<StructFailure> {
+   const { type } = struct
+   const ctx: StructContext = {
+     value,
+@@ -201,7 +207,7 @@ function* check<T>(
+   }
+ 
+   const failures = toFailures(struct.validator(value, ctx), ctx)
+-  const [failure] = failures
++  const failure = iteratorShift(failures)
+ 
+   if (failure) {
+     yield failure
+diff --git a/src/utils.ts b/src/utils.ts
+index 7876b3a..dc5f406 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -7,15 +7,25 @@ export type StructTuple<T> = { [K in keyof T]: Struct<T[K]> }
+  * Convert a validation result to an iterable of failures.
+  */
+ 
+-export function toFailures(
++export function* toFailures(
+   result: StructResult,
+   context: StructContext
+-): Iterable<StructFailure> {
++): IterableIterator<StructFailure> {
+   if (result === true) {
+-    return []
++    // yield nothing
+   } else if (result === false) {
+-    return [context.fail()]
++    yield context.fail()
+   } else {
+-    return result
++    yield* result
+   }
+ }
++
++/**
++ * Shifts (removes and returns) the first value from the `input` iterator.
++ * Like `Array.prototype.shift()` but for an `Iterator`.
++ */
++
++export function iteratorShift<T>(input: Iterator<T>): T | undefined {
++  const { done, value } = input.next()
++  return done ? undefined : value
++}
+commit 1ffa1fd7ef772a827989de8299d7bdb924690f8f
+Author: Matthew Francis Brunetti <zenflow87@gmail.com>
+Date:   Mon Jul 27 01:59:18 2020 -0400
+
+    Test for multiple failures (with minimal changes to tests)
+
+diff --git a/test/fixtures/map/invalid-property.ts b/test/fixtures/map/invalid-property.ts
+index 595fac2..750e739 100644
+--- a/test/fixtures/map/invalid-property.ts
++++ b/test/fixtures/map/invalid-property.ts
+@@ -7,9 +7,17 @@ export const data = new Map([
+   ['b', 'b'],
+ ])
+ 
+-export const error = {
+-  value: 'a',
+-  type: 'number',
+-  path: ['a'],
+-  branch: [data, 'a'],
+-}
++export const failures = [
++  {
++    value: 'a',
++    type: 'number',
++    path: ['a'],
++    branch: [data, 'a'],
++  },
++  {
++    value: 'b',
++    type: 'number',
++    path: ['b'],
++    branch: [data, 'b'],
++  },
++]
+diff --git a/test/fixtures/object/invalid-property.ts b/test/fixtures/object/invalid-property.ts
+index 16017e6..b7a4cfa 100644
+--- a/test/fixtures/object/invalid-property.ts
++++ b/test/fixtures/object/invalid-property.ts
+@@ -3,16 +3,26 @@ import { object, string, number } from '../../..'
+ export const Struct = object({
+   name: string(),
+   age: number(),
++  height: string(),
+ })
+ 
+ export const data = {
+   name: 'john',
+   age: 'invalid',
++  height: 2,
+ }
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'number',
+-  path: ['age'],
+-  branch: [data, data.age],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'number',
++    path: ['age'],
++    branch: [data, data.age],
++  },
++  {
++    value: 2,
++    type: 'string',
++    path: ['height'],
++    branch: [data, data.height],
++  },
++]
+diff --git a/test/fixtures/record/invalid-property.ts b/test/fixtures/record/invalid-property.ts
+index bc98185..84ceab2 100644
+--- a/test/fixtures/record/invalid-property.ts
++++ b/test/fixtures/record/invalid-property.ts
+@@ -7,9 +7,17 @@ export const data = {
+   b: 'b',
+ }
+ 
+-export const error = {
+-  value: 'a',
+-  type: 'number',
+-  path: ['a'],
+-  branch: [data, data.a],
+-}
++export const failures = [
++  {
++    value: 'a',
++    type: 'number',
++    path: ['a'],
++    branch: [data, data.a],
++  },
++  {
++    value: 'b',
++    type: 'number',
++    path: ['b'],
++    branch: [data, data.b],
++  },
++]
+diff --git a/test/index.ts b/test/index.ts
+index 8b25364..6d70057 100644
+--- a/test/index.ts
++++ b/test/index.ts
+@@ -21,7 +21,7 @@ describe('superstruct', () => {
+ 
+       for (const name of tests) {
+         const module = require(resolve(testsDir, name))
+-        const { Struct, data, coerce, only, skip, output, error } = module
++        const { Struct, data, coerce, only, skip, output, failures } = module
+         const run = only ? it.only : skip ? it.skip : it
+         run(name, () => {
+           let actual
+@@ -46,18 +46,24 @@ describe('superstruct', () => {
+             }
+ 
+             assert.deepEqual(actual, output)
+-          } else if ('error' in module) {
++          } else if ('failures' in module) {
+             if (!err) {
+               throw new Error(
+                 `Expected "${name}" fixture to throw an error but it did not.`
+               )
+             }
+ 
+-            const actualError = pick(err, 'type', 'path', 'value', 'branch')
+-            assert.deepEqual(actualError, error)
++            const actualFailures = (err.failures() as object[]).map((failure) =>
++              pick(failure, 'type', 'path', 'value', 'branch')
++            )
++            assert.deepEqual(actualFailures, failures)
++            assert.deepEqual(
++              pick(err, 'type', 'path', 'value', 'branch'),
++              failures[0]
++            )
+           } else {
+             throw new Error(
+-              `The "${name}" fixture did not define an \`output\` or \`error\` export.`
++              `The "${name}" fixture did not define an \`output\` or \`failures\` export.`
+             )
+           }
+         })
+commit a8024a4089acfd4d9ef8f635366110d734402bcf
+Author: Matthew Francis Brunetti <zenflow87@gmail.com>
+Date:   Mon Jul 27 03:38:48 2020 -0400
+
+    Clean up tests: Have all fixtures export `failures` instead of `error`
+
+diff --git a/test/fixtures/array/invalid-element-property.ts b/test/fixtures/array/invalid-element-property.ts
+index 2b04bd3..f053b35 100644
+--- a/test/fixtures/array/invalid-element-property.ts
++++ b/test/fixtures/array/invalid-element-property.ts
+@@ -4,9 +4,11 @@ export const Struct = array(object({ id: string() }))
+ 
+ export const data = [{ id: '1' }, { id: false }, { id: '3' }]
+ 
+-export const error = {
+-  value: false,
+-  type: 'string',
+-  path: [1, 'id'],
+-  branch: [data, data[1], data[1].id],
+-}
++export const failures = [
++  {
++    value: false,
++    type: 'string',
++    path: [1, 'id'],
++    branch: [data, data[1], data[1].id],
++  },
++]
+diff --git a/test/fixtures/array/invalid-element.ts b/test/fixtures/array/invalid-element.ts
+index 7ebf411..f036451 100644
+--- a/test/fixtures/array/invalid-element.ts
++++ b/test/fixtures/array/invalid-element.ts
+@@ -4,9 +4,11 @@ export const Struct = array(number())
+ 
+ export const data = [1, 'invalid', 3]
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'number',
+-  path: [1],
+-  branch: [data, data[1]],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'number',
++    path: [1],
++    branch: [data, data[1]],
++  },
++]
+diff --git a/test/fixtures/array/invalid-opaque.ts b/test/fixtures/array/invalid-opaque.ts
+index 5efa887..4e5665e 100644
+--- a/test/fixtures/array/invalid-opaque.ts
++++ b/test/fixtures/array/invalid-opaque.ts
+@@ -4,9 +4,11 @@ export const Struct = array()
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Array<unknown>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Array<unknown>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/array/invalid.ts b/test/fixtures/array/invalid.ts
+index a29c21c..09dbff5 100644
+--- a/test/fixtures/array/invalid.ts
++++ b/test/fixtures/array/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = array(number())
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Array<number>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Array<number>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/boolean/invalid.ts b/test/fixtures/boolean/invalid.ts
+index b228d83..f78db34 100644
+--- a/test/fixtures/boolean/invalid.ts
++++ b/test/fixtures/boolean/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = boolean()
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'boolean',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'boolean',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/date/invalid-date.ts b/test/fixtures/date/invalid-date.ts
+index 24b08a0..4db0acb 100644
+--- a/test/fixtures/date/invalid-date.ts
++++ b/test/fixtures/date/invalid-date.ts
+@@ -4,9 +4,11 @@ export const Struct = date()
+ 
+ export const data = new Date('invalid')
+ 
+-export const error = {
+-  value: data,
+-  type: 'Date',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: data,
++    type: 'Date',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/date/invalid.ts b/test/fixtures/date/invalid.ts
+index 3b71fc9..0c79b8a 100644
+--- a/test/fixtures/date/invalid.ts
++++ b/test/fixtures/date/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = date()
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Date',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Date',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/dynamic/invalid-reference.ts b/test/fixtures/dynamic/invalid-reference.ts
+index 1dea19e..a53fc48 100644
+--- a/test/fixtures/dynamic/invalid-reference.ts
++++ b/test/fixtures/dynamic/invalid-reference.ts
+@@ -29,9 +29,11 @@ export const data = {
+   price: 'Only $19.99!',
+ }
+ 
+-export const error = {
+-  value: 'Only $19.99!',
+-  type: 'number',
+-  path: ['price'],
+-  branch: [data, data.price],
+-}
++export const failures = [
++  {
++    value: 'Only $19.99!',
++    type: 'number',
++    path: ['price'],
++    branch: [data, data.price],
++  },
++]
+diff --git a/test/fixtures/dynamic/invalid.ts b/test/fixtures/dynamic/invalid.ts
+index fb551eb..e5dcaae 100644
+--- a/test/fixtures/dynamic/invalid.ts
++++ b/test/fixtures/dynamic/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = dynamic(() => string())
+ 
+ export const data = 3
+ 
+-export const error = {
+-  value: 3,
+-  type: 'string',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 3,
++    type: 'string',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/empty/invalid-array.ts b/test/fixtures/empty/invalid-array.ts
+index a08c276..5c613ab 100644
+--- a/test/fixtures/empty/invalid-array.ts
++++ b/test/fixtures/empty/invalid-array.ts
+@@ -4,9 +4,11 @@ export const Struct = empty(array())
+ 
+ export const data = ['invalid']
+ 
+-export const error = {
+-  value: ['invalid'],
+-  type: 'Array<unknown> & Empty',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: ['invalid'],
++    type: 'Array<unknown> & Empty',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/empty/invalid-string.ts b/test/fixtures/empty/invalid-string.ts
+index 37d6903..edebb1b 100644
+--- a/test/fixtures/empty/invalid-string.ts
++++ b/test/fixtures/empty/invalid-string.ts
+@@ -4,9 +4,11 @@ export const Struct = empty(string())
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'string & Empty',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'string & Empty',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/enums/invalid-numbers.ts b/test/fixtures/enums/invalid-numbers.ts
+index bca03c1..90c4a29 100644
+--- a/test/fixtures/enums/invalid-numbers.ts
++++ b/test/fixtures/enums/invalid-numbers.ts
+@@ -4,9 +4,11 @@ export const Struct = enums([1, 2])
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Enum<1,2>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Enum<1,2>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/enums/invalid-strings.ts b/test/fixtures/enums/invalid-strings.ts
+index 6eb3e6a..fe4c930 100644
+--- a/test/fixtures/enums/invalid-strings.ts
++++ b/test/fixtures/enums/invalid-strings.ts
+@@ -4,9 +4,11 @@ export const Struct = enums(['one', 'two'])
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Enum<"one","two">',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Enum<"one","two">',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/function/invalid.ts b/test/fixtures/function/invalid.ts
+index 127a308..23e3175 100644
+--- a/test/fixtures/function/invalid.ts
++++ b/test/fixtures/function/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = func()
+ 
+ export const data = false
+ 
+-export const error = {
+-  value: false,
+-  type: 'Function',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: false,
++    type: 'Function',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/instance/invalid.ts b/test/fixtures/instance/invalid.ts
+index 14e18e3..4539632 100644
+--- a/test/fixtures/instance/invalid.ts
++++ b/test/fixtures/instance/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = instance(Array)
+ 
+ export const data = false
+ 
+-export const error = {
+-  value: false,
+-  type: 'InstanceOf<Array>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: false,
++    type: 'InstanceOf<Array>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/intersection/invalid.ts b/test/fixtures/intersection/invalid.ts
+index 96baace..d528759 100644
+--- a/test/fixtures/intersection/invalid.ts
++++ b/test/fixtures/intersection/invalid.ts
+@@ -10,9 +10,11 @@ export const data = {
+   b: 'invalid',
+ }
+ 
+-export const error = {
+-  type: 'number',
+-  value: 'invalid',
+-  path: ['b'],
+-  branch: [data, data.b],
+-}
++export const failures = [
++  {
++    type: 'number',
++    value: 'invalid',
++    path: ['b'],
++    branch: [data, data.b],
++  },
++]
+diff --git a/test/fixtures/lazy/invalid.ts b/test/fixtures/lazy/invalid.ts
+index c087e78..2ddd3b6 100644
+--- a/test/fixtures/lazy/invalid.ts
++++ b/test/fixtures/lazy/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = lazy(() => string())
+ 
+ export const data = 3
+ 
+-export const error = {
+-  value: 3,
+-  type: 'string',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 3,
++    type: 'string',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/length/invalid-array.ts b/test/fixtures/length/invalid-array.ts
+index 1567d4e..24a0f59 100644
+--- a/test/fixtures/length/invalid-array.ts
++++ b/test/fixtures/length/invalid-array.ts
+@@ -4,9 +4,11 @@ export const Struct = length(array(number()), 1, 5)
+ 
+ export const data = []
+ 
+-export const error = {
+-  value: [],
+-  type: 'Array<number> & Length<1,5>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: [],
++    type: 'Array<number> & Length<1,5>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/length/invalid-string.ts b/test/fixtures/length/invalid-string.ts
+index 41c0094..43f0245 100644
+--- a/test/fixtures/length/invalid-string.ts
++++ b/test/fixtures/length/invalid-string.ts
+@@ -4,9 +4,11 @@ export const Struct = length(string(), 1, 5)
+ 
+ export const data = ''
+ 
+-export const error = {
+-  value: '',
+-  type: 'string & Length<1,5>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: '',
++    type: 'string & Length<1,5>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/literal/invalid.ts b/test/fixtures/literal/invalid.ts
+index 608c77f..1296bc4 100644
+--- a/test/fixtures/literal/invalid.ts
++++ b/test/fixtures/literal/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = literal(42)
+ 
+ export const data = false
+ 
+-export const error = {
+-  value: false,
+-  type: 'Literal<42>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: false,
++    type: 'Literal<42>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/map/invalid.ts b/test/fixtures/map/invalid.ts
+index 20bded6..0f6539c 100644
+--- a/test/fixtures/map/invalid.ts
++++ b/test/fixtures/map/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = map(string(), number())
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Map<string,number>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Map<string,number>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/masked/not-masked.ts b/test/fixtures/masked/not-masked.ts
+index 79302e4..81b8760 100644
+--- a/test/fixtures/masked/not-masked.ts
++++ b/test/fixtures/masked/not-masked.ts
+@@ -4,11 +4,13 @@ export const Struct = masked(object({ name: string() }))
+ 
+ export const data = false
+ 
+-export const error = {
+-  type: 'Object<{name}>',
+-  value: false,
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    type: 'Object<{name}>',
++    value: false,
++    path: [],
++    branch: [data],
++  },
++]
+ 
+ export const coerce = true
+diff --git a/test/fixtures/never/invalid.ts b/test/fixtures/never/invalid.ts
+index 4e17be0..4afdafc 100644
+--- a/test/fixtures/never/invalid.ts
++++ b/test/fixtures/never/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = never()
+ 
+ export const data = true
+ 
+-export const error = {
+-  value: true,
+-  type: 'never',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: true,
++    type: 'never',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/nullable/invalid.ts b/test/fixtures/nullable/invalid.ts
+index 5a36db6..5bbad4b 100644
+--- a/test/fixtures/nullable/invalid.ts
++++ b/test/fixtures/nullable/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = nullable(number())
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'number',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'number',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/number/invalid.ts b/test/fixtures/number/invalid.ts
+index f7a47bb..1675af3 100644
+--- a/test/fixtures/number/invalid.ts
++++ b/test/fixtures/number/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = number()
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'number',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'number',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/object/invalid-element-nested.ts b/test/fixtures/object/invalid-element-nested.ts
+index ba72abf..5ed1d11 100644
+--- a/test/fixtures/object/invalid-element-nested.ts
++++ b/test/fixtures/object/invalid-element-nested.ts
+@@ -10,9 +10,11 @@ export const data = {
+   emails: ['name@example.com', false],
+ }
+ 
+-export const error = {
+-  value: false,
+-  type: 'string',
+-  path: ['emails', 1],
+-  branch: [data, data.emails, data.emails[1]],
+-}
++export const failures = [
++  {
++    value: false,
++    type: 'string',
++    path: ['emails', 1],
++    branch: [data, data.emails, data.emails[1]],
++  },
++]
+diff --git a/test/fixtures/object/invalid-opaque.ts b/test/fixtures/object/invalid-opaque.ts
+index e6ea7f7..2976443 100644
+--- a/test/fixtures/object/invalid-opaque.ts
++++ b/test/fixtures/object/invalid-opaque.ts
+@@ -4,9 +4,11 @@ export const Struct = object()
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Object',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Object',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/object/invalid-property-nested.ts b/test/fixtures/object/invalid-property-nested.ts
+index b5e3fe1..a871fb4 100644
+--- a/test/fixtures/object/invalid-property-nested.ts
++++ b/test/fixtures/object/invalid-property-nested.ts
+@@ -16,9 +16,11 @@ export const data = {
+   },
+ }
+ 
+-export const error = {
+-  value: 123,
+-  type: 'string',
+-  path: ['address', 'street'],
+-  branch: [data, data.address, data.address.street],
+-}
++export const failures = [
++  {
++    value: 123,
++    type: 'string',
++    path: ['address', 'street'],
++    branch: [data, data.address, data.address.street],
++  },
++]
+diff --git a/test/fixtures/object/invalid-property-unknown.ts b/test/fixtures/object/invalid-property-unknown.ts
+index 39576e7..e4f6a53 100644
+--- a/test/fixtures/object/invalid-property-unknown.ts
++++ b/test/fixtures/object/invalid-property-unknown.ts
+@@ -11,9 +11,11 @@ export const data = {
+   unknown: true,
+ }
+ 
+-export const error = {
+-  value: true,
+-  type: 'never',
+-  path: ['unknown'],
+-  branch: [data, data.unknown],
+-}
++export const failures = [
++  {
++    value: true,
++    type: 'never',
++    path: ['unknown'],
++    branch: [data, data.unknown],
++  },
++]
+diff --git a/test/fixtures/object/invalid-referential.ts b/test/fixtures/object/invalid-referential.ts
+index b530622..2f0b1a7 100644
+--- a/test/fixtures/object/invalid-referential.ts
++++ b/test/fixtures/object/invalid-referential.ts
+@@ -16,9 +16,11 @@ export const data = {
+   subsection: '2.1',
+ }
+ 
+-export const error = {
+-  value: '2.1',
+-  type: 'Subsection',
+-  path: ['subsection'],
+-  branch: [data, data.subsection],
+-}
++export const failures = [
++  {
++    value: '2.1',
++    type: 'Subsection',
++    path: ['subsection'],
++    branch: [data, data.subsection],
++  },
++]
+diff --git a/test/fixtures/object/invalid.ts b/test/fixtures/object/invalid.ts
+index 31e4083..4a11516 100644
+--- a/test/fixtures/object/invalid.ts
++++ b/test/fixtures/object/invalid.ts
+@@ -7,9 +7,11 @@ export const Struct = object({
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Object<{name,age}>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Object<{name,age}>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/optional/invalid.ts b/test/fixtures/optional/invalid.ts
+index feb1a05..1a8b06b 100644
+--- a/test/fixtures/optional/invalid.ts
++++ b/test/fixtures/optional/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = optional(number())
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'number',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'number',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/partial/invalid-property-unknown.ts b/test/fixtures/partial/invalid-property-unknown.ts
+index deae06b..f3625d0 100644
+--- a/test/fixtures/partial/invalid-property-unknown.ts
++++ b/test/fixtures/partial/invalid-property-unknown.ts
+@@ -10,9 +10,11 @@ export const data = {
+   unknown: true,
+ }
+ 
+-export const error = {
+-  value: true,
+-  type: 'never',
+-  path: ['unknown'],
+-  branch: [data, data.unknown],
+-}
++export const failures = [
++  {
++    value: true,
++    type: 'never',
++    path: ['unknown'],
++    branch: [data, data.unknown],
++  },
++]
+diff --git a/test/fixtures/partial/invalid-property.ts b/test/fixtures/partial/invalid-property.ts
+index 858710b..efa3175 100644
+--- a/test/fixtures/partial/invalid-property.ts
++++ b/test/fixtures/partial/invalid-property.ts
+@@ -9,9 +9,11 @@ export const data = {
+   age: 'invalid',
+ }
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'number',
+-  path: ['age'],
+-  branch: [data, data.age],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'number',
++    path: ['age'],
++    branch: [data, data.age],
++  },
++]
+diff --git a/test/fixtures/partial/invalid.ts b/test/fixtures/partial/invalid.ts
+index 7b52a16..2f9ad1f 100644
+--- a/test/fixtures/partial/invalid.ts
++++ b/test/fixtures/partial/invalid.ts
+@@ -7,9 +7,11 @@ export const Struct = partial({
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Partial<{name,age}>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Partial<{name,age}>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/pattern/invalid.ts b/test/fixtures/pattern/invalid.ts
+index 0719333..e1842a6 100644
+--- a/test/fixtures/pattern/invalid.ts
++++ b/test/fixtures/pattern/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = pattern(string(), /\d+/)
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'string & Pattern<\\d+>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'string & Pattern<\\d+>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/record/invalid.ts b/test/fixtures/record/invalid.ts
+index d462046..c94c297 100644
+--- a/test/fixtures/record/invalid.ts
++++ b/test/fixtures/record/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = record(string(), number())
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Record<string,number>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Record<string,number>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/refinement/invalid.ts b/test/fixtures/refinement/invalid.ts
+index bcdab75..fb53f62 100644
+--- a/test/fixtures/refinement/invalid.ts
++++ b/test/fixtures/refinement/invalid.ts
+@@ -5,9 +5,11 @@ export const Struct = refinement(string(), 'Email', isEmail)
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Email',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Email',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/set/invalid-element.ts b/test/fixtures/set/invalid-element.ts
+index 87749be..153b50c 100644
+--- a/test/fixtures/set/invalid-element.ts
++++ b/test/fixtures/set/invalid-element.ts
+@@ -4,9 +4,11 @@ export const Struct = set(number())
+ 
+ export const data = new Set([1, 'b', 3])
+ 
+-export const error = {
+-  value: new Set([1, 'b', 3]),
+-  type: 'Set<number>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: new Set([1, 'b', 3]),
++    type: 'Set<number>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/set/invalid.ts b/test/fixtures/set/invalid.ts
+index 61d3767..2db9f9d 100644
+--- a/test/fixtures/set/invalid.ts
++++ b/test/fixtures/set/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = set(number())
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Set<number>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Set<number>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/string/invalid.ts b/test/fixtures/string/invalid.ts
+index 5e84e59..72383d7 100644
+--- a/test/fixtures/string/invalid.ts
++++ b/test/fixtures/string/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = string()
+ 
+ export const data = false
+ 
+-export const error = {
+-  value: false,
+-  type: 'string',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: false,
++    type: 'string',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/tuple/invalid-element-missing.ts b/test/fixtures/tuple/invalid-element-missing.ts
+index 11af425..4f370af 100644
+--- a/test/fixtures/tuple/invalid-element-missing.ts
++++ b/test/fixtures/tuple/invalid-element-missing.ts
+@@ -4,9 +4,11 @@ export const Struct = tuple([string(), number()])
+ 
+ export const data = ['A']
+ 
+-export const error = {
+-  value: undefined,
+-  type: 'number',
+-  path: [1],
+-  branch: [data, data[1]],
+-}
++export const failures = [
++  {
++    value: undefined,
++    type: 'number',
++    path: [1],
++    branch: [data, data[1]],
++  },
++]
+diff --git a/test/fixtures/tuple/invalid-element-unknown.ts b/test/fixtures/tuple/invalid-element-unknown.ts
+index fab6320..2a16342 100644
+--- a/test/fixtures/tuple/invalid-element-unknown.ts
++++ b/test/fixtures/tuple/invalid-element-unknown.ts
+@@ -4,9 +4,11 @@ export const Struct = tuple([string(), number()])
+ 
+ export const data = ['A', 3, 'unknown']
+ 
+-export const error = {
+-  value: 'unknown',
+-  type: 'never',
+-  path: [2],
+-  branch: [data, data[2]],
+-}
++export const failures = [
++  {
++    value: 'unknown',
++    type: 'never',
++    path: [2],
++    branch: [data, data[2]],
++  },
++]
+diff --git a/test/fixtures/tuple/invalid-element.ts b/test/fixtures/tuple/invalid-element.ts
+index bf846e4..d5ddd47 100644
+--- a/test/fixtures/tuple/invalid-element.ts
++++ b/test/fixtures/tuple/invalid-element.ts
+@@ -4,9 +4,11 @@ export const Struct = tuple([string(), number()])
+ 
+ export const data = [false, 3]
+ 
+-export const error = {
+-  value: false,
+-  type: 'string',
+-  path: [0],
+-  branch: [data, data[0]],
+-}
++export const failures = [
++  {
++    value: false,
++    type: 'string',
++    path: [0],
++    branch: [data, data[0]],
++  },
++]
+diff --git a/test/fixtures/tuple/invalid.ts b/test/fixtures/tuple/invalid.ts
+index 2432719..0dc0898 100644
+--- a/test/fixtures/tuple/invalid.ts
++++ b/test/fixtures/tuple/invalid.ts
+@@ -4,9 +4,11 @@ export const Struct = tuple([string(), number()])
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: '[string,number]',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: '[string,number]',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/type/invalid-property-nested.ts b/test/fixtures/type/invalid-property-nested.ts
+index 67de5b3..904ca25 100644
+--- a/test/fixtures/type/invalid-property-nested.ts
++++ b/test/fixtures/type/invalid-property-nested.ts
+@@ -12,9 +12,11 @@ export const data = {
+   id: 1,
+ }
+ 
+-export const error = {
+-  value: undefined,
+-  type: 'Type<{name,age}>',
+-  path: ['person'],
+-  branch: [data, undefined],
+-}
++export const failures = [
++  {
++    value: undefined,
++    type: 'Type<{name,age}>',
++    path: ['person'],
++    branch: [data, undefined],
++  },
++]
+diff --git a/test/fixtures/type/invalid-property.ts b/test/fixtures/type/invalid-property.ts
+index 8cd1327..7539c2a 100644
+--- a/test/fixtures/type/invalid-property.ts
++++ b/test/fixtures/type/invalid-property.ts
+@@ -10,9 +10,11 @@ export const data = {
+   age: 'invalid',
+ }
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'number',
+-  path: ['age'],
+-  branch: [data, data.age],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'number',
++    path: ['age'],
++    branch: [data, data.age],
++  },
++]
+diff --git a/test/fixtures/type/invalid.ts b/test/fixtures/type/invalid.ts
+index 25c46c5..1944a2e 100644
+--- a/test/fixtures/type/invalid.ts
++++ b/test/fixtures/type/invalid.ts
+@@ -7,9 +7,11 @@ export const Struct = type({
+ 
+ export const data = 'invalid'
+ 
+-export const error = {
+-  value: 'invalid',
+-  type: 'Type<{name,age}>',
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    value: 'invalid',
++    type: 'Type<{name,age}>',
++    path: [],
++    branch: [data],
++  },
++]
+diff --git a/test/fixtures/union/invalid.ts b/test/fixtures/union/invalid.ts
+index 0b77322..ede133e 100644
+--- a/test/fixtures/union/invalid.ts
++++ b/test/fixtures/union/invalid.ts
+@@ -9,9 +9,11 @@ export const data = {
+   b: 'invalid',
+ }
+ 
+-export const error = {
+-  type: 'Type<{a}> | Type<{b}>',
+-  value: { b: 'invalid' },
+-  path: [],
+-  branch: [data],
+-}
++export const failures = [
++  {
++    type: 'Type<{a}> | Type<{b}>',
++    value: { b: 'invalid' },
++    path: [],
++    branch: [data],
++  },
++]

@@ -1,0 +1,819 @@
+diff --git a/.changeset/gold-parents-shave.md b/.changeset/gold-parents-shave.md
+deleted file mode 100644
+index 22b1a67ca..000000000
+--- a/.changeset/gold-parents-shave.md
++++ /dev/null
+@@ -1,7 +0,0 @@
+----
+-'@verdaccio/core': minor
+-'@verdaccio/node-api': minor
+-'@verdaccio/config': minor
+----
+-
+-feat: getListenAddress getConfigParsed methods
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 0d9dc1c9b..381fac524 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -68,7 +68,7 @@ jobs:
+       fail-fast: true
+       matrix:
+         os: [ubuntu-latest]
+-        node_version: [18, 20, 22, 24]
++        node_version: [18, 20, 21, 22, 23, 24]
+     name: ${{ matrix.os }} / Node ${{ matrix.node_version }}
+     runs-on: ${{ matrix.os }}
+     steps:
+diff --git a/packages/config/src/address.ts b/packages/config/src/address.ts
+deleted file mode 100644
+index 8f0a400c2..000000000
+--- a/packages/config/src/address.ts
++++ /dev/null
+@@ -1,136 +0,0 @@
+-import createDebug from 'debug';
+-
+-import { DEFAULT_DOMAIN, DEFAULT_PORT, DEFAULT_PROTOCOL } from '@verdaccio/core';
+-import { Logger } from '@verdaccio/types';
+-
+-const debug = createDebug('verdaccio:config:address');
+-
+-export interface ListenAddress {
+-  proto: string;
+-  host?: string;
+-  port?: string;
+-  path?: string;
+-}
+-
+-/**
+- * Parse an internet address
+- * Allow:
+- - https:localhost:1234        - protocol + host + port
+- - localhost:1234              - host + port
+- - 1234                        - port
+- - http::1234                  - protocol + port
+- - https://localhost:443/      - full url + https
+- - http://[::1]:443/           - ipv6
+- - unix:/tmp/http.sock         - unix sockets
+- - https://unix:/tmp/http.sock - unix sockets (https)
+- * @param {*} urlAddress the internet address definition
+- * @return {Object|Null} literal object that represent the address parsed
+- */
+-export function parseAddress(urlAddress: string): ListenAddress | null {
+-  //
+-  // TODO: refactor it to something more reasonable?
+-  //
+-  //        protocol :  //      (  host  )|(    ipv6     ):  port  /
+-  const urlPattern = /^((https?):(\/\/)?)?((([^\/:]*)|\[([^\[\]]+)\]):)?(\d+)\/?$/.exec(urlAddress);
+-
+-  if (urlPattern) {
+-    return {
+-      proto: urlPattern[2] || DEFAULT_PROTOCOL,
+-      host: urlPattern[6] || urlPattern[7] || DEFAULT_DOMAIN,
+-      port: urlPattern[8] || DEFAULT_PORT,
+-    };
+-  }
+-
+-  const unixPattern = /^(?:(https?):\/\/)?unix:(\/.*)$/.exec(urlAddress);
+-  if (!unixPattern) {
+-    // if we cannot match the unix pattern, we return null
+-    // this is to avoid returning a wrong object
+-    return null;
+-  }
+-
+-  return {
+-    host: unixPattern[2],
+-    proto: unixPattern[1] || 'unix',
+-    path: unixPattern[2],
+-  };
+-}
+-
+-function addrToString(a: ListenAddress): string {
+-  return a.proto === 'unix' ? `unix:${a.host}` : `${a.proto}://${a.host}:${a.port}`;
+-}
+-
+-/**
+- * Retrieve all addresses defined in the config file.
+- * Verdaccio is able to listen multiple ports
+- * @param {String} argListen
+- * @param {String} configListen
+- * eg:
+- *  listen:
+- - localhost:5555
+- - localhost:5557
+- @return {Array}
+- */
+-export function getListenAddress(listen: (string | void)[], logger: Logger): ListenAddress {
+-  debug('getListenAddress called with %o', listen);
+-
+-  if (!listen) {
+-    debug('No listen address provided, using default');
+-    return { proto: DEFAULT_PROTOCOL, host: DEFAULT_DOMAIN, port: DEFAULT_PORT };
+-  }
+-
+-  if (Array.isArray(listen)) {
+-    const filteredListen = listen.filter((item) => typeof item === 'string');
+-
+-    if (filteredListen.length === 0) {
+-      throw new Error('Listen addresses array cannot be empty');
+-    }
+-
+-    const invalid: string[] = [];
+-
+-    for (const raw of filteredListen) {
+-      const candidate = parseAddress(raw as string);
+-      if (candidate) {
+-        debug('valid listen address found: %o', candidate);
+-
+-        invalid.forEach((bad) =>
+-          logger.warn(
+-            { addr: bad },
+-            'invalid address - @{addr}, we expect a port (e.g. "4873"), ' +
+-              'host:port (e.g. "localhost:4873"), full url ' +
+-              '(e.g. "http://localhost:4873/") or unix:/path/socket'
+-          )
+-        );
+-
+-        if (listen.length > 1) {
+-          logger.warn(
+-            `Multiple listen addresses are not supported, using the first valid one ${addrToString(
+-              candidate
+-            )}`
+-          );
+-        }
+-        return candidate;
+-      }
+-      invalid.push(raw as string);
+-    }
+-
+-    invalid.forEach((bad) =>
+-      logger.warn(
+-        { addr: bad },
+-        'invalid address - @{addr}, we expect a port (e.g. "4873"), ' +
+-          'host:port (e.g. "localhost:4873"), full url ' +
+-          '(e.g. "http://localhost:4873/") or unix:/path/socket'
+-      )
+-    );
+-    throw new Error('No valid listen addresses found in configuration array');
+-  }
+-
+-  const single = parseAddress(listen);
+-  if (!single) {
+-    throw new Error(
+-      `Invalid address - ${listen}, we expect a port (e.g. "4873"), ` +
+-        `host:port (e.g. "localhost:4873"), full url ` +
+-        `(e.g. "http://localhost:4873/") or unix:/path/socket`
+-    );
+-  }
+-  return single;
+-}
+diff --git a/packages/config/src/conf/index.ts b/packages/config/src/conf/index.ts
+index 2e64d0315..a04a386df 100644
+--- a/packages/config/src/conf/index.ts
++++ b/packages/config/src/conf/index.ts
+@@ -2,7 +2,7 @@ import { join } from 'node:path';
+ 
+ import { parseConfigFile } from '../parse';
+ 
+-export function getDefaultConfig(fileName: string = 'default.yaml') {
++export function getDefaultConfig(fileName = 'default.yaml') {
+   const file = join(__dirname, `./${fileName}`);
+   return parseConfigFile(file);
+ }
+diff --git a/packages/config/src/index.ts b/packages/config/src/index.ts
+index c05b476e0..730e4910e 100644
+--- a/packages/config/src/index.ts
++++ b/packages/config/src/index.ts
+@@ -3,11 +3,10 @@ export * from './config-path';
+ export * from './token';
+ export * from './config-utils';
+ export * from './package-access';
+-export { fromJStoYAML, parseConfigFile, getConfigParsed } from './parse';
++export { fromJStoYAML, parseConfigFile } from './parse';
+ export * from './uplinks';
+ export * from './security';
+ export * from './agent';
+ export * from './user';
+ export { default as ConfigBuilder } from './builder';
+ export { getDefaultConfig } from './conf';
+-export * from './address';
+diff --git a/packages/config/src/parse.ts b/packages/config/src/parse.ts
+index 2396752a9..abb7a40d3 100644
+--- a/packages/config/src/parse.ts
++++ b/packages/config/src/parse.ts
+@@ -2,12 +2,10 @@ import buildDebug from 'debug';
+ import YAML from 'js-yaml';
+ import { isObject } from 'lodash';
+ import fs from 'node:fs';
+-import path from 'node:path';
+ 
+-import { API_ERROR, APP_ERROR } from '@verdaccio/core';
++import { APP_ERROR } from '@verdaccio/core';
+ import { ConfigYaml } from '@verdaccio/types';
+ 
+-import { findConfigFile } from './config-path';
+ import { fileExists } from './config-utils';
+ 
+ const debug = buildDebug('verdaccio:config:parse');
+@@ -63,48 +61,3 @@ export function fromJStoYAML(config: Partial<ConfigYaml>): string | null {
+     throw new Error(`config is not a valid object`);
+   }
+ }
+-
+-/**
+- * Parses and returns a configuration object of type `ConfigYaml`.
+- *
+- * If a string or `undefined` is provided, it is interpreted as a path to a config file
+- * (or uses a default location). The config file is then loaded and parsed.
+- * If an object is provided, it is assumed to be a pre-parsed configuration.
+- * Backward compability: ensures the returned configuration object has a `self_path` property set,
+- * either to the config file path or to a property within the object.
+- *
+- * @param {string | ConfigYaml} [config] - Optional. A path to the configuration file (string),
+- *                                         a pre-parsed config object, or `undefined`.
+- * @returns {ConfigYaml} The parsed configuration object with a guaranteed `self_path` property.
+- * @throws {Error} If the provided config is neither a string, undefined, nor an object.
+- */
+-export function getConfigParsed(config?: string | ConfigYaml): ConfigYaml {
+-  debug('getConfigParsed called with config: %o', typeof config);
+-  let configurationParsed: ConfigYaml;
+-  if (config === undefined || typeof config === 'string') {
+-    debug('using default configuration');
+-    const configPathLocation = findConfigFile(config);
+-    configurationParsed = parseConfigFile(configPathLocation);
+-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+-    // @ts-expect-error
+-    if (!configurationParsed.self_path) {
+-      debug('self_path not defined, using config path location');
+-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+-      // @ts-expect-error
+-      configurationParsed.self_path = path.resolve(configPathLocation);
+-    }
+-  } else if (typeof config === 'object' && config !== null) {
+-    configurationParsed = config;
+-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+-    // @ts-expect-error
+-    if (!configurationParsed.self_path) {
+-      debug('self_path not defined, using config path location');
+-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+-      // @ts-expect-error
+-      configurationParsed.self_path = configurationParsed.configPath;
+-    }
+-  } else {
+-    throw new Error(API_ERROR.CONFIG_BAD_FORMAT);
+-  }
+-  return configurationParsed;
+-}
+diff --git a/packages/config/test/address.spec.ts b/packages/config/test/address.spec.ts
+deleted file mode 100644
+index 789f8900a..000000000
+--- a/packages/config/test/address.spec.ts
++++ /dev/null
+@@ -1,209 +0,0 @@
+-import { beforeEach, describe, expect, test, vi } from 'vitest';
+-
+-import { Logger } from '@verdaccio/types';
+-
+-import { getListenAddress, parseAddress } from '../src';
+-
+-const logger: Logger = {
+-  warn: vi.fn(),
+-  error: vi.fn(),
+-} as any;
+-
+-describe('address parsing', () => {
+-  describe('getListenAddress', () => {
+-    const warn = logger.warn as unknown as ReturnType<typeof vi.fn>;
+-
+-    beforeEach(() => {
+-      vi.clearAllMocks();
+-    });
+-
+-    test('returns a parsed object for a simple port', () => {
+-      const addr = getListenAddress('4873', logger);
+-
+-      expect(addr).toEqual({
+-        proto: 'http',
+-        host: 'localhost',
+-        port: '4873',
+-      });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('throws when the single string is invalid', () => {
+-      expect(() => getListenAddress('not_valid', logger)).toThrow(/Invalid address/i);
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('uses the first valid element and warns about the rest', () => {
+-      const addr = getListenAddress(['bad', 'http://localhost:4873', 'unix:/tmp/x.sock'], logger);
+-
+-      expect(addr).toEqual({
+-        proto: 'http',
+-        host: 'localhost',
+-        port: '4873',
+-      });
+-
+-      expect(warn).toHaveBeenCalledTimes(2);
+-      // expect(warn.mock.calls[0][0]).toMatchObject({ addr: 'bad' });
+-      expect(warn.mock.calls[1][0]).toMatch(/Multiple listen addresses/i);
+-    });
+-
+-    test('throws if every element in the array is invalid', () => {
+-      expect(() => getListenAddress(['bad1', 'also_bad'], logger)).toThrow(
+-        /No valid listen addresses/i
+-      );
+-      // two warnings, one per invalid element
+-      expect(warn).toHaveBeenCalledTimes(2);
+-    });
+-
+-    test('throws when given an empty array', () => {
+-      expect(() => getListenAddress([])).toThrow(/array cannot be empty/i);
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('localhost:4873  (default value)', () => {
+-      const addr = getListenAddress('localhost:4873');
+-
+-      expect(addr).toEqual({ proto: 'http', host: 'localhost', port: '4873' });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('http://localhost:4873 (explicit protocol)', () => {
+-      const addr = getListenAddress('http://localhost:4873', logger);
+-
+-      expect(addr).toEqual({ proto: 'http', host: 'localhost', port: '4873' });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('0.0.0.0:4873 (INADDR_ANY)', () => {
+-      const addr = getListenAddress('0.0.0.0:4873', logger);
+-
+-      expect(addr).toEqual({ proto: 'http', host: '0.0.0.0', port: '4873' });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('https://example.org:4873 (TLS)', () => {
+-      const addr = getListenAddress('https://example.org:4873', logger);
+-
+-      expect(addr).toEqual({ proto: 'https', host: 'example.org', port: '4873' });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('"[::1]:4873" (IPv6)', () => {
+-      const addr = getListenAddress('[::1]:4873', logger);
+-
+-      /* parseAddress collapses brackets & assigns proto http */
+-      expect(addr).toEqual({ proto: 'http', host: '::1', port: '4873' });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('"https:[::1]:4873" (IPv6)', () => {
+-      const addr = getListenAddress('https:[::1]:4873', logger);
+-
+-      /* parseAddress collapses brackets & assigns proto http */
+-      expect(addr).toEqual({ proto: 'https', host: '::1', port: '4873' });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('unix:/tmp/verdaccio.sock (Unix socket)', () => {
+-      const addr = getListenAddress('unix:/tmp/verdaccio.sock', logger);
+-
+-      expect(addr).toEqual({
+-        proto: 'unix',
+-        path: '/tmp/verdaccio.sock',
+-        host: '/tmp/verdaccio.sock',
+-      });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('http://foo.sock:34 (Unix socket)', () => {
+-      const addr = getListenAddress('http://foo.sock:34', logger);
+-
+-      expect(addr).toEqual({
+-        host: 'foo.sock',
+-        port: '34',
+-        proto: 'http',
+-      });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('http://unix:/tmp/verdaccio.sock (HTTP Unix socket)', () => {
+-      const addr = getListenAddress('http://unix:/tmp/verdaccio.sock', logger);
+-
+-      expect(addr).toEqual({
+-        path: '/tmp/verdaccio.sock',
+-        proto: 'http',
+-        host: '/tmp/verdaccio.sock',
+-      });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-
+-    test('https://unix:/tmp/verdaccio.sock (HTTPS Unix socket)', () => {
+-      const addr = getListenAddress('https://unix:/tmp/verdaccio.sock', logger);
+-
+-      expect(addr).toEqual({
+-        path: '/tmp/verdaccio.sock',
+-        proto: 'https',
+-        host: '/tmp/verdaccio.sock',
+-      });
+-      expect(warn).not.toHaveBeenCalled();
+-    });
+-  });
+-
+-  describe('parseAddress – documented listen values', () => {
+-    test('localhost:4873   (default style)', () => {
+-      expect(parseAddress('localhost:4873')).toEqual({
+-        proto: 'http',
+-        host: 'localhost',
+-        port: '4873',
+-      });
+-    });
+-
+-    test('http://localhost:4873  (explicit protocol)', () => {
+-      expect(parseAddress('http://localhost:4873')).toEqual({
+-        proto: 'http',
+-        host: 'localhost',
+-        port: '4873',
+-      });
+-    });
+-
+-    test('0.0.0.0:4873  (INADDR_ANY)', () => {
+-      expect(parseAddress('0.0.0.0:4873')).toEqual({
+-        proto: 'http',
+-        host: '0.0.0.0',
+-        port: '4873',
+-      });
+-    });
+-
+-    test('https://example.org:4873  (HTTPS)', () => {
+-      expect(parseAddress('https://example.org:4873')).toEqual({
+-        proto: 'https',
+-        host: 'example.org',
+-        port: '4873',
+-      });
+-    });
+-
+-    test('"[::1]:4873"  (IPv6)', () => {
+-      expect(parseAddress('[::1]:4873')).toEqual({
+-        proto: 'http',
+-        host: '::1',
+-        port: '4873',
+-      });
+-    });
+-
+-    test('unix:/tmp/verdaccio.sock  (Unix socket)', () => {
+-      expect(parseAddress('unix:/tmp/verdaccio.sock')).toEqual({
+-        host: '/tmp/verdaccio.sock',
+-        proto: 'unix',
+-        path: '/tmp/verdaccio.sock',
+-      });
+-    });
+-
+-    test('https://unix:/tmp/verdaccio.sock  (HTTPS Unix socket)', () => {
+-      expect(parseAddress('https://unix:/tmp/verdaccio.sock')).toEqual({
+-        host: '/tmp/verdaccio.sock',
+-        proto: 'https',
+-        path: '/tmp/verdaccio.sock',
+-      });
+-    });
+-  });
+-});
+diff --git a/packages/config/test/parse.spec.ts b/packages/config/test/parse.spec.ts
+deleted file mode 100644
+index 134300121..000000000
+--- a/packages/config/test/parse.spec.ts
++++ /dev/null
+@@ -1,27 +0,0 @@
+-import path from 'node:path';
+-import { describe, expect, test } from 'vitest';
+-
+-import { getConfigParsed, parseConfigFile } from '../src';
+-
+-describe('getConfigParsed', () => {
+-  const partialsDir = path.join(__dirname, './partials/config/yaml');
+-
+-  test('parses config from a YAML file path', () => {
+-    const yamlFile = path.join(partialsDir, 'config-getMatchedPackagesSpec.yaml');
+-    const config = getConfigParsed(yamlFile);
+-    expect(config).toBeDefined();
+-  });
+-
+-  test('parses config from a YAML file path', () => {
+-    const yamlFile = path.join(partialsDir, 'config-getMatchedPackagesSpec.yaml');
+-    const config = getConfigParsed(parseConfigFile(yamlFile));
+-    expect(config).toBeDefined();
+-  });
+-
+-  test('throws error for invalid config type', () => {
+-    // @ts-expect-error
+-    expect(() => getConfigParsed(123)).toThrow();
+-    // @ts-expect-error
+-    expect(() => getConfigParsed(true)).toThrow();
+-  });
+-});
+diff --git a/packages/core/core/src/constants.ts b/packages/core/core/src/constants.ts
+index bc4c63ca2..033b22785 100644
+--- a/packages/core/core/src/constants.ts
++++ b/packages/core/core/src/constants.ts
+@@ -163,7 +163,3 @@ export const PLUGIN_CATEGORY = {
+   FILTER: 'filter',
+   THEME: 'theme',
+ };
+-
+-export const DEFAULT_PORT = '4873';
+-export const DEFAULT_PROTOCOL = 'http';
+-export const DEFAULT_DOMAIN = 'localhost';
+diff --git a/packages/core/core/src/index.ts b/packages/core/core/src/index.ts
+index 4919d4ddc..4818bf0f9 100644
+--- a/packages/core/core/src/index.ts
++++ b/packages/core/core/src/index.ts
+@@ -31,9 +31,6 @@ export {
+   PLUGIN_PREFIX,
+   PLUGIN_UI_PREFIX,
+   HtpasswdHashAlgorithm,
+-  DEFAULT_DOMAIN,
+-  DEFAULT_PORT,
+-  DEFAULT_PROTOCOL,
+ } from './constants';
+ export {
+   authUtils,
+diff --git a/packages/node-api/src/cli-utils.ts b/packages/node-api/src/cli-utils.ts
+new file mode 100644
+index 000000000..56a2f1740
+--- /dev/null
++++ b/packages/node-api/src/cli-utils.ts
+@@ -0,0 +1,84 @@
++import { warningUtils } from '@verdaccio/core';
++
++export const DEFAULT_PORT = '4873';
++export const DEFAULT_PROTOCOL = 'http';
++export const DEFAULT_DOMAIN = 'localhost';
++/**
++ * Parse an internet address
++ * Allow:
++ - https:localhost:1234        - protocol + host + port
++ - localhost:1234              - host + port
++ - 1234                        - port
++ - http::1234                  - protocol + port
++ - https://localhost:443/      - full url + https
++ - http://[::1]:443/           - ipv6
++ - unix:/tmp/http.sock         - unix sockets
++ - https://unix:/tmp/http.sock - unix sockets (https)
++ * @param {*} urlAddress the internet address definition
++ * @return {Object|Null} literal object that represent the address parsed
++ */
++export function parseAddress(urlAddress: any): any {
++  //
++  // TODO: refactor it to something more reasonable?
++  //
++  //        protocol :  //      (  host  )|(    ipv6     ):  port  /
++  let urlPattern = /^((https?):(\/\/)?)?((([^\/:]*)|\[([^\[\]]+)\]):)?(\d+)\/?$/.exec(urlAddress);
++
++  if (urlPattern) {
++    return {
++      proto: urlPattern[2] || DEFAULT_PROTOCOL,
++      host: urlPattern[6] || urlPattern[7] || DEFAULT_DOMAIN,
++      port: urlPattern[8] || DEFAULT_PORT,
++    };
++  }
++
++  urlPattern = /^((https?):(\/\/)?)?unix:(.*)$/.exec(urlAddress);
++
++  if (urlPattern) {
++    return {
++      proto: urlPattern[2] || DEFAULT_PROTOCOL,
++      path: urlPattern[4],
++    };
++  }
++
++  return null;
++}
++
++/**
++ * Retrieve all addresses defined in the config file.
++ * Verdaccio is able to listen multiple ports
++ * @param {String} argListen
++ * @param {String} configListen
++ * eg:
++ *  listen:
++ - localhost:5555
++ - localhost:5557
++ @return {Array}
++ */
++export function getListListenAddresses(argListen: string | void, configListen: any): any {
++  // command line || config file || default
++  let addresses;
++  if (argListen) {
++    addresses = [argListen];
++  } else if (Array.isArray(configListen)) {
++    addresses = configListen;
++    process.emitWarning('multiple addresses will be deprecated in the next major, only use one');
++  } else if (configListen) {
++    addresses = [configListen];
++  } else {
++    addresses = [DEFAULT_PORT];
++  }
++  addresses = addresses
++    .map(function (addr): string {
++      const parsedAddr = parseAddress(addr);
++
++      if (!parsedAddr) {
++        warningUtils.emit(warningUtils.Codes.VERWAR004, addr);
++      }
++
++      return parsedAddr;
++    })
++    .filter(Boolean);
++
++  return addresses;
++}
+diff --git a/packages/node-api/src/server.ts b/packages/node-api/src/server.ts
+index 2241e855e..641f71b0b 100644
+--- a/packages/node-api/src/server.ts
++++ b/packages/node-api/src/server.ts
+@@ -7,13 +7,14 @@ import http from 'node:http';
+ import https from 'node:https';
+ import url from 'node:url';
+ 
+-import { getConfigParsed, getListenAddress } from '@verdaccio/config';
+-import { DEFAULT_PORT } from '@verdaccio/core';
+-import { logger, setup } from '@verdaccio/logger';
++import { findConfigFile, parseConfigFile } from '@verdaccio/config';
++import { API_ERROR } from '@verdaccio/core';
++import { setup } from '@verdaccio/logger';
+ import expressServer from '@verdaccio/server';
+ import fastifyServer from '@verdaccio/server-fastify';
+ import { ConfigYaml, HttpsConfKeyCert, HttpsConfPfx } from '@verdaccio/types';
+ 
++import { getListListenAddresses } from './cli-utils';
+ import { displayExperimentsInfoBox } from './experiments';
+ 
+ const debug = buildDebug('verdaccio:node-api');
+@@ -120,9 +121,9 @@ export async function initServer(
+   pkgName: string
+ ): Promise<void> {
+   return new Promise(async (resolve, reject) => {
++    // FIXME: get only the first match, the multiple address will be removed
++    const [addr] = getListListenAddresses(port, config.listen);
+     const logger = setup(config?.log as any);
+-    const combined: string | undefined | any[] = [port, config?.listen, DEFAULT_PORT];
+-    const addr = getListenAddress(combined, logger);
+     displayExperimentsInfoBox(config.flags);
+ 
+     let app;
+@@ -197,12 +198,20 @@ export async function initServer(
+  * @param config
+  */
+ export async function runServer(config?: string | ConfigYaml): Promise<any> {
+-  const configurationParsed = getConfigParsed(config);
++  let configurationParsed: ConfigYaml;
++  if (config === undefined || typeof config === 'string') {
++    const configPathLocation = findConfigFile(config);
++    configurationParsed = parseConfigFile(configPathLocation);
++  } else if (_.isObject(config)) {
++    configurationParsed = config;
++  } else {
++    throw new Error(API_ERROR.CONFIG_BAD_FORMAT);
++  }
++
+   setup(configurationParsed.log as any);
+   displayExperimentsInfoBox(configurationParsed.flags);
+   // FIXME: get only the first match, the multiple address will be removed
+-  const combined: string | undefined | any[] = [configurationParsed?.listen, DEFAULT_PORT];
+-  const addr = getListenAddress(combined, logger);
++  const [addr] = getListListenAddresses(undefined, configurationParsed.listen);
+   const app = await expressServer(configurationParsed);
+   return createServerFactory(configurationParsed, addr, app);
+ }
+diff --git a/packages/node-api/test/node-api.utils.spec.ts b/packages/node-api/test/node-api.utils.spec.ts
+new file mode 100644
+index 000000000..b530c18cd
+--- /dev/null
++++ b/packages/node-api/test/node-api.utils.spec.ts
+@@ -0,0 +1,68 @@
++import _ from 'lodash';
++import { describe, expect, test } from 'vitest';
++
++import {
++  DEFAULT_DOMAIN,
++  DEFAULT_PORT,
++  DEFAULT_PROTOCOL,
++  getListListenAddresses,
++} from '../src/cli-utils';
++
++describe('getListListenAddresses test', () => {
++  test('should return no address if a single address is wrong', () => {
++    // @ts-ignore
++    const addrs = getListListenAddresses('wrong');
++
++    expect(_.isArray(addrs)).toBeTruthy();
++    expect(addrs).toHaveLength(0);
++  });
++
++  test('should return no address if a two address are wrong', () => {
++    // @ts-ignore
++    const addrs = getListListenAddresses(['wrong', 'same-wrong']);
++
++    expect(_.isArray(addrs)).toBeTruthy();
++    expect(addrs).toHaveLength(0);
++  });
++
++  test('should return a list of 1 address provided', () => {
++    // @ts-ignore
++    const addrs = getListListenAddresses(null, '1000');
++
++    expect(_.isArray(addrs)).toBeTruthy();
++    expect(addrs).toHaveLength(1);
++  });
++
++  test('should return a list of 2 address provided', () => {
++    // @ts-ignore
++    const addrs = getListListenAddresses(null, ['1000', '2000']);
++
++    expect(_.isArray(addrs)).toBeTruthy();
++    expect(addrs).toHaveLength(2);
++  });
++
++  test(`should return by default ${DEFAULT_PORT}`, () => {
++    // @ts-ignore
++    const [addrs] = getListListenAddresses();
++
++    // @ts-ignore
++    expect(addrs.proto).toBe(DEFAULT_PROTOCOL);
++    // @ts-ignore
++    expect(addrs.host).toBe(DEFAULT_DOMAIN);
++    // @ts-ignore
++    expect(addrs.port).toBe(DEFAULT_PORT);
++  });
++
++  test('should return default proto, host and custom port', () => {
++    const initPort = '1000';
++    // @ts-ignore
++    const [addrs] = getListListenAddresses(null, initPort);
++
++    // @ts-ignore
++    expect(addrs.proto).toEqual(DEFAULT_PROTOCOL);
++    // @ts-ignore
++    expect(addrs.host).toEqual(DEFAULT_DOMAIN);
++    // @ts-ignore
++    expect(addrs.port).toEqual(initPort);
++  });
++});
+diff --git a/packages/node-api/test/parseAddress.spec.ts b/packages/node-api/test/parseAddress.spec.ts
+new file mode 100644
+index 000000000..481be49cc
+--- /dev/null
++++ b/packages/node-api/test/parseAddress.spec.ts
+@@ -0,0 +1,52 @@
++import _ from 'lodash';
++import { describe, expect, test } from 'vitest';
++
++import { DEFAULT_DOMAIN, DEFAULT_PORT, parseAddress } from '../src/cli-utils';
++
++describe('Parse listen address', () => {
++  const useCases: any[] = [];
++
++  function addTest(uri: string, proto: string | null, host?: string, port?: string) {
++    useCases.push([uri, proto, host, port]);
++  }
++
++  addTest(DEFAULT_PORT, 'http', DEFAULT_DOMAIN, DEFAULT_PORT);
++  addTest(':4873', 'http', DEFAULT_DOMAIN, DEFAULT_PORT);
++  addTest('blah:4873', 'http', 'blah', DEFAULT_PORT);
++  addTest('http://:4873', 'http', DEFAULT_DOMAIN, DEFAULT_PORT);
++  addTest('https::4873', 'https', DEFAULT_DOMAIN, DEFAULT_PORT);
++  addTest('https:blah:4873', 'https', 'blah', DEFAULT_PORT);
++  addTest('https://blah:4873/', 'https', 'blah', DEFAULT_PORT);
++  addTest('[::1]:4873', 'http', '::1', DEFAULT_PORT);
++  addTest('https:[::1]:4873', 'https', '::1', DEFAULT_PORT);
++
++  addTest('unix:/tmp/foo.sock', 'http', '/tmp/foo.sock');
++  addTest('http:unix:foo.sock', 'http', 'foo.sock');
++  addTest('https://unix:foo.sock', 'https', 'foo.sock');
++  addTest('https://unix:foo.sock:34', 'https', 'foo.sock:34');
++  addTest('http://foo.sock:34', 'http', 'foo.sock', '34');
++
++  addTest('blah', null);
++  addTest('blah://4873', null);
++  addTest('https://blah:4873///', null);
++  addTest('unix:1234', 'http', 'unix', '1234'); // not unix socket
++
++  test.each(useCases)(`should parse (%s - %s - %s - %s)`, (uri, proto, host, port) => {
++    const parsed = parseAddress(uri);
++
++    if (_.isNull(proto)) {
++      expect(parsed).toBeNull();
++    } else if (port) {
++      expect(parsed).toEqual({
++        proto,
++        host,
++        port,
++      });
++    } else {
++      expect(parsed).toEqual({
++        proto,
++        path: host,
++      });
++    }
++  });
++});

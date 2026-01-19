@@ -1,0 +1,226 @@
+diff --git a/docs/rtk-query/api/fetchBaseQuery.mdx b/docs/rtk-query/api/fetchBaseQuery.mdx
+index 63d21f5e..0485025c 100644
+--- a/docs/rtk-query/api/fetchBaseQuery.mdx
++++ b/docs/rtk-query/api/fetchBaseQuery.mdx
+@@ -13,7 +13,7 @@ description: 'RTK Query > API: fetchBaseQuery reference'
+ 
+ This is a very small wrapper around [`fetch`](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API) that aims to simplify requests. It is not a full-blown replacement for `axios`, `superagent`, or any other more heavy-weight library, but it will cover the large majority of your needs.
+ 
+-It takes all standard options from fetch's [`RequestInit`](https://developer.mozilla.org/en-US/docs/Web/API/WindowOrWorkerGlobalScope/fetch) interface, as well as `baseUrl`, a `prepareHeaders` function, an optional `fetch` function, and a `paramsSerializer` function.
++It takes all standard options from fetch's [`RequestInit`](https://developer.mozilla.org/en-US/docs/Web/API/WindowOrWorkerGlobalScope/fetch) interface, as well as `baseUrl`, a `prepareHeaders` function, an optional `fetch` function, a `paramsSerializer` function, and a `timeout`.
+ 
+ - `baseUrl` _(required)_
+   - Typically a string like `https://api.your-really-great-app.com/v1/`. If you don't provide a `baseUrl`, it defaults to a relative path from where the request is being made. You should most likely _always_ specify this.
+@@ -38,6 +38,8 @@ It takes all standard options from fetch's [`RequestInit`](https://developer.moz
+   - A function that can be used to apply custom transformations to the data passed into [`params`](#setting-the-query-string). If you don't provide this, `params` will be given directly to `new URLSearchParms()`. With some API integrations, you may need to leverage this to use something like the [`query-string`](https://github.com/sindresorhus/query-string) library to support different array types.
+ - `fetchFn` _(optional)_
+   - A fetch function that overrides the default on the window. Can be useful in SSR environments where you may need to leverage `isomorphic-fetch` or `cross-fetch`.
++- `timeout` _(optional)_
++  - A number in milliseconds that represents the maximum time a request can take before timing out.
+ 
+ ```ts title="Return types of fetchBaseQuery" no-transpile
+ Promise<{
+@@ -114,6 +116,7 @@ There is more behavior that you can define on a per-request basis that extends t
+ - [`body`](#setting-the-body)
+ - [`responseHandler`](#parsing-a-Response)
+ - [`validateStatus`](#handling-non-standard-response-status-codes)
++- [`timeout`](#adding-a-custom-timeout-to-requests)
+ 
+ ```ts title="endpoint request options"
+ interface FetchArgs extends RequestInit {
+@@ -122,6 +125,7 @@ interface FetchArgs extends RequestInit {
+   body?: any
+   responseHandler?: 'json' | 'text' | ((response: Response) => Promise<any>)
+   validateStatus?: (response: Response, body: any) => boolean
++  timeout?: number
+ }
+ 
+ const defaultValidateStatus = (response: Response) =>
+@@ -227,3 +231,23 @@ export const customApi = createApi({
+   }),
+ })
+ ```
++
++### Adding a custom timeout to requests
++
++By default, `fetchBaseQuery` has no default timeout value set, meaning your requests will stay pending until your api resolves the request(s) or it reaches the browser's default timeout (normally 5 minutes). Most of the time, this isn't what you'll want. When using `fetchBaseQuery`, you have the ability to set a `timeout` on the `baseQuery` or on individual endpoints. When specifying both options, the endpoint value will take priority.
++
++```ts title="Setting a timeout value"
++import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query'
++
++export const api = createApi({
++  baseQuery: fetchBaseQuery({ baseUrl: '/api/', timeout: 10000 }), // Set a default timeout of 10 seconds
++  endpoints: (builder) => ({
++    getUsers: builder.query({
++      query: () => ({
++        url: `users`,
++        timeout: 1000, // We know the users endpoint is _really fast_ because it's always cached. We can assume if its over > 1000ms, something is wrong and we should abort the request.
++      }),
++    }),
++  }),
++})
++```
+diff --git a/packages/toolkit/src/createAsyncThunk.ts b/packages/toolkit/src/createAsyncThunk.ts
+index 550cb863..f2ece1f0 100644
+--- a/packages/toolkit/src/createAsyncThunk.ts
++++ b/packages/toolkit/src/createAsyncThunk.ts
+@@ -24,6 +24,7 @@ export type BaseThunkAPI<
+   extra: E
+   requestId: string
+   signal: AbortSignal
++  abort: (reason?: string) => void
+   rejectWithValue: IsUnknown<
+     RejectedMeta,
+     (value: RejectedValue) => RejectWithValue<RejectedValue, RejectedMeta>,
+@@ -610,6 +611,7 @@ If you want to use the AbortController to react to \`abort\` events, please cons
+                 extra,
+                 requestId,
+                 signal: abortController.signal,
++                abort,
+                 rejectWithValue: ((
+                   value: RejectedValue,
+                   meta?: RejectedMeta
+diff --git a/packages/toolkit/src/query/baseQueryTypes.ts b/packages/toolkit/src/query/baseQueryTypes.ts
+index 26a656af..ed6a693c 100644
+--- a/packages/toolkit/src/query/baseQueryTypes.ts
++++ b/packages/toolkit/src/query/baseQueryTypes.ts
+@@ -3,6 +3,7 @@ import type { MaybePromise, UnwrapPromise } from './tsHelpers'
+ 
+ export interface BaseQueryApi {
+   signal: AbortSignal
++  abort: (reason?: string) => void
+   dispatch: ThunkDispatch<any, any, any>
+   getState: () => unknown
+   extra: unknown
+diff --git a/packages/toolkit/src/query/core/buildThunks.ts b/packages/toolkit/src/query/core/buildThunks.ts
+index 04f6e06c..684b0d8b 100644
+--- a/packages/toolkit/src/query/core/buildThunks.ts
++++ b/packages/toolkit/src/query/core/buildThunks.ts
+@@ -261,7 +261,15 @@ export function buildThunks<
+     ThunkApiMetaConfig & { state: RootState<any, string, ReducerPath> }
+   > = async (
+     arg,
+-    { signal, rejectWithValue, fulfillWithValue, dispatch, getState, extra }
++    {
++      signal,
++      abort,
++      rejectWithValue,
++      fulfillWithValue,
++      dispatch,
++      getState,
++      extra,
++    }
+   ) => {
+     const endpointDefinition = endpointDefinitions[arg.endpointName]
+ 
+@@ -274,6 +282,7 @@ export function buildThunks<
+       let result: QueryReturnValue
+       const baseQueryApi = {
+         signal,
++        abort,
+         dispatch,
+         getState,
+         extra,
+diff --git a/packages/toolkit/src/query/fetchBaseQuery.ts b/packages/toolkit/src/query/fetchBaseQuery.ts
+index ab01974b..94ee1c4d 100644
+--- a/packages/toolkit/src/query/fetchBaseQuery.ts
++++ b/packages/toolkit/src/query/fetchBaseQuery.ts
+@@ -25,6 +25,7 @@ export interface FetchArgs extends CustomRequestInit {
+   body?: any
+   responseHandler?: ResponseHandler
+   validateStatus?: (response: Response, body: any) => boolean
++  timeout?: number
+ }
+ 
+ /**
+@@ -38,7 +39,7 @@ const defaultValidateStatus = (response: Response) =>
+   response.status >= 200 && response.status <= 299
+ 
+ const defaultIsJsonContentType = (headers: Headers) =>
+-  /*applicat*//ion\/(vnd\.api\+)?json/.test(headers.get('content-type') || '')
++  /*applicat*/ /ion\/(vnd\.api\+)?json/.test(headers.get('content-type') || '')
+ 
+ const handleResponse = async (
+   response: Response,
+@@ -88,6 +89,15 @@ export type FetchBaseQueryError =
+       data: string
+       error: string
+     }
++  | {
++      /**
++       * * `"TIMEOUT_ERROR"`:
++       *   Request timed out
++       **/
++      status: 'TIMEOUT_ERROR'
++      data?: undefined
++      error: string
++    }
+   | {
+       /**
+        * * `"CUSTOM_ERROR"`:
+@@ -136,6 +146,10 @@ export type FetchBaseQueryArgs = {
+    * Defaults to `application/json`;
+    */
+   jsonContentType?: string
++  /**
++   * A number in milliseconds that represents that maximum time a request can take before timing out.
++   */
++  timeout?: number
+ } & RequestInit
+ 
+ export type FetchBaseQueryMeta = { request: Request; response?: Response }
+@@ -180,6 +194,9 @@ export type FetchBaseQueryMeta = { request: Request; response?: Response }
+  * An optional predicate function to determine if `JSON.stringify()` should be called on the `body` arg of `FetchArgs`
+  *
+  * @param {string} jsonContentType Defaults to `application/json`. Used when automatically setting the content-type header for a request with a jsonifiable body that does not have an explicit content-type header.
++ *
++ * @param {number} timeout
++ * A number in milliseconds that represents the maximum time a request can take before timing out.
+  */
+ export function fetchBaseQuery({
+   baseUrl,
+@@ -188,6 +205,7 @@ export function fetchBaseQuery({
+   paramsSerializer,
+   isJsonContentType = defaultIsJsonContentType,
+   jsonContentType = 'application/json',
++  timeout: defaultTimeout,
+   ...baseFetchOptions
+ }: FetchBaseQueryArgs = {}): BaseQueryFn<
+   string | FetchArgs,
+@@ -212,6 +230,7 @@ export function fetchBaseQuery({
+       params = undefined,
+       responseHandler = 'json' as const,
+       validateStatus = defaultValidateStatus,
++      timeout = defaultTimeout,
+       ...rest
+     } = typeof arg == 'string' ? { url: arg } : arg
+     let config: RequestInit = {
+@@ -256,11 +275,26 @@ export function fetchBaseQuery({
+     const requestClone = request.clone()
+     meta = { request: requestClone }
+ 
+-    let response
++    let response,
++      timedOut = false,
++      timeoutId =
++        timeout &&
++        setTimeout(() => {
++          timedOut = true
++          api.abort()
++        }, timeout)
+     try {
+       response = await fetchFn(request)
+     } catch (e) {
+-      return { error: { status: 'FETCH_ERROR', error: String(e) }, meta }
++      return {
++        error: {
++          status: timedOut ? 'TIMEOUT_ERROR' : 'FETCH_ERROR',
++          error: String(e),
++        },
++        meta,
++      }
++    } finally {
++      if (timeoutId) clearTimeout(timeoutId)
+     }
+     const responseClone = response.clone()
+ 

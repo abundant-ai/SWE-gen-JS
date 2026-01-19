@@ -1,0 +1,384 @@
+diff --git a/README.md b/README.md
+index 66176150..cf3ccfbe 100644
+--- a/README.md
++++ b/README.md
+@@ -112,8 +112,9 @@ ws.on('open', function open() {
+   ws.send('something');
+ });
+ 
+-ws.on('message', function incoming(data) {
+-  console.log(data);
++ws.on('message', function incoming(data, flags) {
++  // flags.binary will be set if a binary data is received.
++  // flags.masked will be set if the data was masked.
+ });
+ ```
+ 
+@@ -231,8 +232,8 @@ ws.on('close', function close() {
+   console.log('disconnected');
+ });
+ 
+-ws.on('message', function incoming(data) {
+-  console.log(`Roundtrip time: ${Date.now() - data} ms`);
++ws.on('message', function incoming(data, flags) {
++  console.log(`Roundtrip time: ${Date.now() - data} ms`, flags);
+ 
+   setTimeout(function timeout() {
+     ws.send(Date.now());
+diff --git a/bench/speed.js b/bench/speed.js
+index cae60a2b..b22e6688 100644
+--- a/bench/speed.js
++++ b/bench/speed.js
+@@ -17,7 +17,7 @@ if (cluster.isMaster) {
+   }, () => cluster.fork());
+ 
+   wss.on('connection', (ws) => {
+-    ws.on('message', (data) => ws.send(data));
++    ws.on('message', (data, flags) => ws.send(data, { binary: flags.binary || false }));
+   });
+ 
+   cluster.on('exit', () => wss.close());
+diff --git a/doc/ws.md b/doc/ws.md
+index 4a7db0fc..cdb1f03e 100644
+--- a/doc/ws.md
++++ b/doc/ws.md
+@@ -238,6 +238,9 @@ handshake.  This allows you to read headers from the server, for example
+ ### Event: 'message'
+ 
+ - `data` {String|Buffer}
++- `flags` {Object}
++  - `binary` {Boolean} Specifies if `data` is binary.
++  - `masked` {Boolean} Specifies if `data` was masked.
+ 
+ Emitted when a message is received from the server.
+ 
+@@ -248,12 +251,18 @@ Emitted when the connection is established.
+ ### Event: 'ping'
+ 
+ - `data` {Buffer}
++- `flags` {Object}
++  - `binary` {Boolean} Specifies if `data` is binary.
++  - `masked` {Boolean} Specifies if `data` was masked.
+ 
+ Emitted when a ping is received from the server.
+ 
+ ### Event: 'pong'
+ 
+ - `data` {Buffer}
++- `flags` {Object}
++  - `binary` {Boolean} Specifies if `data` is binary.
++  - `masked` {Boolean} Specifies if `data` was masked.
+ 
+ Emitted when a pong is received from the server.
+ 
+diff --git a/examples/fileapi/server.js b/examples/fileapi/server.js
+index 54e6128f..4202818a 100644
+--- a/examples/fileapi/server.js
++++ b/examples/fileapi/server.js
+@@ -60,8 +60,8 @@ wss.on('connection', function (ws) {
+ 
+   var filesReceived = 0;
+   var currentFile = null;
+-  ws.on('message', function (data) {
+-    if (typeof data === 'string') {
++  ws.on('message', function (data, flags) {
++    if (!flags.binary) {
+       currentFile = JSON.parse(data);
+       // note: a real-world app would want to sanity check the data
+     } else {
+diff --git a/lib/EventTarget.js b/lib/EventTarget.js
+index 8f9a943a..e30b1b3e 100644
+--- a/lib/EventTarget.js
++++ b/lib/EventTarget.js
+@@ -29,11 +29,13 @@ class MessageEvent extends Event {
+    * Create a new `MessageEvent`.
+    *
+    * @param {(String|Buffer|ArrayBuffer|Buffer[])} data The received data
++   * @param {Boolean} isBinary Specifies if `data` is binary
+    * @param {WebSocket} target A reference to the target to which the event was dispatched
+    */
+-  constructor (data, target) {
++  constructor (data, isBinary, target) {
+     super('message', target);
+ 
++    this.binary = isBinary; // non-standard.
+     this.data = data;
+   }
+ }
+@@ -97,8 +99,8 @@ const EventTarget = {
+   addEventListener (method, listener) {
+     if (typeof listener !== 'function') return;
+ 
+-    function onMessage (data) {
+-      listener.call(this, new MessageEvent(data, this));
++    function onMessage (data, flags) {
++      listener.call(this, new MessageEvent(data, !!flags.binary, this));
+     }
+ 
+     function onClose (code, message) {
+diff --git a/lib/Receiver.js b/lib/Receiver.js
+index 7054ca46..6c1a10e2 100644
+--- a/lib/Receiver.js
++++ b/lib/Receiver.js
+@@ -377,7 +377,7 @@ class Receiver {
+           data = fragments;
+         }
+ 
+-        this.onmessage(data);
++        this.onmessage(data, { masked: this.masked, binary: true });
+       } else {
+         const buf = toBuffer(fragments, messageLength);
+ 
+@@ -386,7 +386,7 @@ class Receiver {
+           return;
+         }
+ 
+-        this.onmessage(buf.toString());
++        this.onmessage(buf.toString(), { masked: this.masked });
+       }
+     }
+ 
+@@ -402,7 +402,7 @@ class Receiver {
+   controlMessage (data) {
+     if (this.opcode === 0x08) {
+       if (data.length === 0) {
+-        this.onclose(1000, '');
++        this.onclose(1000, '', { masked: this.masked });
+         this.loop = false;
+         this.cleanup(this.cleanupCallback);
+       } else if (data.length === 1) {
+@@ -422,7 +422,7 @@ class Receiver {
+           return;
+         }
+ 
+-        this.onclose(code, buf.toString());
++        this.onclose(code, buf.toString(), { masked: this.masked });
+         this.loop = false;
+         this.cleanup(this.cleanupCallback);
+       }
+@@ -430,8 +430,10 @@ class Receiver {
+       return;
+     }
+ 
+-    if (this.opcode === 0x09) this.onping(data);
+-    else this.onpong(data);
++    const flags = { masked: this.masked, binary: true };
++
++    if (this.opcode === 0x09) this.onping(data, flags);
++    else this.onpong(data, flags);
+ 
+     this.state = GET_INFO;
+   }
+diff --git a/lib/WebSocket.js b/lib/WebSocket.js
+index 1c82fa43..41868d83 100644
+--- a/lib/WebSocket.js
++++ b/lib/WebSocket.js
+@@ -143,12 +143,12 @@ class WebSocket extends EventEmitter {
+     });
+ 
+     // receiver event handlers
+-    this._receiver.onmessage = (data) => this.emit('message', data);
+-    this._receiver.onping = (data) => {
++    this._receiver.onmessage = (data, flags) => this.emit('message', data, flags);
++    this._receiver.onping = (data, flags) => {
+       this.pong(data, !this._isServer, true);
+-      this.emit('ping', data);
++      this.emit('ping', data, flags);
+     };
+-    this._receiver.onpong = (data) => this.emit('pong', data);
++    this._receiver.onpong = (data, flags) => this.emit('pong', data, flags);
+     this._receiver.onclose = (code, reason) => {
+       this._closeMessage = reason;
+       this._closeCode = code;
+diff --git a/lib/WebSocketServer.js b/lib/WebSocketServer.js
+index bd3ef24e..b3d82df6 100644
+--- a/lib/WebSocketServer.js
++++ b/lib/WebSocketServer.js
+@@ -85,7 +85,6 @@ class WebSocketServer extends EventEmitter {
+       this._ultron.on('error', (err) => this.emit('error', err));
+       this._ultron.on('upgrade', (req, socket, head) => {
+         this.handleUpgrade(req, socket, head, (client) => {
+-          this.emit(`connection${req.url}`, client);
+           this.emit('connection', client);
+         });
+       });
+diff --git a/test/WebSocket.test.js b/test/WebSocket.test.js
+index 0b9e71d7..e93bc6a8 100644
+--- a/test/WebSocket.test.js
++++ b/test/WebSocket.test.js
+@@ -674,7 +674,8 @@ describe('WebSocket', function () {
+         const ws = new WebSocket(`ws://localhost:${port}`);
+ 
+         ws.on('open', () => ws.send(array, { compress: false }));
+-        ws.on('message', (msg) => {
++        ws.on('message', (msg, flags) => {
++          assert.ok(flags.binary);
+           assert.ok(msg.equals(Buffer.from(array.buffer)));
+           wss.close(done);
+         });
+@@ -690,7 +691,7 @@ describe('WebSocket', function () {
+         const ws = new WebSocket(`ws://localhost:${port}`);
+ 
+         ws.on('open', () => ws.send('hi'));
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
+           assert.strictEqual(message, 'hi');
+           wss.close(done);
+         });
+@@ -749,7 +750,8 @@ describe('WebSocket', function () {
+         const ws = new WebSocket(`ws://localhost:${port}`);
+ 
+         ws.on('open', () => ws.send(partial, { binary: true }));
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
++          assert.ok(flags.binary);
+           assert.ok(message.equals(buf));
+           wss.close(done);
+         });
+@@ -766,7 +768,8 @@ describe('WebSocket', function () {
+         const ws = new WebSocket(`ws://localhost:${port}`);
+ 
+         ws.on('open', () => ws.send(buf, { binary: true }));
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
++          assert.ok(flags.binary);
+           assert.ok(message.equals(buf));
+           wss.close(done);
+         });
+@@ -789,6 +792,7 @@ describe('WebSocket', function () {
+ 
+         ws.on('open', () => ws.send(array.buffer));
+         ws.onmessage = (event) => {
++          assert.ok(event.binary);
+           assert.ok(event.data.equals(Buffer.from(array.buffer)));
+           wss.close(done);
+         };
+@@ -807,6 +811,7 @@ describe('WebSocket', function () {
+         ws.on('open', () => ws.send(buf));
+ 
+         ws.onmessage = (event) => {
++          assert.ok(event.binary);
+           assert.ok(event.data.equals(buf));
+           wss.close(done);
+         };
+@@ -872,8 +877,9 @@ describe('WebSocket', function () {
+       });
+ 
+       wss.on('connection', (ws) => {
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
+           assert.strictEqual(message, 'hi');
++          assert.ok(!flags.masked);
+           wss.close(done);
+         });
+       });
+@@ -887,8 +893,9 @@ describe('WebSocket', function () {
+       });
+ 
+       wss.on('connection', (ws) => {
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
+           assert.strictEqual(message, 'hi');
++          assert.ok(flags.masked);
+           wss.close(done);
+         });
+       });
+@@ -908,8 +915,9 @@ describe('WebSocket', function () {
+       });
+ 
+       wss.on('connection', (ws) => {
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
+           assert.ok(message.equals(Buffer.from(array.buffer)));
++          assert.ok(flags.binary);
+           wss.close(done);
+         });
+       });
+@@ -929,8 +937,10 @@ describe('WebSocket', function () {
+       });
+ 
+       wss.on('connection', (ws) => {
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
+           assert.ok(message.equals(Buffer.from(array.buffer)));
++          assert.ok(flags.binary);
++          assert.ok(flags.masked);
+           wss.close(done);
+         });
+       });
+@@ -1483,12 +1493,13 @@ describe('WebSocket', function () {
+       wss.on('connection', (client) => client.send('hi'));
+     });
+ 
+-    it('should pass binary data as a Node.js Buffer by default', function (done) {
++    it('should pass binary data as a node.js Buffer by default', function (done) {
+       const wss = new WebSocketServer({ port: ++port }, () => {
+         const ws = new WebSocket(`ws://localhost:${port}`);
+ 
+         ws.onmessage = (evt) => {
+           assert.ok(Buffer.isBuffer(evt.data));
++          assert.ok(evt.binary);
+           wss.close(done);
+         };
+       });
+@@ -1504,6 +1515,7 @@ describe('WebSocket', function () {
+ 
+         ws.onmessage = (evt) => {
+           assert.ok(evt.data instanceof ArrayBuffer);
++          assert.ok(evt.binary);
+           wss.close(done);
+         };
+       });
+@@ -1643,7 +1655,7 @@ describe('WebSocket', function () {
+       const wss = new WebSocketServer({ server });
+ 
+       wss.on('connection', (ws) => {
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
+           assert.strictEqual(message, 'foobar');
+           server.close(done);
+           wss.close();
+@@ -1679,7 +1691,8 @@ describe('WebSocket', function () {
+         });
+ 
+         ws.on('open', () => ws.send(buf));
+-        ws.on('message', (message) => {
++        ws.on('message', (message, flags) => {
++          assert.strictEqual(flags.binary, true);
+           assert.ok(buf.equals(message));
+ 
+           server.close(done);
+diff --git a/test/WebSocketServer.test.js b/test/WebSocketServer.test.js
+index 35948256..de081a5b 100644
+--- a/test/WebSocketServer.test.js
++++ b/test/WebSocketServer.test.js
+@@ -105,20 +105,6 @@ describe('WebSocketServer', function () {
+       });
+     });
+ 
+-    it('emits path specific connection event', function (done) {
+-      const server = http.createServer();
+-
+-      server.listen(++port, () => {
+-        const wss = new WebSocketServer({ server });
+-        const ws = new WebSocket(`ws://localhost:${port}/endpointName`);
+-
+-        wss.on('connection/endpointName', (ws) => {
+-          wss.close();
+-          server.close(done);
+-        });
+-      });
+-    });
+-
+     it('will not crash when it receives an unhandled opcode', function (done) {
+       const wss = new WebSocketServer({ port: ++port });
+ 
+@@ -904,7 +890,7 @@ describe('WebSocketServer', function () {
+       const wss = new WebSocketServer({ port: ++port }, () => {
+         const ws = new WebSocket(`ws://localhost:${port}`);
+ 
+-        ws.on('message', (message) => ws.send(message));
++        ws.on('message', (message, flags) => ws.send(message));
+       });
+ 
+       wss.on('connection', (client) => {

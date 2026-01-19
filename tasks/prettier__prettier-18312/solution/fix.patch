@@ -1,0 +1,164 @@
+diff --git a/src/language-markdown/print-preprocess.js b/src/language-markdown/print-preprocess.js
+index 7041194cd..50d2bc77c 100644
+--- a/src/language-markdown/print-preprocess.js
++++ b/src/language-markdown/print-preprocess.js
+@@ -12,7 +12,11 @@ function preprocess(ast, options) {
+     ast = addRawToText(ast, options);
+   }
+   ast = mergeContinuousTexts(ast);
+-  ast = transformIndentedCodeblockAndMarkItsParentList(ast, options);
++  if (options.parser === "mdx") {
++    ast = transformIndentedCodeblockAndMarkItsParentList(ast, options);
++  } else {
++    ast = transformIndentedCodeblock(ast, options);
++  }
+   ast = markAlignedList(ast, options);
+   if (options.parser === "mdx") {
+     ast = splitTextIntoSentencesLegacy(ast);
+@@ -179,6 +183,24 @@ function splitTextIntoSentences(ast) {
+   });
+ }
+ 
++function transformIndentedCodeblock(ast, options) {
++  return mapAst(ast, (node) => {
++    if (node.type !== "code") {
++      return node;
++    }
++    // the first char may point to `\n`, e.g. `\n\t\tbar`, just ignore it
++    const isIndented = /^\n?(?: {4,}|\t)/u.test(
++      options.originalText.slice(
++        node.position.start.offset,
++        node.position.end.offset,
++      ),
++    );
++
++    node.isIndented = isIndented;
++    return node;
++  });
++}
++
+ function transformIndentedCodeblockAndMarkItsParentList(ast, options) {
+   return mapAst(ast, (node, index, parentStack) => {
+     if (node.type === "code") {
+diff --git a/src/language-markdown/print/list.js b/src/language-markdown/print/list.js
+index 5f9ee860a..711b2685a 100644
+--- a/src/language-markdown/print/list.js
++++ b/src/language-markdown/print/list.js
+@@ -25,6 +25,63 @@ function printList(path, options, print) {
+     options,
+   );
+ 
++  return printChildren(path, options, print, {
++    processor() {
++      const prefix = getPrefix();
++      const { node: childNode } = path;
++
++      if (
++        childNode.children.length === 2 &&
++        childNode.children[1].type === "html" &&
++        childNode.children[0].position.start.column !==
++          childNode.children[1].position.start.column
++      ) {
++        return [prefix, printListItem(path, options, print, prefix)];
++      }
++
++      return [
++        prefix,
++        align(
++          " ".repeat(prefix.length),
++          printListItem(path, options, print, prefix),
++        ),
++      ];
++
++      function getPrefix() {
++        const rawPrefix = node.ordered
++          ? (path.isFirst
++              ? node.start
++              : isGitDiffFriendlyOrderedList
++                ? 1
++                : node.start + path.index) +
++            (nthSiblingIndex % 2 === 0 ? ". " : ") ")
++          : nthSiblingIndex % 2 === 0
++            ? "- "
++            : "* ";
++
++        return node.isAligned && node.ordered
++          ? alignListPrefix(rawPrefix, options)
++          : rawPrefix;
++      }
++    },
++  });
++}
++
++/**
++ * @param {AstPath} path
++ * @param {*} options
++ * @param {() => Doc} print
++ * @return {Doc}
++ */
++function printListLegacy(path, options, print) {
++  const { node } = path;
++  const nthSiblingIndex = getNthListSiblingIndex(node, path.parent);
++
++  const isGitDiffFriendlyOrderedList = hasGitDiffFriendlyOrderedList(
++    node,
++    options,
++  );
++
+   return printChildren(path, options, print, {
+     processor() {
+       const prefix = getPrefix();
+@@ -108,4 +165,4 @@ function clamp(value, min, max) {
+   return Math.max(min, Math.min(value, max));
+ }
+ 
+-export { printList };
++export { printList, printListLegacy };
+diff --git a/src/language-markdown/printer-markdown.js b/src/language-markdown/printer-markdown.js
+index a9fe231cd..593d48f40 100644
+--- a/src/language-markdown/printer-markdown.js
++++ b/src/language-markdown/printer-markdown.js
+@@ -25,7 +25,7 @@ import getVisitorKeys from "./get-visitor-keys.js";
+ import { locEnd, locStart } from "./loc.js";
+ import { insertPragma } from "./pragma.js";
+ import { printChildren } from "./print/children.js";
+-import { printList } from "./print/list.js";
++import { printList, printListLegacy } from "./print/list.js";
+ import { printTable } from "./print/table.js";
+ import { printParagraph } from "./print-paragraph.js";
+ import preprocess from "./print-preprocess.js";
+@@ -299,6 +299,9 @@ function genericPrint(path, options, print) {
+       );
+     }
+     case "list":
++      if (options.parser === "mdx") {
++        return printListLegacy(path, options, print);
++      }
+       return printList(path, options, print);
+     case "thematicBreak": {
+       const { ancestors } = path;
+diff --git a/src/language-markdown/utils.js b/src/language-markdown/utils.js
+index 10ebec33f..9f400efd0 100644
+--- a/src/language-markdown/utils.js
++++ b/src/language-markdown/utils.js
+@@ -181,10 +181,19 @@ function splitText(text) {
+ }
+ 
+ function getOrderedListItemInfo(orderListItem, options) {
+-  const text = options.originalText.slice(
++  let text = options.originalText.slice(
+     orderListItem.position.start.offset,
+     orderListItem.position.end.offset,
+   );
++  if (options.parser !== "mdx") {
++    const firstChild = orderListItem.children[0];
++    if (firstChild?.position) {
++      text = options.originalText.slice(
++        orderListItem.position.start.offset,
++        firstChild.position.start.offset,
++      );
++    }
++  }
+ 
+   const { numberText, leadingSpaces } = text.match(
+     /^\s*(?<numberText>\d+)(\.|\))(?<leadingSpaces>\s*)/u,

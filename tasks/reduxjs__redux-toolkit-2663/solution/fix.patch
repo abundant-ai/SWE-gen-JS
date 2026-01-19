@@ -1,0 +1,154 @@
+diff --git a/packages/toolkit/src/query/core/buildInitiate.ts b/packages/toolkit/src/query/core/buildInitiate.ts
+index cbb5c19d..f29514cb 100644
+--- a/packages/toolkit/src/query/core/buildInitiate.ts
++++ b/packages/toolkit/src/query/core/buildInitiate.ts
+@@ -5,11 +5,10 @@ import type {
+   QueryArgFrom,
+   ResultTypeFrom,
+ } from '../endpointDefinitions'
+-import { DefinitionType } from '../endpointDefinitions'
++import { DefinitionType, isQueryDefinition } from '../endpointDefinitions'
+ import type { QueryThunk, MutationThunk, QueryThunkArg } from './buildThunks'
+ import type { AnyAction, ThunkAction, SerializedError } from '@reduxjs/toolkit'
+ import type { SubscriptionOptions, RootState } from './apiState'
+-import { QueryStatus } from './apiState'
+ import type { InternalSerializeQueryArgs } from '../defaultSerializeQueryArgs'
+ import type { Api, ApiContext } from '../apiTypes'
+ import type { ApiEndpointQuery } from './module'
+@@ -279,10 +278,11 @@ Features like automatic cache collection, automatic refetching etc. will not be
+           endpointDefinition,
+           endpointName,
+         })
++
+         const thunk = queryThunk({
+           type: 'query',
+           subscribe,
+-          forceRefetch,
++          forceRefetch: forceRefetch,
+           subscriptionOptions,
+           endpointName,
+           originalArgs: arg,
+diff --git a/packages/toolkit/src/query/core/buildThunks.ts b/packages/toolkit/src/query/core/buildThunks.ts
+index d6a111b1..67291aad 100644
+--- a/packages/toolkit/src/query/core/buildThunks.ts
++++ b/packages/toolkit/src/query/core/buildThunks.ts
+@@ -12,10 +12,11 @@ import type {
+   QueryActionCreatorResult,
+ } from './buildInitiate'
+ import { forceQueryFnSymbol, isUpsertQuery } from './buildInitiate'
+-import type {
++import {
+   AssertTagTypes,
+   EndpointDefinition,
+   EndpointDefinitions,
++  isQueryDefinition,
+   MutationDefinition,
+   QueryArgFrom,
+   QueryDefinition,
+@@ -474,26 +475,51 @@ In the case of an unhandled error, no tags will be "provided" or "invalidated".`
+     getPendingMeta() {
+       return { startedTimeStamp: Date.now() }
+     },
+-    condition(arg, { getState }) {
++    condition(queryThunkArgs, { getState }) {
+       const state = getState()
+-      const requestState = state[reducerPath]?.queries?.[arg.queryCacheKey]
++
++      const requestState =
++        state[reducerPath]?.queries?.[queryThunkArgs.queryCacheKey]
+       const fulfilledVal = requestState?.fulfilledTimeStamp
++      const currentArg = queryThunkArgs.originalArgs
++      const previousArg = requestState?.originalArgs
++      const endpointDefinition =
++        endpointDefinitions[queryThunkArgs.endpointName]
+ 
+       // Order of these checks matters.
+       // In order for `upsertQueryData` to successfully run while an existing request is in flight,
+       /// we have to check for that first, otherwise `queryThunk` will bail out and not run at all.
+-      if (isUpsertQuery(arg)) return true
++      if (isUpsertQuery(queryThunkArgs)) {
++        return true
++      }
+ 
+       // Don't retry a request that's currently in-flight
+-      if (requestState?.status === 'pending') return false
++      if (requestState?.status === 'pending') {
++        return false
++      }
+ 
+       // if this is forced, continue
+-      if (isForcedQuery(arg, state)) return true
++      if (isForcedQuery(queryThunkArgs, state)) {
++        return true
++      }
++
++      if (
++        isQueryDefinition(endpointDefinition) &&
++        endpointDefinition?.forceRefetch?.({
++          currentArg,
++          previousArg,
++          endpointState: requestState,
++          state,
++        })
++      ) {
++        return true
++      }
+ 
+       // Pull from the cache unless we explicitly force refetch or qualify based on time
+-      if (fulfilledVal)
++      if (fulfilledVal) {
+         // Value is cached and we didn't specify to refresh, skip it.
+         return false
++      }
+ 
+       return true
+     },
+diff --git a/packages/toolkit/src/query/endpointDefinitions.ts b/packages/toolkit/src/query/endpointDefinitions.ts
+index 477c8ddd..f0bc6c75 100644
+--- a/packages/toolkit/src/query/endpointDefinitions.ts
++++ b/packages/toolkit/src/query/endpointDefinitions.ts
+@@ -1,6 +1,6 @@
+ import type { AnyAction, ThunkDispatch } from '@reduxjs/toolkit'
+ import { SerializeQueryArgs } from './defaultSerializeQueryArgs'
+-import type { RootState } from './core/apiState'
++import type { QuerySubState, RootState } from './core/apiState'
+ import type {
+   BaseQueryExtraOptions,
+   BaseQueryFn,
+@@ -339,6 +339,36 @@ export interface QueryExtraOptions<
+     responseData: ResultType
+   ): ResultType | void
+ 
++  /**
++   * Check to see if the endpoint should force a refetch in cases where it normally wouldn't.
++   * This is primarily useful for "infinite scroll" / pagination use cases where
++   * RTKQ is keeping a single cache entry that is added to over time, in combination
++   * with `serializeQueryArgs` returning a fixed cache key and a `merge` callback
++   * set to add incoming data to the cache entry each time.
++   *
++   * Example:
++   *
++   * ```ts
++   * forceRefetch({currentArg, previousArg}) {
++   *   // Assume these are page numbers
++   *   return currentArg !== previousArg
++   * },
++   * serializeQueryArgs({endpointName}) {
++   *   return endpointName
++   * },
++   * merge(currentCacheData, responseData) {
++   *   currentCacheData.push(...responseData)
++   * }
++   *
++   * ```
++   */
++  forceRefetch?(params: {
++    currentArg: QueryArg | undefined
++    previousArg: QueryArg | undefined
++    state: RootState<any, any, string>
++    endpointState?: QuerySubState<any>
++  }): boolean
++
+   /**
+    * All of these are `undefined` at runtime, purely to be used in TypeScript declarations!
+    */

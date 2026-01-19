@@ -1,0 +1,380 @@
+diff --git a/lib/config/flat-config-array.js b/lib/config/flat-config-array.js
+index ad8986f51..becf1e10b 100644
+--- a/lib/config/flat-config-array.js
++++ b/lib/config/flat-config-array.js
+@@ -139,72 +139,31 @@ class FlatConfigArray extends ConfigArray {
+     [ConfigArraySymbol.finalizeConfig](config) {
+ 
+         const { plugins, languageOptions, processor } = config;
+-        let parserName, processorName;
+-        let invalidParser = false,
+-            invalidProcessor = false;
+ 
+         // Check parser value
+-        if (languageOptions && languageOptions.parser) {
+-            if (typeof languageOptions.parser === "string") {
+-                const { pluginName, objectName: localParserName } = splitPluginIdentifier(languageOptions.parser);
++        if (languageOptions && languageOptions.parser && typeof languageOptions.parser === "string") {
++            const { pluginName, objectName: parserName } = splitPluginIdentifier(languageOptions.parser);
+ 
+-                parserName = languageOptions.parser;
+-
+-                if (!plugins || !plugins[pluginName] || !plugins[pluginName].parsers || !plugins[pluginName].parsers[localParserName]) {
+-                    throw new TypeError(`Key "parser": Could not find "${localParserName}" in plugin "${pluginName}".`);
+-                }
+-
+-                languageOptions.parser = plugins[pluginName].parsers[localParserName];
+-            } else {
+-                invalidParser = true;
++            if (!plugins || !plugins[pluginName] || !plugins[pluginName].parsers || !plugins[pluginName].parsers[parserName]) {
++                throw new TypeError(`Key "parser": Could not find "${parserName}" in plugin "${pluginName}".`);
+             }
++
++            languageOptions.parser = plugins[pluginName].parsers[parserName];
+         }
+ 
+         // Check processor value
+-        if (processor) {
+-            if (typeof processor === "string") {
+-                const { pluginName, objectName: localProcessorName } = splitPluginIdentifier(processor);
+-
+-                processorName = processor;
+-
+-                if (!plugins || !plugins[pluginName] || !plugins[pluginName].processors || !plugins[pluginName].processors[localProcessorName]) {
+-                    throw new TypeError(`Key "processor": Could not find "${localProcessorName}" in plugin "${pluginName}".`);
+-                }
++        if (processor && typeof processor === "string") {
++            const { pluginName, objectName: processorName } = splitPluginIdentifier(processor);
+ 
+-                config.processor = plugins[pluginName].processors[localProcessorName];
+-            } else {
+-                invalidProcessor = true;
++            if (!plugins || !plugins[pluginName] || !plugins[pluginName].processors || !plugins[pluginName].processors[processorName]) {
++                throw new TypeError(`Key "processor": Could not find "${processorName}" in plugin "${pluginName}".`);
+             }
++
++            config.processor = plugins[pluginName].processors[processorName];
+         }
+ 
+         ruleValidator.validate(config);
+ 
+-        // apply special logic for serialization into JSON
+-        /* eslint-disable object-shorthand -- shorthand would change "this" value */
+-        Object.defineProperty(config, "toJSON", {
+-            value: function() {
+-
+-                if (invalidParser) {
+-                    throw new Error("Caching is not supported when parser is an object.");
+-                }
+-
+-                if (invalidProcessor) {
+-                    throw new Error("Caching is not supported when processor is an object.");
+-                }
+-
+-                return {
+-                    ...this,
+-                    plugins: Object.keys(plugins),
+-                    languageOptions: {
+-                        ...languageOptions,
+-                        parser: parserName
+-                    },
+-                    processor: processorName
+-                };
+-            }
+-        });
+-        /* eslint-enable object-shorthand -- ok to enable now */
+-
+         return config;
+     }
+     /* eslint-enable class-methods-use-this -- Desired as instance method */
+diff --git a/lib/eslint/eslint-helpers.js b/lib/eslint/eslint-helpers.js
+index 5818d8d10..bf5c32a64 100644
+--- a/lib/eslint/eslint-helpers.js
++++ b/lib/eslint/eslint-helpers.js
+@@ -436,6 +436,9 @@ function processOptions({
+     if (typeof cache !== "boolean") {
+         errors.push("'cache' must be a boolean.");
+     }
++    if (cache) {
++        errors.push("'cache' option is not yet supported.");
++    }
+     if (!isNonEmptyString(cacheLocation)) {
+         errors.push("'cacheLocation' must be a non-empty string.");
+     }
+diff --git a/lib/eslint/flat-eslint.js b/lib/eslint/flat-eslint.js
+index 6755356f1..1867050e4 100644
+--- a/lib/eslint/flat-eslint.js
++++ b/lib/eslint/flat-eslint.js
+@@ -30,7 +30,6 @@ const {
+ const {
+     fileExists,
+     findFiles,
+-    getCacheFile,
+ 
+     isNonEmptyString,
+     isArrayOfNonEmptyString,
+@@ -42,7 +41,6 @@ const {
+ } = require("./eslint-helpers");
+ const { pathToFileURL } = require("url");
+ const { FlatConfigArray } = require("../config/flat-config-array");
+-const LintResultCache = require("../cli-engine/lint-result-cache");
+ 
+ /*
+  * This is necessary to allow overwriting writeFile for testing purposes.
+@@ -608,20 +606,9 @@ class FlatESLint {
+             configType: "flat"
+         });
+ 
+-        const cacheFilePath = getCacheFile(
+-            processedOptions.cacheLocation,
+-            processedOptions.cwd
+-        );
+-
+-        const lintResultCache = processedOptions.cache
+-            ? new LintResultCache(cacheFilePath, processedOptions.cacheStrategy)
+-            : null;
+-
+         privateMembers.set(this, {
+             options: processedOptions,
+             linter,
+-            cacheFilePath,
+-            lintResultCache,
+             defaultConfigs,
+             defaultIgnores: () => false,
+             configs: null
+@@ -795,8 +782,6 @@ class FlatESLint {
+ 
+         // Delete cache file; should this be done here?
+         if (!cache && cacheFilePath) {
+-            debug(`Deleting cache file at ${cacheFilePath}`);
+-
+             try {
+                 await fs.unlink(cacheFilePath);
+             } catch (error) {
+diff --git a/tests/lib/config/flat-config-array.js b/tests/lib/config/flat-config-array.js
+index 675257ee8..bf154ccff 100644
+--- a/tests/lib/config/flat-config-array.js
++++ b/tests/lib/config/flat-config-array.js
+@@ -13,7 +13,6 @@ const { FlatConfigArray } = require("../../../lib/config/flat-config-array");
+ const assert = require("chai").assert;
+ const allConfig = require("../../../conf/eslint-all");
+ const recommendedConfig = require("../../../conf/eslint-recommended");
+-const stringify = require("json-stable-stringify-without-jsonify");
+ 
+ //-----------------------------------------------------------------------------
+ // Helpers
+@@ -183,78 +182,6 @@ describe("FlatConfigArray", () => {
+         assert.notStrictEqual(base[0].languageOptions.parserOptions, config.languageOptions.parserOptions, "parserOptions should be new object");
+     });
+ 
+-    describe("Serialization of configs", () => {
+-        it("should convert config into normalized JSON object", () => {
+-
+-            const configs = new FlatConfigArray([{
+-                plugins: {
+-                    a: {},
+-                    b: {}
+-                }
+-            }]);
+-
+-            configs.normalizeSync();
+-
+-            const config = configs.getConfig("foo.js");
+-            const expected = {
+-                plugins: ["@", "a", "b"],
+-                languageOptions: {
+-                    ecmaVersion: "latest",
+-                    sourceType: "module",
+-                    parser: "@/espree",
+-                    parserOptions: {}
+-                },
+-                processor: void 0
+-            };
+-            const actual = config.toJSON();
+-
+-            assert.deepStrictEqual(actual, expected);
+-
+-            assert.strictEqual(stringify(actual), stringify(expected));
+-        });
+-
+-        it("should throw an error when config with parser object is normalized", () => {
+-
+-            const configs = new FlatConfigArray([{
+-                languageOptions: {
+-                    parser: {
+-                        parse() { /* empty */ }
+-                    }
+-                }
+-            }]);
+-
+-            configs.normalizeSync();
+-
+-            const config = configs.getConfig("foo.js");
+-
+-            assert.throws(() => {
+-                config.toJSON();
+-            }, /Caching is not supported/u);
+-
+-        });
+-
+-        it("should throw an error when config with processor object is normalized", () => {
+-
+-            const configs = new FlatConfigArray([{
+-                processor: {
+-                    preprocess() { /* empty */ },
+-                    postprocess() { /* empty */ }
+-                }
+-            }]);
+-
+-            configs.normalizeSync();
+-
+-            const config = configs.getConfig("foo.js");
+-
+-            assert.throws(() => {
+-                config.toJSON();
+-            }, /Caching is not supported/u);
+-
+-        });
+-
+-
+-    });
+-
+     describe("Special configs", () => {
+         it("eslint:recommended is replaced with an actual config", async () => {
+             const configs = new FlatConfigArray(["eslint:recommended"]);
+diff --git a/tests/lib/eslint/flat-eslint.js b/tests/lib/eslint/flat-eslint.js
+index d06ab5267..62f1afd6b 100644
+--- a/tests/lib/eslint/flat-eslint.js
++++ b/tests/lib/eslint/flat-eslint.js
+@@ -1396,7 +1396,7 @@ describe("FlatESLint", () => {
+             });
+ 
+             // Cannot be run properly until cache is implemented
+-            it("should run autofix even if files are cached without autofix results", async () => {
++            xit("should run autofix even if files are cached without autofix results", async () => {
+                 const baseOptions = {
+                     cwd: path.join(fixtureDir, ".."),
+                     overrideConfigFile: true,
+@@ -1470,7 +1470,7 @@ describe("FlatESLint", () => {
+             });
+         });
+ 
+-        describe("cache", () => {
++        xdescribe("cache", () => {
+ 
+             /**
+              * helper method to delete a file without caring about exceptions
+@@ -1609,15 +1609,11 @@ describe("FlatESLint", () => {
+                 assert(shell.test("-f", path.resolve(cwd, ".eslintcache")), "the cache for eslint was created at provided cwd");
+             });
+ 
+-            it("should invalidate the cache if the overrideConfig changed between executions", async () => {
+-                const cwd = getFixturePath("cache/src");
+-                const cacheLocation = path.resolve(cwd, ".eslintcache");
+-
+-                assert(!shell.test("-f", cacheLocation), "the cache for eslint does not exist");
++            it("should invalidate the cache if the configuration changed between executions", async () => {
++                assert(!shell.test("-f", path.resolve(".eslintcache")), "the cache for eslint does not exist");
+ 
+                 eslint = new FlatESLint({
+                     overrideConfigFile: true,
+-                    cwd,
+ 
+                     // specifying cache true the cache will be created
+                     cache: true,
+@@ -1631,9 +1627,9 @@ describe("FlatESLint", () => {
+                     ignore: false
+                 });
+ 
+-                let spy = sinon.spy(fs.promises, "readFile");
++                let spy = sinon.spy(fs, "readFileSync");
+ 
+-                let file = path.join(cwd, "test-file.js");
++                let file = getFixturePath("cache/src", "test-file.js");
+ 
+                 file = fs.realpathSync(file);
+                 const results = await eslint.lintFiles([file]);
+@@ -1641,16 +1637,14 @@ describe("FlatESLint", () => {
+                 for (const { errorCount, warningCount } of results) {
+                     assert.strictEqual(errorCount + warningCount, 0, "the file passed without errors or warnings");
+                 }
+-
+-                assert(spy.calledWith(file), "ESLint should have read the file because it's considered changed");
+-                assert(shell.test("-f", cacheLocation), "the cache for eslint should still exist");
++                assert.strictEqual(spy.getCall(0).args[0], file, "the module read the file because is considered changed");
++                assert(shell.test("-f", path.resolve(".eslintcache")), "the cache for eslint was created");
+ 
+                 // destroy the spy
+                 sinon.restore();
+ 
+                 eslint = new FlatESLint({
+                     overrideConfigFile: true,
+-                    cwd,
+ 
+                     // specifying cache true the cache will be created
+                     cache: true,
+@@ -1665,23 +1659,20 @@ describe("FlatESLint", () => {
+                 });
+ 
+                 // create a new spy
+-                spy = sinon.spy(fs.promises, "readFile");
++                spy = sinon.spy(fs, "readFileSync");
+ 
+                 const [cachedResult] = await eslint.lintFiles([file]);
+ 
+-                assert(spy.calledWith(file), "ESLint should have read the file again because is considered changed because the config changed");
+-                assert.strictEqual(cachedResult.errorCount, 1, "since configuration changed the cache was not used and one error was reported");
+-                assert(shell.test("-f", cacheLocation), "The cache for ESLint should still exist (2)");
++                assert.strictEqual(spy.getCall(0).args[0], file, "the module read the file because is considered changed because the config changed");
++                assert.strictEqual(cachedResult.errorCount, 1, "since configuration changed the cache was not used an one error was reported");
++                assert(shell.test("-f", path.resolve(".eslintcache")), "the cache for eslint was created");
+             });
+ 
+             it("should remember the files from a previous run and do not operate on them if not changed", async () => {
+-
+-                const cwd = getFixturePath("cache/src");
+-                const cacheLocation = path.resolve(cwd, ".eslintcache");
++                assert(!shell.test("-f", path.resolve(".eslintcache")), "the cache for eslint does not exist");
+ 
+                 eslint = new FlatESLint({
+                     overrideConfigFile: true,
+-                    cwd,
+ 
+                     // specifying cache true the cache will be created
+                     cache: true,
+@@ -1695,7 +1686,7 @@ describe("FlatESLint", () => {
+                     ignore: false
+                 });
+ 
+-                let spy = sinon.spy(fs.promises, "readFile");
++                let spy = sinon.spy(fs, "readFileSync");
+ 
+                 let file = getFixturePath("cache/src", "test-file.js");
+ 
+@@ -1703,15 +1694,14 @@ describe("FlatESLint", () => {
+ 
+                 const result = await eslint.lintFiles([file]);
+ 
+-                assert(spy.calledWith(file), "the module read the file because is considered changed");
+-                assert(shell.test("-f", cacheLocation), "the cache for eslint was created");
++                assert.strictEqual(spy.getCall(0).args[0], file, "the module read the file because is considered changed");
++                assert(shell.test("-f", path.resolve(".eslintcache")), "the cache for eslint was created");
+ 
+                 // destroy the spy
+                 sinon.restore();
+ 
+                 eslint = new FlatESLint({
+                     overrideConfigFile: true,
+-                    cwd,
+ 
+                     // specifying cache true the cache will be created
+                     cache: true,
+@@ -1726,7 +1716,7 @@ describe("FlatESLint", () => {
+                 });
+ 
+                 // create a new spy
+-                spy = sinon.spy(fs.promises, "readFile");
++                spy = sinon.spy(fs, "readFileSync");
+ 
+                 const cachedResult = await eslint.lintFiles([file]);
+ 

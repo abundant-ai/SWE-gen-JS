@@ -1,0 +1,439 @@
+diff --git a/changelog_unreleased/misc/15709.md b/changelog_unreleased/misc/15709.md
+new file mode 100644
+index 000000000..20235d75f
+--- /dev/null
++++ b/changelog_unreleased/misc/15709.md
+@@ -0,0 +1,5 @@
++#### Fix `cursorOffset` feature sometimes being catastrophically slow (#15709 by @ExplodingCabbage)
++
++Previously, Prettier's `cursorOffset` feature would be spectacularly slow in certain unfortunate circumstances (namely when the user's cursor was not contained within a leaf node of the AST, and the non-leaf node containing it was very large and being significantly reformatted by Prettier). As a consequence, if you used Prettier via an editor integration that used `cursorOffset` under the hood, your editor would sometimes inexplicably hang when you tried to format a file.
++
++All examples of this phenomenon that we are aware of should now be fixed, but bug reports of any further pathological examples would be welcome.
+diff --git a/src/document/printer.js b/src/document/printer.js
+index 32f9590f7..196691b42 100644
+--- a/src/document/printer.js
++++ b/src/document/printer.js
+@@ -651,6 +651,38 @@ function printDocToString(doc, options) {
+       CURSOR_PLACEHOLDER,
+       cursorPlaceholderIndex + 1,
+     );
++
++    if (otherCursorPlaceholderIndex === -1) {
++      // If we got here, the doc must have contained ONE cursor command,
++      // instead of the expected zero or two. If the doc being printed was
++      // returned by printAstToDoc, then the only ways this can have happened
++      // are if:
++      // 1. a plugin added a cursor command itself, or
++      // 2. one (but not both) of options.nodeAfterCursor and
++      //    options.nodeAfterCursor pointed to a node within a subtree of the
++      //    AST that the printer plugin used in printAstToDoc simply omits from
++      //    the doc, or that it prints without recursively calling mainPrint,
++      //    with the consequence that the logic for adding a cursor command in
++      //    callPluginPrintFunction was never called for that node.
++      // These are both weird scenarios that should be considered a bug if they
++      // ever occur with one of Prettier's built-in plugins. If a third-party
++      // plugin was used when printing the AST to a doc, the possibility of
++      // reaching this scenario MIGHT be reasonable to consider a bug in the
++      // plugin. However, we try to at least not crash if this ever happens;
++      // instead we simply give up on returning a cursorNodeStart or
++      // cursorNodeText.
++      //
++      // coreFormat has logic specifically to handle this scenario - where it
++      // is supposed to preserve the cursor position but the printer gives it
++      // no information about where the nodes around the cursor ended up -
++      // although that logic is unavoidably slower (and has more potential to
++      // return a perverse result) than the happy path where we help out
++      // coreFormat by returning a cursorNodeStart and cursorNodeText here.
++      return {
++        formatted: out.filter((char) => char !== CURSOR_PLACEHOLDER).join(""),
++      };
++    }
++
+     const beforeCursor = out.slice(0, cursorPlaceholderIndex).join("");
+     const aroundCursor = out
+       .slice(cursorPlaceholderIndex + 1, otherCursorPlaceholderIndex)
+diff --git a/src/document/public.d.ts b/src/document/public.d.ts
+index c92651161..50117757c 100644
+--- a/src/document/public.d.ts
++++ b/src/document/public.d.ts
+@@ -192,7 +192,18 @@ export namespace printer {
+     options: Options,
+   ): {
+     formatted: string;
++    /**
++     * This property is a misnomer, and has been since the changes in
++     * https://github.com/prettier/prettier/pull/15709.
++     * The region of the document indicated by `cursorNodeStart` and `cursorNodeText` will
++     * sometimes actually be what lies BETWEEN a pair of leaf nodes in the AST, rather than a node.
++     */
+     cursorNodeStart?: number | undefined;
++
++    /**
++     * Note that, like cursorNodeStart, this is a misnomer and may actually be the text between two
++     * leaf nodes in the AST instead of the text of a node.
++     */
+     cursorNodeText?: string | undefined;
+   };
+   interface Options {
+diff --git a/src/language-js/print/jsx.js b/src/language-js/print/jsx.js
+index f685cf299..870fb4fde 100644
+--- a/src/language-js/print/jsx.js
++++ b/src/language-js/print/jsx.js
+@@ -244,14 +244,25 @@ function printJsxElementInternal(path, options, print) {
+     : group(multilineChildren, { shouldBreak: true });
+ 
+   /*
+-  `printJsxChildren` won't call `print` on `JSXText`
+-  When the cursorNode is inside `cursor` won't get print.
++  `printJsxChildren` won't call `print` on `JSXText`, so when the cursorNode,
++  nodeBeforeCursor, or nodeAfterCursor is inside, `cursor` won't get printed.
++  This logic fixes that:
+   */
+   if (
+     options.cursorNode?.type === "JSXText" &&
+     node.children.includes(options.cursorNode)
+   ) {
+     content = [cursor, content, cursor];
++  } else if (
++    options.nodeBeforeCursor?.type === "JSXText" &&
++    node.children.includes(options.nodeBeforeCursor)
++  ) {
++    content = [cursor, content];
++  } else if (
++    options.nodeAfterCursor?.type === "JSXText" &&
++    node.children.includes(options.nodeAfterCursor)
++  ) {
++    content = [content, cursor];
+   }
+ 
+   if (isMdxBlock) {
+diff --git a/src/main/ast-to-doc.js b/src/main/ast-to-doc.js
+index c8beb4b72..7d2f23703 100644
+--- a/src/main/ast-to-doc.js
++++ b/src/main/ast-to-doc.js
+@@ -51,6 +51,13 @@ async function printAstToDoc(ast, options) {
+ 
+   ensureAllCommentsPrinted(options);
+ 
++  if (options.nodeAfterCursor && !options.nodeBeforeCursor) {
++    return [cursor, doc];
++  }
++  if (options.nodeBeforeCursor && !options.nodeAfterCursor) {
++    return [doc, cursor];
++  }
++
+   return doc;
+ 
+   function mainPrint(selector, args) {
+@@ -106,8 +113,16 @@ function callPluginPrintFunction(path, options, printPath, args, embeds) {
+     doc = printer.print(path, options, printPath, args);
+   }
+ 
+-  if (node === options.cursorNode) {
+-    doc = inheritLabel(doc, (doc) => [cursor, doc, cursor]);
++  switch (node) {
++    case options.cursorNode:
++      doc = inheritLabel(doc, (doc) => [cursor, doc, cursor]);
++      break;
++    case options.nodeBeforeCursor:
++      doc = inheritLabel(doc, (doc) => [doc, cursor]);
++      break;
++    case options.nodeAfterCursor:
++      doc = inheritLabel(doc, (doc) => [cursor, doc]);
++      break;
+   }
+ 
+   // We let JSXElement print its comments itself because it adds () around
+diff --git a/src/main/core.js b/src/main/core.js
+index 11cb07196..fffebf096 100644
+--- a/src/main/core.js
++++ b/src/main/core.js
+@@ -11,7 +11,7 @@ import { printDocToDebug } from "../document/debug.js";
+ import { printDocToString as printDocToStringWithoutNormalizeOptions } from "../document/printer.js";
+ import getAlignmentSize from "../utils/get-alignment-size.js";
+ import { prepareToPrint, printAstToDoc } from "./ast-to-doc.js";
+-import getCursorNode from "./get-cursor-node.js";
++import getCursorLocation from "./get-cursor-node.js";
+ import massageAst from "./massage-ast.js";
+ import normalizeFormatOptions from "./normalize-format-options.js";
+ import parseText from "./parse.js";
+@@ -30,7 +30,10 @@ async function coreFormat(originalText, opts, addAlignmentSize = 0) {
+   const { ast, text } = await parseText(originalText, opts);
+ 
+   if (opts.cursorOffset >= 0) {
+-    opts.cursorNode = getCursorNode(ast, opts);
++    opts = {
++      ...opts,
++      ...getCursorLocation(ast, opts),
++    };
+   }
+ 
+   let doc = await printAstToDoc(ast, opts, addAlignmentSize);
+@@ -48,6 +51,16 @@ async function coreFormat(originalText, opts, addAlignmentSize = 0) {
+ 
+     if (result.cursorNodeStart !== undefined) {
+       result.cursorNodeStart -= result.formatted.indexOf(trimmed);
++      if (result.cursorNodeStart < 0) {
++        result.cursorNodeStart = 0;
++        result.cursorNodeText = result.cursorNodeText.trimStart();
++      }
++      if (
++        result.cursorNodeStart + result.cursorNodeText.length >
++        trimmed.length
++      ) {
++        result.cursorNodeText = result.cursorNodeText.trimEnd();
++      }
+     }
+ 
+     result.formatted = trimmed + convertEndOfLineToChars(opts.endOfLine);
+@@ -56,40 +69,75 @@ async function coreFormat(originalText, opts, addAlignmentSize = 0) {
+   const comments = opts[Symbol.for("comments")];
+ 
+   if (opts.cursorOffset >= 0) {
+-    let oldCursorNodeStart;
+-    let oldCursorNodeText;
+-
+-    let cursorOffsetRelativeToOldCursorNode;
+-
+-    let newCursorNodeStart;
+-    let newCursorNodeText;
+-
+-    if (opts.cursorNode && result.cursorNodeText) {
+-      oldCursorNodeStart = opts.locStart(opts.cursorNode);
+-      oldCursorNodeText = text.slice(
+-        oldCursorNodeStart,
+-        opts.locEnd(opts.cursorNode),
+-      );
+-
+-      cursorOffsetRelativeToOldCursorNode =
+-        opts.cursorOffset - oldCursorNodeStart;
++    // Roughly, our logic for preserving the user's cursor position is as
++    // follows:
++    // 1. Before formatting, identify from the AST the smallest possible region
++    //    of the document that contains the cursor. (This will either be a leaf
++    //    node, a range between two nodes, or a range between a node and the
++    //    start or end of the document.)
++    // 2. During formatting, record where this cursor-containing region gets
++    //    written.
++    // 3. Run a diff (with only insertions and deletions allowed) of the
++    //    original vs formatted version of the region, with the cursor included
++    //    as a character in the original version. By undoing the deletion of
++    //    the cursor from the diff, we add the cursor to the appropriate point
++    //    in the formatted version.
++    //
++    // Steps 1 and 2 have already happened; now we implement step 3.
++
++    let oldCursorRegionStart;
++    let oldCursorRegionText;
++
++    let newCursorRegionStart;
++    let newCursorRegionText;
+ 
+-      newCursorNodeStart = result.cursorNodeStart;
+-      newCursorNodeText = result.cursorNodeText;
++    if (
++      (opts.cursorNode || opts.nodeBeforeCursor || opts.nodeAfterCursor) &&
++      result.cursorNodeText
++    ) {
++      newCursorRegionStart = result.cursorNodeStart;
++      newCursorRegionText = result.cursorNodeText;
++
++      if (opts.cursorNode) {
++        oldCursorRegionStart = opts.locStart(opts.cursorNode);
++        oldCursorRegionText = text.slice(
++          oldCursorRegionStart,
++          opts.locEnd(opts.cursorNode),
++        );
++      } else {
++        if (!opts.nodeBeforeCursor && !opts.nodeAfterCursor) {
++          throw new Error(
++            "Cursor location must contain at least one of cursorNode, nodeBeforeCursor, nodeAfterCursor",
++          );
++        }
++        oldCursorRegionStart = opts.nodeBeforeCursor
++          ? opts.locEnd(opts.nodeBeforeCursor)
++          : 0;
++        const oldCursorRegionEnd = opts.nodeAfterCursor
++          ? opts.locStart(opts.nodeAfterCursor)
++          : text.length;
++
++        oldCursorRegionText = text.slice(
++          oldCursorRegionStart,
++          oldCursorRegionEnd,
++        );
++      }
+     } else {
+-      oldCursorNodeStart = 0;
+-      oldCursorNodeText = text;
+-
+-      cursorOffsetRelativeToOldCursorNode = opts.cursorOffset;
++      oldCursorRegionStart = 0;
++      oldCursorRegionText = text;
+ 
+-      newCursorNodeStart = 0;
+-      newCursorNodeText = result.formatted;
++      newCursorRegionStart = 0;
++      newCursorRegionText = result.formatted;
+     }
+ 
+-    if (oldCursorNodeText === newCursorNodeText) {
++    const cursorOffsetRelativeToOldCursorRegionStart =
++      opts.cursorOffset - oldCursorRegionStart;
++
++    if (oldCursorRegionText === newCursorRegionText) {
+       return {
+         formatted: result.formatted,
+-        cursorOffset: newCursorNodeStart + cursorOffsetRelativeToOldCursorNode,
++        cursorOffset:
++          newCursorRegionStart + cursorOffsetRelativeToOldCursorRegionStart,
+         comments,
+       };
+     }
+@@ -98,22 +146,21 @@ async function coreFormat(originalText, opts, addAlignmentSize = 0) {
+     // symbol inserted to find out where it moves to
+ 
+     // eslint-disable-next-line unicorn/prefer-spread
+-    const oldCursorNodeCharArray = oldCursorNodeText.split("");
++    const oldCursorNodeCharArray = oldCursorRegionText.split("");
+     oldCursorNodeCharArray.splice(
+-      cursorOffsetRelativeToOldCursorNode,
++      cursorOffsetRelativeToOldCursorRegionStart,
+       0,
+       CURSOR,
+     );
+ 
+     // eslint-disable-next-line unicorn/prefer-spread
+-    const newCursorNodeCharArray = newCursorNodeText.split("");
+-
++    const newCursorNodeCharArray = newCursorRegionText.split("");
+     const cursorNodeDiff = diffArrays(
+       oldCursorNodeCharArray,
+       newCursorNodeCharArray,
+     );
+ 
+-    let cursorOffset = newCursorNodeStart;
++    let cursorOffset = newCursorRegionStart;
+     for (const entry of cursorNodeDiff) {
+       if (entry.removed) {
+         if (entry.value.includes(CURSOR)) {
+diff --git a/src/main/get-cursor-node.js b/src/main/get-cursor-node.js
+index 66220b0c7..abb19e8b4 100644
+--- a/src/main/get-cursor-node.js
++++ b/src/main/get-cursor-node.js
+@@ -1,23 +1,87 @@
+-import { getDescendants } from "../utils/ast-utils.js";
++import { getChildren, getDescendants, isLeaf } from "../utils/ast-utils.js";
+ import createGetVisitorKeysFunction from "./create-get-visitor-keys-function.js";
+ 
+-function getCursorNode(ast, options) {
++/**
++ * Find the location of the cursor in the AST, represented in one of the
++ * following ways:
++ * 
++ *   { "cursorNode": <node> } - the cursor is WITHIN <node>
++ 
++ *   { "nodeBeforeCursor": <node1> | undefined,
++ *     "nodeAfterCursor": <node2> | undefined }
++ *   - the cursor is BETWEEN <node1> and <node2>. `undefined` represents the
++ *     beginning or end of the document.
++ * 
++ * This function will return whichever of the above possibilities most
++ * precisely identifies the cursor's location. This means returning a
++ * "cursorNode" when the cursor lies within a leaf node of the AST, and one of
++ * the other possibilities otherwise.
++ */
++function getCursorLocation(ast, options) {
+   const { cursorOffset, locStart, locEnd } = options;
+   const getVisitorKeys = createGetVisitorKeysFunction(
+     options.printer.getVisitorKeys,
+   );
++
+   const nodeContainsCursor = (node) =>
+     locStart(node) <= cursorOffset && locEnd(node) >= cursorOffset;
+ 
+   let cursorNode = ast;
++  const nodesContainingCursor = [ast];
++
+   for (const node of getDescendants(ast, {
+     getVisitorKeys,
+     filter: nodeContainsCursor,
+   })) {
++    nodesContainingCursor.push(node);
+     cursorNode = node;
+   }
+ 
+-  return cursorNode;
++  if (isLeaf(cursorNode, { getVisitorKeys })) {
++    return { cursorNode };
++  }
++
++  // We've established that the cursor is NOT contained in a leaf node of the
++  // AST. We instead need to find two nodes (which needn't necessarily be
++  // leaves) of the AST that the cursor lies *between*.
++
++  let nodeBeforeCursor;
++  let nodeAfterCursor;
++  let nodeBeforeCursorEndIndex = -1;
++  let nodeAfterCursorStartIndex = Number.POSITIVE_INFINITY;
++
++  while (
++    nodesContainingCursor.length > 0 &&
++    (nodeBeforeCursor === undefined || nodeAfterCursor === undefined)
++  ) {
++    cursorNode = nodesContainingCursor.pop();
++    const foundBeforeNode = nodeBeforeCursor !== undefined;
++    const foundAfterNode = nodeAfterCursor !== undefined;
++    for (const node of getChildren(cursorNode, { getVisitorKeys })) {
++      if (!foundBeforeNode) {
++        const nodeEnd = locEnd(node);
++        if (nodeEnd <= cursorOffset && nodeEnd > nodeBeforeCursorEndIndex) {
++          nodeBeforeCursor = node;
++          nodeBeforeCursorEndIndex = nodeEnd;
++        }
++      }
++      if (!foundAfterNode) {
++        const nodeStart = locStart(node);
++        if (
++          nodeStart >= cursorOffset &&
++          nodeStart < nodeAfterCursorStartIndex
++        ) {
++          nodeAfterCursor = node;
++          nodeAfterCursorStartIndex = nodeStart;
++        }
++      }
++    }
++  }
++
++  return {
++    nodeBeforeCursor,
++    nodeAfterCursor,
++  };
+ }
+ 
+-export default getCursorNode;
++export default getCursorLocation;
+diff --git a/src/utils/ast-utils.js b/src/utils/ast-utils.js
+index 4879e7a95..f204bfe38 100644
+--- a/src/utils/ast-utils.js
++++ b/src/utils/ast-utils.js
+@@ -45,6 +45,14 @@ function* getDescendants(node, options) {
+   }
+ }
+ 
++/**
++ * @param {Node} node
++ * @param {{getVisitorKeys: GetVisitorKeys}} options
++ */
++function isLeaf(node, options) {
++  return getChildren(node, options).next().done;
++}
++
+ /**
+  * @param {Node} node
+  * @param {{getVisitorKeys: GetVisitorKeys, predicate: Predicate}} options
+@@ -59,4 +67,4 @@ function hasDescendant(node, { getVisitorKeys, predicate }) {
+   return false;
+ }
+ 
+-export { getChildren, getDescendants, hasDescendant };
++export { getChildren, getDescendants, hasDescendant, isLeaf };

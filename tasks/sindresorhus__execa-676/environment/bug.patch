@@ -1,0 +1,2946 @@
+diff --git a/index.d.ts b/index.d.ts
+index 853c4f7..dd0e0ee 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -241,7 +241,7 @@ export type Options<IsSync extends boolean = boolean, EncodingType extends Encod
+ 	readonly shell?: boolean | string | URL;
+ 
+ 	/**
+-	Specify the character encoding used to decode the `stdout`, `stderr` and `stdio` output. If set to `'buffer'`, then `stdout`, `stderr` and `stdio` will be `Uint8Array`s instead of strings.
++	Specify the character encoding used to decode the `stdout` and `stderr` output. If set to `'buffer'`, then `stdout` and `stderr` will be a `Uint8Array` instead of a string.
+ 
+ 	@default 'utf8'
+ 	*/
+@@ -255,7 +255,7 @@ export type Options<IsSync extends boolean = boolean, EncodingType extends Encod
+ 	readonly timeout?: number;
+ 
+ 	/**
+-	Largest amount of data in bytes allowed on `stdout`, `stderr` and `stdio`. Default: 100 MB.
++	Largest amount of data in bytes allowed on `stdout` or `stderr`. Default: 100 MB.
+ 
+ 	@default 100_000_000
+ 	*/
+@@ -428,13 +428,6 @@ export type ExecaReturnValue<IsSync extends boolean, StdoutStderrType extends St
+ 	*/
+ 	stderr: StdoutStderrType;
+ 
+-	/**
+-	The output of the process on `stdin`, `stdout`, `stderr` and other file descriptors.
+-
+-	Items are `undefined` when their corresponding `stdio` option is set to [`'inherit'`, `'ipc'`, `'ignore'`, `Stream` or `integer`](https://nodejs.org/api/child_process.html#child_process_options_stdio).
+-	*/
+-	stdio: [undefined, StdoutStderrType, StdoutStderrType, ...Array<StdoutStderrType | undefined>];
+-
+ 	/**
+ 	Whether the process failed to run.
+ 	*/
+@@ -496,17 +489,17 @@ export type ExecaError<IsSync extends boolean = boolean, StdoutStderrType extend
+ 	/**
+ 	Error message when the child process failed to run. In addition to the underlying error message, it also contains some information related to why the child process errored.
+ 
+-	The child process `stderr`, `stdout` and other file descriptors' output are appended to the end, separated with newlines and not interleaved.
++	The child process `stderr` then `stdout` are appended to the end, separated with newlines and not interleaved.
+ 	*/
+ 	message: string;
+ 
+ 	/**
+-	This is the same as the `message` property except it does not include the child process `stdout`/`stderr`/`stdio`.
++	This is the same as the `message` property except it does not include the child process `stdout`/`stderr`.
+ 	*/
+ 	shortMessage: string;
+ 
+ 	/**
+-	Original error message. This is the same as the `message` property excluding the child process `stdout`/`stderr`/`stdio` and some additional information added by Execa.
++	Original error message. This is the same as the `message` property excluding the child process `stdout`/`stderr` and some additional information added by Execa.
+ 
+ 	This is `undefined` unless the child process exited due to an `error` event or a timeout.
+ 	*/
+diff --git a/index.js b/index.js
+index 1b934b6..b702988 100644
+--- a/index.js
++++ b/index.js
+@@ -80,23 +80,32 @@ const handleArguments = (rawFile, rawArgs, rawOptions = {}) => {
+ 	return {file, args, command, escapedCommand, options};
+ };
+ 
+-const handleOutput = (options, value) => {
++const handleOutputSync = (options, value, error) => {
++	if (Buffer.isBuffer(value)) {
++		value = bufferToUint8Array(value);
++	}
++
++	return handleOutput(options, value, error);
++};
++
++const handleOutput = (options, value, error) => {
+ 	if (typeof value !== 'string' && !ArrayBuffer.isView(value)) {
+-		return;
++		// When `execaSync()` errors, we normalize it to '' to mimic `execa()`
++		return error === undefined ? undefined : '';
+ 	}
+ 
+-	if (Buffer.isBuffer(value)) {
+-		value = bufferToUint8Array(value);
++	if (options.stripFinalNewline) {
++		return stripFinalNewline(value);
+ 	}
+ 
+-	return options.stripFinalNewline ? stripFinalNewline(value) : value;
++	return value;
+ };
+ 
+ export function execa(rawFile, rawArgs, rawOptions) {
+ 	const {file, args, command, escapedCommand, options} = handleArguments(rawFile, rawArgs, rawOptions);
+ 	validateTimeout(options);
+ 
+-	const {stdioStreams, stdioLength} = handleInputAsync(options);
++	const stdioStreams = handleInputAsync(options);
+ 
+ 	let spawned;
+ 	try {
+@@ -106,8 +115,9 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 		const dummySpawned = new childProcess.ChildProcess();
+ 		const errorPromise = Promise.reject(makeError({
+ 			error,
+-			stdio: Array.from({length: stdioLength}),
+-			all: options.all ? '' : undefined,
++			stdout: '',
++			stderr: '',
++			all: '',
+ 			command,
+ 			escapedCommand,
+ 			options,
+@@ -137,10 +147,12 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ const handlePromise = async ({spawned, options, context, stdioStreams, command, escapedCommand}) => {
+ 	const [
+ 		[exitCode, signal, error],
+-		stdioResults,
++		stdoutResult,
++		stderrResult,
+ 		allResult,
+ 	] = await getSpawnedResult(spawned, options, context, stdioStreams);
+-	const stdio = stdioResults.map(stdioResult => handleOutput(options, stdioResult));
++	const stdout = handleOutput(options, stdoutResult);
++	const stderr = handleOutput(options, stderrResult);
+ 	const all = handleOutput(options, allResult);
+ 
+ 	if (error || exitCode !== 0 || signal !== null) {
+@@ -149,7 +161,8 @@ const handlePromise = async ({spawned, options, context, stdioStreams, command,
+ 			error,
+ 			exitCode,
+ 			signal,
+-			stdio,
++			stdout,
++			stderr,
+ 			all,
+ 			command,
+ 			escapedCommand,
+@@ -169,9 +182,8 @@ const handlePromise = async ({spawned, options, context, stdioStreams, command,
+ 		command,
+ 		escapedCommand,
+ 		exitCode: 0,
+-		stdio,
+-		stdout: stdio[1],
+-		stderr: stdio[2],
++		stdout,
++		stderr,
+ 		all,
+ 		failed: false,
+ 		timedOut: false,
+@@ -183,7 +195,7 @@ const handlePromise = async ({spawned, options, context, stdioStreams, command,
+ export function execaSync(rawFile, rawArgs, rawOptions) {
+ 	const {file, args, command, escapedCommand, options} = handleArguments(rawFile, rawArgs, rawOptions);
+ 
+-	const {stdioStreams, stdioLength} = handleInputSync(options);
++	const stdioStreams = handleInputSync(options);
+ 
+ 	let result;
+ 	try {
+@@ -191,7 +203,9 @@ export function execaSync(rawFile, rawArgs, rawOptions) {
+ 	} catch (error) {
+ 		throw makeError({
+ 			error,
+-			stdio: Array.from({length: stdioLength}),
++			stdout: '',
++			stderr: '',
++			all: '',
+ 			command,
+ 			escapedCommand,
+ 			options,
+@@ -201,13 +215,13 @@ export function execaSync(rawFile, rawArgs, rawOptions) {
+ 	}
+ 
+ 	pipeOutputSync(stdioStreams, result);
+-
+-	const output = result.output || [undefined, undefined, undefined];
+-	const stdio = output.map(stdioOutput => handleOutput(options, stdioOutput));
++	const stdout = handleOutputSync(options, result.stdout, result.error);
++	const stderr = handleOutputSync(options, result.stderr, result.error);
+ 
+ 	if (result.error || result.status !== 0 || result.signal !== null) {
+ 		const error = makeError({
+-			stdio,
++			stdout,
++			stderr,
+ 			error: result.error,
+ 			signal: result.signal,
+ 			exitCode: result.status,
+@@ -229,9 +243,8 @@ export function execaSync(rawFile, rawArgs, rawOptions) {
+ 		command,
+ 		escapedCommand,
+ 		exitCode: 0,
+-		stdio,
+-		stdout: stdio[1],
+-		stderr: stdio[2],
++		stdout,
++		stderr,
+ 		failed: false,
+ 		timedOut: false,
+ 		isCanceled: false,
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 7f18dc2..22001e7 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -63,12 +63,8 @@ try {
+ 	expectType<string>(unicornsResult.command);
+ 	expectType<string>(unicornsResult.escapedCommand);
+ 	expectType<number | undefined>(unicornsResult.exitCode);
+-	expectType<undefined>(unicornsResult.stdio[0]);
+ 	expectType<string>(unicornsResult.stdout);
+-	expectType<string>(unicornsResult.stdio[1]);
+ 	expectType<string>(unicornsResult.stderr);
+-	expectType<string>(unicornsResult.stdio[2]);
+-	expectType<string | undefined>(unicornsResult.stdio[3]);
+ 	expectType<string | undefined>(unicornsResult.all);
+ 	expectType<boolean>(unicornsResult.failed);
+ 	expectType<boolean>(unicornsResult.timedOut);
+@@ -82,12 +78,8 @@ try {
+ 
+ 	expectType<string>(execaError.message);
+ 	expectType<number | undefined>(execaError.exitCode);
+-	expectType<undefined>(execaError.stdio[0]);
+ 	expectType<string>(execaError.stdout);
+-	expectType<string>(execaError.stdio[1]);
+ 	expectType<string>(execaError.stderr);
+-	expectType<string>(execaError.stdio[2]);
+-	expectType<string | undefined>(execaError.stdio[3]);
+ 	expectType<string | undefined>(execaError.all);
+ 	expectType<boolean>(execaError.failed);
+ 	expectType<boolean>(execaError.timedOut);
+@@ -106,12 +98,8 @@ try {
+ 	expectType<string>(unicornsResult.command);
+ 	expectType<string>(unicornsResult.escapedCommand);
+ 	expectType<number | undefined>(unicornsResult.exitCode);
+-	expectType<undefined>(unicornsResult.stdio[0]);
+ 	expectType<string>(unicornsResult.stdout);
+-	expectType<string>(unicornsResult.stdio[1]);
+ 	expectType<string>(unicornsResult.stderr);
+-	expectType<string>(unicornsResult.stdio[2]);
+-	expectType<string | undefined>(unicornsResult.stdio[3]);
+ 	expectError(unicornsResult.all);
+ 	expectError(unicornsResult.pipeStdout);
+ 	expectError(unicornsResult.pipeStderr);
+@@ -129,12 +117,8 @@ try {
+ 	expectType<ExecaSyncError>(execaError);
+ 	expectType<string>(execaError.message);
+ 	expectType<number | undefined>(execaError.exitCode);
+-	expectType<undefined>(execaError.stdio[0]);
+ 	expectType<string>(execaError.stdout);
+-	expectType<string>(execaError.stdio[1]);
+ 	expectType<string>(execaError.stderr);
+-	expectType<string>(execaError.stdio[2]);
+-	expectType<string | undefined>(execaError.stdio[3]);
+ 	expectError(execaError.all);
+ 	expectType<boolean>(execaError.failed);
+ 	expectType<boolean>(execaError.timedOut);
+diff --git a/lib/error.js b/lib/error.js
+index d554bc3..907e21b 100644
+--- a/lib/error.js
++++ b/lib/error.js
+@@ -26,7 +26,8 @@ const getErrorPrefix = ({timedOut, timeout, errorCode, signal, signalDescription
+ };
+ 
+ export const makeError = ({
+-	stdio,
++	stdout,
++	stderr,
+ 	all,
+ 	error,
+ 	signal,
+@@ -37,8 +38,6 @@ export const makeError = ({
+ 	isCanceled,
+ 	options: {timeout, cwd = process.cwd()},
+ }) => {
+-	stdio = stdio.map(stdioOutput => stdioOutput ?? '');
+-
+ 	// `signal` and `exitCode` emitted on `spawned.on('exit')` event can be `null`.
+ 	// We normalize them to `undefined`
+ 	exitCode = exitCode === null ? undefined : exitCode;
+@@ -51,7 +50,7 @@ export const makeError = ({
+ 	const execaMessage = `Command ${prefix}: ${command}`;
+ 	const isError = Object.prototype.toString.call(error) === '[object Error]';
+ 	const shortMessage = isError ? `${execaMessage}\n${error.message}` : execaMessage;
+-	const message = [shortMessage, stdio[2], stdio[1], ...stdio.slice(3)].filter(Boolean).join('\n');
++	const message = [shortMessage, stderr, stdout].filter(Boolean).join('\n');
+ 
+ 	if (isError) {
+ 		error.originalMessage = error.message;
+@@ -66,9 +65,8 @@ export const makeError = ({
+ 	error.exitCode = exitCode;
+ 	error.signal = signal;
+ 	error.signalDescription = signalDescription;
+-	error.stdio = stdio;
+-	error.stdout = stdio[1];
+-	error.stderr = stdio[2];
++	error.stdout = stdout;
++	error.stderr = stderr;
+ 	error.cwd = cwd;
+ 
+ 	if (all !== undefined) {
+diff --git a/lib/stdio/handle.js b/lib/stdio/handle.js
+index ccacfef..56be992 100644
+--- a/lib/stdio/handle.js
++++ b/lib/stdio/handle.js
+@@ -13,7 +13,7 @@ export const handleInput = (addProperties, options) => {
+ 		.map(stdioStreams => addStreamDirection(stdioStreams))
+ 		.map(stdioStreams => addStreamsProperties(stdioStreams, addProperties));
+ 	options.stdio = transformStdio(stdioStreamsGroups);
+-	return {stdioStreams: stdioStreamsGroups.flat(), stdioLength: stdioStreamsGroups.length};
++	return stdioStreamsGroups.flat();
+ };
+ 
+ // We make sure passing an array with a single item behaves the same as passing that item without an array.
+diff --git a/lib/stdio/sync.js b/lib/stdio/sync.js
+index d93ab0a..d50ea3f 100644
+--- a/lib/stdio/sync.js
++++ b/lib/stdio/sync.js
+@@ -6,9 +6,9 @@ import {bufferToUint8Array} from './utils.js';
+ 
+ // Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in sync mode
+ export const handleInputSync = options => {
+-	const {stdioStreams, stdioLength} = handleInput(addPropertiesSync, options);
++	const stdioStreams = handleInput(addPropertiesSync, options);
+ 	addInputOptionSync(stdioStreams, options);
+-	return {stdioStreams, stdioLength};
++	return stdioStreams;
+ };
+ 
+ const forbiddenIfStreamSync = ({value, optionName}) => {
+diff --git a/lib/stream.js b/lib/stream.js
+index fa7967e..a0b9128 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -35,11 +35,6 @@ const getBufferedData = async (streamPromise, encoding) => {
+ 	}
+ };
+ 
+-const getStdioPromise = ({stream, index, stdioStreams, encoding, buffer, maxBuffer}) => {
+-	const stdioStream = stdioStreams.find(stdioStream => stdioStream.index === index);
+-	return stdioStream?.direction === 'output' ? getStreamPromise(stream, {encoding, buffer, maxBuffer}) : undefined;
+-};
+-
+ const getStreamPromise = async (stream, {encoding, buffer, maxBuffer}) => {
+ 	if (!stream || !buffer) {
+ 		return;
+@@ -117,14 +112,16 @@ export const getSpawnedResult = async (
+ 	cleanupOnExit(spawned, cleanup, detached, finalizers);
+ 	const customStreams = getCustomStreams(stdioStreams);
+ 
+-	const stdioPromises = spawned.stdio.map((stream, index) => getStdioPromise({stream, index, stdioStreams, encoding, buffer, maxBuffer}));
++	const stdoutPromise = getStreamPromise(spawned.stdout, {encoding, buffer, maxBuffer});
++	const stderrPromise = getStreamPromise(spawned.stderr, {encoding, buffer, maxBuffer});
+ 	const allPromise = getStreamPromise(spawned.all, {encoding, buffer, maxBuffer: maxBuffer * 2});
+ 
+ 	try {
+ 		return await Promise.race([
+ 			Promise.all([
+ 				once(spawned, 'exit'),
+-				Promise.all(stdioPromises),
++				stdoutPromise,
++				stderrPromise,
+ 				allPromise,
+ 				...waitForCustomStreamsEnd(customStreams),
+ 			]),
+@@ -136,7 +133,8 @@ export const getSpawnedResult = async (
+ 		spawned.kill();
+ 		const results = await Promise.all([
+ 			[undefined, context.signal, error],
+-			Promise.all(stdioPromises.map(stdioPromise => getBufferedData(stdioPromise, encoding))),
++			getBufferedData(stdoutPromise, encoding),
++			getBufferedData(stderrPromise, encoding),
+ 			getBufferedData(allPromise, encoding),
+ 		]);
+ 		cleanupStdioStreams(customStreams, error);
+diff --git a/readme.md b/readme.md
+index 2398507..1743ba1 100644
+--- a/readme.md
++++ b/readme.md
+@@ -255,7 +255,7 @@ This is the preferred method when executing Node.js files.
+ Like [`child_process#fork()`](https://nodejs.org/api/child_process.html#child_process_child_process_fork_modulepath_args_options):
+ - the current Node version and options are used. This can be overridden using the [`nodePath`](#nodepath-for-node-only) and [`nodeOptions`](#nodeoptions-for-node-only) options.
+ - the [`shell`](#shell) option cannot be used
+-- an extra channel [`ipc`](https://nodejs.org/api/child_process.html#child_process_options_stdio) is passed to [`stdio`](#stdio-1)
++- an extra channel [`ipc`](https://nodejs.org/api/child_process.html#child_process_options_stdio) is passed to [`stdio`](#stdio)
+ 
+ #### $\`command\`
+ 
+@@ -289,7 +289,7 @@ This is the preferred method when executing a user-supplied `command` string, su
+ 
+ Same as [`execa()`](#execacommandcommand-options) but synchronous.
+ 
+-Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio-1) and [`input`](#input) options cannot be a stream nor an iterable.
++Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio) and [`input`](#input) options cannot be a stream nor an iterable.
+ 
+ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+@@ -298,7 +298,7 @@ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+ Same as [$\`command\`](#command) but synchronous.
+ 
+-Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio-1) and [`input`](#input) options cannot be a stream nor an iterable.
++Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio) and [`input`](#input) options cannot be a stream nor an iterable.
+ 
+ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+@@ -306,7 +306,7 @@ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+ Same as [`execaCommand()`](#execacommand-command-options) but synchronous.
+ 
+-Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio-1) and [`input`](#input) options cannot be a stream nor an iterable.
++Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio) and [`input`](#input) options cannot be a stream nor an iterable.
+ 
+ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+@@ -432,14 +432,6 @@ This is `undefined` if either:
+ - the [`all` option](#all-2) is `false` (the default value)
+ - both [`stdout`](#stdout-1) and [`stderr`](#stderr-1) options are set to [`'inherit'`, `'ipc'`, `'ignore'`, `Stream` or `integer`](https://nodejs.org/api/child_process.html#child_process_options_stdio)
+ 
+-#### stdio
+-
+-Type: `Array<string | Uint8Array | undefined>`
+-
+-The output of the process on [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1) and [other file descriptors](#stdio-1).
+-
+-Items are `undefined` when their corresponding [`stdio`](#stdio-1) option is set to [`'inherit'`, `'ipc'`, `'ignore'`, `Stream` or `integer`](https://nodejs.org/api/child_process.html#child_process_options_stdio).
+-
+ #### failed
+ 
+ Type: `boolean`
+@@ -498,19 +490,19 @@ Type: `string`
+ 
+ Error message when the child process failed to run. In addition to the [underlying error message](#originalMessage), it also contains some information related to why the child process errored.
+ 
+-The child process [`stderr`](#stderr), [`stdout`](#stdout) and other [file descriptors' output](#stdio) are appended to the end, separated with newlines and not interleaved.
++The child process [`stderr`](#stderr) then [`stdout`](#stdout) are appended to the end, separated with newlines and not interleaved.
+ 
+ #### shortMessage
+ 
+ Type: `string`
+ 
+-This is the same as the [`message` property](#message) except it does not include the child process [`stdout`](#stdout)/[`stderr`](#stderr)/[`stdio`](#stdio).
++This is the same as the [`message` property](#message) except it does not include the child process `stdout`/`stderr`.
+ 
+ #### originalMessage
+ 
+ Type: `string | undefined`
+ 
+-Original error message. This is the same as the `message` property excluding the child process [`stdout`](#stdout)/[`stderr`](#stderr)/[`stdio`](#stdio) and some additional information added by Execa.
++Original error message. This is the same as the `message` property excluding the child process `stdout`/`stderr` and some additional information added by Execa.
+ 
+ This is `undefined` unless the child process exited due to an `error` event or a timeout.
+ 
+@@ -562,7 +554,7 @@ Default: `true`
+ 
+ Buffer the output from the spawned process. When set to `false`, you must read the output of [`stdout`](#stdout-1) and [`stderr`](#stderr-1) (or [`all`](#all) if the [`all`](#all-2) option is `true`). Otherwise the returned promise will not be resolved/rejected.
+ 
+-If the spawned process fails, [`error.stdout`](#stdout), [`error.stderr`](#stderr), [`error.all`](#all) and [`error.stdio`](#stdio) will contain the buffered data.
++If the spawned process fails, [`error.stdout`](#stdout), [`error.stderr`](#stderr), and [`error.all`](#all) will contain the buffered data.
+ 
+ #### input
+ 
+@@ -707,7 +699,7 @@ Explicitly set the value of `argv[0]` sent to the child process. This will be se
+ Type: `string`\
+ Default: `'json'`
+ 
+-Specify the kind of serialization used for sending messages between processes when using the [`stdio: 'ipc'`](#stdio-1) option or [`execaNode()`](#execanodescriptpath-arguments-options):
++Specify the kind of serialization used for sending messages between processes when using the [`stdio: 'ipc'`](#stdio) option or [`execaNode()`](#execanodescriptpath-arguments-options):
+ 	- `json`: Uses `JSON.stringify()` and `JSON.parse()`.
+ 	- `advanced`: Uses [`v8.serialize()`](https://nodejs.org/api/v8.html#v8_v8_serialize_value)
+ 
+@@ -748,7 +740,7 @@ We recommend against using this option since it is:
+ Type: `string`\
+ Default: `utf8`
+ 
+-Specify the character encoding used to decode the [`stdout`](#stdout), [`stderr`](#stderr) and [`stdio`](#stdio) output. If set to `'buffer'`, then `stdout`, `stderr` and `stdio` will be `Uint8Array`s instead of strings.
++Specify the character encoding used to decode the `stdout` and `stderr` output. If set to `'buffer'`, then `stdout` and `stderr` will be a `Uint8Array` instead of a string.
+ 
+ #### timeout
+ 
+@@ -762,7 +754,7 @@ If timeout is greater than `0`, the parent will send the signal identified by th
+ Type: `number`\
+ Default: `100_000_000` (100 MB)
+ 
+-Largest amount of data in bytes allowed on [`stdout`](#stdout), [`stderr`](#stderr) and [`stdio`](#stdio).
++Largest amount of data in bytes allowed on `stdout` or `stderr`.
+ 
+ #### killSignal
+ 
+diff --git a/test/encoding.js b/test/encoding.js
+deleted file mode 100644
+index bf0b335..0000000
+--- a/test/encoding.js
++++ /dev/null
+@@ -1,121 +0,0 @@
+-import {Buffer} from 'node:buffer';
+-import {exec} from 'node:child_process';
+-import {promisify} from 'node:util';
+-import test from 'ava';
+-import {execa, execaSync} from '../index.js';
+-import {setFixtureDir, FIXTURES_DIR} from './helpers/fixtures-dir.js';
+-import {fullStdio} from './helpers/stdio.js';
+-
+-const pExec = promisify(exec);
+-
+-setFixtureDir();
+-
+-const checkEncoding = async (t, encoding, index, execaMethod) => {
+-	const {stdio} = await execaMethod('noop-fd.js', [`${index}`, STRING_TO_ENCODE], {...fullStdio, encoding});
+-	compareValues(t, stdio[index], encoding);
+-
+-	if (index === 3) {
+-		return;
+-	}
+-
+-	const {stdout, stderr} = await pExec(`node noop-fd.js ${index} ${STRING_TO_ENCODE}`, {encoding, cwd: FIXTURES_DIR});
+-	compareValues(t, index === 1 ? stdout : stderr, encoding);
+-};
+-
+-const compareValues = (t, value, encoding) => {
+-	if (encoding === 'buffer') {
+-		t.true(ArrayBuffer.isView(value));
+-		t.true(BUFFER_TO_ENCODE.equals(value));
+-	} else {
+-		t.is(value, BUFFER_TO_ENCODE.toString(encoding));
+-	}
+-};
+-
+-// This string gives different outputs with each encoding type
+-const STRING_TO_ENCODE = '\u1000.';
+-const BUFFER_TO_ENCODE = Buffer.from(STRING_TO_ENCODE);
+-
+-/* eslint-disable unicorn/text-encoding-identifier-case */
+-test('can pass encoding "buffer" to stdout', checkEncoding, 'buffer', 1, execa);
+-test('can pass encoding "utf8" to stdout', checkEncoding, 'utf8', 1, execa);
+-test('can pass encoding "utf-8" to stdout', checkEncoding, 'utf-8', 1, execa);
+-test('can pass encoding "utf16le" to stdout', checkEncoding, 'utf16le', 1, execa);
+-test('can pass encoding "utf-16le" to stdout', checkEncoding, 'utf-16le', 1, execa);
+-test('can pass encoding "ucs2" to stdout', checkEncoding, 'ucs2', 1, execa);
+-test('can pass encoding "ucs-2" to stdout', checkEncoding, 'ucs-2', 1, execa);
+-test('can pass encoding "latin1" to stdout', checkEncoding, 'latin1', 1, execa);
+-test('can pass encoding "binary" to stdout', checkEncoding, 'binary', 1, execa);
+-test('can pass encoding "ascii" to stdout', checkEncoding, 'ascii', 1, execa);
+-test('can pass encoding "hex" to stdout', checkEncoding, 'hex', 1, execa);
+-test('can pass encoding "base64" to stdout', checkEncoding, 'base64', 1, execa);
+-test('can pass encoding "base64url" to stdout', checkEncoding, 'base64url', 1, execa);
+-test('can pass encoding "buffer" to stderr', checkEncoding, 'buffer', 2, execa);
+-test('can pass encoding "utf8" to stderr', checkEncoding, 'utf8', 2, execa);
+-test('can pass encoding "utf-8" to stderr', checkEncoding, 'utf-8', 2, execa);
+-test('can pass encoding "utf16le" to stderr', checkEncoding, 'utf16le', 2, execa);
+-test('can pass encoding "utf-16le" to stderr', checkEncoding, 'utf-16le', 2, execa);
+-test('can pass encoding "ucs2" to stderr', checkEncoding, 'ucs2', 2, execa);
+-test('can pass encoding "ucs-2" to stderr', checkEncoding, 'ucs-2', 2, execa);
+-test('can pass encoding "latin1" to stderr', checkEncoding, 'latin1', 2, execa);
+-test('can pass encoding "binary" to stderr', checkEncoding, 'binary', 2, execa);
+-test('can pass encoding "ascii" to stderr', checkEncoding, 'ascii', 2, execa);
+-test('can pass encoding "hex" to stderr', checkEncoding, 'hex', 2, execa);
+-test('can pass encoding "base64" to stderr', checkEncoding, 'base64', 2, execa);
+-test('can pass encoding "base64url" to stderr', checkEncoding, 'base64url', 2, execa);
+-test('can pass encoding "buffer" to stdio[*]', checkEncoding, 'buffer', 3, execa);
+-test('can pass encoding "utf8" to stdio[*]', checkEncoding, 'utf8', 3, execa);
+-test('can pass encoding "utf-8" to stdio[*]', checkEncoding, 'utf-8', 3, execa);
+-test('can pass encoding "utf16le" to stdio[*]', checkEncoding, 'utf16le', 3, execa);
+-test('can pass encoding "utf-16le" to stdio[*]', checkEncoding, 'utf-16le', 3, execa);
+-test('can pass encoding "ucs2" to stdio[*]', checkEncoding, 'ucs2', 3, execa);
+-test('can pass encoding "ucs-2" to stdio[*]', checkEncoding, 'ucs-2', 3, execa);
+-test('can pass encoding "latin1" to stdio[*]', checkEncoding, 'latin1', 3, execa);
+-test('can pass encoding "binary" to stdio[*]', checkEncoding, 'binary', 3, execa);
+-test('can pass encoding "ascii" to stdio[*]', checkEncoding, 'ascii', 3, execa);
+-test('can pass encoding "hex" to stdio[*]', checkEncoding, 'hex', 3, execa);
+-test('can pass encoding "base64" to stdio[*]', checkEncoding, 'base64', 3, execa);
+-test('can pass encoding "base64url" to stdio[*]', checkEncoding, 'base64url', 3, execa);
+-test('can pass encoding "buffer" to stdout - sync', checkEncoding, 'buffer', 1, execaSync);
+-test('can pass encoding "utf8" to stdout - sync', checkEncoding, 'utf8', 1, execaSync);
+-test('can pass encoding "utf-8" to stdout - sync', checkEncoding, 'utf-8', 1, execaSync);
+-test('can pass encoding "utf16le" to stdout - sync', checkEncoding, 'utf16le', 1, execaSync);
+-test('can pass encoding "utf-16le" to stdout - sync', checkEncoding, 'utf-16le', 1, execaSync);
+-test('can pass encoding "ucs2" to stdout - sync', checkEncoding, 'ucs2', 1, execaSync);
+-test('can pass encoding "ucs-2" to stdout - sync', checkEncoding, 'ucs-2', 1, execaSync);
+-test('can pass encoding "latin1" to stdout - sync', checkEncoding, 'latin1', 1, execaSync);
+-test('can pass encoding "binary" to stdout - sync', checkEncoding, 'binary', 1, execaSync);
+-test('can pass encoding "ascii" to stdout - sync', checkEncoding, 'ascii', 1, execaSync);
+-test('can pass encoding "hex" to stdout - sync', checkEncoding, 'hex', 1, execaSync);
+-test('can pass encoding "base64" to stdout - sync', checkEncoding, 'base64', 1, execaSync);
+-test('can pass encoding "base64url" to stdout - sync', checkEncoding, 'base64url', 1, execaSync);
+-test('can pass encoding "buffer" to stderr - sync', checkEncoding, 'buffer', 2, execaSync);
+-test('can pass encoding "utf8" to stderr - sync', checkEncoding, 'utf8', 2, execaSync);
+-test('can pass encoding "utf-8" to stderr - sync', checkEncoding, 'utf-8', 2, execaSync);
+-test('can pass encoding "utf16le" to stderr - sync', checkEncoding, 'utf16le', 2, execaSync);
+-test('can pass encoding "utf-16le" to stderr - sync', checkEncoding, 'utf-16le', 2, execaSync);
+-test('can pass encoding "ucs2" to stderr - sync', checkEncoding, 'ucs2', 2, execaSync);
+-test('can pass encoding "ucs-2" to stderr - sync', checkEncoding, 'ucs-2', 2, execaSync);
+-test('can pass encoding "latin1" to stderr - sync', checkEncoding, 'latin1', 2, execaSync);
+-test('can pass encoding "binary" to stderr - sync', checkEncoding, 'binary', 2, execaSync);
+-test('can pass encoding "ascii" to stderr - sync', checkEncoding, 'ascii', 2, execaSync);
+-test('can pass encoding "hex" to stderr - sync', checkEncoding, 'hex', 2, execaSync);
+-test('can pass encoding "base64" to stderr - sync', checkEncoding, 'base64', 2, execaSync);
+-test('can pass encoding "base64url" to stderr - sync', checkEncoding, 'base64url', 2, execaSync);
+-test('can pass encoding "buffer" to stdio[*] - sync', checkEncoding, 'buffer', 3, execaSync);
+-test('can pass encoding "utf8" to stdio[*] - sync', checkEncoding, 'utf8', 3, execaSync);
+-test('can pass encoding "utf-8" to stdio[*] - sync', checkEncoding, 'utf-8', 3, execaSync);
+-test('can pass encoding "utf16le" to stdio[*] - sync', checkEncoding, 'utf16le', 3, execaSync);
+-test('can pass encoding "utf-16le" to stdio[*] - sync', checkEncoding, 'utf-16le', 3, execaSync);
+-test('can pass encoding "ucs2" to stdio[*] - sync', checkEncoding, 'ucs2', 3, execaSync);
+-test('can pass encoding "ucs-2" to stdio[*] - sync', checkEncoding, 'ucs-2', 3, execaSync);
+-test('can pass encoding "latin1" to stdio[*] - sync', checkEncoding, 'latin1', 3, execaSync);
+-test('can pass encoding "binary" to stdio[*] - sync', checkEncoding, 'binary', 3, execaSync);
+-test('can pass encoding "ascii" to stdio[*] - sync', checkEncoding, 'ascii', 3, execaSync);
+-test('can pass encoding "hex" to stdio[*] - sync', checkEncoding, 'hex', 3, execaSync);
+-test('can pass encoding "base64" to stdio[*] - sync', checkEncoding, 'base64', 3, execaSync);
+-test('can pass encoding "base64url" to stdio[*] - sync', checkEncoding, 'base64url', 3, execaSync);
+-/* eslint-enable unicorn/text-encoding-identifier-case */
+-
+-test('validate unknown encodings', async t => {
+-	await t.throwsAsync(execa('noop.js', {encoding: 'unknownEncoding'}), {code: 'ERR_UNKNOWN_ENCODING'});
+-});
+diff --git a/test/error.js b/test/error.js
+index da8c4d3..7ef2aef 100644
+--- a/test/error.js
++++ b/test/error.js
+@@ -2,7 +2,6 @@ import process from 'node:process';
+ import test from 'ava';
+ import {execa, execaSync} from '../index.js';
+ import {FIXTURES_DIR, setFixtureDir} from './helpers/fixtures-dir.js';
+-import {fullStdio} from './helpers/stdio.js';
+ 
+ const isWindows = process.platform === 'win32';
+ 
+@@ -10,64 +9,33 @@ setFixtureDir();
+ 
+ const TIMEOUT_REGEXP = /timed out after/;
+ 
+-test('empty error.stdout/stderr/stdio', async t => {
+-	const {stdout, stderr, stdio} = await t.throwsAsync(execa('fail.js'));
+-	t.is(stdout, '');
+-	t.is(stderr, '');
+-	t.deepEqual(stdio, ['', '', '']);
+-});
+-
+-test('empty error.all', async t => {
+-	const {all} = await t.throwsAsync(execa('fail.js', {all: true}));
+-	t.is(all, '');
+-});
++const getExitRegExp = exitMessage => new RegExp(`failed with exit code ${exitMessage}`);
+ 
+-test('undefined error.all', async t => {
+-	const {all} = await t.throwsAsync(execa('fail.js'));
+-	t.is(all, undefined);
+-});
+-
+-test('empty error.stdio[0] even with input', async t => {
+-	const {stdio} = await t.throwsAsync(execa('fail.js', {input: 'test'}));
+-	t.is(stdio[0], '');
++test('stdout/stderr/all available on errors', async t => {
++	const {stdout, stderr, all} = await t.throwsAsync(execa('exit.js', ['2'], {all: true}), {message: getExitRegExp('2')});
++	t.is(typeof stdout, 'string');
++	t.is(typeof stderr, 'string');
++	t.is(typeof all, 'string');
+ });
+ 
+ const WRONG_COMMAND = isWindows
+ 	? '\'wrong\' is not recognized as an internal or external command,\r\noperable program or batch file.'
+ 	: '';
+ 
+-test('stdout/stderr/all/stdio on process errors', async t => {
+-	const {stdout, stderr, all, stdio} = await t.throwsAsync(execa('wrong command', {all: true}));
++test('stdout/stderr/all on process errors', async t => {
++	const {stdout, stderr, all} = await t.throwsAsync(execa('wrong command', {all: true}));
+ 	t.is(stdout, '');
+ 	t.is(stderr, WRONG_COMMAND);
+ 	t.is(all, WRONG_COMMAND);
+-	t.deepEqual(stdio, ['', '', WRONG_COMMAND]);
+ });
+ 
+-test('stdout/stderr/all/stdio on process errors, in sync mode', t => {
+-	const {stdout, stderr, all, stdio} = t.throws(() => {
++test('stdout/stderr/all on process errors, in sync mode', t => {
++	const {stdout, stderr, all} = t.throws(() => {
+ 		execaSync('wrong command');
+ 	});
+ 	t.is(stdout, '');
+ 	t.is(stderr, WRONG_COMMAND);
+ 	t.is(all, undefined);
+-	t.deepEqual(stdio, ['', '', WRONG_COMMAND]);
+-});
+-
+-test('error.stdout/stderr/stdio is defined', async t => {
+-	const {stdout, stderr, stdio} = await t.throwsAsync(execa('echo-fail.js', fullStdio));
+-	t.is(stdout, 'stdout');
+-	t.is(stderr, 'stderr');
+-	t.deepEqual(stdio, ['', 'stdout', 'stderr', 'fd3']);
+-});
+-
+-test('error.stdout/stderr/stdio is defined, in sync mode', t => {
+-	const {stdout, stderr, stdio} = t.throws(() => {
+-		execaSync('echo-fail.js', fullStdio);
+-	});
+-	t.is(stdout, 'stdout');
+-	t.is(stderr, 'stderr');
+-	t.deepEqual(stdio, ['', 'stdout', 'stderr', 'fd3']);
+ });
+ 
+ test('exitCode is 0 on success', async t => {
+@@ -76,7 +44,7 @@ test('exitCode is 0 on success', async t => {
+ });
+ 
+ const testExitCode = async (t, number) => {
+-	const {exitCode} = await t.throwsAsync(execa('exit.js', [`${number}`]), {message: new RegExp(`failed with exit code ${number}`)});
++	const {exitCode} = await t.throwsAsync(execa('exit.js', [`${number}`]), {message: getExitRegExp(number)});
+ 	t.is(exitCode, number);
+ };
+ 
+@@ -88,33 +56,22 @@ test('error.message contains the command', async t => {
+ 	await t.throwsAsync(execa('exit.js', ['2', 'foo', 'bar']), {message: /exit.js 2 foo bar/});
+ });
+ 
+-test('error.message contains stdout/stderr/stdio if available', async t => {
+-	const {message} = await t.throwsAsync(execa('echo-fail.js', fullStdio));
+-	t.true(message.endsWith('stderr\nstdout\nfd3'));
+-});
+-
+-test('error.message does not contain stdout if not available', async t => {
+-	const {message} = await t.throwsAsync(execa('echo-fail.js', {stdio: ['pipe', 'ignore', 'pipe', 'pipe']}));
+-	t.true(message.endsWith('stderr\nfd3'));
+-});
+-
+-test('error.message does not contain stderr if not available', async t => {
+-	const {message} = await t.throwsAsync(execa('echo-fail.js', {stdio: ['pipe', 'pipe', 'ignore', 'pipe']}));
+-	t.true(message.endsWith('stdout\nfd3'));
++test('error.message contains stdout/stderr if available', async t => {
++	const {message} = await t.throwsAsync(execa('echo-fail.js'));
++	t.true(message.includes('stderr'));
++	t.true(message.includes('stdout'));
+ });
+ 
+-test('error.message does not contain stdout/stderr/stdio if not available', async t => {
++test('error.message does not contain stdout/stderr if not available', async t => {
+ 	const {message} = await t.throwsAsync(execa('echo-fail.js', {stdio: 'ignore'}));
+ 	t.false(message.includes('stderr'));
+ 	t.false(message.includes('stdout'));
+-	t.false(message.includes('fd3'));
+ });
+ 
+-test('error.shortMessage does not contain stdout/stderr/stdio', async t => {
+-	const {shortMessage} = await t.throwsAsync(execa('echo-fail.js', fullStdio));
++test('error.shortMessage does not contain stdout/stderr', async t => {
++	const {shortMessage} = await t.throwsAsync(execa('echo-fail.js'));
+ 	t.false(shortMessage.includes('stderr'));
+ 	t.false(shortMessage.includes('stdout'));
+-	t.false(shortMessage.includes('fd3'));
+ });
+ 
+ test('Original error.message is kept', async t => {
+@@ -128,7 +85,7 @@ test('failed is false on success', async t => {
+ });
+ 
+ test('failed is true on failure', async t => {
+-	const {failed} = await t.throwsAsync(execa('fail.js'));
++	const {failed} = await t.throwsAsync(execa('exit.js', ['2']));
+ 	t.true(failed);
+ });
+ 
+@@ -231,7 +188,7 @@ test('result.signal is undefined for successful execution', async t => {
+ });
+ 
+ test('result.signal is undefined if process failed, but was not killed', async t => {
+-	const {signal} = await t.throwsAsync(execa('fail.js'));
++	const {signal} = await t.throwsAsync(execa('exit.js', [2]), {message: getExitRegExp('2')});
+ 	t.is(signal, undefined);
+ });
+ 
+@@ -251,12 +208,12 @@ test('error.code is defined on failure if applicable', async t => {
+ });
+ 
+ test('error.cwd is defined on failure if applicable', async t => {
+-	const {cwd} = await t.throwsAsync(execa('fail.js', [], {cwd: FIXTURES_DIR}));
++	const {cwd} = await t.throwsAsync(execa('noop-throw.js', [], {cwd: FIXTURES_DIR}));
+ 	t.is(cwd, FIXTURES_DIR);
+ });
+ 
+ test('error.cwd is undefined on failure if not passed as options', async t => {
+ 	const expectedCwd = process.cwd();
+-	const {cwd} = await t.throwsAsync(execa('fail.js'));
++	const {cwd} = await t.throwsAsync(execa('noop-throw.js'));
+ 	t.is(cwd, expectedCwd);
+ });
+diff --git a/test/fixtures/echo-fail.js b/test/fixtures/echo-fail.js
+index df2ddda..7ac2f13 100755
+--- a/test/fixtures/echo-fail.js
++++ b/test/fixtures/echo-fail.js
+@@ -1,8 +1,6 @@
+ #!/usr/bin/env node
+ import process from 'node:process';
+-import {writeSync} from 'node:fs';
+ 
+ console.log('stdout');
+ console.error('stderr');
+-writeSync(3, 'fd3');
+ process.exit(1);
+diff --git a/test/fixtures/max-buffer.js b/test/fixtures/max-buffer.js
+index 986b4f4..4d28851 100755
+--- a/test/fixtures/max-buffer.js
++++ b/test/fixtures/max-buffer.js
+@@ -1,13 +1,7 @@
+ #!/usr/bin/env node
+ import process from 'node:process';
+-import {writeSync} from 'node:fs';
+ 
+-const index = Number(process.argv[2]);
+-const bytes = '.'.repeat(Number(process.argv[3] || 1e7));
+-if (index === 1) {
+-	process.stdout.write(bytes);
+-} else if (index === 2) {
+-	process.stderr.write(bytes);
+-} else {
+-	writeSync(index, bytes);
+-}
++const output = process.argv[2] || 'stdout';
++const bytes = Number(process.argv[3] || 1e7);
++
++process[output].write('.'.repeat(bytes - 1) + '\n');
+diff --git a/test/fixtures/nested-multiple-stderr.js b/test/fixtures/nested-multiple-stderr.js
+index d7614b0..48493f2 100755
+--- a/test/fixtures/nested-multiple-stderr.js
++++ b/test/fixtures/nested-multiple-stderr.js
+@@ -3,5 +3,5 @@ import process from 'node:process';
+ import {execa} from '../../index.js';
+ 
+ const [options] = process.argv.slice(2);
+-const result = await execa('noop-fd.js', ['2', 'foobar'], {stderr: JSON.parse(options)});
++const result = await execa('noop-err.js', ['foobar'], {stderr: JSON.parse(options)});
+ process.stdout.write(`nested ${result.stderr}`);
+diff --git a/test/fixtures/nested-stdio.js b/test/fixtures/nested-stdio.js
+index 97d95a5..1063b67 100755
+--- a/test/fixtures/nested-stdio.js
++++ b/test/fixtures/nested-stdio.js
+@@ -10,7 +10,7 @@ optionValue = Array.isArray(optionValue) && typeof optionValue[0] === 'string'
+ 	: optionValue;
+ const stdio = ['ignore', 'inherit', 'inherit'];
+ stdio[index] = optionValue;
+-const childProcess = execa(file, [`${index}`, ...args], {stdio});
++const childProcess = execa(file, args, {stdio});
+ 
+ const shouldPipe = Array.isArray(optionValue) && optionValue.includes('pipe');
+ const hasPipe = childProcess.stdio[index] !== null;
+diff --git a/test/fixtures/noop-delay.js b/test/fixtures/noop-delay.js
+index c624d88..4511a07 100755
+--- a/test/fixtures/noop-delay.js
++++ b/test/fixtures/noop-delay.js
+@@ -1,7 +1,6 @@
+ #!/usr/bin/env node
+ import process from 'node:process';
+-import {writeSync} from 'node:fs';
+ import {setTimeout} from 'node:timers/promises';
+ 
+-writeSync(Number(process.argv[2]), 'foobar');
+-await setTimeout(100);
++console.log(process.argv[2]);
++await setTimeout((Number(process.argv[3]) || 1) * 1e3);
+diff --git a/test/fixtures/noop-err.js b/test/fixtures/noop-err.js
+new file mode 100755
+index 0000000..505fb97
+--- /dev/null
++++ b/test/fixtures/noop-err.js
+@@ -0,0 +1,4 @@
++#!/usr/bin/env node
++import process from 'node:process';
++
++console.error(process.argv[2]);
+diff --git a/test/fixtures/noop-fail.js b/test/fixtures/noop-fail.js
+index c5f7886..b445b68 100755
+--- a/test/fixtures/noop-fail.js
++++ b/test/fixtures/noop-fail.js
+@@ -1,6 +1,5 @@
+ #!/usr/bin/env node
+ import process from 'node:process';
+-import {writeSync} from 'node:fs';
+ 
+-writeSync(Number(process.argv[2]), 'foobar');
++console.log(process.argv[2]);
+ process.exit(2);
+diff --git a/test/fixtures/noop-fd.js b/test/fixtures/noop-fd.js
+deleted file mode 100755
+index b25409b..0000000
+--- a/test/fixtures/noop-fd.js
++++ /dev/null
+@@ -1,5 +0,0 @@
+-#!/usr/bin/env node
+-import process from 'node:process';
+-import {writeSync} from 'node:fs';
+-
+-writeSync(Number(process.argv[2]), process.argv[3] || 'foobar');
+diff --git a/test/fixtures/noop-fd3.js b/test/fixtures/noop-fd3.js
+new file mode 100755
+index 0000000..bb32353
+--- /dev/null
++++ b/test/fixtures/noop-fd3.js
+@@ -0,0 +1,6 @@
++#!/usr/bin/env node
++import process from 'node:process';
++import {writeSync} from 'node:fs';
++
++const fileDescriptorIndex = Number(process.argv[3] || 3);
++writeSync(fileDescriptorIndex, `${process.argv[2]}\n`);
+diff --git a/test/fixtures/noop-no-newline.js b/test/fixtures/noop-no-newline.js
+new file mode 100755
+index 0000000..b9d9d9d
+--- /dev/null
++++ b/test/fixtures/noop-no-newline.js
+@@ -0,0 +1,4 @@
++#!/usr/bin/env node
++import process from 'node:process';
++
++process.stdout.write(process.argv[2]);
+diff --git a/test/fixtures/noop-throw.js b/test/fixtures/noop-throw.js
+new file mode 100755
+index 0000000..2a42f98
+--- /dev/null
++++ b/test/fixtures/noop-throw.js
+@@ -0,0 +1,5 @@
++#!/usr/bin/env node
++import process from 'node:process';
++
++console.error(process.argv[2]);
++process.exit(2);
+diff --git a/test/fixtures/stdin-fd.js b/test/fixtures/stdin-fd.js
+deleted file mode 100755
+index 7ddff1d..0000000
+--- a/test/fixtures/stdin-fd.js
++++ /dev/null
+@@ -1,10 +0,0 @@
+-#!/usr/bin/env node
+-import process from 'node:process';
+-import {readFileSync} from 'node:fs';
+-
+-const fileDescriptorIndex = Number(process.argv[2]);
+-if (fileDescriptorIndex === 0) {
+-	process.stdin.pipe(process.stdout);
+-} else {
+-	process.stdout.write(readFileSync(fileDescriptorIndex));
+-}
+diff --git a/test/fixtures/stdin-fd3.js b/test/fixtures/stdin-fd3.js
+new file mode 100755
+index 0000000..0bb21b2
+--- /dev/null
++++ b/test/fixtures/stdin-fd3.js
+@@ -0,0 +1,6 @@
++#!/usr/bin/env node
++import process from 'node:process';
++import {readFileSync} from 'node:fs';
++
++const fileDescriptorIndex = Number(process.argv[2] || 3);
++console.log(readFileSync(fileDescriptorIndex, {encoding: 'utf8'}));
+diff --git a/test/helpers/run.js b/test/helpers/run.js
+deleted file mode 100644
+index c6de810..0000000
+--- a/test/helpers/run.js
++++ /dev/null
+@@ -1,6 +0,0 @@
+-import {execa, execaSync, $} from '../../index.js';
+-
+-export const runExeca = (file, options) => execa(file, options);
+-export const runExecaSync = (file, options) => execaSync(file, options);
+-export const runScript = (file, options) => $(options)`${file}`;
+-export const runScriptSync = (file, options) => $(options).sync`${file}`;
+diff --git a/test/helpers/stdio.js b/test/helpers/stdio.js
+index 695c44e..e8254a6 100644
+--- a/test/helpers/stdio.js
++++ b/test/helpers/stdio.js
+@@ -1,17 +1,10 @@
+-import process from 'node:process';
++export const getStdinOption = stdioOption => ({stdin: stdioOption});
++export const getStdoutOption = stdioOption => ({stdout: stdioOption});
++export const getStderrOption = stdioOption => ({stderr: stdioOption});
++export const getStdioOption = stdioOption => ({stdio: ['pipe', 'pipe', 'pipe', stdioOption]});
++export const getInputOption = input => ({input});
++export const getInputFileOption = inputFile => ({inputFile});
+ 
+-export const identity = value => value;
+-
+-export const getStdio = (indexOrName, stdioOption) => {
+-	if (typeof indexOrName === 'string') {
+-		return {[indexOrName]: stdioOption};
+-	}
+-
+-	const stdio = ['pipe', 'pipe', 'pipe'];
+-	stdio[indexOrName] = stdioOption;
+-	return {stdio};
+-};
++export const getScriptSync = $ => $.sync;
+ 
+-export const fullStdio = getStdio(3, 'pipe');
+-
+-export const STANDARD_STREAMS = [process.stdin, process.stdout, process.stderr];
++export const identity = value => value;
+diff --git a/test/kill.js b/test/kill.js
+index 7389e4b..498455b 100644
+--- a/test/kill.js
++++ b/test/kill.js
+@@ -64,10 +64,9 @@ if (process.platform !== 'win32') {
+ 	test('`forceKillAfterTimeout` should not be negative', testInvalidForceKill, -1);
+ }
+ 
+-test('execa() returns a promise with kill()', async t => {
+-	const subprocess = execa('noop.js', ['foo']);
+-	t.is(typeof subprocess.kill, 'function');
+-	await subprocess;
++test('execa() returns a promise with kill()', t => {
++	const {kill} = execa('noop.js', ['foo']);
++	t.is(typeof kill, 'function');
+ });
+ 
+ test('timeout kills the process if it times out', async t => {
+diff --git a/test/node.js b/test/node.js
+index 1bbd7a3..13c4da4 100644
+--- a/test/node.js
++++ b/test/node.js
+@@ -37,11 +37,6 @@ test('node pipe stdout', async t => {
+ 	t.is(stdout, 'foo');
+ });
+ 
+-test('node does not return ipc channel\'s output', async t => {
+-	const {stdio} = await execaNode('test/fixtures/noop.js', ['foo']);
+-	t.deepEqual(stdio, [undefined, 'foo', '', undefined]);
+-});
+-
+ test('node correctly use nodePath', async t => {
+ 	const {stdout} = await execaNode(process.platform === 'win32' ? 'hello.cmd' : 'hello.sh', {
+ 		stdout: 'pipe',
+diff --git a/test/pipe.js b/test/pipe.js
+index a0d156a..2e7d757 100644
+--- a/test/pipe.js
++++ b/test/pipe.js
+@@ -9,44 +9,44 @@ import {setFixtureDir} from './helpers/fixtures-dir.js';
+ 
+ setFixtureDir();
+ 
+-const pipeToProcess = async (t, index, funcName) => {
+-	const {stdout} = await execa('noop-fd.js', [`${index}`, 'test'], {all: true})[funcName](execa('stdin.js'));
++const pipeToProcess = async (t, fixtureName, funcName) => {
++	const {stdout} = await execa(fixtureName, ['test'], {all: true})[funcName](execa('stdin.js'));
+ 	t.is(stdout, 'test');
+ };
+ 
+-test('pipeStdout() can pipe to Execa child processes', pipeToProcess, 1, 'pipeStdout');
+-test('pipeStderr() can pipe to Execa child processes', pipeToProcess, 2, 'pipeStderr');
+-test('pipeAll() can pipe stdout to Execa child processes', pipeToProcess, 1, 'pipeAll');
+-test('pipeAll() can pipe stderr to Execa child processes', pipeToProcess, 2, 'pipeAll');
++test('pipeStdout() can pipe to Execa child processes', pipeToProcess, 'noop.js', 'pipeStdout');
++test('pipeStderr() can pipe to Execa child processes', pipeToProcess, 'noop-err.js', 'pipeStderr');
++test('pipeAll() can pipe stdout to Execa child processes', pipeToProcess, 'noop.js', 'pipeAll');
++test('pipeAll() can pipe stderr to Execa child processes', pipeToProcess, 'noop-err.js', 'pipeAll');
+ 
+-const pipeToStream = async (t, index, funcName) => {
++const pipeToStream = async (t, fixtureName, funcName, streamName) => {
+ 	const stream = new PassThrough();
+-	const result = await execa('noop-fd.js', [`${index}`, 'test'], {all: true})[funcName](stream);
+-	t.is(result.stdio[index], 'test');
+-	t.is(await getStream(stream), 'test');
++	const result = await execa(fixtureName, ['test'], {all: true})[funcName](stream);
++	t.is(result[streamName], 'test');
++	t.is(await getStream(stream), 'test\n');
+ };
+ 
+-test('pipeStdout() can pipe to streams', pipeToStream, 1, 'pipeStdout');
+-test('pipeStderr() can pipe to streams', pipeToStream, 2, 'pipeStderr');
+-test('pipeAll() can pipe stdout to streams', pipeToStream, 1, 'pipeAll');
+-test('pipeAll() can pipe stderr to streams', pipeToStream, 2, 'pipeAll');
++test('pipeStdout() can pipe to streams', pipeToStream, 'noop.js', 'pipeStdout', 'stdout');
++test('pipeStderr() can pipe to streams', pipeToStream, 'noop-err.js', 'pipeStderr', 'stderr');
++test('pipeAll() can pipe stdout to streams', pipeToStream, 'noop.js', 'pipeAll', 'stdout');
++test('pipeAll() can pipe stderr to streams', pipeToStream, 'noop-err.js', 'pipeAll', 'stderr');
+ 
+-const pipeToFile = async (t, index, funcName) => {
++const pipeToFile = async (t, fixtureName, funcName, streamName) => {
+ 	const file = tempfile();
+-	const result = await execa('noop-fd.js', [`${index}`, 'test'], {all: true})[funcName](file);
+-	t.is(result.stdio[index], 'test');
+-	t.is(await readFile(file, 'utf8'), 'test');
++	const result = await execa(fixtureName, ['test'], {all: true})[funcName](file);
++	t.is(result[streamName], 'test');
++	t.is(await readFile(file, 'utf8'), 'test\n');
+ 	await rm(file);
+ };
+ 
+ // `test.serial()` is due to a race condition: `execa(...).pipe*(file)` might resolve before the file stream has resolved
+-test.serial('pipeStdout() can pipe to files', pipeToFile, 1, 'pipeStdout');
+-test.serial('pipeStderr() can pipe to files', pipeToFile, 2, 'pipeStderr');
+-test.serial('pipeAll() can pipe stdout to files', pipeToFile, 1, 'pipeAll');
+-test.serial('pipeAll() can pipe stderr to files', pipeToFile, 2, 'pipeAll');
++test.serial('pipeStdout() can pipe to files', pipeToFile, 'noop.js', 'pipeStdout', 'stdout');
++test.serial('pipeStderr() can pipe to files', pipeToFile, 'noop-err.js', 'pipeStderr', 'stderr');
++test.serial('pipeAll() can pipe stdout to files', pipeToFile, 'noop.js', 'pipeAll', 'stdout');
++test.serial('pipeAll() can pipe stderr to files', pipeToFile, 'noop-err.js', 'pipeAll', 'stderr');
+ 
+ const invalidTarget = (t, funcName, getTarget) => {
+-	t.throws(() => execa('empty.js', {all: true})[funcName](getTarget()), {
++	t.throws(() => execa('noop.js', {all: true})[funcName](getTarget()), {
+ 		message: /a stream or an Execa child process/,
+ 	});
+ };
+@@ -69,12 +69,12 @@ test('Must set "stdout" option to "pipe" to use pipeStdout()', invalidSource, 'p
+ test('Must set "stderr" option to "pipe" to use pipeStderr()', invalidSource, 'pipeStderr');
+ test('Must set "stdout" or "stderr" option to "pipe" to use pipeAll()', invalidSource, 'pipeAll');
+ 
+-const invalidPipeToProcess = async (t, index, funcName) => {
+-	t.throws(() => execa('noop-fd.js', [`${index}`, 'test'], {all: true})[funcName](execa('stdin.js', {stdin: 'ignore'})), {
++const invalidPipeToProcess = async (t, fixtureName, funcName) => {
++	t.throws(() => execa(fixtureName, ['test'], {all: true})[funcName](execa('stdin.js', {stdin: 'ignore'})), {
+ 		message: /stdin must be available/,
+ 	});
+ };
+ 
+-test('Must set target "stdin" option to "pipe" to use pipeStdout()', invalidPipeToProcess, 1, 'pipeStdout');
+-test('Must set target "stdin" option to "pipe" to use pipeStderr()', invalidPipeToProcess, 2, 'pipeStderr');
+-test('Must set target "stdin" option to "pipe" to use pipeAll()', invalidPipeToProcess, 1, 'pipeAll');
++test('Must set target "stdin" option to "pipe" to use pipeStdout()', invalidPipeToProcess, 'noop.js', 'pipeStdout');
++test('Must set target "stdin" option to "pipe" to use pipeStderr()', invalidPipeToProcess, 'noop-err.js', 'pipeStderr');
++test('Must set target "stdin" option to "pipe" to use pipeAll()', invalidPipeToProcess, 'noop.js', 'pipeAll');
+diff --git a/test/stdio/array.js b/test/stdio/array.js
+index d73a9ee..84109a8 100644
+--- a/test/stdio/array.js
++++ b/test/stdio/array.js
+@@ -3,96 +3,103 @@ import process from 'node:process';
+ import test from 'ava';
+ import tempfile from 'tempfile';
+ import {execa, execaSync} from '../../index.js';
+-import {fullStdio, getStdio, STANDARD_STREAMS} from '../helpers/stdio.js';
++import {getStdinOption, getStdoutOption, getStderrOption, getStdioOption} from '../helpers/stdio.js';
+ import {stringGenerator} from '../helpers/generator.js';
+ import {setFixtureDir} from '../helpers/fixtures-dir.js';
+ 
+ setFixtureDir();
+ 
+-const testEmptyArray = (t, index, optionName, execaMethod) => {
++const testEmptyArray = (t, getOptions, optionName, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', getStdio(index, []));
++		execaMethod('noop.js', getOptions([]));
+ 	}, {message: `The \`${optionName}\` option must not be an empty array.`});
+ };
+ 
+-test('Cannot pass an empty array to stdin', testEmptyArray, 0, 'stdin', execa);
+-test('Cannot pass an empty array to stdout', testEmptyArray, 1, 'stdout', execa);
+-test('Cannot pass an empty array to stderr', testEmptyArray, 2, 'stderr', execa);
+-test('Cannot pass an empty array to stdio[*]', testEmptyArray, 3, 'stdio[3]', execa);
+-test('Cannot pass an empty array to stdin - sync', testEmptyArray, 0, 'stdin', execaSync);
+-test('Cannot pass an empty array to stdout - sync', testEmptyArray, 1, 'stdout', execaSync);
+-test('Cannot pass an empty array to stderr - sync', testEmptyArray, 2, 'stderr', execaSync);
+-test('Cannot pass an empty array to stdio[*] - sync', testEmptyArray, 3, 'stdio[3]', execaSync);
++test('Cannot pass an empty array to stdin', testEmptyArray, getStdinOption, 'stdin', execa);
++test('Cannot pass an empty array to stdout', testEmptyArray, getStdoutOption, 'stdout', execa);
++test('Cannot pass an empty array to stderr', testEmptyArray, getStderrOption, 'stderr', execa);
++test('Cannot pass an empty array to stdio[*]', testEmptyArray, getStdioOption, 'stdio[3]', execa);
++test('Cannot pass an empty array to stdin - sync', testEmptyArray, getStdinOption, 'stdin', execaSync);
++test('Cannot pass an empty array to stdout - sync', testEmptyArray, getStdoutOption, 'stdout', execaSync);
++test('Cannot pass an empty array to stderr - sync', testEmptyArray, getStderrOption, 'stderr', execaSync);
++test('Cannot pass an empty array to stdio[*] - sync', testEmptyArray, getStdioOption, 'stdio[3]', execaSync);
+ 
+-const testNoPipeOption = async (t, stdioOption, index) => {
+-	const childProcess = execa('empty.js', getStdio(index, stdioOption));
+-	t.is(childProcess.stdio[index], null);
++const testNoPipeOption = async (t, stdioOption, streamName) => {
++	const childProcess = execa('empty.js', {[streamName]: stdioOption});
++	t.is(childProcess[streamName], null);
+ 	await childProcess;
+ };
+ 
+-test('stdin can be "ignore"', testNoPipeOption, 'ignore', 0);
+-test('stdin can be ["ignore"]', testNoPipeOption, ['ignore'], 0);
+-test('stdin can be ["ignore", "ignore"]', testNoPipeOption, ['ignore', 'ignore'], 0);
+-test('stdin can be "ipc"', testNoPipeOption, 'ipc', 0);
+-test('stdin can be ["ipc"]', testNoPipeOption, ['ipc'], 0);
+-test('stdin can be "inherit"', testNoPipeOption, 'inherit', 0);
+-test('stdin can be ["inherit"]', testNoPipeOption, ['inherit'], 0);
+-test('stdin can be 0', testNoPipeOption, 0, 0);
+-test('stdin can be [0]', testNoPipeOption, [0], 0);
+-test('stdout can be "ignore"', testNoPipeOption, 'ignore', 1);
+-test('stdout can be ["ignore"]', testNoPipeOption, ['ignore'], 1);
+-test('stdout can be ["ignore", "ignore"]', testNoPipeOption, ['ignore', 'ignore'], 1);
+-test('stdout can be "ipc"', testNoPipeOption, 'ipc', 1);
+-test('stdout can be ["ipc"]', testNoPipeOption, ['ipc'], 1);
+-test('stdout can be "inherit"', testNoPipeOption, 'inherit', 1);
+-test('stdout can be ["inherit"]', testNoPipeOption, ['inherit'], 1);
+-test('stdout can be 1', testNoPipeOption, 1, 1);
+-test('stdout can be [1]', testNoPipeOption, [1], 1);
+-test('stderr can be "ignore"', testNoPipeOption, 'ignore', 2);
+-test('stderr can be ["ignore"]', testNoPipeOption, ['ignore'], 2);
+-test('stderr can be ["ignore", "ignore"]', testNoPipeOption, ['ignore', 'ignore'], 2);
+-test('stderr can be "ipc"', testNoPipeOption, 'ipc', 2);
+-test('stderr can be ["ipc"]', testNoPipeOption, ['ipc'], 2);
+-test('stderr can be "inherit"', testNoPipeOption, 'inherit', 2);
+-test('stderr can be ["inherit"]', testNoPipeOption, ['inherit'], 2);
+-test('stderr can be 2', testNoPipeOption, 2, 2);
+-test('stderr can be [2]', testNoPipeOption, [2], 2);
+-test('stdio[*] can be "ignore"', testNoPipeOption, 'ignore', 3);
+-test('stdio[*] can be ["ignore"]', testNoPipeOption, ['ignore'], 3);
+-test('stdio[*] can be ["ignore", "ignore"]', testNoPipeOption, ['ignore', 'ignore'], 3);
+-test('stdio[*] can be "ipc"', testNoPipeOption, 'ipc', 3);
+-test('stdio[*] can be ["ipc"]', testNoPipeOption, ['ipc'], 3);
+-test('stdio[*] can be "inherit"', testNoPipeOption, 'inherit', 3);
+-test('stdio[*] can be ["inherit"]', testNoPipeOption, ['inherit'], 3);
+-test('stdio[*] can be 3', testNoPipeOption, 3, 3);
+-test('stdio[*] can be [3]', testNoPipeOption, [3], 3);
+-
+-const testInvalidArrayValue = (t, invalidStdio, index, execaMethod) => {
++test('stdin can be "ignore"', testNoPipeOption, 'ignore', 'stdin');
++test('stdin can be ["ignore"]', testNoPipeOption, ['ignore'], 'stdin');
++test('stdin can be ["ignore", "ignore"]', testNoPipeOption, ['ignore', 'ignore'], 'stdin');
++test('stdin can be "ipc"', testNoPipeOption, 'ipc', 'stdin');
++test('stdin can be ["ipc"]', testNoPipeOption, ['ipc'], 'stdin');
++test('stdin can be "inherit"', testNoPipeOption, 'inherit', 'stdin');
++test('stdin can be ["inherit"]', testNoPipeOption, ['inherit'], 'stdin');
++test('stdin can be 0', testNoPipeOption, 0, 'stdin');
++test('stdin can be [0]', testNoPipeOption, [0], 'stdin');
++test('stdout can be "ignore"', testNoPipeOption, 'ignore', 'stdout');
++test('stdout can be ["ignore"]', testNoPipeOption, ['ignore'], 'stdout');
++test('stdout can be ["ignore", "ignore"]', testNoPipeOption, ['ignore', 'ignore'], 'stdout');
++test('stdout can be "ipc"', testNoPipeOption, 'ipc', 'stdout');
++test('stdout can be ["ipc"]', testNoPipeOption, ['ipc'], 'stdout');
++test('stdout can be "inherit"', testNoPipeOption, 'inherit', 'stdout');
++test('stdout can be ["inherit"]', testNoPipeOption, ['inherit'], 'stdout');
++test('stdout can be 1', testNoPipeOption, 1, 'stdout');
++test('stdout can be [1]', testNoPipeOption, [1], 'stdout');
++test('stderr can be "ignore"', testNoPipeOption, 'ignore', 'stderr');
++test('stderr can be ["ignore"]', testNoPipeOption, ['ignore'], 'stderr');
++test('stderr can be ["ignore", "ignore"]', testNoPipeOption, ['ignore', 'ignore'], 'stderr');
++test('stderr can be "ipc"', testNoPipeOption, 'ipc', 'stderr');
++test('stderr can be ["ipc"]', testNoPipeOption, ['ipc'], 'stderr');
++test('stderr can be "inherit"', testNoPipeOption, 'inherit', 'stderr');
++test('stderr can be ["inherit"]', testNoPipeOption, ['inherit'], 'stderr');
++test('stderr can be 2', testNoPipeOption, 2, 'stderr');
++test('stderr can be [2]', testNoPipeOption, [2], 'stderr');
++
++const testNoPipeStdioOption = async (t, stdioOption) => {
++	const childProcess = execa('empty.js', {stdio: ['pipe', 'pipe', 'pipe', stdioOption]});
++	t.is(childProcess.stdio[3], null);
++	await childProcess;
++};
++
++test('stdio[*] can be "ignore"', testNoPipeStdioOption, 'ignore');
++test('stdio[*] can be ["ignore"]', testNoPipeStdioOption, ['ignore']);
++test('stdio[*] can be ["ignore", "ignore"]', testNoPipeStdioOption, ['ignore', 'ignore']);
++test('stdio[*] can be "ipc"', testNoPipeStdioOption, 'ipc');
++test('stdio[*] can be ["ipc"]', testNoPipeStdioOption, ['ipc']);
++test('stdio[*] can be "inherit"', testNoPipeStdioOption, 'inherit');
++test('stdio[*] can be ["inherit"]', testNoPipeStdioOption, ['inherit']);
++test('stdio[*] can be 3', testNoPipeStdioOption, 3);
++test('stdio[*] can be [3]', testNoPipeStdioOption, [3]);
++
++const testInvalidArrayValue = (t, invalidStdio, getOptions, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', getStdio(index, ['pipe', invalidStdio]));
++		execaMethod('noop.js', getOptions(['pipe', invalidStdio]));
+ 	}, {message: /must not include/});
+ };
+ 
+-test('Cannot pass "ignore" and another value to stdin', testInvalidArrayValue, 'ignore', 0, execa);
+-test('Cannot pass "ignore" and another value to stdout', testInvalidArrayValue, 'ignore', 1, execa);
+-test('Cannot pass "ignore" and another value to stderr', testInvalidArrayValue, 'ignore', 2, execa);
+-test('Cannot pass "ignore" and another value to stdio[*]', testInvalidArrayValue, 'ignore', 3, execa);
+-test('Cannot pass "ignore" and another value to stdin - sync', testInvalidArrayValue, 'ignore', 0, execaSync);
+-test('Cannot pass "ignore" and another value to stdout - sync', testInvalidArrayValue, 'ignore', 1, execaSync);
+-test('Cannot pass "ignore" and another value to stderr - sync', testInvalidArrayValue, 'ignore', 2, execaSync);
+-test('Cannot pass "ignore" and another value to stdio[*] - sync', testInvalidArrayValue, 'ignore', 3, execaSync);
+-test('Cannot pass "ipc" and another value to stdin', testInvalidArrayValue, 'ipc', 0, execa);
+-test('Cannot pass "ipc" and another value to stdout', testInvalidArrayValue, 'ipc', 1, execa);
+-test('Cannot pass "ipc" and another value to stderr', testInvalidArrayValue, 'ipc', 2, execa);
+-test('Cannot pass "ipc" and another value to stdio[*]', testInvalidArrayValue, 'ipc', 3, execa);
+-test('Cannot pass "ipc" and another value to stdin - sync', testInvalidArrayValue, 'ipc', 0, execaSync);
+-test('Cannot pass "ipc" and another value to stdout - sync', testInvalidArrayValue, 'ipc', 1, execaSync);
+-test('Cannot pass "ipc" and another value to stderr - sync', testInvalidArrayValue, 'ipc', 2, execaSync);
+-test('Cannot pass "ipc" and another value to stdio[*] - sync', testInvalidArrayValue, 'ipc', 3, execaSync);
++test('Cannot pass "ignore" and another value to stdin', testInvalidArrayValue, 'ignore', getStdinOption, execa);
++test('Cannot pass "ignore" and another value to stdout', testInvalidArrayValue, 'ignore', getStdoutOption, execa);
++test('Cannot pass "ignore" and another value to stderr', testInvalidArrayValue, 'ignore', getStderrOption, execa);
++test('Cannot pass "ignore" and another value to stdio[*]', testInvalidArrayValue, 'ignore', getStdioOption, execa);
++test('Cannot pass "ignore" and another value to stdin - sync', testInvalidArrayValue, 'ignore', getStdinOption, execaSync);
++test('Cannot pass "ignore" and another value to stdout - sync', testInvalidArrayValue, 'ignore', getStdoutOption, execaSync);
++test('Cannot pass "ignore" and another value to stderr - sync', testInvalidArrayValue, 'ignore', getStderrOption, execaSync);
++test('Cannot pass "ignore" and another value to stdio[*] - sync', testInvalidArrayValue, 'ignore', getStdioOption, execaSync);
++test('Cannot pass "ipc" and another value to stdin', testInvalidArrayValue, 'ipc', getStdinOption, execa);
++test('Cannot pass "ipc" and another value to stdout', testInvalidArrayValue, 'ipc', getStdoutOption, execa);
++test('Cannot pass "ipc" and another value to stderr', testInvalidArrayValue, 'ipc', getStderrOption, execa);
++test('Cannot pass "ipc" and another value to stdio[*]', testInvalidArrayValue, 'ipc', getStdioOption, execa);
++test('Cannot pass "ipc" and another value to stdin - sync', testInvalidArrayValue, 'ipc', getStdinOption, execaSync);
++test('Cannot pass "ipc" and another value to stdout - sync', testInvalidArrayValue, 'ipc', getStdoutOption, execaSync);
++test('Cannot pass "ipc" and another value to stderr - sync', testInvalidArrayValue, 'ipc', getStderrOption, execaSync);
++test('Cannot pass "ipc" and another value to stdio[*] - sync', testInvalidArrayValue, 'ipc', getStdioOption, execaSync);
+ 
+ const testInputOutput = (t, stdioOption, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', getStdio(3, [new ReadableStream(), stdioOption]));
++		execaMethod('noop.js', getStdioOption([new ReadableStream(), stdioOption]));
+ 	}, {message: /readable and writable/});
+ };
+ 
+@@ -109,71 +116,74 @@ test('Cannot pass both readable and writable values to stdio[*] - process.stderr
+ 
+ const testAmbiguousDirection = async (t, execaMethod) => {
+ 	const [filePathOne, filePathTwo] = [tempfile(), tempfile()];
+-	await execaMethod('noop-fd.js', ['3', 'foobar'], getStdio(3, [{file: filePathOne}, {file: filePathTwo}]));
+-	t.deepEqual(
+-		await Promise.all([readFile(filePathOne, 'utf8'), readFile(filePathTwo, 'utf8')]),
+-		['foobar', 'foobar'],
+-	);
++	await execaMethod('noop-fd3.js', ['foobar'], getStdioOption([{file: filePathOne}, {file: filePathTwo}]));
++	t.deepEqual(await Promise.all([readFile(filePathOne, 'utf8'), readFile(filePathTwo, 'utf8')]), ['foobar\n', 'foobar\n']);
+ 	await Promise.all([rm(filePathOne), rm(filePathTwo)]);
+ };
+ 
+ test('stdio[*] default direction is output', testAmbiguousDirection, execa);
+ test('stdio[*] default direction is output - sync', testAmbiguousDirection, execaSync);
+ 
+-const testAmbiguousMultiple = async (t, index) => {
++const testAmbiguousMultiple = async (t, fixtureName, getOptions) => {
+ 	const filePath = tempfile();
+ 	await writeFile(filePath, 'foobar');
+-	const {stdout} = await execa('stdin-fd.js', [`${index}`], getStdio(index, [{file: filePath}, stringGenerator()]));
++	const {stdout} = await execa(fixtureName, getOptions([{file: filePath}, stringGenerator()]));
+ 	t.is(stdout, 'foobarfoobar');
+ 	await rm(filePath);
+ };
+ 
+-test('stdin ambiguous direction is influenced by other values', testAmbiguousMultiple, 0);
+-test('stdio[*] ambiguous direction is influenced by other values', testAmbiguousMultiple, 3);
+-
+-const testRedirect = async (t, stdioOption, index, isInput) => {
+-	const {fixtureName, ...options} = isInput
+-		? {fixtureName: 'stdin-fd.js', input: 'foobar'}
+-		: {fixtureName: 'noop-fd.js'};
+-	const {stdio} = await execa('nested-stdio.js', [JSON.stringify(stdioOption), `${index}`, fixtureName, 'foobar'], options);
+-	const resultIndex = isStderrDescriptor(stdioOption) ? 2 : 1;
+-	t.is(stdio[resultIndex], 'foobar');
+-};
+-
+-const isStderrDescriptor = stdioOption => stdioOption === 2
+-	|| stdioOption === 'stderr'
+-	|| (Array.isArray(stdioOption) && isStderrDescriptor(stdioOption[0]));
+-
+-test.serial('stdio[*] can be 0', testRedirect, 0, 3, true);
+-test.serial('stdio[*] can be [0]', testRedirect, [0], 3, true);
+-test.serial('stdio[*] can be [0, "pipe"]', testRedirect, [0, 'pipe'], 3, true);
+-test.serial('stdio[*] can be process.stdin', testRedirect, 'stdin', 3, true);
+-test.serial('stdio[*] can be [process.stdin]', testRedirect, ['stdin'], 3, true);
+-test.serial('stdio[*] can be [process.stdin, "pipe"]', testRedirect, ['stdin', 'pipe'], 3, true);
+-test('stdout can be 2', testRedirect, 2, 1, false);
+-test('stdout can be [2]', testRedirect, [2], 1, false);
+-test('stdout can be [2, "pipe"]', testRedirect, [2, 'pipe'], 1, false);
+-test('stdout can be process.stderr', testRedirect, 'stderr', 1, false);
+-test('stdout can be [process.stderr]', testRedirect, ['stderr'], 1, false);
+-test('stdout can be [process.stderr, "pipe"]', testRedirect, ['stderr', 'pipe'], 1, false);
+-test('stderr can be 1', testRedirect, 1, 2, false);
+-test('stderr can be [1]', testRedirect, [1], 2, false);
+-test('stderr can be [1, "pipe"]', testRedirect, [1, 'pipe'], 2, false);
+-test('stderr can be process.stdout', testRedirect, 'stdout', 2, false);
+-test('stderr can be [process.stdout]', testRedirect, ['stdout'], 2, false);
+-test('stderr can be [process.stdout, "pipe"]', testRedirect, ['stdout', 'pipe'], 2, false);
+-test('stdio[*] can be 1', testRedirect, 1, 3, false);
+-test('stdio[*] can be [1]', testRedirect, [1], 3, false);
+-test('stdio[*] can be [1, "pipe"]', testRedirect, [1, 'pipe'], 3, false);
+-test('stdio[*] can be 2', testRedirect, 2, 3, false);
+-test('stdio[*] can be [2]', testRedirect, [2], 3, false);
+-test('stdio[*] can be [2, "pipe"]', testRedirect, [2, 'pipe'], 3, false);
+-test('stdio[*] can be process.stdout', testRedirect, 'stdout', 3, false);
+-test('stdio[*] can be [process.stdout]', testRedirect, ['stdout'], 3, false);
+-test('stdio[*] can be [process.stdout, "pipe"]', testRedirect, ['stdout', 'pipe'], 3, false);
+-test('stdio[*] can be process.stderr', testRedirect, 'stderr', 3, false);
+-test('stdio[*] can be [process.stderr]', testRedirect, ['stderr'], 3, false);
+-test('stdio[*] can be [process.stderr, "pipe"]', testRedirect, ['stderr', 'pipe'], 3, false);
++test('stdin ambiguous direction is influenced by other values', testAmbiguousMultiple, 'stdin.js', getStdinOption);
++test('stdio[*] ambiguous direction is influenced by other values', testAmbiguousMultiple, 'stdin-fd3.js', getStdioOption);
++
++const testRedirectInput = async (t, stdioOption, index, fixtureName) => {
++	const {stdout} = await execa('nested-stdio.js', [JSON.stringify(stdioOption), String(index), fixtureName], {input: 'foobar'});
++	t.is(stdout, 'foobar');
++};
++
++test.serial('stdio[*] can be 0', testRedirectInput, 0, 3, 'stdin-fd3.js');
++test.serial('stdio[*] can be [0]', testRedirectInput, [0], 3, 'stdin-fd3.js');
++test.serial('stdio[*] can be [0, "pipe"]', testRedirectInput, [0, 'pipe'], 3, 'stdin-fd3.js');
++test.serial('stdio[*] can be process.stdin', testRedirectInput, 'stdin', 3, 'stdin-fd3.js');
++test.serial('stdio[*] can be [process.stdin]', testRedirectInput, ['stdin'], 3, 'stdin-fd3.js');
++test.serial('stdio[*] can be [process.stdin, "pipe"]', testRedirectInput, ['stdin', 'pipe'], 3, 'stdin-fd3.js');
++
++const OUTPUT_DESCRIPTOR_FIXTURES = ['noop.js', 'noop-err.js', 'noop-fd3.js'];
++
++const isStdoutDescriptor = stdioOption => stdioOption === 1
++	|| stdioOption === 'stdout'
++	|| (Array.isArray(stdioOption) && isStdoutDescriptor(stdioOption[0]));
++
++const testRedirectOutput = async (t, stdioOption, index) => {
++	const fixtureName = OUTPUT_DESCRIPTOR_FIXTURES[index - 1];
++	const result = await execa('nested-stdio.js', [JSON.stringify(stdioOption), String(index), fixtureName, 'foobar']);
++	const streamName = isStdoutDescriptor(stdioOption) ? 'stdout' : 'stderr';
++	t.is(result[streamName], 'foobar');
++};
++
++test('stdout can be 2', testRedirectOutput, 2, 1);
++test('stdout can be [2]', testRedirectOutput, [2], 1);
++test('stdout can be [2, "pipe"]', testRedirectOutput, [2, 'pipe'], 1);
++test('stdout can be process.stderr', testRedirectOutput, 'stderr', 1);
++test('stdout can be [process.stderr]', testRedirectOutput, ['stderr'], 1);
++test('stdout can be [process.stderr, "pipe"]', testRedirectOutput, ['stderr', 'pipe'], 1);
++test('stderr can be 1', testRedirectOutput, 1, 2);
++test('stderr can be [1]', testRedirectOutput, [1], 2);
++test('stderr can be [1, "pipe"]', testRedirectOutput, [1, 'pipe'], 2);
++test('stderr can be process.stdout', testRedirectOutput, 'stdout', 2);
++test('stderr can be [process.stdout]', testRedirectOutput, ['stdout'], 2);
++test('stderr can be [process.stdout, "pipe"]', testRedirectOutput, ['stdout', 'pipe'], 2);
++test('stdio[*] can be 1', testRedirectOutput, 1, 3);
++test('stdio[*] can be [1]', testRedirectOutput, [1], 3);
++test('stdio[*] can be [1, "pipe"]', testRedirectOutput, [1, 'pipe'], 3);
++test('stdio[*] can be 2', testRedirectOutput, 2, 3);
++test('stdio[*] can be [2]', testRedirectOutput, [2], 3);
++test('stdio[*] can be [2, "pipe"]', testRedirectOutput, [2, 'pipe'], 3);
++test('stdio[*] can be process.stdout', testRedirectOutput, 'stdout', 3);
++test('stdio[*] can be [process.stdout]', testRedirectOutput, ['stdout'], 3);
++test('stdio[*] can be [process.stdout, "pipe"]', testRedirectOutput, ['stdout', 'pipe'], 3);
++test('stdio[*] can be process.stderr', testRedirectOutput, 'stderr', 3);
++test('stdio[*] can be [process.stderr]', testRedirectOutput, ['stderr'], 3);
++test('stdio[*] can be [process.stderr, "pipe"]', testRedirectOutput, ['stderr', 'pipe'], 3);
+ 
+ const testInheritStdin = async (t, stdin) => {
+ 	const {stdout} = await execa('nested-multiple-stdin.js', [JSON.stringify(stdin)], {input: 'foobar'});
+@@ -201,55 +211,55 @@ const testInheritStderr = async (t, stderr) => {
+ test('stderr can be ["inherit", "pipe"]', testInheritStderr, ['inherit', 'pipe']);
+ test('stderr can be [2, "pipe"]', testInheritStderr, [2, 'pipe']);
+ 
+-const testOverflowStream = async (t, index, stdioOption) => {
+-	const {stdout} = await execa('nested.js', [JSON.stringify(getStdio(index, stdioOption)), 'empty.js'], fullStdio);
++const testOverflowStream = async (t, stdio) => {
++	const {stdout} = await execa('nested.js', [JSON.stringify({stdio}), 'empty.js'], {stdio: ['pipe', 'pipe', 'pipe', 'pipe']});
+ 	t.is(stdout, '');
+ };
+ 
+ if (process.platform === 'linux') {
+-	test('stdin can use 4+', testOverflowStream, 0, 4);
+-	test('stdin can use [4+]', testOverflowStream, 0, [4]);
+-	test('stdout can use 4+', testOverflowStream, 1, 4);
+-	test('stdout can use [4+]', testOverflowStream, 1, [4]);
+-	test('stderr can use 4+', testOverflowStream, 2, 4);
+-	test('stderr can use [4+]', testOverflowStream, 2, [4]);
+-	test('stdio[*] can use 4+', testOverflowStream, 3, 4);
+-	test('stdio[*] can use [4+]', testOverflowStream, 3, [4]);
++	test('stdin can use 4+', testOverflowStream, [4, 'pipe', 'pipe', 'pipe']);
++	test('stdin can use [4+]', testOverflowStream, [[4], 'pipe', 'pipe', 'pipe']);
++	test('stdout can use 4+', testOverflowStream, ['pipe', 4, 'pipe', 'pipe']);
++	test('stdout can use [4+]', testOverflowStream, ['pipe', [4], 'pipe', 'pipe']);
++	test('stderr can use 4+', testOverflowStream, ['pipe', 'pipe', 4, 'pipe']);
++	test('stderr can use [4+]', testOverflowStream, ['pipe', 'pipe', [4], 'pipe']);
++	test('stdio[*] can use 4+', testOverflowStream, ['pipe', 'pipe', 'pipe', 4]);
++	test('stdio[*] can use [4+]', testOverflowStream, ['pipe', 'pipe', 'pipe', [4]]);
+ }
+ 
+-test('stdio[*] can use "inherit"', testOverflowStream, 3, 'inherit');
+-test('stdio[*] can use ["inherit"]', testOverflowStream, 3, ['inherit']);
++test('stdio[*] can use "inherit"', testOverflowStream, ['pipe', 'pipe', 'pipe', 'inherit']);
++test('stdio[*] can use ["inherit"]', testOverflowStream, ['pipe', 'pipe', 'pipe', ['inherit']]);
+ 
+-const testOverflowStreamArray = (t, index, stdioOption) => {
++const testOverflowStreamArray = (t, stdio) => {
+ 	t.throws(() => {
+-		execa('empty.js', getStdio(index, stdioOption));
++		execa('noop.js', {stdio});
+ 	}, {message: /no such standard stream/});
+ };
+ 
+-test('stdin cannot use 4+ and another value', testOverflowStreamArray, 0, [4, 'pipe']);
+-test('stdout cannot use 4+ and another value', testOverflowStreamArray, 1, [4, 'pipe']);
+-test('stderr cannot use 4+ and another value', testOverflowStreamArray, 2, [4, 'pipe']);
+-test('stdio[*] cannot use 4+ and another value', testOverflowStreamArray, 3, [4, 'pipe']);
+-test('stdio[*] cannot use "inherit" and another value', testOverflowStreamArray, 3, ['inherit', 'pipe']);
++test('stdin cannot use 4+ and another value', testOverflowStreamArray, [[4, 'pipe'], 'pipe', 'pipe', 'pipe']);
++test('stdout cannot use 4+ and another value', testOverflowStreamArray, ['pipe', [4, 'pipe'], 'pipe', 'pipe']);
++test('stderr cannot use 4+ and another value', testOverflowStreamArray, ['pipe', 'pipe', [4, 'pipe'], 'pipe']);
++test('stdio[*] cannot use 4+ and another value', testOverflowStreamArray, ['pipe', 'pipe', 'pipe', [4, 'pipe']]);
++test('stdio[*] cannot use "inherit" and another value', testOverflowStreamArray, ['pipe', 'pipe', 'pipe', ['inherit', 'pipe']]);
+ 
+-const testOverlapped = async (t, index) => {
+-	const {stdout} = await execa('noop.js', ['foobar'], getStdio(index, ['overlapped', 'pipe']));
++const testOverlapped = async (t, getOptions) => {
++	const {stdout} = await execa('noop.js', ['foobar'], getOptions(['overlapped', 'pipe']));
+ 	t.is(stdout, 'foobar');
+ };
+ 
+-test('stdin can be ["overlapped", "pipe"]', testOverlapped, 0);
+-test('stdout can be ["overlapped", "pipe"]', testOverlapped, 1);
+-test('stderr can be ["overlapped", "pipe"]', testOverlapped, 2);
+-test('stdio[*] can be ["overlapped", "pipe"]', testOverlapped, 3);
++test('stdin can be ["overlapped", "pipe"]', testOverlapped, getStdinOption);
++test('stdout can be ["overlapped", "pipe"]', testOverlapped, getStdoutOption);
++test('stderr can be ["overlapped", "pipe"]', testOverlapped, getStderrOption);
++test('stdio[*] can be ["overlapped", "pipe"]', testOverlapped, getStdioOption);
+ 
+-const testDestroyStandard = async (t, index) => {
++const testDestroyStandard = async (t, optionName) => {
+ 	await t.throwsAsync(
+-		execa('forever.js', {...getStdio(index, [STANDARD_STREAMS[index], 'pipe']), timeout: 1}),
++		execa('forever.js', {timeout: 1, [optionName]: [process[optionName], 'pipe']}),
+ 		{message: /timed out/},
+ 	);
+-	t.false(STANDARD_STREAMS[index].destroyed);
++	t.false(process[optionName].destroyed);
+ };
+ 
+-test('Does not destroy process.stdin on errors', testDestroyStandard, 0);
+-test('Does not destroy process.stdout on errors', testDestroyStandard, 1);
+-test('Does not destroy process.stderr on errors', testDestroyStandard, 2);
++test('Does not destroy process.stdin on errors', testDestroyStandard, 'stdin');
++test('Does not destroy process.stdout on errors', testDestroyStandard, 'stdout');
++test('Does not destroy process.stderr on errors', testDestroyStandard, 'stderr');
+diff --git a/test/stdio/file-descriptor.js b/test/stdio/file-descriptor.js
+index 4e95d94..b940e22 100644
+--- a/test/stdio/file-descriptor.js
++++ b/test/stdio/file-descriptor.js
+@@ -3,32 +3,34 @@ import test from 'ava';
+ import tempfile from 'tempfile';
+ import {execa, execaSync} from '../../index.js';
+ import {setFixtureDir} from '../helpers/fixtures-dir.js';
+-import {getStdio} from '../helpers/stdio.js';
++import {getStdinOption, getStdoutOption, getStderrOption, getStdioOption} from '../helpers/stdio.js';
+ 
+ setFixtureDir();
+ 
+-const testFileDescriptorOption = async (t, index, execaMethod) => {
++const getStdinProp = ({stdin}) => stdin;
++const getStdioProp = ({stdio}) => stdio[3];
++
++const testFileDescriptorOption = async (t, fixtureName, getOptions, execaMethod) => {
+ 	const filePath = tempfile();
+ 	const fileDescriptor = await open(filePath, 'w');
+-	await execaMethod('noop-fd.js', [`${index}`, 'foobar'], getStdio(index, fileDescriptor));
+-	t.is(await readFile(filePath, 'utf8'), 'foobar');
++	await execaMethod(fixtureName, ['foobar'], getOptions(fileDescriptor));
++	t.is(await readFile(filePath, 'utf8'), 'foobar\n');
+ 	await rm(filePath);
+-	await fileDescriptor.close();
+ };
+ 
+-test('pass `stdout` to a file descriptor', testFileDescriptorOption, 1, execa);
+-test('pass `stderr` to a file descriptor', testFileDescriptorOption, 2, execa);
+-test('pass `stdio[*]` to a file descriptor', testFileDescriptorOption, 3, execa);
+-test('pass `stdout` to a file descriptor - sync', testFileDescriptorOption, 1, execaSync);
+-test('pass `stderr` to a file descriptor - sync', testFileDescriptorOption, 2, execaSync);
+-test('pass `stdio[*]` to a file descriptor - sync', testFileDescriptorOption, 3, execaSync);
++test('pass `stdout` to a file descriptor', testFileDescriptorOption, 'noop.js', getStdoutOption, execa);
++test('pass `stderr` to a file descriptor', testFileDescriptorOption, 'noop-err.js', getStderrOption, execa);
++test('pass `stdio[*]` to a file descriptor', testFileDescriptorOption, 'noop-fd3.js', getStdioOption, execa);
++test('pass `stdout` to a file descriptor - sync', testFileDescriptorOption, 'noop.js', getStdoutOption, execaSync);
++test('pass `stderr` to a file descriptor - sync', testFileDescriptorOption, 'noop-err.js', getStderrOption, execaSync);
++test('pass `stdio[*]` to a file descriptor - sync', testFileDescriptorOption, 'noop-fd3.js', getStdioOption, execaSync);
+ 
+-const testStdinWrite = async (t, index) => {
+-	const subprocess = execa('stdin-fd.js', [`${index}`], getStdio(index, 'pipe'));
+-	subprocess.stdio[index].end('unicorns');
++const testStdinWrite = async (t, getStreamProp, fixtureName, getOptions) => {
++	const subprocess = execa(fixtureName, getOptions('pipe'));
++	getStreamProp(subprocess).end('unicorns');
+ 	const {stdout} = await subprocess;
+ 	t.is(stdout, 'unicorns');
+ };
+ 
+-test('you can write to child.stdin', testStdinWrite, 0);
+-test('you can write to child.stdio[*]', testStdinWrite, 3);
++test('you can write to child.stdin', testStdinWrite, getStdinProp, 'stdin.js', getStdinOption);
++test('you can write to child.stdio[*]', testStdinWrite, getStdioProp, 'stdin-fd3.js', getStdioOption);
+diff --git a/test/stdio/file-path.js b/test/stdio/file-path.js
+index ea29573..d6a3a82 100644
+--- a/test/stdio/file-path.js
++++ b/test/stdio/file-path.js
+@@ -4,10 +4,9 @@ import process from 'node:process';
+ import {pathToFileURL} from 'node:url';
+ import test from 'ava';
+ import tempfile from 'tempfile';
+-import {execa, execaSync} from '../../index.js';
++import {execa, execaSync, $} from '../../index.js';
+ import {setFixtureDir} from '../helpers/fixtures-dir.js';
+-import {identity, getStdio} from '../helpers/stdio.js';
+-import {runExeca, runExecaSync, runScript, runScriptSync} from '../helpers/run.js';
++import {getStdinOption, getStdoutOption, getStderrOption, getStdioOption, getInputFileOption, getScriptSync, identity} from '../helpers/stdio.js';
+ 
+ setFixtureDir();
+ 
+@@ -17,102 +16,90 @@ const nonFileUrl = new URL('https://example.com');
+ 
+ const getAbsolutePath = file => ({file});
+ const getRelativePath = filePath => ({file: relative('.', filePath)});
++const getStdinFilePath = file => ({stdin: {file}});
+ 
+-const getStdioFile = (index, file) => getStdio(index, index === 0 ? {file} : file);
+-
+-const getStdioInput = (index, file) => {
+-	if (index === 'string') {
+-		return {input: 'foobar'};
+-	}
+-
+-	if (index === 'binary') {
+-		return {input: binaryFoobar};
+-	}
+-
+-	return getStdioFile(index, file);
+-};
+-
+-const testStdinFile = async (t, mapFilePath, index, execaMethod) => {
++const testStdinFile = async (t, mapFilePath, getOptions, execaMethod) => {
+ 	const filePath = tempfile();
+ 	await writeFile(filePath, 'foobar');
+-	const {stdout} = await execaMethod('stdin.js', getStdio(index, mapFilePath(filePath)));
++	const {stdout} = await execaMethod('stdin.js', getOptions(mapFilePath(filePath)));
+ 	t.is(stdout, 'foobar');
+ 	await rm(filePath);
+ };
+ 
+-test('inputFile can be a file URL', testStdinFile, pathToFileURL, 'inputFile', execa);
+-test('stdin can be a file URL', testStdinFile, pathToFileURL, 0, execa);
+-test('inputFile can be an absolute file path', testStdinFile, identity, 'inputFile', execa);
+-test('stdin can be an absolute file path', testStdinFile, getAbsolutePath, 0, execa);
+-test('inputFile can be a relative file path', testStdinFile, identity, 'inputFile', execa);
+-test('stdin can be a relative file path', testStdinFile, getRelativePath, 0, execa);
+-test('inputFile can be a file URL - sync', testStdinFile, pathToFileURL, 'inputFile', execaSync);
+-test('stdin can be a file URL - sync', testStdinFile, pathToFileURL, 0, execaSync);
+-test('inputFile can be an absolute file path - sync', testStdinFile, identity, 'inputFile', execaSync);
+-test('stdin can be an absolute file path - sync', testStdinFile, getAbsolutePath, 0, execaSync);
+-test('inputFile can be a relative file path - sync', testStdinFile, identity, 'inputFile', execaSync);
+-test('stdin can be a relative file path - sync', testStdinFile, getRelativePath, 0, execaSync);
+-
+-const testOutputFile = async (t, mapFile, index, execaMethod) => {
++test('inputFile can be a file URL', testStdinFile, pathToFileURL, getInputFileOption, execa);
++test('stdin can be a file URL', testStdinFile, pathToFileURL, getStdinOption, execa);
++test('inputFile can be an absolute file path', testStdinFile, identity, getInputFileOption, execa);
++test('stdin can be an absolute file path', testStdinFile, getAbsolutePath, getStdinOption, execa);
++test('inputFile can be a relative file path', testStdinFile, identity, getInputFileOption, execa);
++test('stdin can be a relative file path', testStdinFile, getRelativePath, getStdinOption, execa);
++test('inputFile can be a file URL - sync', testStdinFile, pathToFileURL, getInputFileOption, execaSync);
++test('stdin can be a file URL - sync', testStdinFile, pathToFileURL, getStdinOption, execaSync);
++test('inputFile can be an absolute file path - sync', testStdinFile, identity, getInputFileOption, execaSync);
++test('stdin can be an absolute file path - sync', testStdinFile, getAbsolutePath, getStdinOption, execaSync);
++test('inputFile can be a relative file path - sync', testStdinFile, identity, getInputFileOption, execaSync);
++test('stdin can be a relative file path - sync', testStdinFile, getRelativePath, getStdinOption, execaSync);
++
++// eslint-disable-next-line max-params
++const testOutputFile = async (t, mapFile, fixtureName, getOptions, execaMethod) => {
+ 	const filePath = tempfile();
+-	await execaMethod('noop-fd.js', [`${index}`, 'foobar'], getStdio(index, mapFile(filePath)));
+-	t.is(await readFile(filePath, 'utf8'), 'foobar');
++	await execaMethod(fixtureName, ['foobar'], getOptions(mapFile(filePath)));
++	t.is(await readFile(filePath, 'utf8'), 'foobar\n');
+ 	await rm(filePath);
+ };
+ 
+-test('stdout can be a file URL', testOutputFile, pathToFileURL, 1, execa);
+-test('stderr can be a file URL', testOutputFile, pathToFileURL, 2, execa);
+-test('stdio[*] can be a file URL', testOutputFile, pathToFileURL, 3, execa);
+-test('stdout can be an absolute file path', testOutputFile, getAbsolutePath, 1, execa);
+-test('stderr can be an absolute file path', testOutputFile, getAbsolutePath, 2, execa);
+-test('stdio[*] can be an absolute file path', testOutputFile, getAbsolutePath, 3, execa);
+-test('stdout can be a relative file path', testOutputFile, getRelativePath, 1, execa);
+-test('stderr can be a relative file path', testOutputFile, getRelativePath, 2, execa);
+-test('stdio[*] can be a relative file path', testOutputFile, getRelativePath, 3, execa);
+-test('stdout can be a file URL - sync', testOutputFile, pathToFileURL, 1, execaSync);
+-test('stderr can be a file URL - sync', testOutputFile, pathToFileURL, 2, execaSync);
+-test('stdio[*] can be a file URL - sync', testOutputFile, pathToFileURL, 3, execaSync);
+-test('stdout can be an absolute file path - sync', testOutputFile, getAbsolutePath, 1, execaSync);
+-test('stderr can be an absolute file path - sync', testOutputFile, getAbsolutePath, 2, execaSync);
+-test('stdio[*] can be an absolute file path - sync', testOutputFile, getAbsolutePath, 3, execaSync);
+-test('stdout can be a relative file path - sync', testOutputFile, getRelativePath, 1, execaSync);
+-test('stderr can be a relative file path - sync', testOutputFile, getRelativePath, 2, execaSync);
+-test('stdio[*] can be a relative file path - sync', testOutputFile, getRelativePath, 3, execaSync);
+-
+-const testStdioNonFileUrl = (t, index, execaMethod) => {
++test('stdout can be a file URL', testOutputFile, pathToFileURL, 'noop.js', getStdoutOption, execa);
++test('stderr can be a file URL', testOutputFile, pathToFileURL, 'noop-err.js', getStderrOption, execa);
++test('stdio[*] can be a file URL', testOutputFile, pathToFileURL, 'noop-fd3.js', getStdioOption, execa);
++test('stdout can be an absolute file path', testOutputFile, getAbsolutePath, 'noop.js', getStdoutOption, execa);
++test('stderr can be an absolute file path', testOutputFile, getAbsolutePath, 'noop-err.js', getStderrOption, execa);
++test('stdio[*] can be an absolute file path', testOutputFile, getAbsolutePath, 'noop-fd3.js', getStdioOption, execa);
++test('stdout can be a relative file path', testOutputFile, getRelativePath, 'noop.js', getStdoutOption, execa);
++test('stderr can be a relative file path', testOutputFile, getRelativePath, 'noop-err.js', getStderrOption, execa);
++test('stdio[*] can be a relative file path', testOutputFile, getRelativePath, 'noop-fd3.js', getStdioOption, execa);
++test('stdout can be a file URL - sync', testOutputFile, pathToFileURL, 'noop.js', getStdoutOption, execaSync);
++test('stderr can be a file URL - sync', testOutputFile, pathToFileURL, 'noop-err.js', getStderrOption, execaSync);
++test('stdio[*] can be a file URL - sync', testOutputFile, pathToFileURL, 'noop-fd3.js', getStdioOption, execaSync);
++test('stdout can be an absolute file path - sync', testOutputFile, getAbsolutePath, 'noop.js', getStdoutOption, execaSync);
++test('stderr can be an absolute file path - sync', testOutputFile, getAbsolutePath, 'noop-err.js', getStderrOption, execaSync);
++test('stdio[*] can be an absolute file path - sync', testOutputFile, getAbsolutePath, 'noop-fd3.js', getStdioOption, execaSync);
++test('stdout can be a relative file path - sync', testOutputFile, getRelativePath, 'noop.js', getStdoutOption, execaSync);
++test('stderr can be a relative file path - sync', testOutputFile, getRelativePath, 'noop-err.js', getStderrOption, execaSync);
++test('stdio[*] can be a relative file path - sync', testOutputFile, getRelativePath, 'noop-fd3.js', getStdioOption, execaSync);
++
++const testStdioNonFileUrl = (t, getOptions, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', getStdio(index, nonFileUrl));
++		execaMethod('noop.js', getOptions(nonFileUrl));
+ 	}, {message: /pathToFileURL/});
+ };
+ 
+-test('inputFile cannot be a non-file URL', testStdioNonFileUrl, 'inputFile', execa);
+-test('stdin cannot be a non-file URL', testStdioNonFileUrl, 0, execa);
+-test('stdout cannot be a non-file URL', testStdioNonFileUrl, 1, execa);
+-test('stderr cannot be a non-file URL', testStdioNonFileUrl, 2, execa);
+-test('stdio[*] cannot be a non-file URL', testStdioNonFileUrl, 3, execa);
+-test('inputFile cannot be a non-file URL - sync', testStdioNonFileUrl, 'inputFile', execaSync);
+-test('stdin cannot be a non-file URL - sync', testStdioNonFileUrl, 0, execaSync);
+-test('stdout cannot be a non-file URL - sync', testStdioNonFileUrl, 1, execaSync);
+-test('stderr cannot be a non-file URL - sync', testStdioNonFileUrl, 2, execaSync);
+-test('stdio[*] cannot be a non-file URL - sync', testStdioNonFileUrl, 3, execaSync);
++test('inputFile cannot be a non-file URL', testStdioNonFileUrl, getInputFileOption, execa);
++test('stdin cannot be a non-file URL', testStdioNonFileUrl, getStdinOption, execa);
++test('stdout cannot be a non-file URL', testStdioNonFileUrl, getStdoutOption, execa);
++test('stderr cannot be a non-file URL', testStdioNonFileUrl, getStderrOption, execa);
++test('stdio[*] cannot be a non-file URL', testStdioNonFileUrl, getStdioOption, execa);
++test('inputFile cannot be a non-file URL - sync', testStdioNonFileUrl, getInputFileOption, execaSync);
++test('stdin cannot be a non-file URL - sync', testStdioNonFileUrl, getStdinOption, execaSync);
++test('stdout cannot be a non-file URL - sync', testStdioNonFileUrl, getStdoutOption, execaSync);
++test('stderr cannot be a non-file URL - sync', testStdioNonFileUrl, getStderrOption, execaSync);
++test('stdio[*] cannot be a non-file URL - sync', testStdioNonFileUrl, getStdioOption, execaSync);
+ 
+ const testInvalidInputFile = (t, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', getStdio('inputFile', false));
++		execaMethod('noop.js', getInputFileOption(false));
+ 	}, {message: /a file path string or a file URL/});
+ };
+ 
+ test('inputFile must be a file URL or string', testInvalidInputFile, execa);
+ test('inputFile must be a file URL or string - sync', testInvalidInputFile, execaSync);
+ 
+-const testInputFileValidUrl = async (t, index, execaMethod) => {
++const testInputFileValidUrl = async (t, getOptions, execaMethod) => {
+ 	const filePath = tempfile();
+ 	await writeFile(filePath, 'foobar');
+ 	const currentCwd = process.cwd();
+ 	process.chdir(dirname(filePath));
+ 
+ 	try {
+-		const {stdout} = await execaMethod('stdin.js', getStdioFile(index, basename(filePath)));
++		const {stdout} = await execaMethod('stdin.js', getOptions(basename(filePath)));
+ 		t.is(stdout, 'foobar');
+ 	} finally {
+ 		process.chdir(currentCwd);
+@@ -120,85 +107,106 @@ const testInputFileValidUrl = async (t, index, execaMethod) => {
+ 	}
+ };
+ 
+-test.serial('inputFile does not need to start with . when being a relative file path', testInputFileValidUrl, 'inputFile', execa);
+-test.serial('stdin does not need to start with . when being a relative file path', testInputFileValidUrl, 0, execa);
+-test.serial('inputFile does not need to start with . when being a relative file path - sync', testInputFileValidUrl, 'inputFile', execaSync);
+-test.serial('stdin does not need to start with . when being a relative file path - sync', testInputFileValidUrl, 0, execaSync);
++test.serial('inputFile does not need to start with . when being a relative file path', testInputFileValidUrl, getInputFileOption, execa);
++test.serial('stdin does not need to start with . when being a relative file path', testInputFileValidUrl, getStdinFilePath, execa);
++test.serial('inputFile does not need to start with . when being a relative file path - sync', testInputFileValidUrl, getInputFileOption, execaSync);
++test.serial('stdin does not need to start with . when being a relative file path - sync', testInputFileValidUrl, getStdinFilePath, execaSync);
+ 
+-const testFilePathObject = (t, index, execaMethod) => {
++const testFilePathObject = (t, getOptions, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', getStdio(index, 'foobar'));
++		execaMethod('noop.js', getOptions('foobar'));
+ 	}, {message: /must be used/});
+ };
+ 
+-test('stdin must be an object when it is a file path string', testFilePathObject, 0, execa);
+-test('stdout must be an object when it is a file path string', testFilePathObject, 1, execa);
+-test('stderr must be an object when it is a file path string', testFilePathObject, 2, execa);
+-test('stdio[*] must be an object when it is a file path string', testFilePathObject, 3, execa);
+-test('stdin be an object when it is a file path string - sync', testFilePathObject, 0, execaSync);
+-test('stdout be an object when it is a file path string - sync', testFilePathObject, 1, execaSync);
+-test('stderr be an object when it is a file path string - sync', testFilePathObject, 2, execaSync);
+-test('stdio[*] must be an object when it is a file path string - sync', testFilePathObject, 3, execaSync);
++test('stdin must be an object when it is a file path string', testFilePathObject, getStdinOption, execa);
++test('stdout must be an object when it is a file path string', testFilePathObject, getStdoutOption, execa);
++test('stderr must be an object when it is a file path string', testFilePathObject, getStderrOption, execa);
++test('stdio[*] must be an object when it is a file path string', testFilePathObject, getStdioOption, execa);
++test('stdin be an object when it is a file path string - sync', testFilePathObject, getStdinOption, execaSync);
++test('stdout be an object when it is a file path string - sync', testFilePathObject, getStdoutOption, execaSync);
++test('stderr be an object when it is a file path string - sync', testFilePathObject, getStderrOption, execaSync);
++test('stdio[*] must be an object when it is a file path string - sync', testFilePathObject, getStdioOption, execaSync);
+ 
+-const testFileError = async (t, mapFile, index) => {
++const testFileError = async (t, mapFile, getOptions) => {
+ 	await t.throwsAsync(
+-		execa('empty.js', getStdio(index, mapFile('./unknown/file'))),
++		execa('noop.js', getOptions(mapFile('./unknown/file'))),
+ 		{code: 'ENOENT'},
+ 	);
+ };
+ 
+-test('inputFile file URL errors should be handled', testFileError, pathToFileURL, 'inputFile');
+-test('stdin file URL errors should be handled', testFileError, pathToFileURL, 0);
+-test('stdout file URL errors should be handled', testFileError, pathToFileURL, 1);
+-test('stderr file URL errors should be handled', testFileError, pathToFileURL, 2);
+-test('stdio[*] file URL errors should be handled', testFileError, pathToFileURL, 3);
+-test('inputFile file path errors should be handled', testFileError, identity, 'inputFile');
+-test('stdin file path errors should be handled', testFileError, getAbsolutePath, 0);
+-test('stdout file path errors should be handled', testFileError, getAbsolutePath, 1);
+-test('stderr file path errors should be handled', testFileError, getAbsolutePath, 2);
+-test('stdio[*] file path errors should be handled', testFileError, getAbsolutePath, 3);
+-
+-const testFileErrorSync = (t, mapFile, index) => {
++test('inputFile file URL errors should be handled', testFileError, pathToFileURL, getInputFileOption);
++test('stdin file URL errors should be handled', testFileError, pathToFileURL, getStdinOption);
++test('stdout file URL errors should be handled', testFileError, pathToFileURL, getStdoutOption);
++test('stderr file URL errors should be handled', testFileError, pathToFileURL, getStderrOption);
++test('stdio[*] file URL errors should be handled', testFileError, pathToFileURL, getStdioOption);
++test('inputFile file path errors should be handled', testFileError, identity, getInputFileOption);
++test('stdin file path errors should be handled', testFileError, getAbsolutePath, getStdinOption);
++test('stdout file path errors should be handled', testFileError, getAbsolutePath, getStdoutOption);
++test('stderr file path errors should be handled', testFileError, getAbsolutePath, getStderrOption);
++test('stdio[*] file path errors should be handled', testFileError, getAbsolutePath, getStdioOption);
++
++const testFileErrorSync = (t, mapFile, getOptions) => {
+ 	t.throws(() => {
+-		execaSync('empty.js', getStdio(index, mapFile('./unknown/file')));
++		execaSync('noop.js', getOptions(mapFile('./unknown/file')));
+ 	}, {code: 'ENOENT'});
+ };
+ 
+-test('inputFile file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, 'inputFile');
+-test('stdin file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, 0);
+-test('stdout file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, 1);
+-test('stderr file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, 2);
+-test('stdio[*] file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, 3);
+-test('inputFile file path errors should be handled - sync', testFileErrorSync, identity, 'inputFile');
+-test('stdin file path errors should be handled - sync', testFileErrorSync, getAbsolutePath, 0);
+-test('stdout file path errors should be handled - sync', testFileErrorSync, getAbsolutePath, 1);
+-test('stderr file path errors should be handled - sync', testFileErrorSync, getAbsolutePath, 2);
+-test('stdio[*] file path errors should be handled - sync', testFileErrorSync, getAbsolutePath, 3);
+-
+-const testMultipleInputs = async (t, indices, execaMethod) => {
++test('inputFile file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, getInputFileOption);
++test('stdin file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, getStdinOption);
++test('stdout file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, getStdoutOption);
++test('stderr file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, getStderrOption);
++test('stdio[*] file URL errors should be handled - sync', testFileErrorSync, pathToFileURL, getStdioOption);
++test('inputFile file path errors should be handled - sync', testFileErrorSync, identity, getInputFileOption);
++test('stdin file path errors should be handled - sync', testFileErrorSync, getAbsolutePath, getStdinOption);
++test('stdout file path errors should be handled - sync', testFileErrorSync, getAbsolutePath, getStdoutOption);
++test('stderr file path errors should be handled - sync', testFileErrorSync, getAbsolutePath, getStderrOption);
++test('stdio[*] file path errors should be handled - sync', testFileErrorSync, getAbsolutePath, getStdioOption);
++
++const testInputFile = async (t, execaMethod) => {
++	const inputFile = tempfile();
++	await writeFile(inputFile, 'foobar');
++	const {stdout} = await execaMethod('stdin.js', {inputFile});
++	t.is(stdout, 'foobar');
++	await rm(inputFile);
++};
++
++test('inputFile can be set', testInputFile, execa);
++test('inputFile can be set - sync', testInputFile, execa);
++
++const testInputFileScript = async (t, getExecaMethod) => {
++	const inputFile = tempfile();
++	await writeFile(inputFile, 'foobar');
++	const {stdout} = await getExecaMethod($({inputFile}))`stdin.js`;
++	t.is(stdout, 'foobar');
++	await rm(inputFile);
++};
++
++test('inputFile can be set with $', testInputFileScript, identity);
++test('inputFile can be set with $.sync', testInputFileScript, getScriptSync);
++
++const testMultipleInputs = async (t, allGetOptions, execaMethod) => {
+ 	const filePath = tempfile();
+ 	await writeFile(filePath, 'foobar');
+-	const options = Object.assign({}, ...indices.map(index => getStdioInput(index, filePath)));
++	const options = Object.assign({}, ...allGetOptions.map(getOptions => getOptions(filePath)));
+ 	const {stdout} = await execaMethod('stdin.js', options);
+-	t.is(stdout, 'foobar'.repeat(indices.length));
++	t.is(stdout, 'foobar'.repeat(allGetOptions.length));
+ 	await rm(filePath);
+ };
+ 
+-test('inputFile can be set', testMultipleInputs, ['inputFile'], runExeca);
+-test('inputFile can be set - sync', testMultipleInputs, ['inputFile'], runExecaSync);
+-test('inputFile can be set with $', testMultipleInputs, ['inputFile'], runScript);
+-test('inputFile can be set with $.sync', testMultipleInputs, ['inputFile'], runScriptSync);
+-test('input String and inputFile can be both set', testMultipleInputs, ['inputFile', 'string'], execa);
+-test('input String and stdin can be both set', testMultipleInputs, [0, 'string'], execa);
+-test('input Uint8Array and inputFile can be both set', testMultipleInputs, ['inputFile', 'binary'], execa);
+-test('input Uint8Array and stdin can be both set', testMultipleInputs, [0, 'binary'], execa);
+-test('stdin and inputFile can be both set', testMultipleInputs, [0, 'inputFile'], execa);
+-test('input String, stdin and inputFile can be all set', testMultipleInputs, ['inputFile', 0, 'string'], execa);
+-test('input Uint8Array, stdin and inputFile can be all set', testMultipleInputs, ['inputFile', 0, 'binary'], execa);
+-test('input String and inputFile can be both set - sync', testMultipleInputs, ['inputFile', 'string'], execaSync);
+-test('input String and stdin can be both set - sync', testMultipleInputs, [0, 'string'], execaSync);
+-test('input Uint8Array and inputFile can be both set - sync', testMultipleInputs, ['inputFile', 'binary'], execaSync);
+-test('input Uint8Array and stdin can be both set - sync', testMultipleInputs, [0, 'binary'], execaSync);
+-test('stdin and inputFile can be both set - sync', testMultipleInputs, [0, 'inputFile'], execaSync);
+-test('input String, stdin and inputFile can be all set - sync', testMultipleInputs, ['inputFile', 0, 'string'], execaSync);
+-test('input Uint8Array, stdin and inputFile can be all set - sync', testMultipleInputs, ['inputFile', 0, 'binary'], execaSync);
++const getStringInput = () => ({input: 'foobar'});
++const getBinaryInput = () => ({input: binaryFoobar});
++
++test('input String and inputFile can be both set', testMultipleInputs, [getInputFileOption, getStringInput], execa);
++test('input String and stdin can be both set', testMultipleInputs, [getStdinFilePath, getStringInput], execa);
++test('input Uint8Array and inputFile can be both set', testMultipleInputs, [getInputFileOption, getBinaryInput], execa);
++test('input Uint8Array and stdin can be both set', testMultipleInputs, [getStdinFilePath, getBinaryInput], execa);
++test('stdin and inputFile can be both set', testMultipleInputs, [getStdinFilePath, getInputFileOption], execa);
++test('input String, stdin and inputFile can be all set', testMultipleInputs, [getInputFileOption, getStdinFilePath, getStringInput], execa);
++test('input Uint8Array, stdin and inputFile can be all set', testMultipleInputs, [getInputFileOption, getStdinFilePath, getBinaryInput], execa);
++test('input String and inputFile can be both set - sync', testMultipleInputs, [getInputFileOption, getStringInput], execaSync);
++test('input String and stdin can be both set - sync', testMultipleInputs, [getStdinFilePath, getStringInput], execaSync);
++test('input Uint8Array and inputFile can be both set - sync', testMultipleInputs, [getInputFileOption, getBinaryInput], execaSync);
++test('input Uint8Array and stdin can be both set - sync', testMultipleInputs, [getStdinFilePath, getBinaryInput], execaSync);
++test('stdin and inputFile can be both set - sync', testMultipleInputs, [getStdinFilePath, getInputFileOption], execaSync);
++test('input String, stdin and inputFile can be all set - sync', testMultipleInputs, [getInputFileOption, getStdinFilePath, getStringInput], execaSync);
++test('input Uint8Array, stdin and inputFile can be all set - sync', testMultipleInputs, [getInputFileOption, getStdinFilePath, getBinaryInput], execaSync);
+diff --git a/test/stdio/input.js b/test/stdio/input.js
+index b3d7023..7247915 100644
+--- a/test/stdio/input.js
++++ b/test/stdio/input.js
+@@ -1,9 +1,9 @@
+ import {Buffer} from 'node:buffer';
+ import {Writable} from 'node:stream';
+ import test from 'ava';
+-import {execa, execaSync} from '../../index.js';
++import {execa, execaSync, $} from '../../index.js';
+ import {setFixtureDir} from '../helpers/fixtures-dir.js';
+-import {runExeca, runExecaSync, runScript, runScriptSync} from '../helpers/run.js';
++import {getScriptSync, identity} from '../helpers/stdio.js';
+ 
+ setFixtureDir();
+ 
+@@ -19,16 +19,22 @@ const testInput = async (t, input, execaMethod) => {
+ 	t.is(stdout, 'foobar');
+ };
+ 
+-test('input option can be a String', testInput, 'foobar', runExeca);
+-test('input option can be a Uint8Array', testInput, binaryFoobar, runExeca);
+-test('input option can be a String - sync', testInput, 'foobar', runExecaSync);
+-test('input option can be a Uint8Array - sync', testInput, binaryFoobar, runExecaSync);
+-test('input option can be used with $', testInput, 'foobar', runScript);
+-test('input option can be used with $.sync', testInput, 'foobar', runScriptSync);
++test('input option can be a String', testInput, 'foobar', execa);
++test('input option can be a String - sync', testInput, 'foobar', execaSync);
++test('input option can be a Uint8Array', testInput, binaryFoobar, execa);
++test('input option can be a Uint8Array - sync', testInput, binaryFoobar, execaSync);
++
++const testInputScript = async (t, getExecaMethod) => {
++	const {stdout} = await getExecaMethod($({input: 'foobar'}))`stdin.js`;
++	t.is(stdout, 'foobar');
++};
++
++test('input option can be used with $', testInputScript, identity);
++test('input option can be used with $.sync', testInputScript, getScriptSync);
+ 
+ const testInvalidInput = async (t, input, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', {input});
++		execaMethod('noop.js', {input});
+ 	}, {message: /a string, a Uint8Array/});
+ };
+ 
+diff --git a/test/stdio/iterable.js b/test/stdio/iterable.js
+index 85ce591..ca21417 100644
+--- a/test/stdio/iterable.js
++++ b/test/stdio/iterable.js
+@@ -2,57 +2,57 @@ import {once} from 'node:events';
+ import test from 'ava';
+ import {execa, execaSync} from '../../index.js';
+ import {setFixtureDir} from '../helpers/fixtures-dir.js';
+-import {getStdio} from '../helpers/stdio.js';
++import {getStdinOption, getStdoutOption, getStderrOption, getStdioOption} from '../helpers/stdio.js';
+ import {stringGenerator, binaryGenerator, asyncGenerator, throwingGenerator, infiniteGenerator} from '../helpers/generator.js';
+ 
+ setFixtureDir();
+ 
+-const testIterable = async (t, stdioOption, index) => {
+-	const {stdout} = await execa('stdin-fd.js', [`${index}`], getStdio(index, stdioOption));
++const testIterable = async (t, stdioOption, fixtureName, getOptions) => {
++	const {stdout} = await execa(fixtureName, getOptions(stdioOption));
+ 	t.is(stdout, 'foobar');
+ };
+ 
+-test('stdin option can be an iterable of strings', testIterable, stringGenerator(), 0);
+-test('stdio[*] option can be an iterable of strings', testIterable, stringGenerator(), 3);
+-test('stdin option can be an iterable of Uint8Arrays', testIterable, binaryGenerator(), 0);
+-test('stdio[*] option can be an iterable of Uint8Arrays', testIterable, binaryGenerator(), 3);
+-test('stdin option can be an async iterable', testIterable, asyncGenerator(), 0);
+-test('stdio[*] option can be an async iterable', testIterable, asyncGenerator(), 3);
++test('stdin option can be an iterable of strings', testIterable, stringGenerator(), 'stdin.js', getStdinOption);
++test('stdio[*] option can be an iterable of strings', testIterable, stringGenerator(), 'stdin-fd3.js', getStdioOption);
++test('stdin option can be an iterable of Uint8Arrays', testIterable, binaryGenerator(), 'stdin.js', getStdinOption);
++test('stdio[*] option can be an iterable of Uint8Arrays', testIterable, binaryGenerator(), 'stdin-fd3.js', getStdioOption);
++test('stdin option can be an async iterable', testIterable, asyncGenerator(), 'stdin.js', getStdinOption);
++test('stdio[*] option can be an async iterable', testIterable, asyncGenerator(), 'stdin-fd3.js', getStdioOption);
+ 
+-const testIterableSync = (t, stdioOption, index) => {
++const testIterableSync = (t, stdioOption, fixtureName, getOptions) => {
+ 	t.throws(() => {
+-		execaSync('empty.js', getStdio(index, stdioOption));
++		execaSync(fixtureName, getOptions(stdioOption));
+ 	}, {message: /an iterable in sync mode/});
+ };
+ 
+-test('stdin option cannot be a sync iterable - sync', testIterableSync, stringGenerator(), 0);
+-test('stdio[*] option cannot be a sync iterable - sync', testIterableSync, stringGenerator(), 3);
+-test('stdin option cannot be an async iterable - sync', testIterableSync, asyncGenerator(), 0);
+-test('stdio[*] option cannot be an async iterable - sync', testIterableSync, asyncGenerator(), 3);
++test('stdin option cannot be a sync iterable - sync', testIterableSync, stringGenerator(), 'stdin.js', getStdinOption);
++test('stdio[*] option cannot be a sync iterable - sync', testIterableSync, stringGenerator(), 'stdin-fd3.js', getStdioOption);
++test('stdin option cannot be an async iterable - sync', testIterableSync, asyncGenerator(), 'stdin.js', getStdinOption);
++test('stdio[*] option cannot be an async iterable - sync', testIterableSync, asyncGenerator(), 'stdin-fd3.js', getStdioOption);
+ 
+-const testIterableError = async (t, index) => {
+-	const {originalMessage} = await t.throwsAsync(execa('stdin-fd.js', [`${index}`], getStdio(index, throwingGenerator())));
++const testIterableError = async (t, fixtureName, getOptions) => {
++	const {originalMessage} = await t.throwsAsync(execa(fixtureName, getOptions(throwingGenerator())));
+ 	t.is(originalMessage, 'generator error');
+ };
+ 
+-test('stdin option handles errors in iterables', testIterableError, 0);
+-test('stdio[*] option handles errors in iterables', testIterableError, 3);
++test('stdin option handles errors in iterables', testIterableError, 'stdin.js', getStdinOption);
++test('stdio[*] option handles errors in iterables', testIterableError, 'stdin-fd3.js', getStdioOption);
+ 
+-const testNoIterableOutput = (t, index, execaMethod) => {
++const testNoIterableOutput = (t, getOptions, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', getStdio(index, stringGenerator()));
++		execaMethod('noop.js', getOptions(stringGenerator()));
+ 	}, {message: /cannot be an iterable/});
+ };
+ 
+-test('stdout option cannot be an iterable', testNoIterableOutput, 1, execa);
+-test('stderr option cannot be an iterable', testNoIterableOutput, 2, execa);
+-test('stdout option cannot be an iterable - sync', testNoIterableOutput, 1, execaSync);
+-test('stderr option cannot be an iterable - sync', testNoIterableOutput, 2, execaSync);
++test('stdout option cannot be an iterable', testNoIterableOutput, getStdoutOption, execa);
++test('stderr option cannot be an iterable', testNoIterableOutput, getStderrOption, execa);
++test('stdout option cannot be an iterable - sync', testNoIterableOutput, getStdoutOption, execaSync);
++test('stderr option cannot be an iterable - sync', testNoIterableOutput, getStderrOption, execaSync);
+ 
+ test('stdin option can be an infinite iterable', async t => {
+ 	const {iterable, abort} = infiniteGenerator();
+ 	try {
+-		const childProcess = execa('stdin.js', getStdio(0, iterable));
++		const childProcess = execa('stdin.js', getStdinOption(iterable));
+ 		const stdout = await once(childProcess.stdout, 'data');
+ 		t.is(stdout.toString(), 'foo');
+ 		childProcess.kill('SIGKILL');
+@@ -62,10 +62,10 @@ test('stdin option can be an infinite iterable', async t => {
+ 	}
+ });
+ 
+-const testMultipleIterable = async (t, index) => {
+-	const {stdout} = await execa('stdin-fd.js', [`${index}`], getStdio(index, [stringGenerator(), asyncGenerator()]));
++const testMultipleIterable = async (t, fixtureName, getOptions) => {
++	const {stdout} = await execa(fixtureName, getOptions([stringGenerator(), asyncGenerator()]));
+ 	t.is(stdout, 'foobarfoobar');
+ };
+ 
+-test('stdin option can be multiple iterables', testMultipleIterable, 0);
+-test('stdio[*] option can be multiple iterables', testMultipleIterable, 3);
++test('stdin option can be multiple iterables', testMultipleIterable, 'stdin.js', getStdinOption);
++test('stdio[*] option can be multiple iterables', testMultipleIterable, 'stdin-fd3.js', getStdioOption);
+diff --git a/test/stdio/node-stream.js b/test/stdio/node-stream.js
+index dc404c6..e68da8d 100644
+--- a/test/stdio/node-stream.js
++++ b/test/stdio/node-stream.js
+@@ -6,7 +6,7 @@ import test from 'ava';
+ import tempfile from 'tempfile';
+ import {execa, execaSync} from '../../index.js';
+ import {setFixtureDir} from '../helpers/fixtures-dir.js';
+-import {getStdio} from '../helpers/stdio.js';
++import {getStdinOption, getStdoutOption, getStderrOption, getStdioOption, getInputOption} from '../helpers/stdio.js';
+ 
+ setFixtureDir();
+ 
+@@ -17,90 +17,89 @@ const createNoFileReadable = value => {
+ 	return stream;
+ };
+ 
+-const testNodeStreamSync = (t, StreamClass, index, optionName) => {
++const testNodeStreamSync = (t, StreamClass, getOptions, optionName) => {
+ 	t.throws(() => {
+-		execaSync('empty.js', getStdio(index, new StreamClass()));
++		execaSync('noop.js', getOptions(new StreamClass()));
+ 	}, {message: `The \`${optionName}\` option cannot be a Node.js stream in sync mode.`});
+ };
+ 
+-test('input cannot be a Node.js Readable - sync', testNodeStreamSync, Readable, 'input', 'input');
+-test('stdin cannot be a Node.js Readable - sync', testNodeStreamSync, Readable, 0, 'stdin');
+-test('stdio[*] cannot be a Node.js Readable - sync', testNodeStreamSync, Readable, 3, 'stdio[3]');
+-test('stdout cannot be a Node.js Writable - sync', testNodeStreamSync, Writable, 1, 'stdout');
+-test('stderr cannot be a Node.js Writable - sync', testNodeStreamSync, Writable, 2, 'stderr');
+-test('stdio[*] cannot be a Node.js Writable - sync', testNodeStreamSync, Writable, 3, 'stdio[3]');
++test('input cannot be a Node.js Readable - sync', testNodeStreamSync, Readable, getInputOption, 'input');
++test('stdin cannot be a Node.js Readable - sync', testNodeStreamSync, Readable, getStdinOption, 'stdin');
++test('stdio[*] cannot be a Node.js Readable - sync', testNodeStreamSync, Readable, getStdioOption, 'stdio[3]');
++test('stdout cannot be a Node.js Writable - sync', testNodeStreamSync, Writable, getStdoutOption, 'stdout');
++test('stderr cannot be a Node.js Writable - sync', testNodeStreamSync, Writable, getStderrOption, 'stderr');
++test('stdio[*] cannot be a Node.js Writable - sync', testNodeStreamSync, Writable, getStdioOption, 'stdio[3]');
+ 
+ test('input can be a Node.js Readable without a file descriptor', async t => {
+ 	const {stdout} = await execa('stdin.js', {input: createNoFileReadable('foobar')});
+ 	t.is(stdout, 'foobar');
+ });
+ 
+-const testNoFileStream = async (t, index, StreamClass) => {
+-	await t.throwsAsync(execa('empty.js', getStdio(index, new StreamClass())), {code: 'ERR_INVALID_ARG_VALUE'});
++const testNoFileStream = async (t, getOptions, StreamClass) => {
++	await t.throwsAsync(execa('noop.js', getOptions(new StreamClass())), {code: 'ERR_INVALID_ARG_VALUE'});
+ };
+ 
+-test('stdin cannot be a Node.js Readable without a file descriptor', testNoFileStream, 0, Readable);
+-test('stdout cannot be a Node.js Writable without a file descriptor', testNoFileStream, 1, Writable);
+-test('stderr cannot be a Node.js Writable without a file descriptor', testNoFileStream, 2, Writable);
+-test('stdio[*] cannot be a Node.js Readable without a file descriptor', testNoFileStream, 3, Readable);
+-test('stdio[*] cannot be a Node.js Writable without a file descriptor', testNoFileStream, 3, Writable);
++test('stdin cannot be a Node.js Readable without a file descriptor', testNoFileStream, getStdinOption, Readable);
++test('stdout cannot be a Node.js Writable without a file descriptor', testNoFileStream, getStdoutOption, Writable);
++test('stderr cannot be a Node.js Writable without a file descriptor', testNoFileStream, getStderrOption, Writable);
++test('stdio[*] cannot be a Node.js Readable without a file descriptor', testNoFileStream, getStdioOption, Readable);
++test('stdio[*] cannot be a Node.js Writable without a file descriptor', testNoFileStream, getStdioOption, Writable);
+ 
+-const testFileReadable = async (t, index) => {
++const testFileReadable = async (t, fixtureName, getOptions) => {
+ 	const filePath = tempfile();
+ 	await writeFile(filePath, 'foobar');
+ 	const stream = createReadStream(filePath);
+ 	await once(stream, 'open');
+ 
+-	const indexString = index === 'input' ? '0' : `${index}`;
+-	const {stdout} = await execa('stdin-fd.js', [indexString], getStdio(index, stream));
++	const {stdout} = await execa(fixtureName, getOptions(stream));
+ 	t.is(stdout, 'foobar');
+ 
+ 	await rm(filePath);
+ };
+ 
+-test('input can be a Node.js Readable with a file descriptor', testFileReadable, 'input');
+-test('stdin can be a Node.js Readable with a file descriptor', testFileReadable, 0);
+-test('stdio[*] can be a Node.js Readable with a file descriptor', testFileReadable, 3);
++test('input can be a Node.js Readable with a file descriptor', testFileReadable, 'stdin.js', getInputOption);
++test('stdin can be a Node.js Readable with a file descriptor', testFileReadable, 'stdin.js', getStdinOption);
++test('stdio[*] can be a Node.js Readable with a file descriptor', testFileReadable, 'stdin-fd3.js', getStdioOption);
+ 
+-const testFileWritable = async (t, index) => {
++const testFileWritable = async (t, getOptions, fixtureName) => {
+ 	const filePath = tempfile();
+ 	const stream = createWriteStream(filePath);
+ 	await once(stream, 'open');
+ 
+-	await execa('noop-fd.js', [`${index}`, 'foobar'], getStdio(index, stream));
+-	t.is(await readFile(filePath, 'utf8'), 'foobar');
++	await execa(fixtureName, ['foobar'], getOptions(stream));
++	t.is(await readFile(filePath, 'utf8'), 'foobar\n');
+ 
+ 	await rm(filePath);
+ };
+ 
+-test('stdout can be a Node.js Writable with a file descriptor', testFileWritable, 1);
+-test('stderr can be a Node.js Writable with a file descriptor', testFileWritable, 2);
+-test('stdio[*] can be a Node.js Writable with a file descriptor', testFileWritable, 3);
++test('stdout can be a Node.js Writable with a file descriptor', testFileWritable, getStdoutOption, 'noop.js');
++test('stderr can be a Node.js Writable with a file descriptor', testFileWritable, getStderrOption, 'noop-err.js');
++test('stdio[*] can be a Node.js Writable with a file descriptor', testFileWritable, getStdioOption, 'noop-fd3.js');
+ 
+-const testLazyFileReadable = async (t, index) => {
++const testLazyFileReadable = async (t, fixtureName, getOptions) => {
+ 	const filePath = tempfile();
+ 	await writeFile(filePath, 'foobar');
+ 	const stream = createReadStream(filePath);
+ 
+-	const {stdout} = await execa('stdin-fd.js', [`${index}`], getStdio(index, [stream, 'pipe']));
++	const {stdout} = await execa(fixtureName, getOptions([stream, 'pipe']));
+ 	t.is(stdout, 'foobar');
+ 
+ 	await rm(filePath);
+ };
+ 
+-test('stdin can be [Readable, "pipe"] without a file descriptor', testLazyFileReadable, 0);
+-test('stdio[*] can be [Readable, "pipe"] without a file descriptor', testLazyFileReadable, 3);
++test('stdin can be [Readable, "pipe"] without a file descriptor', testLazyFileReadable, 'stdin.js', getStdinOption);
++test('stdio[*] can be [Readable, "pipe"] without a file descriptor', testLazyFileReadable, 'stdin-fd3.js', getStdioOption);
+ 
+-const testLazyFileWritable = async (t, index) => {
++const testLazyFileWritable = async (t, getOptions, fixtureName) => {
+ 	const filePath = tempfile();
+ 	const stream = createWriteStream(filePath);
+ 
+-	await execa('noop-fd.js', [`${index}`, 'foobar'], getStdio(index, [stream, 'pipe']));
+-	t.is(await readFile(filePath, 'utf8'), 'foobar');
++	await execa(fixtureName, ['foobar'], getOptions([stream, 'pipe']));
++	t.is(await readFile(filePath, 'utf8'), 'foobar\n');
+ 
+ 	await rm(filePath);
+ };
+ 
+-test('stdout can be [Writable, "pipe"] without a file descriptor', testLazyFileWritable, 1);
+-test('stderr can be [Writable, "pipe"] without a file descriptor', testLazyFileWritable, 2);
+-test('stdio[*] can be [Writable, "pipe"] without a file descriptor', testLazyFileWritable, 3);
++test('stdout can be [Writable, "pipe"] without a file descriptor', testLazyFileWritable, getStdoutOption, 'noop.js');
++test('stderr can be [Writable, "pipe"] without a file descriptor', testLazyFileWritable, getStderrOption, 'noop-err.js');
++test('stdio[*] can be [Writable, "pipe"] without a file descriptor', testLazyFileWritable, getStdioOption, 'noop-fd3.js');
+diff --git a/test/stdio/typed-array.js b/test/stdio/typed-array.js
+index 8c1eaf8..82b6fa7 100644
+--- a/test/stdio/typed-array.js
++++ b/test/stdio/typed-array.js
+@@ -1,29 +1,29 @@
+ import test from 'ava';
+ import {execa, execaSync} from '../../index.js';
+ import {setFixtureDir} from '../helpers/fixtures-dir.js';
+-import {getStdio} from '../helpers/stdio.js';
++import {getStdinOption, getStdoutOption, getStderrOption, getStdioOption} from '../helpers/stdio.js';
+ 
+ setFixtureDir();
+ 
+ const uint8ArrayFoobar = new TextEncoder().encode('foobar');
+ 
+-const testUint8Array = async (t, index) => {
+-	const {stdout} = await execa('stdin-fd.js', [`${index}`], getStdio(index, uint8ArrayFoobar));
++const testUint8Array = async (t, fixtureName, getOptions) => {
++	const {stdout} = await execa(fixtureName, getOptions(uint8ArrayFoobar));
+ 	t.is(stdout, 'foobar');
+ };
+ 
+-test('stdin option can be a Uint8Array', testUint8Array, 0);
+-test('stdio[*] option can be a Uint8Array', testUint8Array, 3);
+-test('stdin option can be a Uint8Array - sync', testUint8Array, 0);
+-test('stdio[*] option can be a Uint8Array - sync', testUint8Array, 3);
++test('stdin option can be a Uint8Array', testUint8Array, 'stdin.js', getStdinOption);
++test('stdio[*] option can be a Uint8Array', testUint8Array, 'stdin-fd3.js', getStdioOption);
++test('stdin option can be a Uint8Array - sync', testUint8Array, 'stdin.js', getStdinOption);
++test('stdio[*] option can be a Uint8Array - sync', testUint8Array, 'stdin-fd3.js', getStdioOption);
+ 
+-const testNoUint8ArrayOutput = (t, index, execaMethod) => {
++const testNoUint8ArrayOutput = (t, getOptions, execaMethod) => {
+ 	t.throws(() => {
+-		execaMethod('empty.js', getStdio(index, uint8ArrayFoobar));
++		execaMethod('noop.js', getOptions(uint8ArrayFoobar));
+ 	}, {message: /cannot be a Uint8Array/});
+ };
+ 
+-test('stdout option cannot be a Uint8Array', testNoUint8ArrayOutput, 1, execa);
+-test('stderr option cannot be a Uint8Array', testNoUint8ArrayOutput, 2, execa);
+-test('stdout option cannot be a Uint8Array - sync', testNoUint8ArrayOutput, 1, execaSync);
+-test('stderr option cannot be a Uint8Array - sync', testNoUint8ArrayOutput, 2, execaSync);
++test('stdout option cannot be a Uint8Array', testNoUint8ArrayOutput, getStdoutOption, execa);
++test('stderr option cannot be a Uint8Array', testNoUint8ArrayOutput, getStderrOption, execa);
++test('stdout option cannot be a Uint8Array - sync', testNoUint8ArrayOutput, getStdoutOption, execaSync);
++test('stderr option cannot be a Uint8Array - sync', testNoUint8ArrayOutput, getStderrOption, execaSync);
+diff --git a/test/stdio/web-stream.js b/test/stdio/web-stream.js
+index c27bf4c..45fbf94 100644
+--- a/test/stdio/web-stream.js
++++ b/test/stdio/web-stream.js
+@@ -3,47 +3,47 @@ import {setTimeout} from 'node:timers/promises';
+ import test from 'ava';
+ import {execa, execaSync} from '../../index.js';
+ import {setFixtureDir} from '../helpers/fixtures-dir.js';
+-import {getStdio} from '../helpers/stdio.js';
++import {getStdinOption, getStdoutOption, getStderrOption, getStdioOption} from '../helpers/stdio.js';
+ 
+ setFixtureDir();
+ 
+-const testReadableStream = async (t, index) => {
++const testReadableStream = async (t, fixtureName, getOptions) => {
+ 	const readableStream = Readable.toWeb(Readable.from('foobar'));
+-	const {stdout} = await execa('stdin-fd.js', [`${index}`], getStdio(index, readableStream));
++	const {stdout} = await execa(fixtureName, getOptions(readableStream));
+ 	t.is(stdout, 'foobar');
+ };
+ 
+-test('stdin can be a ReadableStream', testReadableStream, 0);
+-test('stdio[*] can be a ReadableStream', testReadableStream, 3);
++test('stdin can be a ReadableStream', testReadableStream, 'stdin.js', getStdinOption);
++test('stdio[*] can be a ReadableStream', testReadableStream, 'stdin-fd3.js', getStdioOption);
+ 
+-const testWritableStream = async (t, index) => {
++const testWritableStream = async (t, fixtureName, getOptions) => {
+ 	const result = [];
+ 	const writableStream = new WritableStream({
+ 		write(chunk) {
+ 			result.push(chunk);
+ 		},
+ 	});
+-	await execa('noop-fd.js', [`${index}`, 'foobar'], getStdio(index, writableStream));
+-	t.is(result.join(''), 'foobar');
++	await execa(fixtureName, ['foobar'], getOptions(writableStream));
++	t.is(result.join(''), 'foobar\n');
+ };
+ 
+-test('stdout can be a WritableStream', testWritableStream, 1);
+-test('stderr can be a WritableStream', testWritableStream, 2);
+-test('stdio[*] can be a WritableStream', testWritableStream, 3);
++test('stdout can be a WritableStream', testWritableStream, 'noop.js', getStdoutOption);
++test('stderr can be a WritableStream', testWritableStream, 'noop-err.js', getStderrOption);
++test('stdio[*] can be a WritableStream', testWritableStream, 'noop-fd3.js', getStdioOption);
+ 
+-const testWebStreamSync = (t, StreamClass, index, optionName) => {
++const testWebStreamSync = (t, StreamClass, getOptions, optionName) => {
+ 	t.throws(() => {
+-		execaSync('empty.js', getStdio(index, new StreamClass()));
++		execaSync('noop.js', getOptions(new StreamClass()));
+ 	}, {message: `The \`${optionName}\` option cannot be a web stream in sync mode.`});
+ };
+ 
+-test('stdin cannot be a ReadableStream - sync', testWebStreamSync, ReadableStream, 0, 'stdin');
+-test('stdio[*] cannot be a ReadableStream - sync', testWebStreamSync, ReadableStream, 3, 'stdio[3]');
+-test('stdout cannot be a WritableStream - sync', testWebStreamSync, WritableStream, 1, 'stdout');
+-test('stderr cannot be a WritableStream - sync', testWebStreamSync, WritableStream, 2, 'stderr');
+-test('stdio[*] cannot be a WritableStream - sync', testWebStreamSync, WritableStream, 3, 'stdio[3]');
++test('stdin cannot be a ReadableStream - sync', testWebStreamSync, ReadableStream, getStdinOption, 'stdin');
++test('stdio[*] cannot be a ReadableStream - sync', testWebStreamSync, ReadableStream, getStdioOption, 'stdio[3]');
++test('stdout cannot be a WritableStream - sync', testWebStreamSync, WritableStream, getStdoutOption, 'stdout');
++test('stderr cannot be a WritableStream - sync', testWebStreamSync, WritableStream, getStderrOption, 'stderr');
++test('stdio[*] cannot be a WritableStream - sync', testWebStreamSync, WritableStream, getStdioOption, 'stdio[3]');
+ 
+-const testLongWritableStream = async (t, index) => {
++const testLongWritableStream = async (t, getOptions) => {
+ 	let result = false;
+ 	const writableStream = new WritableStream({
+ 		async close() {
+@@ -51,24 +51,24 @@ const testLongWritableStream = async (t, index) => {
+ 			result = true;
+ 		},
+ 	});
+-	await execa('empty.js', getStdio(index, writableStream));
++	await execa('empty.js', getOptions(writableStream));
+ 	t.true(result);
+ };
+ 
+-test('stdout waits for WritableStream completion', testLongWritableStream, 1);
+-test('stderr waits for WritableStream completion', testLongWritableStream, 2);
+-test('stdio[*] waits for WritableStream completion', testLongWritableStream, 3);
++test('stdout waits for WritableStream completion', testLongWritableStream, getStdoutOption);
++test('stderr waits for WritableStream completion', testLongWritableStream, getStderrOption);
++test('stdio[*] waits for WritableStream completion', testLongWritableStream, getStdioOption);
+ 
+-const testWritableStreamError = async (t, index) => {
++const testWritableStreamError = async (t, getOptions) => {
+ 	const writableStream = new WritableStream({
+ 		start(controller) {
+ 			controller.error(new Error('foobar'));
+ 		},
+ 	});
+-	const {originalMessage} = await t.throwsAsync(execa('noop.js', getStdio(index, writableStream)));
++	const {originalMessage} = await t.throwsAsync(execa('noop.js', getOptions(writableStream)));
+ 	t.is(originalMessage, 'foobar');
+ };
+ 
+-test('stdout option handles errors in WritableStream', testWritableStreamError, 1);
+-test('stderr option handles errors in WritableStream', testWritableStreamError, 2);
+-test('stdio[*] option handles errors in WritableStream', testWritableStreamError, 3);
++test('stdout option handles errors in WritableStream', testWritableStreamError, getStdoutOption);
++test('stderr option handles errors in WritableStream', testWritableStreamError, getStderrOption);
++test('stdio[*] option handles errors in WritableStream', testWritableStreamError, getStdioOption);
+diff --git a/test/stream.js b/test/stream.js
+index 27c0ccb..d976d43 100644
+--- a/test/stream.js
++++ b/test/stream.js
+@@ -1,15 +1,61 @@
+ import {Buffer} from 'node:buffer';
++import {exec} from 'node:child_process';
+ import {once} from 'node:events';
+ import process from 'node:process';
+ import {setTimeout} from 'node:timers/promises';
++import {promisify} from 'node:util';
+ import test from 'ava';
+ import getStream from 'get-stream';
++import {pEvent} from 'p-event';
+ import {execa, execaSync} from '../index.js';
+-import {setFixtureDir} from './helpers/fixtures-dir.js';
+-import {fullStdio, getStdio} from './helpers/stdio.js';
++import {setFixtureDir, FIXTURES_DIR} from './helpers/fixtures-dir.js';
++
++const pExec = promisify(exec);
+ 
+ setFixtureDir();
+ 
++const checkEncoding = async (t, encoding) => {
++	const {stdout} = await execa('noop-no-newline.js', [STRING_TO_ENCODE], {encoding});
++	t.is(stdout, BUFFER_TO_ENCODE.toString(encoding));
++
++	const {stdout: nativeStdout} = await pExec(`node noop-no-newline.js ${STRING_TO_ENCODE}`, {encoding, cwd: FIXTURES_DIR});
++	t.is(stdout, nativeStdout);
++};
++
++// This string gives different outputs with each encoding type
++const STRING_TO_ENCODE = '\u1000.';
++const BUFFER_TO_ENCODE = Buffer.from(STRING_TO_ENCODE);
++
++test('can pass encoding "utf8"', checkEncoding, 'utf8');
++test('can pass encoding "utf-8"', checkEncoding, 'utf8');
++test('can pass encoding "utf16le"', checkEncoding, 'utf16le');
++test('can pass encoding "utf-16le"', checkEncoding, 'utf16le');
++test('can pass encoding "ucs2"', checkEncoding, 'utf16le');
++test('can pass encoding "ucs-2"', checkEncoding, 'utf16le');
++test('can pass encoding "latin1"', checkEncoding, 'latin1');
++test('can pass encoding "binary"', checkEncoding, 'latin1');
++test('can pass encoding "ascii"', checkEncoding, 'ascii');
++test('can pass encoding "hex"', checkEncoding, 'hex');
++test('can pass encoding "base64"', checkEncoding, 'base64');
++test('can pass encoding "base64url"', checkEncoding, 'base64url');
++
++const checkBufferEncoding = async (t, execaMethod) => {
++	const {stdout} = await execaMethod('noop-no-newline.js', [STRING_TO_ENCODE], {encoding: 'buffer'});
++	t.true(ArrayBuffer.isView(stdout));
++	t.true(BUFFER_TO_ENCODE.equals(stdout));
++
++	const {stdout: nativeStdout} = await pExec(`node noop-no-newline.js ${STRING_TO_ENCODE}`, {encoding: 'buffer', cwd: FIXTURES_DIR});
++	t.true(Buffer.isBuffer(nativeStdout));
++	t.true(BUFFER_TO_ENCODE.equals(nativeStdout));
++};
++
++test('can pass encoding "buffer"', checkBufferEncoding, execa);
++test('can pass encoding "buffer" - sync', checkBufferEncoding, execaSync);
++
++test('validate unknown encodings', async t => {
++	await t.throwsAsync(execa('noop.js', {encoding: 'unknownEncoding'}), {code: 'ERR_UNKNOWN_ENCODING'});
++});
++
+ test.serial('result.all shows both `stdout` and `stderr` intermixed', async t => {
+ 	const {all} = await execa('noop-132.js', {all: true});
+ 	t.is(all, '132');
+@@ -34,238 +80,174 @@ const testAllIgnore = async (t, streamName, otherStreamName) => {
+ test('can use all: true with stdout: ignore', testAllIgnore, 'stderr', 'stdout');
+ test('can use all: true with stderr: ignore', testAllIgnore, 'stdout', 'stderr');
+ 
+-const testIgnore = async (t, index, execaMethod) => {
+-	const result = await execaMethod('noop.js', getStdio(index, 'ignore'));
+-	t.is(result.stdio[index], undefined);
++const testIgnore = async (t, streamName, execaMethod) => {
++	const result = await execaMethod('noop.js', {[streamName]: 'ignore'});
++	t.is(result[streamName], undefined);
+ };
+ 
+-test('stdout is undefined if ignored', testIgnore, 1, execa);
+-test('stderr is undefined if ignored', testIgnore, 2, execa);
+-test('stdio[*] is undefined if ignored', testIgnore, 3, execa);
+-test('stdout is undefined if ignored - sync', testIgnore, 1, execaSync);
+-test('stderr is undefined if ignored - sync', testIgnore, 2, execaSync);
+-test('stdio[*] is undefined if ignored - sync', testIgnore, 3, execaSync);
++test('stdout is undefined if ignored', testIgnore, 'stdout', execa);
++test('stderr is undefined if ignored', testIgnore, 'stderr', execa);
++test('stdout is undefined if ignored - sync', testIgnore, 'stdout', execaSync);
++test('stderr is undefined if ignored - sync', testIgnore, 'stderr', execaSync);
+ 
+-const maxBuffer = 10;
+-
+-const testMaxBufferSuccess = async (t, index, all) => {
+-	await t.notThrowsAsync(execa('max-buffer.js', [`${index}`, `${maxBuffer}`], {...fullStdio, maxBuffer, all}));
+-};
+-
+-test('maxBuffer does not affect stdout if too high', testMaxBufferSuccess, 1, false);
+-test('maxBuffer does not affect stderr if too high', testMaxBufferSuccess, 2, false);
+-test('maxBuffer does not affect stdio[*] if too high', testMaxBufferSuccess, 3, false);
+-test('maxBuffer does not affect all if too high', testMaxBufferSuccess, 1, true);
+-
+-const testMaxBufferLimit = async (t, index, all) => {
+-	const length = all ? maxBuffer * 2 : maxBuffer;
+-	const result = await t.throwsAsync(
+-		execa('max-buffer.js', [`${index}`, `${length + 1}`], {...fullStdio, maxBuffer, all}),
+-		{message: /maxBuffer exceeded/},
++const testMaxBuffer = async (t, streamName) => {
++	await t.notThrowsAsync(execa('max-buffer.js', [streamName, '10'], {maxBuffer: 10}));
++	const {[streamName]: stream, all} = await t.throwsAsync(
++		execa('max-buffer.js', [streamName, '11'], {maxBuffer: 10, all: true}),
++		{message: new RegExp(`max-buffer.js ${streamName}`)},
+ 	);
+-	t.is(all ? result.all : result.stdio[index], '.'.repeat(length));
++	t.is(stream, '.'.repeat(10));
++	t.is(all, '.'.repeat(10));
+ };
+ 
+-test('maxBuffer affects stdout', testMaxBufferLimit, 1, false);
+-test('maxBuffer affects stderr', testMaxBufferLimit, 2, false);
+-test('maxBuffer affects stdio[*]', testMaxBufferLimit, 3, false);
+-test('maxBuffer affects all', testMaxBufferLimit, 1, true);
++test('maxBuffer affects stdout', testMaxBuffer, 'stdout');
++test('maxBuffer affects stderr', testMaxBuffer, 'stderr');
+ 
+-const testMaxBufferEncoding = async (t, index) => {
+-	const result = await t.throwsAsync(
+-		execa('max-buffer.js', [`${index}`, `${maxBuffer + 1}`], {...fullStdio, maxBuffer, encoding: 'buffer'}),
++test('maxBuffer works with encoding buffer', async t => {
++	const {stdout} = await t.throwsAsync(
++		execa('max-buffer.js', ['stdout', '11'], {maxBuffer: 10, encoding: 'buffer'}),
+ 	);
+-	const stream = result.stdio[index];
+-	t.true(stream instanceof Uint8Array);
+-	t.is(Buffer.from(stream).toString(), '.'.repeat(maxBuffer));
+-};
+-
+-test('maxBuffer works with encoding buffer and stdout', testMaxBufferEncoding, 1);
+-test('maxBuffer works with encoding buffer and stderr', testMaxBufferEncoding, 2);
+-test('maxBuffer works with encoding buffer and stdio[*]', testMaxBufferEncoding, 3);
++	t.true(stdout instanceof Uint8Array);
++	t.is(Buffer.from(stdout).toString(), '.'.repeat(10));
++});
+ 
+-const testMaxBufferHex = async (t, index) => {
+-	const {stdio} = await t.throwsAsync(
+-		execa('max-buffer.js', [`${index}`, `${maxBuffer + 1}`], {...fullStdio, maxBuffer, encoding: 'hex'}),
++test('maxBuffer works with other encodings', async t => {
++	const {stdout} = await t.throwsAsync(
++		execa('max-buffer.js', ['stdout', '11'], {maxBuffer: 10, encoding: 'hex'}),
+ 	);
+-	t.is(stdio[index], Buffer.from('.'.repeat(maxBuffer)).toString('hex'));
+-};
+-
+-test('maxBuffer works with other encodings and stdout', testMaxBufferHex, 1);
+-test('maxBuffer works with other encodings and stderr', testMaxBufferHex, 2);
+-test('maxBuffer works with other encodings and stdio[*]', testMaxBufferHex, 3);
++	t.is(stdout, Buffer.from('.'.repeat(10)).toString('hex'));
++});
+ 
+-const testNoMaxBuffer = async (t, index) => {
+-	const subprocess = execa('max-buffer.js', [`${index}`, `${maxBuffer}`], {...fullStdio, buffer: false});
++const testNoMaxBuffer = async (t, streamName) => {
++	const promise = execa('max-buffer.js', [streamName, '10'], {buffer: false});
+ 	const [result, output] = await Promise.all([
+-		subprocess,
+-		getStream(subprocess.stdio[index]),
++		promise,
++		getStream(promise[streamName]),
+ 	]);
+-	t.is(result.stdio[index], undefined);
+-	t.is(output, '.'.repeat(maxBuffer));
+-};
+ 
+-test('do not buffer stdout when `buffer` set to `false`', testNoMaxBuffer, 1);
+-test('do not buffer stderr when `buffer` set to `false`', testNoMaxBuffer, 2);
+-test('do not buffer stdio[*] when `buffer` set to `false`', testNoMaxBuffer, 3);
+-
+-const testNoMaxBufferOption = async (t, index) => {
+-	const length = maxBuffer + 1;
+-	const subprocess = execa('max-buffer.js', [`${index}`, `${length}`], {...fullStdio, maxBuffer, buffer: false});
+-	const [result, output] = await Promise.all([
+-		subprocess,
+-		getStream(subprocess.stdio[index]),
+-	]);
+-	t.is(result.stdio[index], undefined);
+-	t.is(output, '.'.repeat(length));
++	t.is(result[streamName], undefined);
++	t.is(output, '.........\n');
+ };
+ 
+-test('do not hit maxBuffer when `buffer` is `false` with stdout', testNoMaxBufferOption, 1);
+-test('do not hit maxBuffer when `buffer` is `false` with stderr', testNoMaxBufferOption, 2);
+-test('do not hit maxBuffer when `buffer` is `false` with stdio[*]', testNoMaxBufferOption, 3);
++test('do not buffer stdout when `buffer` set to `false`', testNoMaxBuffer, 'stdout');
++test('do not buffer stderr when `buffer` set to `false`', testNoMaxBuffer, 'stderr');
+ 
+-const testMaxBufferAbort = async (t, index) => {
+-	const childProcess = execa('max-buffer.js', [`${index}`, `${maxBuffer + 1}`], {...fullStdio, maxBuffer});
++test('do not buffer when streaming and `buffer` is `false`', async t => {
++	const {stdout} = execa('max-buffer.js', ['stdout', '21'], {maxBuffer: 10, buffer: false});
++	const result = await getStream(stdout);
++	t.is(result, '....................\n');
++});
++
++test('buffers when streaming and `buffer` is `true`', async t => {
++	const childProcess = execa('max-buffer.js', ['stdout', '21'], {maxBuffer: 10});
+ 	await Promise.all([
+ 		t.throwsAsync(childProcess, {message: /maxBuffer exceeded/}),
+-		t.throwsAsync(getStream(childProcess.stdio[index]), {code: 'ABORT_ERR'}),
++		t.throwsAsync(getStream(childProcess.stdout), {code: 'ABORT_ERR'}),
+ 	]);
+-};
+-
+-test('abort stream when hitting maxBuffer with stdout', testMaxBufferAbort, 1);
+-test('abort stream when hitting maxBuffer with stderr', testMaxBufferAbort, 2);
+-test('abort stream when hitting maxBuffer with stdio[*]', testMaxBufferAbort, 3);
++});
+ 
+ test('buffer: false > promise resolves', async t => {
+ 	await t.notThrowsAsync(execa('noop.js', {buffer: false}));
+ });
+ 
+-test('buffer: false > promise rejects when process returns non-zero', async t => {
+-	const {exitCode} = await t.throwsAsync(execa('fail.js', {buffer: false}));
+-	t.is(exitCode, 2);
++test('buffer: false > promise resolves when output is big but is not pipable', async t => {
++	await t.notThrowsAsync(execa('max-buffer.js', {buffer: false, stdout: 'ignore'}));
+ });
+ 
+-const testStreamEnd = async (t, index, buffer) => {
+-	const subprocess = execa('wrong command', {...fullStdio, buffer});
+-	await Promise.all([
+-		t.throwsAsync(subprocess, {message: /wrong command/}),
+-		once(subprocess.stdio[index], 'end'),
+-	]);
+-};
++test('buffer: false > promise resolves when output is big and is read', async t => {
++	const subprocess = execa('max-buffer.js', {buffer: false});
++	subprocess.stdout.resume();
++	subprocess.stderr.resume();
++	await t.notThrowsAsync(subprocess);
++});
+ 
+-test('buffer: false > emits end event on stdout when promise is rejected', testStreamEnd, 1, false);
+-test('buffer: false > emits end event on stderr when promise is rejected', testStreamEnd, 2, false);
+-test('buffer: false > emits end event on stdio[*] when promise is rejected', testStreamEnd, 3, false);
+-test('buffer: true > emits end event on stdout when promise is rejected', testStreamEnd, 1, true);
+-test('buffer: true > emits end event on stderr when promise is rejected', testStreamEnd, 2, true);
+-test('buffer: true > emits end event on stdio[*] when promise is rejected', testStreamEnd, 3, true);
++test('buffer: false > promise resolves when output is big and "all" is used and is read', async t => {
++	const subprocess = execa('max-buffer.js', {buffer: false, all: true});
++	subprocess.all.resume();
++	await t.notThrowsAsync(subprocess);
++});
+ 
+-const testBufferIgnore = async (t, index, all) => {
+-	await t.notThrowsAsync(execa('max-buffer.js', [`${index}`], {...getStdio(index, 'ignore'), buffer: false, all}));
+-};
++test('buffer: false > promise rejects when process returns non-zero', async t => {
++	const subprocess = execa('fail.js', {buffer: false});
++	const {exitCode} = await t.throwsAsync(subprocess);
++	t.is(exitCode, 2);
++});
+ 
+-test('Process buffers stdout, which does not prevent exit if ignored', testBufferIgnore, 1, false);
+-test('Process buffers stderr, which does not prevent exit if ignored', testBufferIgnore, 2, false);
+-test('Process buffers all, which does not prevent exit if ignored', testBufferIgnore, 1, true);
++test('buffer: false > emits end event when promise is rejected', async t => {
++	const subprocess = execa('wrong command', {buffer: false, reject: false});
++	await t.notThrowsAsync(Promise.all([subprocess, pEvent(subprocess.stdout, 'end')]));
++});
+ 
+ // This specific behavior does not happen on Windows.
+ // Also, on macOS, it randomly happens, which would make those tests randomly fail.
+ if (process.platform === 'linux') {
+-	const testBufferNotRead = async (t, index, all) => {
+-		const {timedOut} = await t.throwsAsync(execa('max-buffer.js', [`${index}`], {...fullStdio, buffer: false, all, timeout: 1e3}));
++	const testBufferNotRead = async (t, streamArgument, all) => {
++		const {timedOut} = await t.throwsAsync(execa('max-buffer.js', [streamArgument], {buffer: false, all, timeout: 1e3}));
+ 		t.true(timedOut);
+ 	};
+ 
+-	test.serial('Process buffers stdout, which prevents exit if not read and buffer is false', testBufferNotRead, 1, false);
+-	test.serial('Process buffers stderr, which prevents exit if not read and buffer is false', testBufferNotRead, 2, false);
+-	test.serial('Process buffers stdio[*], which prevents exit if not read and buffer is false', testBufferNotRead, 3, false);
+-	test.serial('Process buffers all, which prevents exit if not read and buffer is false', testBufferNotRead, 1, true);
++	test.serial('Process buffers stdout, which prevents exit if not read and buffer is false', testBufferNotRead, 'stdout', false);
++	test.serial('Process buffers stderr, which prevents exit if not read and buffer is false', testBufferNotRead, 'stderr', false);
++	test.serial('Process buffers all, which prevents exit if not read and buffer is false', testBufferNotRead, 'stdout', true);
+ 
+-	const testBufferRead = async (t, index, all) => {
+-		const subprocess = execa('max-buffer.js', [`${index}`], {...fullStdio, buffer: false, all, timeout: 1e4});
+-		const stream = all ? subprocess.all : subprocess.stdio[index];
+-		stream.resume();
+-		await t.notThrowsAsync(subprocess);
++	const testBufferRead = async (t, streamName, streamArgument, all) => {
++		const subprocess = execa('max-buffer.js', [streamArgument], {buffer: false, all, timeout: 1e4});
++		subprocess[streamName].resume();
++		const {timedOut} = await subprocess;
++		t.false(timedOut);
+ 	};
+ 
+-	test.serial('Process buffers stdout, which does not prevent exit if read and buffer is false', testBufferRead, 1, false);
+-	test.serial('Process buffers stderr, which does not prevent exit if read and buffer is false', testBufferRead, 2, false);
+-	test.serial('Process buffers stdio[*], which does not prevent exit if read and buffer is false', testBufferRead, 3, false);
+-	test.serial('Process buffers all, which does not prevent exit if read and buffer is false', testBufferRead, 1, true);
++	test.serial('Process buffers stdout, which does not prevent exit if read and buffer is false', testBufferRead, 'stdout', 'stdout', false);
++	test.serial('Process buffers stderr, which does not prevent exit if read and buffer is false', testBufferRead, 'stderr', 'stderr', false);
++	test.serial('Process buffers all, which does not prevent exit if read and buffer is false', testBufferRead, 'all', 'stdout', true);
+ }
+ 
+-const testStreamDestroy = async (t, index) => {
+-	const childProcess = execa('forever.js', fullStdio);
+-	const error = new Error('test');
+-	childProcess.stdio[index].destroy(error);
+-	await t.throwsAsync(childProcess, {message: /test/});
+-};
+-
+-test('Destroying stdin should make the process exit', testStreamDestroy, 0);
+-test('Destroying stdout should make the process exit', testStreamDestroy, 1);
+-test('Destroying stderr should make the process exit', testStreamDestroy, 2);
+-test('Destroying stdio[*] should make the process exit', testStreamDestroy, 3);
+-
+-const testStreamError = async (t, index) => {
+-	const childProcess = execa('forever.js', fullStdio);
+-	await setTimeout(0);
+-	const error = new Error('test');
+-	childProcess.stdio[index].emit('error', error);
+-	await t.throwsAsync(childProcess, {message: /test/});
+-};
++test('Errors on streams should make the process exit', async t => {
++	const childProcess = execa('forever.js');
++	childProcess.stdout.destroy();
++	await t.throwsAsync(childProcess, {code: 'ERR_STREAM_PREMATURE_CLOSE'});
++});
+ 
+-test('Errors on stdin should make the process exit', testStreamError, 0);
+-test('Errors on stdout should make the process exit', testStreamError, 1);
+-test('Errors on stderr should make the process exit', testStreamError, 2);
+-test('Errors on stdio[*] should make the process exit', testStreamError, 3);
++test.serial('Process waits on stdin before exiting', async t => {
++	const childProcess = execa('stdin.js');
++	await setTimeout(1e3);
++	childProcess.stdin.end('foobar');
++	const {stdout} = await childProcess;
++	t.is(stdout, 'foobar');
++});
+ 
+-const testWaitOnStreamEnd = async (t, index) => {
+-	const childProcess = execa('stdin-fd.js', [`${index}`], fullStdio);
+-	await setTimeout(100);
+-	childProcess.stdio[index].end('foobar');
++test.serial('Process buffers stdout before it is read', async t => {
++	const childProcess = execa('noop-delay.js', ['foobar']);
++	await setTimeout(5e2);
+ 	const {stdout} = await childProcess;
+ 	t.is(stdout, 'foobar');
+-};
++});
+ 
+-test.serial('Process waits on stdin before exiting', testWaitOnStreamEnd, 0);
+-test.serial('Process waits on stdio[*] before exiting', testWaitOnStreamEnd, 3);
++test.serial('Process buffers stdout right away, on successfully exit', async t => {
++	const childProcess = execa('noop.js', ['foobar']);
++	await setTimeout(1e3);
++	const {stdout} = await childProcess;
++	t.is(stdout, 'foobar');
++});
+ 
+-const testBufferExit = async (t, index, fixtureName, reject) => {
+-	const childProcess = execa(fixtureName, [`${index}`], {...fullStdio, reject});
+-	await setTimeout(100);
+-	const {stdio} = await childProcess;
+-	t.is(stdio[index], 'foobar');
+-};
++test.serial('Process buffers stdout right away, on failure', async t => {
++	const childProcess = execa('noop-fail.js', ['foobar'], {reject: false});
++	await setTimeout(1e3);
++	const {stdout} = await childProcess;
++	t.is(stdout, 'foobar');
++});
+ 
+-test.serial('Process buffers stdout before it is read', testBufferExit, 1, 'noop-delay.js', true);
+-test.serial('Process buffers stderr before it is read', testBufferExit, 2, 'noop-delay.js', true);
+-test.serial('Process buffers stdio[*] before it is read', testBufferExit, 3, 'noop-delay.js', true);
+-test.serial('Process buffers stdout right away, on successfully exit', testBufferExit, 1, 'noop-fd.js', true);
+-test.serial('Process buffers stderr right away, on successfully exit', testBufferExit, 2, 'noop-fd.js', true);
+-test.serial('Process buffers stdio[*] right away, on successfully exit', testBufferExit, 3, 'noop-fd.js', true);
+-test.serial('Process buffers stdout right away, on failure', testBufferExit, 1, 'noop-fail.js', false);
+-test.serial('Process buffers stderr right away, on failure', testBufferExit, 2, 'noop-fail.js', false);
+-test.serial('Process buffers stdio[*] right away, on failure', testBufferExit, 3, 'noop-fail.js', false);
+-
+-const testBufferDirect = async (t, index) => {
+-	const childProcess = execa('noop-fd.js', [`${index}`], fullStdio);
+-	const data = await once(childProcess.stdio[index], 'data');
++test('Process buffers stdout right away, even if directly read', async t => {
++	const childProcess = execa('noop.js', ['foobar']);
++	const data = await once(childProcess.stdout, 'data');
+ 	t.is(data.toString().trim(), 'foobar');
+-	const result = await childProcess;
+-	t.is(result.stdio[index], 'foobar');
+-};
+-
+-test('Process buffers stdout right away, even if directly read', testBufferDirect, 1);
+-test('Process buffers stderr right away, even if directly read', testBufferDirect, 2);
+-test('Process buffers stdio[*] right away, even if directly read', testBufferDirect, 3);
+-
+-const testBufferDestroyOnEnd = async (t, index) => {
+-	const childProcess = execa('noop-fd.js', [`${index}`], fullStdio);
+-	const result = await childProcess;
+-	t.is(result.stdio[index], 'foobar');
+-	t.true(childProcess.stdio[index].destroyed);
+-};
++	const {stdout} = await childProcess;
++	t.is(stdout, 'foobar');
++});
+ 
+-test('childProcess.stdout must be read right away', testBufferDestroyOnEnd, 1);
+-test('childProcess.stderr must be read right away', testBufferDestroyOnEnd, 2);
+-test('childProcess.stdio[*] must be read right away', testBufferDestroyOnEnd, 3);
++test('childProcess.stdout|stderr must be read right away', async t => {
++	const childProcess = execa('noop.js', ['foobar']);
++	const {stdout} = await childProcess;
++	t.is(stdout, 'foobar');
++	t.true(childProcess.stdout.destroyed);
++});
+diff --git a/test/test.js b/test/test.js
+index c0254b8..995b9dd 100644
+--- a/test/test.js
++++ b/test/test.js
+@@ -1,5 +1,6 @@
+ import path from 'node:path';
+ import process from 'node:process';
++import {setTimeout} from 'node:timers/promises';
+ import {fileURLToPath, pathToFileURL} from 'node:url';
+ import test from 'ava';
+ import isRunning from 'is-running';
+@@ -7,43 +8,17 @@ import getNode from 'get-node';
+ import which from 'which';
+ import {execa, execaSync, execaNode, $} from '../index.js';
+ import {setFixtureDir, PATH_KEY, FIXTURES_DIR_URL} from './helpers/fixtures-dir.js';
+-import {identity, fullStdio} from './helpers/stdio.js';
+-import {stringGenerator} from './helpers/generator.js';
+ 
+ setFixtureDir();
+ process.env.FOO = 'foo';
+ 
+ const ENOENT_REGEXP = process.platform === 'win32' ? /failed with exit code 1/ : /spawn.* ENOENT/;
+ 
+-const testOutput = async (t, index, execaCommand) => {
+-	const {stdout, stderr, stdio} = await execaCommand('noop-fd.js', [`${index}`, 'foobar'], fullStdio);
+-	t.is(stdio[index], 'foobar');
++const identity = value => value;
+ 
+-	if (index === 1) {
+-		t.is(stdio[index], stdout);
+-	} else if (index === 2) {
+-		t.is(stdio[index], stderr);
+-	}
+-};
+-
+-test('can return stdout', testOutput, 1, execa);
+-test('can return stderr', testOutput, 2, execa);
+-test('can return output stdio[*]', testOutput, 3, execa);
+-test('can return stdout - sync', testOutput, 1, execaSync);
+-test('can return stderr - sync', testOutput, 2, execaSync);
+-test('can return output stdio[*] - sync', testOutput, 3, execaSync);
+-
+-const testNoStdin = async (t, execaCommand) => {
+-	const {stdio} = await execaCommand('noop.js', ['foobar']);
+-	t.is(stdio[0], undefined);
+-};
+-
+-test('cannot return stdin', testNoStdin, execa);
+-test('cannot return stdin - sync', testNoStdin, execaSync);
+-
+-test('cannot return input stdio[*]', async t => {
+-	const {stdio} = await execa('stdin-fd.js', ['3'], {stdio: ['pipe', 'pipe', 'pipe', stringGenerator()]});
+-	t.is(stdio[3], undefined);
++test('execa()', async t => {
++	const {stdout} = await execa('noop.js', ['foo']);
++	t.is(stdout, 'foo');
+ });
+ 
+ if (process.platform === 'win32') {
+@@ -58,7 +33,12 @@ if (process.platform === 'win32') {
+ 	});
+ }
+ 
+-test('execaSync() throws error if ENOENT', t => {
++test('execaSync()', t => {
++	const {stdout} = execaSync('noop.js', ['foo']);
++	t.is(stdout, 'foo');
++});
++
++test('execaSync() throws error if written to stderr', t => {
+ 	t.throws(() => {
+ 		execaSync('foo');
+ 	}, {message: ENOENT_REGEXP});
+@@ -74,23 +54,32 @@ test('skip throwing when using reject option in sync mode', t => {
+ 	t.is(exitCode, 2);
+ });
+ 
+-const testStripFinalNewline = async (t, index, stripFinalNewline, execaCommand) => {
+-	const {stdio} = await execaCommand('noop-fd.js', [`${index}`, 'foobar\n'], {...fullStdio, stripFinalNewline});
+-	t.is(stdio[index], `foobar${stripFinalNewline ? '' : '\n'}`);
+-};
++test('stripFinalNewline: true', async t => {
++	const {stdout} = await execa('noop.js', ['foo']);
++	t.is(stdout, 'foo');
++});
++
++test('stripFinalNewline: false', async t => {
++	const {stdout} = await execa('noop.js', ['foo'], {stripFinalNewline: false});
++	t.is(stdout, 'foo\n');
++});
++
++test('stripFinalNewline on failure', async t => {
++	const {stderr} = await t.throwsAsync(execa('noop-throw.js', ['foo'], {stripFinalNewline: true}));
++	t.is(stderr, 'foo');
++});
++
++test('stripFinalNewline in sync mode', t => {
++	const {stdout} = execaSync('noop.js', ['foo'], {stripFinalNewline: true});
++	t.is(stdout, 'foo');
++});
+ 
+-test('stripFinalNewline: true with stdout', testStripFinalNewline, 1, undefined, execa);
+-test('stripFinalNewline: false with stdout', testStripFinalNewline, 1, false, execa);
+-test('stripFinalNewline: true with stderr', testStripFinalNewline, 2, undefined, execa);
+-test('stripFinalNewline: false with stderr', testStripFinalNewline, 2, false, execa);
+-test('stripFinalNewline: true with stdio[*]', testStripFinalNewline, 3, undefined, execa);
+-test('stripFinalNewline: false with stdio[*]', testStripFinalNewline, 3, false, execa);
+-test('stripFinalNewline: true with stdout - sync', testStripFinalNewline, 1, undefined, execaSync);
+-test('stripFinalNewline: false with stdout - sync', testStripFinalNewline, 1, false, execaSync);
+-test('stripFinalNewline: true with stderr - sync', testStripFinalNewline, 2, undefined, execaSync);
+-test('stripFinalNewline: false with stderr - sync', testStripFinalNewline, 2, false, execaSync);
+-test('stripFinalNewline: true with stdio[*] - sync', testStripFinalNewline, 3, undefined, execaSync);
+-test('stripFinalNewline: false with stdio[*] - sync', testStripFinalNewline, 3, false, execaSync);
++test('stripFinalNewline in sync mode on failure', t => {
++	const {stderr} = t.throws(() => {
++		execaSync('noop-throw.js', ['foo'], {stripFinalNewline: true});
++	});
++	t.is(stderr, 'foo');
++});
+ 
+ const getPathWithoutLocalDir = () => {
+ 	const newPath = process.env[PATH_KEY].split(path.delimiter).filter(pathDir => !BIN_DIR_REGEXP.test(pathDir)).join(path.delimiter);
+@@ -136,16 +125,34 @@ const testExecPath = async (t, mapPath) => {
+ test.serial('execPath option', testExecPath, identity);
+ test.serial('execPath option can be a file URL', testExecPath, pathToFileURL);
+ 
++const emitStdinError = async subprocess => {
++	await setTimeout(0);
++	subprocess.stdin.emit('error', new Error('test'));
++};
++
++test('stdin errors are handled', async t => {
++	const subprocess = execa('forever.js');
++	await Promise.all([
++		t.throwsAsync(subprocess, {message: /test/}),
++		emitStdinError(subprocess),
++	]);
++});
++
+ test('child process errors are handled', async t => {
+ 	const subprocess = execa('noop.js');
+ 	subprocess.emit('error', new Error('test'));
+ 	await t.throwsAsync(subprocess, {message: /test/});
+ });
+ 
+-test('execa() returns a promise with pid', async t => {
+-	const subprocess = execa('noop.js', ['foo']);
+-	t.is(typeof subprocess.pid, 'number');
+-	await subprocess;
++test('child process errors rejects promise right away', async t => {
++	const subprocess = execa('noop.js');
++	subprocess.emit('error', new Error('test'));
++	await t.throwsAsync(subprocess, {message: /test/});
++});
++
++test('execa() returns a promise with pid', t => {
++	const {pid} = execa('noop.js', ['foo']);
++	t.is(typeof pid, 'number');
+ });
+ 
+ test('child_process.spawn() propagated errors have correct shape', t => {
+@@ -185,7 +192,8 @@ test('use relative path with \'..\' chars', async t => {
+ 
+ if (process.platform !== 'win32') {
+ 	test('execa() rejects if running non-executable', async t => {
+-		await t.throwsAsync(execa('non-executable.js'));
++		const subprocess = execa('non-executable.js');
++		await t.throwsAsync(subprocess);
+ 	});
+ 
+ 	test('execa() rejects with correct error and doesn\'t throw if running non-executable with input', async t => {

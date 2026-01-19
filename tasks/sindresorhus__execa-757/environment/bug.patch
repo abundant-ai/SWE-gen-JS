@@ -1,0 +1,449 @@
+diff --git a/docs/scripts.md b/docs/scripts.md
+index d45be60..762429e 100644
+--- a/docs/scripts.md
++++ b/docs/scripts.md
+@@ -6,7 +6,7 @@ With Execa, you can write scripts with Node.js instead of a shell language. It i
+ import {$} from 'execa';
+ 
+ const {stdout: name} = await $`cat package.json`
+-  .pipe($({stdin: 'pipe'})`grep name`);
++  .pipeStdout($({stdin: 'pipe'})`grep name`);
+ console.log(name);
+ 
+ const branch = await $`git branch --show-current`;
+@@ -598,7 +598,7 @@ await $`echo example | cat`;
+ 
+ ```js
+ // Execa
+-await $`echo example`.pipe($({stdin: 'pipe'})`cat`);
++await $`echo example`.pipeStdout($({stdin: 'pipe'})`cat`);
+ ```
+ 
+ ### Piping stdout and stderr to another command
+@@ -619,7 +619,7 @@ await Promise.all([echo, cat]);
+ 
+ ```js
+ // Execa
+-await $({all: true})`echo example`.pipe($({stdin: 'pipe'})`cat`, 'all');
++await $({all: true})`echo example`.pipeAll($({stdin: 'pipe'})`cat`);
+ ```
+ 
+ ### Piping stdout to a file
+diff --git a/index.d.ts b/index.d.ts
+index 6780ba3..ea67373 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -812,13 +812,25 @@ export type ExecaChildPromise<OptionsType extends Options = Options> = {
+ 	/**
+ 	[Pipe](https://nodejs.org/api/stream.html#readablepipedestination-options) the child process' `stdout` to another Execa child process' `stdin`.
+ 
+-	A `streamName` can be passed to pipe `"stderr"`, `"all"` (both `stdout` and `stderr`) or any another file descriptor instead of `stdout`.
++	Returns `execaChildProcess`, which allows chaining `pipeStdout()` then `await`ing the final result.
+ 
+-	`childProcess.stdout` (and/or `childProcess.stderr` depending on `streamName`) must not be `undefined`. When `streamName` is `"all"`, the `all` option must be set to `true`.
++	`childProcess.stdout` must not be `undefined`.
++	*/
++	pipeStdout?<Target extends ExecaChildProcess>(target: Target): Target;
++
++	/**
++	Like `pipeStdout()` but piping the child process's `stderr` instead.
++
++	`childProcess.stderr` must not be `undefined`.
++	*/
++	pipeStderr?<Target extends ExecaChildProcess>(target: Target): Target;
++
++	/**
++	Combines both `pipeStdout()` and `pipeStderr()`.
+ 
+-	Returns `execaChildProcess`, which allows chaining `.pipe()` then `await`ing the final result.
++	The `all` option must be set to `true`.
+ 	*/
+-	pipe<Target extends ExecaChildProcess>(target: Target, streamName?: 'stdout' | 'stderr' | 'all' | number): Target;
++	pipeAll?<Target extends ExecaChildProcess>(target: Target): Target;
+ };
+ 
+ export type ExecaChildProcess<OptionsType extends Options = Options> = ChildProcess &
+@@ -853,13 +865,13 @@ console.log(stdout);
+ import {execa} from 'execa';
+ 
+ // Similar to `echo unicorns > stdout.txt` in Bash
+-await execa('echo', ['unicorns'], {stdout: {file: 'stdout.txt'}});
++await execa('echo', ['unicorns']).pipeStdout('stdout.txt');
+ 
+ // Similar to `echo unicorns 2> stdout.txt` in Bash
+-await execa('echo', ['unicorns'], {stderr: {file: 'stderr.txt'}});
++await execa('echo', ['unicorns']).pipeStderr('stderr.txt');
+ 
+ // Similar to `echo unicorns &> stdout.txt` in Bash
+-await execa('echo', ['unicorns'], {stdout: {file: 'all.txt'}, stderr: {file: 'all.txt'}});
++await execa('echo', ['unicorns'], {all: true}).pipeAll('all.txt');
+ ```
+ 
+ @example <caption>Redirect input from a file</caption>
+@@ -876,7 +888,7 @@ console.log(stdout);
+ ```
+ import {execa} from 'execa';
+ 
+-const {stdout} = await execa('echo', ['unicorns'], {stdout: ['pipe', 'inherit']});
++const {stdout} = await execa('echo', ['unicorns']).pipeStdout(process.stdout);
+ // Prints `unicorns`
+ console.log(stdout);
+ // Also returns 'unicorns'
+@@ -887,7 +899,7 @@ console.log(stdout);
+ import {execa} from 'execa';
+ 
+ // Similar to `echo unicorns | cat` in Bash
+-const {stdout} = await execa('echo', ['unicorns']).pipe(execa('cat'));
++const {stdout} = await execa('echo', ['unicorns']).pipeStdout(execa('cat'));
+ console.log(stdout);
+ //=> 'unicorns'
+ ```
+diff --git a/index.js b/index.js
+index e03083f..9570ba5 100644
+--- a/index.js
++++ b/index.js
+@@ -11,7 +11,7 @@ import {handleInputAsync, pipeOutputAsync} from './lib/stdio/async.js';
+ import {handleInputSync, pipeOutputSync} from './lib/stdio/sync.js';
+ import {normalizeStdioNode} from './lib/stdio/normalize.js';
+ import {spawnedKill, validateTimeout, normalizeForceKillAfterDelay} from './lib/kill.js';
+-import {pipeToProcess} from './lib/pipe.js';
++import {addPipeMethods} from './lib/pipe.js';
+ import {getSpawnedResult, makeAllStream} from './lib/stream.js';
+ import {mergePromise} from './lib/promise.js';
+ import {joinCommand, parseCommand, parseTemplates, getEscapedCommand} from './lib/command.js';
+@@ -154,9 +154,10 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 
+ 	pipeOutputAsync(spawned, stdioStreamsGroups);
+ 
+-	spawned.kill = spawnedKill.bind(undefined, spawned.kill.bind(spawned), options, controller);
++	spawned.kill = spawnedKill.bind(null, spawned.kill.bind(spawned), options, controller);
+ 	spawned.all = makeAllStream(spawned, options);
+-	spawned.pipe = pipeToProcess.bind(undefined, {spawned, stdioStreamsGroups, options});
++
++	addPipeMethods(spawned);
+ 
+ 	const promise = handlePromise({spawned, options, stdioStreamsGroups, command, escapedCommand, controller});
+ 	mergePromise(spawned, promise);
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 72d0a2f..b4bc972 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -82,14 +82,23 @@ try {
+ 	const execaBufferPromise = execa('unicorns', {encoding: 'buffer', all: true});
+ 	const writeStream = createWriteStream('output.txt');
+ 
+-	expectType<typeof execaPromise>(execaBufferPromise.pipe(execaPromise));
+-	expectError(execaBufferPromise.pipe(writeStream));
+-	expectError(execaBufferPromise.pipe('output.txt'));
+-	await execaBufferPromise.pipe(execaPromise, 'stdout');
+-	await execaBufferPromise.pipe(execaPromise, 'stderr');
+-	await execaBufferPromise.pipe(execaPromise, 'all');
+-	await execaBufferPromise.pipe(execaPromise, 3);
+-	expectError(execaBufferPromise.pipe(execaPromise, 'other'));
++	expectAssignable<Function | undefined>(execaPromise.pipeStdout);
++	expectAssignable<ExecaChildProcess>(execaPromise.pipeStdout!(execaPromise));
++	expectAssignable<ExecaChildProcess>(execaPromise.pipeStdout!(execaBufferPromise));
++	expectAssignable<ExecaChildProcess>(execaBufferPromise.pipeStdout!(execaPromise));
++	expectAssignable<ExecaChildProcess>(execaBufferPromise.pipeStdout!(execaBufferPromise));
++
++	expectAssignable<Function | undefined>(execaPromise.pipeStderr);
++	expectAssignable<ExecaChildProcess>(execaPromise.pipeStderr!(execaPromise));
++	expectAssignable<ExecaChildProcess>(execaPromise.pipeStderr!(execaBufferPromise));
++	expectAssignable<ExecaChildProcess>(execaBufferPromise.pipeStderr!(execaPromise));
++	expectAssignable<ExecaChildProcess>(execaBufferPromise.pipeStderr!(execaBufferPromise));
++
++	expectAssignable<Function | undefined>(execaPromise.pipeAll);
++	expectAssignable<ExecaChildProcess>(execaPromise.pipeAll!(execaPromise));
++	expectAssignable<ExecaChildProcess>(execaPromise.pipeAll!(execaBufferPromise));
++	expectAssignable<ExecaChildProcess>(execaBufferPromise.pipeAll!(execaPromise));
++	expectAssignable<ExecaChildProcess>(execaBufferPromise.pipeAll!(execaBufferPromise));
+ 
+ 	expectType<Readable>(execaPromise.all);
+ 	const noAllPromise = execa('unicorns');
+@@ -542,7 +551,9 @@ try {
+ 	expectType<string>(unicornsResult.command);
+ 	expectType<string>(unicornsResult.escapedCommand);
+ 	expectType<number | undefined>(unicornsResult.exitCode);
+-	expectError(unicornsResult.pipe);
++	expectError(unicornsResult.pipeStdout);
++	expectError(unicornsResult.pipeStderr);
++	expectError(unicornsResult.pipeAll);
+ 	expectType<boolean>(unicornsResult.failed);
+ 	expectType<boolean>(unicornsResult.timedOut);
+ 	expectType<boolean>(unicornsResult.isCanceled);
+diff --git a/lib/pipe.js b/lib/pipe.js
+index 07c5634..3326f39 100644
+--- a/lib/pipe.js
++++ b/lib/pipe.js
+@@ -1,79 +1,31 @@
+ import {ChildProcess} from 'node:child_process';
+ import {isWritableStream} from 'is-stream';
+ 
+-export const pipeToProcess = ({spawned, stdioStreamsGroups, options}, targetProcess, streamName = 'stdout') => {
+-	validateTargetProcess(targetProcess);
+-
+-	const inputStream = getInputStream(spawned, streamName, stdioStreamsGroups);
+-	validateStdioOption(inputStream, spawned, streamName, options);
+-
+-	inputStream.pipe(targetProcess.stdin);
+-	return targetProcess;
+-};
+-
+-const validateTargetProcess = targetProcess => {
+-	if (!isExecaChildProcess(targetProcess)) {
+-		throw new TypeError('The first argument must be an Execa child process.');
+-	}
+-
+-	if (!isWritableStream(targetProcess.stdin)) {
+-		throw new TypeError('The target child process\'s stdin must be available.');
+-	}
+-};
+-
+ const isExecaChildProcess = target => target instanceof ChildProcess && typeof target.then === 'function';
+ 
+-const getInputStream = (spawned, streamName, stdioStreamsGroups) => {
+-	if (VALID_STREAM_NAMES.has(streamName)) {
+-		return spawned[streamName];
+-	}
+-
+-	if (streamName === 'stdin') {
+-		throw new TypeError('The second argument must not be "stdin".');
++const pipeToTarget = (spawned, streamName, target) => {
++	if (!isExecaChildProcess(target)) {
++		throw new TypeError('The second argument must be an Execa child process.');
+ 	}
+ 
+-	if (!Number.isInteger(streamName) || streamName < 0) {
+-		throw new TypeError(`The second argument must not be "${streamName}".
+-It must be "stdout", "stderr", "all" or a file descriptor integer.
+-It is optional and defaults to "stdout".`);
+-	}
+-
+-	const stdioStreams = stdioStreamsGroups[streamName];
+-	if (stdioStreams === undefined) {
+-		throw new TypeError(`The second argument must not be ${streamName}: that file descriptor does not exist.
+-Please set the "stdio" option to ensure that file descriptor exists.`);
+-	}
+-
+-	if (stdioStreams[0].direction === 'input') {
+-		throw new TypeError(`The second argument must not be ${streamName}: it must be a readable stream, not writable.`);
++	if (!isWritableStream(target.stdin)) {
++		throw new TypeError('The target child process\'s stdin must be available.');
+ 	}
+ 
+-	return spawned.stdio[streamName];
++	spawned[streamName].pipe(target.stdin);
++	return target;
+ };
+ 
+-const VALID_STREAM_NAMES = new Set(['stdout', 'stderr', 'all']);
+-
+-const validateStdioOption = (inputStream, spawned, streamName, options) => {
+-	if (inputStream !== null && inputStream !== undefined) {
+-		return;
++export const addPipeMethods = spawned => {
++	if (spawned.stdout !== null) {
++		spawned.pipeStdout = pipeToTarget.bind(undefined, spawned, 'stdout');
+ 	}
+ 
+-	if (streamName === 'all' && !options.all) {
+-		throw new TypeError('The "all" option must be true to use `childProcess.pipe(targetProcess, "all")`.');
++	if (spawned.stderr !== null) {
++		spawned.pipeStderr = pipeToTarget.bind(undefined, spawned, 'stderr');
+ 	}
+ 
+-	throw new TypeError(`The "${getInvalidStdioOption(inputStream, spawned, options)}" option's value is incompatible with using \`childProcess.pipe(targetProcess)\`.
+-Please set this option with "pipe" instead.`);
+-};
+-
+-const getInvalidStdioOption = (inputStream, spawned, options) => {
+-	if (inputStream === spawned.stdout && options.stdout !== undefined) {
+-		return 'stdout';
++	if (spawned.all !== undefined) {
++		spawned.pipeAll = pipeToTarget.bind(undefined, spawned, 'all');
+ 	}
+-
+-	if (inputStream === spawned.stderr && options.stderr !== undefined) {
+-		return 'stderr';
+-	}
+-
+-	return 'stdio';
+ };
+diff --git a/readme.md b/readme.md
+index aacde8d..b8a5ab4 100644
+--- a/readme.md
++++ b/readme.md
+@@ -183,7 +183,7 @@ console.log(stdout);
+ import {execa} from 'execa';
+ 
+ // Similar to `echo unicorns | cat` in Bash
+-const {stdout} = await execa('echo', ['unicorns']).pipe(execa('cat'));
++const {stdout} = await execa('echo', ['unicorns']).pipeStdout(execa('cat'));
+ console.log(stdout);
+ //=> 'unicorns'
+ ```
+@@ -319,18 +319,31 @@ This is `undefined` if either:
+ - the [`all` option](#all-2) is `false` (the default value)
+ - both [`stdout`](#stdout-1) and [`stderr`](#stderr-1) options are set to [`'inherit'`, `'ipc'`, `'ignore'`, `Stream` or `integer`](https://nodejs.org/api/child_process.html#child_process_options_stdio)
+ 
+-#### pipe(execaChildProcess, streamName?)
++#### pipeStdout(execaChildProcess)
+ 
+ `execaChildProcess`: [`execa()` return value](#pipe-multiple-processes)
+-`streamName`: `"stdout"` (default), `"stderr"`, `"all"` or file descriptor index
+ 
+ [Pipe](https://nodejs.org/api/stream.html#readablepipedestination-options) the child process' `stdout` to another Execa child process' `stdin`.
+ 
+-A `streamName` can be passed to pipe `"stderr"`, `"all"` (both `stdout` and `stderr`) or any another file descriptor instead of `stdout`.
++Returns `execaChildProcess`, which allows chaining `pipeStdout()` then `await`ing the [final result](#childprocessresult).
+ 
+-[`childProcess.stdout`](#stdout) (and/or [`childProcess.stderr`](#stderr) depending on `streamName`) must not be `undefined`. When `streamName` is `"all"`, the [`all` option](#all-2) must be set to `true`.
++[`childProcess.stdout`](#stdout) must not be `undefined`.
+ 
+-Returns `execaChildProcess`, which allows chaining `.pipe()` then `await`ing the [final result](#childprocessresult).
++#### pipeStderr(execaChildProcess)
++
++`execaChildProcess`: [`execa()` return value](#pipe-multiple-processes)
++
++Like [`pipeStdout()`](#pipestdoutexecachildprocess) but piping the child process's `stderr` instead.
++
++[`childProcess.stderr`](#stderr) must not be `undefined`.
++
++#### pipeAll(execaChildProcess)
++
++`execaChildProcess`: [`execa()` return value](#pipe-multiple-processes)
++
++Combines both [`pipeStdout()`](#pipestdoutexecachildprocess) and [`pipeStderr()`](#pipestderrexecachildprocess).
++
++The [`all` option](#all-2) must be set to `true`.
+ 
+ ### childProcessResult
+ 
+diff --git a/test/pipe.js b/test/pipe.js
+index cb5a173..ebffb8b 100644
+--- a/test/pipe.js
++++ b/test/pipe.js
+@@ -1,95 +1,48 @@
+ import {PassThrough} from 'node:stream';
+ import {spawn} from 'node:child_process';
+-import process from 'node:process';
+ import test from 'ava';
+ import {execa} from '../index.js';
+ import {setFixtureDir} from './helpers/fixtures-dir.js';
+-import {fullStdio} from './helpers/stdio.js';
+ 
+ setFixtureDir();
+ 
+-const pipeToProcess = async (t, index, streamName) => {
+-	const {stdout} = await execa('noop-fd.js', [`${index}`, 'test'], {...fullStdio, all: true}).pipe(execa('stdin.js'), streamName);
++const pipeToProcess = async (t, index, funcName) => {
++	const {stdout} = await execa('noop-fd.js', [`${index}`, 'test'], {all: true})[funcName](execa('stdin.js'));
+ 	t.is(stdout, 'test');
+ };
+ 
+-test('pipe() can pipe to Execa child processes', pipeToProcess, 1, undefined);
+-test('pipe() stdout can pipe to Execa child processes', pipeToProcess, 1, 'stdout');
+-test('pipe() 1 can pipe to Execa child processes', pipeToProcess, 1, 1);
+-test('pipe() stderr can pipe to Execa child processes', pipeToProcess, 2, 'stderr');
+-test('pipe() 2 can pipe to Execa child processes', pipeToProcess, 2, 2);
+-test('pipe() 3 can pipe to Execa child processes', pipeToProcess, 3, 3);
++test('pipeStdout() can pipe to Execa child processes', pipeToProcess, 1, 'pipeStdout');
++test('pipeStderr() can pipe to Execa child processes', pipeToProcess, 2, 'pipeStderr');
++test('pipeAll() can pipe stdout to Execa child processes', pipeToProcess, 1, 'pipeAll');
++test('pipeAll() can pipe stderr to Execa child processes', pipeToProcess, 2, 'pipeAll');
+ 
+-const pipeAllToProcess = async (t, index) => {
+-	const {stdout} = await execa('noop-fd.js', [`${index}`, 'test'], {...fullStdio, all: true}).pipe(execa('stdin.js'), 'all');
+-	t.is(stdout, 'test');
++const invalidTarget = (t, funcName, getTarget) => {
++	t.throws(() => execa('empty.js', {all: true})[funcName](getTarget()), {
++		message: /an Execa child process/,
++	});
+ };
+ 
+-test('pipe() all can pipe stdout to Execa child processes', pipeAllToProcess, 1, {all: true});
+-test('pipe() all can pipe stdout to Execa child processes even with "stderr: ignore"', pipeAllToProcess, 1, {all: true, stderr: 'ignore'});
+-test('pipe() all can pipe stderr to Execa child processes', pipeAllToProcess, 2, {all: true});
+-test('pipe() all can pipe stderr to Execa child processes even with "stdout: ignore"', pipeAllToProcess, 1, {all: true, stdout: 'ignore'});
+-
+-test('Must set "all" option to "true" to use pipe() with "all"', t => {
+-	t.throws(() => {
+-		execa('empty.js').pipe(execa('empty.js'), 'all');
+-	}, {message: /"all" option must be true/});
+-});
++test('pipeStdout() cannot pipe to non-processes', invalidTarget, 'pipeStdout', () => ({stdin: new PassThrough()}));
++test('pipeStderr() cannot pipe to non-processes', invalidTarget, 'pipeStderr', () => ({stdin: new PassThrough()}));
++test('pipeAll() cannot pipe to non-processes', invalidTarget, 'pipeStderr', () => ({stdin: new PassThrough()}));
++test('pipeStdout() cannot pipe to non-Execa processes', invalidTarget, 'pipeStdout', () => spawn('node', ['--version']));
++test('pipeStderr() cannot pipe to non-Execa processes', invalidTarget, 'pipeStderr', () => spawn('node', ['--version']));
++test('pipeAll() cannot pipe to non-Execa processes', invalidTarget, 'pipeStderr', () => spawn('node', ['--version']));
+ 
+-const invalidTarget = (t, getTarget) => {
+-	t.throws(() => {
+-		execa('empty.js').pipe(getTarget());
+-	}, {message: /an Execa child process/});
++const invalidSource = (t, funcName) => {
++	t.false(funcName in execa('noop.js', {stdout: 'ignore', stderr: 'ignore'}));
+ };
+ 
+-test('pipe() cannot pipe to non-processes', invalidTarget, () => ({stdin: new PassThrough()}));
+-test('pipe() cannot pipe to non-Execa processes', invalidTarget, () => spawn('node', ['--version']));
+-
+-test('pipe() second argument cannot be "stdin"', t => {
+-	t.throws(() => {
+-		execa('empty.js').pipe(execa('empty.js'), 'stdin');
+-	}, {message: /not be "stdin"/});
+-});
+-
+-const invalidStreamName = (t, streamName) => {
+-	t.throws(() => {
+-		execa('empty.js').pipe(execa('empty.js'), streamName);
+-	}, {message: /second argument must not be/});
+-};
+-
+-test('pipe() second argument cannot be any string', invalidStreamName, 'other');
+-test('pipe() second argument cannot be a float', invalidStreamName, 1.5);
+-test('pipe() second argument cannot be a negative number', invalidStreamName, -1);
+-
+-test('pipe() second argument cannot be a non-existing file descriptor', t => {
+-	t.throws(() => {
+-		execa('empty.js').pipe(execa('empty.js'), 3);
+-	}, {message: /file descriptor does not exist/});
+-});
+-
+-test('pipe() second argument cannot be an input file descriptor', t => {
+-	t.throws(() => {
+-		execa('stdin-fd.js', ['3'], {stdio: ['pipe', 'pipe', 'pipe', new Uint8Array()]}).pipe(execa('empty.js'), 3);
+-	}, {message: /must be a readable stream/});
+-});
+-
+-test('Must set target "stdin" option to "pipe" to use pipe()', t => {
+-	t.throws(() => {
+-		execa('empty.js').pipe(execa('stdin.js', {stdin: 'ignore'}));
+-	}, {message: /stdin must be available/});
+-});
++test('Must set "stdout" option to "pipe" to use pipeStdout()', invalidSource, 'pipeStdout');
++test('Must set "stderr" option to "pipe" to use pipeStderr()', invalidSource, 'pipeStderr');
++test('Must set "stdout" or "stderr" option to "pipe" to use pipeAll()', invalidSource, 'pipeAll');
+ 
+-const invalidSource = (t, optionName, streamName, options) => {
+-	t.throws(() => {
+-		execa('empty.js', options).pipe(execa('empty.js'), streamName);
+-	}, {message: new RegExp(`"${optionName}" option's value is incompatible`)});
++const invalidPipeToProcess = async (t, index, funcName) => {
++	t.throws(() => execa('noop-fd.js', [`${index}`, 'test'], {all: true})[funcName](execa('stdin.js', {stdin: 'ignore'})), {
++		message: /stdin must be available/,
++	});
+ };
+ 
+-test('Cannot set "stdout" option to "ignore" to use pipe()', invalidSource, 'stdout', 1, {stdout: 'ignore'});
+-test('Cannot set "stderr" option to "ignore" to use pipe()', invalidSource, 'stderr', 2, {stderr: 'ignore'});
+-test('Cannot set "stdio[*]" option to "ignore" to use pipe()', invalidSource, 'stdio', 3, {stdio: ['pipe', 'pipe', 'pipe', 'ignore']});
+-test('Cannot set "stdout" + "stderr" option to "ignore" to use pipe() with "all"', invalidSource, 'stdout', 1, {stdout: 'ignore', stderr: 'ignore', all: true});
+-test('Cannot set "stdout" option to "inherit" to use pipe()', invalidSource, 'stdout', 1, {stdout: 'inherit'});
+-test('Cannot set "stdout" option to "ipc" to use pipe()', invalidSource, 'stdout', 1, {stdout: 'ipc'});
+-test('Cannot set "stdout" option to file descriptors to use pipe()', invalidSource, 'stdout', 1, {stdout: 1});
+-test('Cannot set "stdout" option to Node.js streams to use pipe()', invalidSource, 'stdout', 1, {stdout: process.stdout});
++test('Must set target "stdin" option to "pipe" to use pipeStdout()', invalidPipeToProcess, 1, 'pipeStdout');
++test('Must set target "stdin" option to "pipe" to use pipeStderr()', invalidPipeToProcess, 2, 'pipeStderr');
++test('Must set target "stdin" option to "pipe" to use pipeAll()', invalidPipeToProcess, 1, 'pipeAll');

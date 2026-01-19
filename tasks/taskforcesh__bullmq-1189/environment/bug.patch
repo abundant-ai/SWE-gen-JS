@@ -1,0 +1,766 @@
+diff --git a/src/classes/queue-base.ts b/src/classes/queue-base.ts
+index 46b2388ca6..7987c56fcc 100644
+--- a/src/classes/queue-base.ts
++++ b/src/classes/queue-base.ts
+@@ -1,6 +1,5 @@
+ import { EventEmitter } from 'events';
+ import { QueueBaseOptions, RedisClient } from '../interfaces';
+-import { delay, DELAY_TIME_5, isNotConnectionError } from '../utils';
+ import { RedisConnection } from './redis-connection';
+ import { KeysMap, QueueKeys } from './queue-keys';
+ 
+@@ -89,23 +88,4 @@ export class QueueBase extends EventEmitter {
+   disconnect(): Promise<void> {
+     return this.connection.disconnect();
+   }
+-
+-  protected async checkConnectionError<T>(
+-    fn: () => Promise<T>,
+-    delayInMs = DELAY_TIME_5,
+-  ): Promise<T> {
+-    try {
+-      return await fn();
+-    } catch (error) {
+-      if (isNotConnectionError(error as Error)) {
+-        this.emit('error', <Error>error);
+-      }
+-
+-      if (!this.closing && delayInMs) {
+-        await delay(delayInMs);
+-      } else {
+-        return;
+-      }
+-    }
+-  }
+ }
+diff --git a/src/classes/queue-events.ts b/src/classes/queue-events.ts
+index 12e99fc9c4..92e071e8ab 100644
+--- a/src/classes/queue-events.ts
++++ b/src/classes/queue-events.ts
+@@ -2,8 +2,11 @@ import { QueueEventsOptions, RedisClient, StreamReadRaw } from '../interfaces';
+ import {
+   array2obj,
+   clientCommandMessageReg,
++  DELAY_TIME_5,
++  delay,
++  isNotConnectionError,
+   isRedisInstance,
+-  QUEUE_EVENT_SUFFIX,
++  QUEUE_EVENT_SUFFIX
+ } from '../utils';
+ import { QueueBase } from './queue-base';
+ import { RedisConnection } from './redis-connection';
+@@ -222,13 +225,16 @@ export class QueueEvents extends QueueBase {
+         const client = await this.client;
+ 
+         try {
+-          await client.client('setname', this.clientName(QUEUE_EVENT_SUFFIX));
++          await client.client(
++            'setname',
++            this.clientName(QUEUE_EVENT_SUFFIX),
++          );
+         } catch (err) {
+           if (!clientCommandMessageReg.test((<Error>err).message)) {
+             throw err;
+           }
+         }
+-
++      
+         await this.consumeEvents(client);
+       } catch (error) {
+         this.running = false;
+@@ -239,46 +245,59 @@ export class QueueEvents extends QueueBase {
+     }
+   }
+ 
+-  private async consumeEvents(client: RedisClient): Promise<void> {
++  private async consumeEvents(client: RedisClient) {
+     const opts: QueueEventsOptions = this.opts;
+ 
+     const key = this.keys.events;
+     let id = opts.lastEventId || '$';
+ 
+     while (!this.closing) {
+-      // Cast to actual return type, see: https://github.com/DefinitelyTyped/DefinitelyTyped/issues/44301
+-      const data: StreamReadRaw = await this.checkConnectionError(() =>
+-        client.xread('BLOCK', opts.blockingTimeout, 'STREAMS', key, id),
+-      );
+-      if (data) {
+-        const stream = data[0];
+-        const events = stream[1];
+-
+-        for (let i = 0; i < events.length; i++) {
+-          id = events[i][0];
+-          const args = array2obj(events[i][1]);
+-
+-          //
+-          // TODO: we may need to have a separate xtream for progress data
+-          // to avoid this hack.
+-          switch (args.event) {
+-            case 'progress':
+-              args.data = JSON.parse(args.data);
+-              break;
+-            case 'completed':
+-              args.returnvalue = JSON.parse(args.returnvalue);
+-              break;
+-          }
+-
+-          const { event, ...restArgs } = args;
+-
+-          if (event === 'drained') {
+-            this.emit(event, id);
+-          } else {
+-            this.emit(event as any, restArgs, id);
+-            this.emit(`${event}:${restArgs.jobId}` as any, restArgs, id);
++      try {
++        // Cast to actual return type, see: https://github.com/DefinitelyTyped/DefinitelyTyped/issues/44301
++        const data: StreamReadRaw = (await client.xread(
++          'BLOCK',
++          opts.blockingTimeout,
++          'STREAMS',
++          key,
++          id,
++        )) as any;
++
++        if (data) {
++          const stream = data[0];
++          const events = stream[1];
++
++          for (let i = 0; i < events.length; i++) {
++            id = events[i][0];
++            const args = array2obj(events[i][1]);
++
++            //
++            // TODO: we may need to have a separate xtream for progress data
++            // to avoid this hack.
++            switch (args.event) {
++              case 'progress':
++                args.data = JSON.parse(args.data);
++                break;
++              case 'completed':
++                args.returnvalue = JSON.parse(args.returnvalue);
++                break;
++            }
++
++            const { event, ...restArgs } = args;
++
++            if (event === 'drained') {
++              this.emit(event, id);
++            } else {
++              this.emit(event as any, restArgs, id);
++              this.emit(`${event}:${restArgs.jobId}` as any, restArgs, id);
++            }
+           }
+         }
++      } catch (err) {
++        if (isNotConnectionError(err as Error)) {
++          throw err;
++        }
++
++        await delay(DELAY_TIME_5);
+       }
+     }
+   }
+diff --git a/src/classes/queue-scheduler.ts b/src/classes/queue-scheduler.ts
+index c88d222262..23642dd0ea 100644
+--- a/src/classes/queue-scheduler.ts
++++ b/src/classes/queue-scheduler.ts
+@@ -6,9 +6,6 @@ import {
+ import {
+   array2obj,
+   clientCommandMessageReg,
+-  DELAY_TIME_5,
+-  delay,
+-  isNotConnectionError,
+   isRedisInstance,
+   QUEUE_SCHEDULER_SUFFIX,
+ } from '../utils';
+@@ -18,11 +15,11 @@ import { RedisConnection } from './redis-connection';
+ 
+ export interface QueueSchedulerListener {
+   /**
+-   * Listen to 'error' event.
++   * Listen to 'stalled' event.
+    *
+-   * This event is triggered when an exception is thrown.
++   * This event is triggered when a job gets stalled.
+    */
+-  error: (error: Error) => void;
++  stalled: (jobId: string, prev: string) => void;
+ 
+   /**
+    * Listen to 'failed' event.
+@@ -30,13 +27,6 @@ export interface QueueSchedulerListener {
+    * This event is triggered when a job has thrown an exception.
+    */
+   failed: (jobId: string, failedReason: Error, prev: string) => void;
+-
+-  /**
+-   * Listen to 'stalled' event.
+-   *
+-   * This event is triggered when a job gets stalled.
+-   */
+-  stalled: (jobId: string, prev: string) => void;
+ }
+ 
+ /**
+@@ -56,7 +46,6 @@ export interface QueueSchedulerListener {
+  *
+  */
+ export class QueueScheduler extends QueueBase {
+-  opts: QueueSchedulerOptions;
+   private nextTimestamp = Number.MAX_VALUE;
+   private isBlocked = false;
+   private running = false;
+@@ -81,13 +70,13 @@ export class QueueScheduler extends QueueBase {
+       Connection,
+     );
+ 
+-    if (!this.opts.stalledInterval) {
++    if (!(this.opts as QueueSchedulerOptions).stalledInterval) {
+       throw new Error('Stalled interval cannot be zero or undefined');
+     }
+ 
+     if (autorun) {
+       this.run().catch(error => {
+-        this.emit('error', error);
++        console.error(error);
+       });
+     }
+   }
+@@ -154,7 +143,7 @@ export class QueueScheduler extends QueueBase {
+ 
+         while (!this.closing) {
+           // Check if at least the min stalled check time has passed.
+-          await this.checkConnectionError(() => this.moveStalledJobsToWait());
++          await this.moveStalledJobsToWait();
+ 
+           // Listen to the delay event stream from lastDelayStreamTimestamp
+           // Can we use XGROUPS to reduce redundancy?
+@@ -190,18 +179,15 @@ export class QueueScheduler extends QueueBase {
+             // for all kind of scenarios.
+             //
+             if (!this.closing) {
+-              await this.checkConnectionError<number>(() =>
+-                client.xtrim(key, 'MAXLEN', '~', 100),
+-              );
++              await client.xtrim(key, 'MAXLEN', '~', 100);
+             }
+           }
+ 
+           const now = Date.now();
+-          const nextDelayedJobDelay = this.nextTimestamp - now;
++          const delay = this.nextTimestamp - now;
+ 
+-          if (nextDelayedJobDelay <= 0) {
++          if (delay <= 0) {
+             const [nextTimestamp, id] = await this.updateDelaySet(now);
+-
+             if (nextTimestamp) {
+               this.nextTimestamp = nextTimestamp;
+               streamLastId = id;
+@@ -244,18 +230,14 @@ export class QueueScheduler extends QueueBase {
+           );
+         } catch (err) {
+           // We can ignore closed connection errors
+-          if (isNotConnectionError(err as Error)) {
++          if ((<Error>err).message !== 'Connection is closed.') {
+             throw err;
+           }
+-
+-          await delay(DELAY_TIME_5);
+         } finally {
+           this.isBlocked = false;
+         }
+       } else {
+-        data = await this.checkConnectionError(() =>
+-          client.xread('STREAMS', key, streamLastId),
+-        );
++        data = await client.xread('STREAMS', key, streamLastId);
+       }
+ 
+       // Cast to actual return type, see: https://github.com/DefinitelyTyped/DefinitelyTyped/issues/44301
+@@ -265,11 +247,7 @@ export class QueueScheduler extends QueueBase {
+ 
+   private async updateDelaySet(timestamp: number): Promise<[number, string]> {
+     if (!this.closing) {
+-      const result = await this.checkConnectionError(() =>
+-        Scripts.updateDelaySet(this, timestamp),
+-      );
+-
+-      return result;
++      return Scripts.updateDelaySet(this, timestamp);
+     }
+     return [0, '0'];
+   }
+diff --git a/src/classes/redis-connection.ts b/src/classes/redis-connection.ts
+index 40b076c201..68e4804d46 100644
+--- a/src/classes/redis-connection.ts
++++ b/src/classes/redis-connection.ts
+@@ -35,7 +35,6 @@ export class RedisConnection extends EventEmitter {
+   private closing: boolean;
+   private version: string;
+   private handleClientError: (e: Error) => void;
+-  private handleClientClose: () => void;
+ 
+   constructor(
+     opts?: ConnectionOptions,
+@@ -82,10 +81,6 @@ export class RedisConnection extends EventEmitter {
+       this.emit('error', err);
+     };
+ 
+-    this.handleClientClose = (): void => {
+-      this.emit('error', new Error(CONNECTION_CLOSED_ERROR_MSG));
+-    };
+-
+     this.initializing = this.init();
+     this.initializing.catch(err => this.emit('error', err));
+   }
+@@ -166,8 +161,6 @@ export class RedisConnection extends EventEmitter {
+     }
+ 
+     this._client.on('error', this.handleClientError);
+-    // ioredis treats connection errors as a different event ('close')
+-    this._client.on('close', this.handleClientClose);
+ 
+     await RedisConnection.waitUntilReady(this._client);
+     await this.loadCommands();
+@@ -226,7 +219,6 @@ export class RedisConnection extends EventEmitter {
+         }
+       } finally {
+         this._client.off('error', this.handleClientError);
+-        this._client.off('close', this.handleClientClose);
+       }
+     }
+   }
+diff --git a/src/classes/worker.ts b/src/classes/worker.ts
+index a7be573be9..9fd047df3f 100644
+--- a/src/classes/worker.ts
++++ b/src/classes/worker.ts
+@@ -173,8 +173,8 @@ export class Worker<
+       drainDelay: 5,
+       concurrency: 1,
+       lockDuration: 30000,
+-      autorun: true,
+       runRetryDelay: 15000,
++      autorun: true,
+       ...this.opts,
+     };
+ 
+diff --git a/tests/test_clean.ts b/tests/test_clean.ts
+index 49613c28e1..0e59b65a72 100644
+--- a/tests/test_clean.ts
++++ b/tests/test_clean.ts
+@@ -125,19 +125,11 @@ describe('Cleaner', () => {
+     );
+     await worker.waitUntilReady();
+ 
+-    await queue.addBulk([
+-      {
+-        name: 'test',
+-        data: { some: 'data' },
+-      },
+-      {
+-        name: 'test',
+-        data: { some: 'data' },
+-      },
+-    ]);
++    await queue.add('test', { some: 'data' });
++    await queue.add('test', { some: 'data' });
+ 
+     const failing = new Promise(resolve => {
+-      queueEvents.on('failed', after(2, resolve));
++      worker.on('failed', after(2, resolve));
+     });
+ 
+     worker.run();
+diff --git a/tests/test_connection.ts b/tests/test_connection.ts
+index 41164ff95e..a449784164 100644
+--- a/tests/test_connection.ts
++++ b/tests/test_connection.ts
+@@ -1,7 +1,7 @@
+ import { expect } from 'chai';
+ import * as IORedis from 'ioredis';
+ import { v4 } from 'uuid';
+-import { Queue, Job, Worker, QueueBase, QueueScheduler } from '../src/classes';
++import { Queue, Job, Worker, QueueBase } from '../src/classes';
+ import { removeAllQueueData } from '../src/utils';
+ 
+ describe('connection', () => {
+@@ -112,7 +112,6 @@ describe('connection', () => {
+     });
+ 
+     const worker = new Worker(queueName, processor, { connection });
+-    const queueScheduler = new QueueScheduler(queueName, { connection });
+ 
+     worker.on('error', err => {
+       // error event has to be observed or the exception will bubble up
+@@ -123,7 +122,6 @@ describe('connection', () => {
+     });
+ 
+     const workerClient = await worker.client;
+-    const queueSchedulerClient = await queueScheduler.client;
+     const queueClient = await queue.client;
+ 
+     // Simulate disconnect
+@@ -133,11 +131,8 @@ describe('connection', () => {
+     (<any>workerClient).stream.end();
+     workerClient.emit('error', new Error('ECONNRESET'));
+ 
+-    (<any>queueSchedulerClient).stream.end();
+-    queueSchedulerClient.emit('error', new Error('ECONNRESET'));
+-
+     // add something to the queue
+-    await queue.add('test', { foo: 'bar' }, { delay: 2000 });
++    await queue.add('test', { foo: 'bar' });
+ 
+     await processing;
+     await worker.close();
+diff --git a/tests/test_delay.ts b/tests/test_delay.ts
+index 071b2097dd..b588d53f87 100644
+--- a/tests/test_delay.ts
++++ b/tests/test_delay.ts
+@@ -6,11 +6,10 @@ import {
+   QueueScheduler,
+ } from '../src/classes';
+ import { describe, beforeEach, it } from 'mocha';
+-import { after } from 'lodash';
+ import { expect } from 'chai';
+ import * as IORedis from 'ioredis';
+ import { v4 } from 'uuid';
+-import { removeAllQueueData, delay } from '../src/utils';
++import { removeAllQueueData } from '../src/utils';
+ 
+ describe('Delayed jobs', function () {
+   this.timeout(15000);
+@@ -23,7 +22,6 @@ describe('Delayed jobs', function () {
+   beforeEach(async function () {
+     queueName = `test-${v4()}`;
+     queue = new Queue(queueName, { connection });
+-    await queue.waitUntilReady();
+   });
+ 
+   afterEach(async function () {
+@@ -82,95 +80,6 @@ describe('Delayed jobs', function () {
+     await worker.close();
+   });
+ 
+-  it('should reconnect after client is disconnected', async function () {
+-    const delayT = 1000;
+-    const numJobs = 5;
+-
+-    const queueScheduler = new QueueScheduler(queueName, { connection });
+-    await queueScheduler.waitUntilReady();
+-
+-    const client = await queueScheduler.client;
+-
+-    const queueEvents = new QueueEvents(queueName, { connection });
+-    await queueEvents.waitUntilReady();
+-
+-    const worker = new Worker(queueName, async () => {}, { connection });
+-    await worker.waitUntilReady();
+-
+-    const timestamp = Date.now();
+-    let publishHappened = false;
+-
+-    const delayed = new Promise<void>(resolve => {
+-      queueEvents.on('delayed', () => {
+-        publishHappened = true;
+-        resolve();
+-      });
+-    });
+-
+-    const queueSchedulerError = new Promise<void>(resolve => {
+-      queueScheduler.on('error', async function (error) {
+-        expect(error.message).to.be.equal('Connection is closed.');
+-        resolve();
+-      });
+-    });
+-
+-    worker.on('error', async function () {});
+-
+-    queueEvents.on('error', async function () {});
+-
+-    const completed = new Promise<void>((resolve, reject) => {
+-      queueEvents.on('completed', async function () {
+-        try {
+-          expect(Date.now() > timestamp + delayT);
+-          const jobs = await queue.getWaiting();
+-          expect(jobs.length).to.be.equal(0);
+-
+-          const delayedJobs = await queue.getDelayed();
+-          expect(delayedJobs.length).to.be.equal(4);
+-          expect(publishHappened).to.be.eql(true);
+-          await client.disconnect();
+-          resolve();
+-        } catch (err) {
+-          reject(err);
+-        }
+-      });
+-    });
+-
+-    const workerCompleted = new Promise(resolve => {
+-      worker.on(
+-        'completed',
+-        // after every job has been completed
+-        after(numJobs - 1, resolve),
+-      );
+-    });
+-
+-    const jobs = Array.from(Array(numJobs).keys()).map(index => ({
+-      name: 'test',
+-      data: { index },
+-      opts: {
+-        delay: delayT + index * 500,
+-      },
+-    }));
+-
+-    await queue.addBulk(jobs);
+-
+-    await delayed;
+-    await completed;
+-
+-    await queueSchedulerError;
+-
+-    await delay(2000);
+-
+-    expect(queueScheduler.isRunning()).to.be.equal(true);
+-    await client.connect();
+-
+-    await workerCompleted;
+-
+-    await queueScheduler.close();
+-    await queueEvents.close();
+-    await worker.close();
+-  });
+-
+   describe('when autorun option is provided as false', function () {
+     it('should process a delayed job only after delayed time', async function () {
+       const delay = 1000;
+@@ -255,9 +164,8 @@ describe('Delayed jobs', function () {
+   });
+ 
+   it('should process delayed jobs in correct order', async function () {
+-    this.timeout(3500);
++    this.timeout(2000);
+     let order = 0;
+-    const numJobs = 10;
+     const queueScheduler = new QueueScheduler(queueName, { connection });
+     await queueScheduler.waitUntilReady();
+ 
+@@ -268,7 +176,7 @@ describe('Delayed jobs', function () {
+         order++;
+         try {
+           expect(order).to.be.equal(job.data.order);
+-          if (order === numJobs) {
++          if (order === 10) {
+             resolve();
+           }
+         } catch (err) {
+@@ -281,15 +189,18 @@ describe('Delayed jobs', function () {
+ 
+     worker.on('failed', function (job, err) {});
+ 
+-    const jobs = Array.from(Array(numJobs).keys()).map(index => ({
+-      name: 'test',
+-      data: { order: numJobs - index },
+-      opts: {
+-        delay: 500 + (numJobs - index) * 150,
+-      },
+-    }));
+-
+-    await queue.addBulk(jobs);
++    await Promise.all([
++      queue.add('test', { order: 1 }, { delay: 100 }),
++      queue.add('test', { order: 6 }, { delay: 600 }),
++      queue.add('test', { order: 10 }, { delay: 1000 }),
++      queue.add('test', { order: 2 }, { delay: 200 }),
++      queue.add('test', { order: 9 }, { delay: 900 }),
++      queue.add('test', { order: 5 }, { delay: 500 }),
++      queue.add('test', { order: 3 }, { delay: 300 }),
++      queue.add('test', { order: 7 }, { delay: 700 }),
++      queue.add('test', { order: 4 }, { delay: 400 }),
++      queue.add('test', { order: 8 }, { delay: 800 }),
++    ]);
+ 
+     await processing;
+ 
+diff --git a/tests/test_obliterate.ts b/tests/test_obliterate.ts
+index 1d2bfa7f0f..de7e2d18b3 100644
+--- a/tests/test_obliterate.ts
++++ b/tests/test_obliterate.ts
+@@ -376,6 +376,8 @@ describe('Obliterate', function () {
+   });
+ 
+   it('should remove job logs', async () => {
++    const job = await queue.add('test', {});
++
+     const queueEvents = new QueueEvents(queue.name, { connection });
+ 
+     const worker = new Worker(
+@@ -388,8 +390,6 @@ describe('Obliterate', function () {
+     );
+     await worker.waitUntilReady();
+ 
+-    const job = await queue.add('test', {});
+-
+     await job.waitUntilFinished(queueEvents);
+ 
+     await queue.obliterate({ force: true });
+diff --git a/tests/test_rate_limiter.ts b/tests/test_rate_limiter.ts
+index 70ebe65cc7..1e7d70b013 100644
+--- a/tests/test_rate_limiter.ts
++++ b/tests/test_rate_limiter.ts
+@@ -370,7 +370,7 @@ describe('Rate Limiter', function () {
+           const timeDiff = Date.now() - startTime;
+           // In some test envs, these timestamps can drift.
+           expect(timeDiff).to.be.gte(numGroups * 990);
+-          expect(timeDiff).to.be.below((numGroups + 1) * 1500);
++          expect(timeDiff).to.be.below((numGroups + 1) * 1200);
+ 
+           for (const group in completed) {
+             let prevTime = completed[group][0];
+diff --git a/tests/test_script_loader.ts b/tests/test_script_loader.ts
+index e43c0a4295..4574522184 100644
+--- a/tests/test_script_loader.ts
++++ b/tests/test_script_loader.ts
+@@ -282,7 +282,7 @@ describe('scriptLoader', () => {
+ 
+     it('caches loadScripts calls per directory', async () => {
+       const loader = new ScriptLoader();
+-      const loadScriptSpy = sinon.spy(loader, 'loadScripts');
++      sinon.spy(loader, 'loadScripts');
+ 
+       const dirname = __dirname + '/fixtures/scripts/dir-test';
+       const dirname1 = __dirname + '/fixtures/scripts/load';
+@@ -302,7 +302,6 @@ describe('scriptLoader', () => {
+       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+       // @ts-ignore
+       expect(loader.loadScripts.calledTwice);
+-      loadScriptSpy.restore();
+     });
+ 
+     it('throws error if no lua files are found in a directory', async () => {
+@@ -327,17 +326,16 @@ describe('scriptLoader', () => {
+     const path = __dirname + '/fixtures/scripts/load';
+     let client: RedisClient;
+     let connection: RedisConnection;
+-    //let loader: ScriptLoader;
++    let loader: ScriptLoader;
+ 
+     beforeEach(async () => {
+       connection = new RedisConnection();
+-      connection.on('error', () => {});
+       client = await connection.client;
+-      await RedisConnection.waitUntilReady(client);
++      loader = new ScriptLoader();
+     });
+ 
+     afterEach(async () => {
+-      await connection.disconnect();
++      connection.disconnect();
+     });
+ 
+     it('properly sets commands on the instance', async () => {
+@@ -346,21 +344,20 @@ describe('scriptLoader', () => {
+     });
+ 
+     it('sets commands on a client only once', async () => {
+-      const loadScriptSpy = sinon.spy(loader, 'loadScripts');
++      sinon.spy(loader, 'loadScripts');
+       await loader.load(client, path);
+       await loader.load(client, path);
+       await loader.load(client, path);
+       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+       // @ts-ignore
+       expect(loader.loadScripts.calledOnce);
+-      loadScriptSpy.restore();
+     });
+   });
+ 
+   describe('.clearCache', () => {
+     it('can clear the command cache', async () => {
+       const loader = new ScriptLoader();
+-      const loadScriptSpy = sinon.spy(loader, 'loadScripts');
++      sinon.spy(loader, 'loadScripts');
+ 
+       const dirname = __dirname + '/fixtures/scripts/dir-test';
+       const dirname1 = __dirname + '/fixtures/scripts/load';
+@@ -382,7 +379,6 @@ describe('scriptLoader', () => {
+       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+       // @ts-ignore
+       expect(loader.loadScripts.callCount - origCallCount).to.eq(2);
+-      loadScriptSpy.restore();
+     });
+   });
+ });
+diff --git a/tests/test_stalled_jobs.ts b/tests/test_stalled_jobs.ts
+index 9595eb3d9d..2be25868cd 100644
+--- a/tests/test_stalled_jobs.ts
++++ b/tests/test_stalled_jobs.ts
+@@ -32,7 +32,7 @@ describe('stalled jobs', function () {
+ 
+     const worker = new Worker(
+       queueName,
+-      async () => {
++      async job => {
+         return delay(10000);
+       },
+       {
+diff --git a/tests/test_worker.ts b/tests/test_worker.ts
+index 5380852856..e70b7b0f09 100644
+--- a/tests/test_worker.ts
++++ b/tests/test_worker.ts
+@@ -13,6 +13,7 @@ import {
+   Worker,
+ } from '../src/classes';
+ import { KeepJobs, JobsOptions } from '../src/interfaces';
++
+ import { delay, removeAllQueueData } from '../src/utils';
+ 
+ describe('workers', function () {
+@@ -1228,7 +1229,7 @@ describe('workers', function () {
+     await worker.close();
+   });
+ 
+-  it('emits error if lock is lost', async function () {
++  it('emit error if lock is lost', async function () {
+     this.timeout(10000);
+ 
+     const worker = new Worker(
+@@ -1254,7 +1255,7 @@ describe('workers', function () {
+ 
+     const errorMessage = `Missing lock for job ${job.id}. failed`;
+     const workerError = new Promise<void>(resolve => {
+-      worker.once('error', error => {
++      worker.on('error', error => {
+         expect(error.message).to.be.equal(errorMessage);
+         resolve();
+       });
+@@ -1321,7 +1322,7 @@ describe('workers', function () {
+ 
+       const worker = new Worker(
+         queueName,
+-        async () => {
++        async job => {
+           expect(processing).to.be.equal(false);
+           processing = true;
+           await delay(50);
+@@ -1354,7 +1355,7 @@ describe('workers', function () {
+ 
+       const worker = new Worker(
+         queueName,
+-        async () => {
++        async job => {
+           try {
+             nbProcessing++;
+             expect(nbProcessing).to.be.lessThan(5);
+@@ -1399,7 +1400,7 @@ describe('workers', function () {
+ 
+       const worker = new Worker(
+         queueName,
+-        async () => {
++        async job => {
+           try {
+             if (++i === 4) {
+               // Pause when all 4 works are processing

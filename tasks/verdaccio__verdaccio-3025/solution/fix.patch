@@ -1,0 +1,337 @@
+diff --git a/.changeset/swift-pumpkins-knock.md b/.changeset/swift-pumpkins-knock.md
+new file mode 100644
+index 000000000..eca1d97df
+--- /dev/null
++++ b/.changeset/swift-pumpkins-knock.md
+@@ -0,0 +1,6 @@
++---
++'@verdaccio/auth': patch
++'verdaccio-htpasswd': patch
++---
++
++Refactor htpasswd plugin to use the bcryptjs 'compare' api call instead of 'comparSync'. Add a new configuration value named 'slow_verify_ms' to the htpasswd plugin that when exceeded during password verification will log a warning message.
+diff --git a/packages/auth/src/auth.ts b/packages/auth/src/auth.ts
+index 9fb136c5c..2ee660a71 100644
+--- a/packages/auth/src/auth.ts
++++ b/packages/auth/src/auth.ts
+@@ -111,7 +111,7 @@ class Auth implements IAuth {
+     };
+     let authPlugin;
+     try {
+-      authPlugin = new HTPasswd(plugingConf, pluginOptions);
++      authPlugin = new HTPasswd(plugingConf, pluginOptions as any as PluginOptions<HTPasswdConfig>);
+     } catch (error: any) {
+       debug('error on loading auth htpasswd plugin stack: %o', error);
+       return [];
+diff --git a/packages/plugins/htpasswd/README.md b/packages/plugins/htpasswd/README.md
+index 7caff08f4..c512b162c 100644
+--- a/packages/plugins/htpasswd/README.md
++++ b/packages/plugins/htpasswd/README.md
+@@ -30,7 +30,26 @@ As simple as running:
+             # Hash algorithm, possible options are: "bcrypt", "md5", "sha1", "crypt".
+             #algorithm: bcrypt
+             # Rounds number for "bcrypt", will be ignored for other algorithms.
++            # Setting this value higher will result in password verification taking longer.
+             #rounds: 10
++            # Log a warning if the password takes more then this duration in milliseconds to verify.
++            #slow_verify_ms: 200
++
++### Bcrypt rounds
++
++It is important to note that when using the default `bcrypt` algorithm and setting
++the `rounds` configuration value to a higher number then the default of `10`, that
++verification of a user password can cause significantly increased CPU usage and
++additional latency in processing requests.
++
++If your Verdaccio instance handles a large number of authenticated requests using
++username and password for authentication, the `rounds` configuration value may need
++to be decreased to prevent excessive CPU usage and request latency.
++
++Also note that setting the `rounds` configuration value to a value that is too small
++increases the risk of successful brute force attack. Auth0 has a
++[blog article](https://auth0.com/blog/hashing-in-action-understanding-bcrypt)
++that provides an overview of how `bcrypt` hashing works and some best practices.
+ 
+ ## Logging In
+ 
+diff --git a/packages/plugins/htpasswd/src/htpasswd.ts b/packages/plugins/htpasswd/src/htpasswd.ts
+index ee7469453..6e7f6829d 100644
+--- a/packages/plugins/htpasswd/src/htpasswd.ts
++++ b/packages/plugins/htpasswd/src/htpasswd.ts
+@@ -19,9 +19,12 @@ export type HTPasswdConfig = {
+   file: string;
+   algorithm?: HtpasswdHashAlgorithm;
+   rounds?: number;
++  max_users?: number;
++  slow_verify_ms?: number;
+ } & Config;
+ 
+ export const DEFAULT_BCRYPT_ROUNDS = 10;
++export const DEFAULT_SLOW_VERIFY_MS = 200;
+ 
+ /**
+  * HTPasswd - Verdaccio auth class
+@@ -30,30 +33,21 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+   /**
+    *
+    * @param {*} config htpasswd file
+-   * @param {object} stuff config.yaml in object from
++   * @param {object} options config.yaml in object from
+    */
+   private users: {};
+-  private stuff: {};
+-  private config: {};
+-  private verdaccioConfig: Config;
+   private maxUsers: number;
+   private hashConfig: HtpasswdHashConfig;
+   private path: string;
++  private slowVerifyMs: number;
+   private logger: Logger;
+   private lastTime: any;
+   // constructor
+-  public constructor(config: HTPasswdConfig, stuff: PluginOptions<{}>) {
++  public constructor(config: HTPasswdConfig, options: PluginOptions<HTPasswdConfig>) {
+     this.users = {};
+ 
+-    // config for this module
+-    this.config = config;
+-    this.stuff = stuff;
+-
+     // verdaccio logger
+-    this.logger = stuff.logger;
+-
+-    // verdaccio main config object
+-    this.verdaccioConfig = stuff.config;
++    this.logger = options.logger;
+ 
+     // all this "verdaccio_config" stuff is for b/w compatibility only
+     this.maxUsers = config.max_users ? config.max_users : Infinity;
+@@ -88,25 +82,41 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+       throw new Error('should specify "file" in config');
+     }
+ 
+-    this.path = Path.resolve(Path.dirname(this.verdaccioConfig.config_path), file);
++    this.path = Path.resolve(Path.dirname(options.config.config_path), file);
++    this.slowVerifyMs = config.slow_verify_ms || DEFAULT_SLOW_VERIFY_MS;
+   }
+ 
+   /**
+    * authenticate - Authenticate user.
+    * @param {string} user
+    * @param {string} password
+-   * @param {function} cd
+-   * @returns {function}
++   * @param {function} cb
++   * @returns {void}
+    */
+   public authenticate(user: string, password: string, cb: Callback): void {
+-    this.reload((err) => {
++    this.reload(async (err) => {
+       if (err) {
+         return cb(err.code === 'ENOENT' ? null : err);
+       }
+       if (!this.users[user]) {
+         return cb(null, false);
+       }
+-      if (!verifyPassword(password, this.users[user])) {
++
++      let passwordValid = false;
++      try {
++        const start = new Date();
++        passwordValid = await verifyPassword(password, this.users[user]);
++        const durationMs = new Date().getTime() - start.getTime();
++        if (durationMs > this.slowVerifyMs) {
++          this.logger.warn(
++            { user, durationMs },
++            'Password for user "@{user}" took @{durationMs}ms to verify'
++          );
++        }
++      } catch ({ message }) {
++        this.logger.error({ message }, 'Unable to verify user password: @{message}');
++      }
++      if (!passwordValid) {
+         return cb(null, false);
+       }
+ 
+@@ -130,11 +140,11 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+    * @param {string} user
+    * @param {string} password
+    * @param {function} realCb
+-   * @returns {function}
++   * @returns {Promise<any>}
+    */
+-  public adduser(user: string, password: string, realCb: Callback): any {
++  public async adduser(user: string, password: string, realCb: Callback): Promise<any> {
+     const pathPass = this.path;
+-    let sanity = sanityCheck(user, password, verifyPassword, this.users, this.maxUsers);
++    let sanity = await sanityCheck(user, password, verifyPassword, this.users, this.maxUsers);
+ 
+     // preliminary checks, just to ensure that file won't be reloaded if it's
+     // not needed
+@@ -142,7 +152,7 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+       return realCb(sanity, false);
+     }
+ 
+-    lockAndRead(pathPass, (err, res): void => {
++    lockAndRead(pathPass, async (err, res): Promise<void> => {
+       let locked = false;
+ 
+       // callback that cleans up lock first
+@@ -170,7 +180,7 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+ 
+       // real checks, to prevent race conditions
+       // parsing users after reading file.
+-      sanity = sanityCheck(user, password, verifyPassword, this.users, this.maxUsers);
++      sanity = await sanityCheck(user, password, verifyPassword, this.users, this.maxUsers);
+ 
+       if (sanity) {
+         return cb(sanity);
+@@ -230,7 +240,8 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+    * changePassword - change password for existing user.
+    * @param {string} user
+    * @param {string} password
+-   * @param {function} cd
++   * @param {string} newPassword
++   * @param {function} realCb
+    * @returns {function}
+    */
+   public changePassword(
+@@ -239,7 +250,7 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+     newPassword: string,
+     realCb: Callback
+   ): void {
+-    lockAndRead(this.path, (err, res) => {
++    lockAndRead(this.path, async (err, res) => {
+       let locked = false;
+       const pathPassFile = this.path;
+ 
+@@ -266,13 +277,9 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+       const body = this._stringToUt8(res);
+       this.users = parseHTPasswd(body);
+ 
+-      if (!this.users[user]) {
+-        return cb(new Error('User not found'));
+-      }
+-
+       try {
+         this._writeFile(
+-          changePasswordToHTPasswd(body, user, password, newPassword, this.hashConfig),
++          await changePasswordToHTPasswd(body, user, password, newPassword, this.hashConfig),
+           cb
+         );
+       } catch (err: any) {
+diff --git a/packages/plugins/htpasswd/src/utils.ts b/packages/plugins/htpasswd/src/utils.ts
+index 958b0c6e2..4a78927fc 100644
+--- a/packages/plugins/htpasswd/src/utils.ts
++++ b/packages/plugins/htpasswd/src/utils.ts
+@@ -39,8 +39,9 @@ export function lockAndRead(name: string, cb: Callback): void {
+  * @returns {object}
+  */
+ export function parseHTPasswd(input: string): Record<string, any> {
+-  return input.split('\n').reduce((result, line) => {
+-    const args = line.split(':', 3);
++  // The input is split on line ending styles that are both windows and unix compatible
++  return input.split(/[\r]?[\n]/).reduce((result, line) => {
++    const args = line.split(':', 3).map((str) => str.trim());
+     if (args.length > 1) {
+       result[args[0]] = args[1];
+     }
+@@ -52,11 +53,13 @@ export function parseHTPasswd(input: string): Record<string, any> {
+  * verifyPassword - matches password and it's hash.
+  * @param {string} passwd
+  * @param {string} hash
+- * @returns {boolean}
++ * @returns {Promise<boolean>}
+  */
+-export function verifyPassword(passwd: string, hash: string): boolean {
+-  if (hash.match(/^\$2(a|b|y)\$/)) {
+-    return bcrypt.compareSync(passwd, hash);
++export async function verifyPassword(passwd: string, hash: string): Promise<boolean> {
++  if (hash.match(/^\$2([aby])\$/)) {
++    return new Promise((resolve, reject) =>
++      bcrypt.compare(passwd, hash, (error, result) => (error ? reject(error) : resolve(result)))
++    );
+   } else if (hash.indexOf('{PLAIN}') === 0) {
+     return passwd === hash.substr(7);
+   } else if (hash.indexOf('{SHA}') === 0) {
+@@ -112,6 +115,7 @@ export function generateHtpasswdLine(
+  * @param {string} body
+  * @param {string} user
+  * @param {string} passwd
++ * @param {HtpasswdHashConfig} hashConfig
+  * @returns {string}
+  */
+ export function addUserToHTPasswd(
+@@ -139,16 +143,18 @@ export function addUserToHTPasswd(
+  * Sanity check for a user
+  * @param {string} user
+  * @param {object} users
++ * @param {string} password
++ * @param {Callback} verifyFn
+  * @param {number} maxUsers
+  * @returns {object}
+  */
+-export function sanityCheck(
++export async function sanityCheck(
+   user: string,
+   password: string,
+   verifyFn: Callback,
+   users: {},
+   maxUsers: number
+-): HttpError | null {
++): Promise<HttpError | null> {
+   let err;
+ 
+   // check for user or password
+@@ -167,7 +173,7 @@ export function sanityCheck(
+   }
+ 
+   if (hash) {
+-    const auth = verifyFn(password, users[user]);
++    const auth = await verifyFn(password, users[user]);
+     if (auth) {
+       err = Error(API_ERROR.USERNAME_ALREADY_REGISTERED);
+       err.status = HTTP_STATUS.CONFLICT;
+@@ -191,28 +197,27 @@ export function sanityCheck(
+  * @param {string} user
+  * @param {string} passwd
+  * @param {string} newPasswd
++ * @param {HtpasswdHashConfig} hashConfig
+  * @returns {string}
+  */
+-export function changePasswordToHTPasswd(
++export async function changePasswordToHTPasswd(
+   body: string,
+   user: string,
+   passwd: string,
+   newPasswd: string,
+   hashConfig: HtpasswdHashConfig
+-): string {
++): Promise<string> {
+   let lines = body.split('\n');
+-  lines = lines.map((line) => {
+-    const [username, hash] = line.split(':', 3);
+-
+-    if (username === user) {
+-      if (verifyPassword(passwd, hash)) {
+-        line = generateHtpasswdLine(user, newPasswd, hashConfig);
+-      } else {
+-        throw new Error('Invalid old Password');
+-      }
+-    }
+-    return line;
+-  });
+-
++  const userLineIndex = lines.findIndex((line) => line.split(':', 1).shift() === user);
++  if (userLineIndex === -1) {
++    throw new Error(`Unable to change password for user '${user}': user does not currently exist`);
++  }
++  const [username, hash] = lines[userLineIndex].split(':', 2);
++  const passwordValid = await verifyPassword(passwd, hash);
++  if (!passwordValid) {
++    throw new Error(`Unable to change password for user '${user}': invalid old password`);
++  }
++  const updatedUserLine = generateHtpasswdLine(username, newPasswd, hashConfig);
++  lines.splice(userLineIndex, 1, updatedUserLine);
+   return lines.join('\n');
+ }

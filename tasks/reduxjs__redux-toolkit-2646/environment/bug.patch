@@ -1,0 +1,209 @@
+diff --git a/packages/toolkit/src/query/core/buildInitiate.ts b/packages/toolkit/src/query/core/buildInitiate.ts
+index cbb5c19d..0f801232 100644
+--- a/packages/toolkit/src/query/core/buildInitiate.ts
++++ b/packages/toolkit/src/query/core/buildInitiate.ts
+@@ -6,7 +6,7 @@ import type {
+   ResultTypeFrom,
+ } from '../endpointDefinitions'
+ import { DefinitionType } from '../endpointDefinitions'
+-import type { QueryThunk, MutationThunk, QueryThunkArg } from './buildThunks'
++import type { QueryThunk, MutationThunk } from './buildThunks'
+ import type { AnyAction, ThunkAction, SerializedError } from '@reduxjs/toolkit'
+ import type { SubscriptionOptions, RootState } from './apiState'
+ import { QueryStatus } from './apiState'
+@@ -35,8 +35,6 @@ declare module './module' {
+ }
+ 
+ export const forceQueryFnSymbol = Symbol('forceQueryFn')
+-export const isUpsertQuery = (arg: QueryThunkArg) =>
+-  typeof arg[forceQueryFnSymbol] === 'function'
+ 
+ export interface StartQueryActionCreatorOptions {
+   subscribe?: boolean
+@@ -303,20 +301,13 @@ Features like automatic cache collection, automatic refetching etc. will not be
+         const skippedSynchronously = stateAfter.requestId !== requestId
+ 
+         const runningQuery = runningQueries[queryCacheKey]
+-        const selectFromState = () => selector(getState())
+ 
+         const statePromise: QueryActionCreatorResult<any> = Object.assign(
+-          forceQueryFn
+-            ? // a query has been forced (upsertQueryData)
+-              // -> we want to resolve it once data has been written with the data that will be written
+-              thunkResult.then(selectFromState)
+-            : skippedSynchronously && !runningQuery
+-            ? // a query has been skipped due to a condition and we do not have any currently running query
+-              // -> we want to resolve it immediately with the current data
+-              Promise.resolve(stateAfter)
+-            : // query just started or one is already in flight
+-              // -> wait for the running query, then resolve with data from after that
+-              Promise.all([runningQuery, thunkResult]).then(selectFromState),
++          skippedSynchronously && !runningQuery
++            ? Promise.resolve(stateAfter)
++            : Promise.all([runningQuery, thunkResult]).then(() =>
++                selector(getState())
++              ),
+           {
+             arg,
+             requestId,
+@@ -359,7 +350,7 @@ Features like automatic cache collection, automatic refetching etc. will not be
+           }
+         )
+ 
+-        if (!runningQuery && !skippedSynchronously && !forceQueryFn) {
++        if (!runningQuery && !skippedSynchronously) {
+           runningQueries[queryCacheKey] = statePromise
+           statePromise.then(() => {
+             delete runningQueries[queryCacheKey]
+diff --git a/packages/toolkit/src/query/core/buildSlice.ts b/packages/toolkit/src/query/core/buildSlice.ts
+index 41b75c94..c9db2acb 100644
+--- a/packages/toolkit/src/query/core/buildSlice.ts
++++ b/packages/toolkit/src/query/core/buildSlice.ts
+@@ -39,7 +39,6 @@ import {
+   copyWithStructuralSharing,
+ } from '../utils'
+ import type { ApiContext } from '../apiTypes'
+-import { isUpsertQuery } from './buildInitiate'
+ 
+ function updateQuerySubstateIfExists(
+   state: QueryState<any>,
+@@ -146,13 +145,7 @@ export function buildSlice({
+ 
+           updateQuerySubstateIfExists(draft, arg.queryCacheKey, (substate) => {
+             substate.status = QueryStatus.pending
+-
+-            substate.requestId =
+-              isUpsertQuery(arg) && substate.requestId
+-                ? // for `upsertQuery` **updates**, keep the current `requestId`
+-                  substate.requestId
+-                : // for normal queries or `upsertQuery` **inserts** always update the `requestId`
+-                  meta.requestId
++            substate.requestId = meta.requestId
+             if (arg.originalArgs !== undefined) {
+               substate.originalArgs = arg.originalArgs
+             }
+@@ -164,11 +157,14 @@ export function buildSlice({
+             draft,
+             meta.arg.queryCacheKey,
+             (substate) => {
+-              if (
+-                substate.requestId !== meta.requestId &&
+-                !isUpsertQuery(meta.arg)
+-              )
+-                return
++              if (substate.requestId !== meta.requestId) {
++                if (
++                  substate.fulfilledTimeStamp &&
++                  meta.fulfilledTimeStamp < substate.fulfilledTimeStamp
++                ) {
++                  return
++                }
++              }
+               const { merge } = definitions[
+                 meta.arg.endpointName
+               ] as QueryDefinition<any, any, any, any>
+diff --git a/packages/toolkit/src/query/core/buildThunks.ts b/packages/toolkit/src/query/core/buildThunks.ts
+index d6a111b1..6da388bb 100644
+--- a/packages/toolkit/src/query/core/buildThunks.ts
++++ b/packages/toolkit/src/query/core/buildThunks.ts
+@@ -7,11 +7,11 @@ import type {
+ } from '../baseQueryTypes'
+ import type { RootState, QueryKeys, QuerySubstateIdentifier } from './apiState'
+ import { QueryStatus } from './apiState'
+-import type {
++import {
++  forceQueryFnSymbol,
+   StartQueryActionCreatorOptions,
+   QueryActionCreatorResult,
+ } from './buildInitiate'
+-import { forceQueryFnSymbol, isUpsertQuery } from './buildInitiate'
+ import type {
+   AssertTagTypes,
+   EndpointDefinition,
+@@ -482,7 +482,9 @@ In the case of an unhandled error, no tags will be "provided" or "invalidated".`
+       // Order of these checks matters.
+       // In order for `upsertQueryData` to successfully run while an existing request is in flight,
+       /// we have to check for that first, otherwise `queryThunk` will bail out and not run at all.
+-      if (isUpsertQuery(arg)) return true
++      const isUpsertQuery =
++        typeof arg[forceQueryFnSymbol] === 'function' && arg.forceRefetch
++      if (isUpsertQuery) return true
+ 
+       // Don't retry a request that's currently in-flight
+       if (requestState?.status === 'pending') return false
+diff --git a/packages/toolkit/src/query/tests/optimisticUpserts.test.tsx b/packages/toolkit/src/query/tests/optimisticUpserts.test.tsx
+index c500ba09..56693a1e 100644
+--- a/packages/toolkit/src/query/tests/optimisticUpserts.test.tsx
++++ b/packages/toolkit/src/query/tests/optimisticUpserts.test.tsx
+@@ -234,62 +234,6 @@ describe('upsertQueryData', () => {
+       contents: 'I love cheese!',
+     })
+   })
+-
+-  test('upsert while a normal query is running (success)', async () => {
+-    const fetchedData = {
+-      id: '3',
+-      title: 'All about cheese.',
+-      contents: 'Yummy',
+-    }
+-    baseQuery.mockImplementation(() => delay(20).then(() => fetchedData))
+-    const upsertedData = {
+-      id: '3',
+-      title: 'Data from a SSR Render',
+-      contents: 'This is just some random data',
+-    }
+-
+-    const selector = api.endpoints.post.select('3')
+-    const fetchRes = storeRef.store.dispatch(api.endpoints.post.initiate('3'))
+-    const upsertRes = storeRef.store.dispatch(
+-      api.util.upsertQueryData('post', '3', upsertedData)
+-    )
+-
+-    await upsertRes
+-    let state = selector(storeRef.store.getState())
+-    expect(state.data).toEqual(upsertedData)
+-
+-    await fetchRes
+-    state = selector(storeRef.store.getState())
+-    expect(state.data).toEqual(fetchedData)
+-  })
+-  test('upsert while a normal query is running (rejected)', async () => {
+-    baseQuery.mockImplementation(async () => {
+-      await delay(20)
+-      // eslint-disable-next-line no-throw-literal
+-      throw 'Error!'
+-    })
+-    const upsertedData = {
+-      id: '3',
+-      title: 'Data from a SSR Render',
+-      contents: 'This is just some random data',
+-    }
+-
+-    const selector = api.endpoints.post.select('3')
+-    const fetchRes = storeRef.store.dispatch(api.endpoints.post.initiate('3'))
+-    const upsertRes = storeRef.store.dispatch(
+-      api.util.upsertQueryData('post', '3', upsertedData)
+-    )
+-
+-    await upsertRes
+-    let state = selector(storeRef.store.getState())
+-    expect(state.data).toEqual(upsertedData)
+-    expect(state.isSuccess).toBeTruthy()
+-
+-    await fetchRes
+-    state = selector(storeRef.store.getState())
+-    expect(state.data).toEqual(upsertedData)
+-    expect(state.isError).toBeTruthy()
+-  })
+ })
+ 
+ describe('full integration', () => {
+@@ -423,7 +367,7 @@ describe('full integration', () => {
+     )
+   })
+ 
+-  test('Interop with in-flight requests', async () => {
++  test.only('Interop with in-flight requests', async () => {
+     await act(async () => {
+       const fetchRes = storeRef.store.dispatch(
+         api.endpoints.post2.initiate('3')

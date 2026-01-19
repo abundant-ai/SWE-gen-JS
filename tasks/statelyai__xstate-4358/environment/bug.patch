@@ -1,0 +1,345 @@
+diff --git a/.changeset/olive-suns-begin.md b/.changeset/olive-suns-begin.md
+deleted file mode 100644
+index d26796e526..0000000000
+--- a/.changeset/olive-suns-begin.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-`xstate.done.state.*` events will now be generated recursively for all parallel states on the ancestors path.
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 365fd44298..e181a78137 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -281,9 +281,7 @@ export class StateMachine<
+       ...(state as any),
+       value: resolveStateValue(this.root, state.value),
+       configuration,
+-      status: isInFinalState(configurationSet, this.root)
+-        ? 'done'
+-        : state.status
++      status: isInFinalState(configuration) ? 'done' : state.status
+     });
+   }
+ 
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 0a29f3afb6..2afd557af6 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -215,12 +215,12 @@ export function getStateValue(
+ }
+ 
+ export function isInFinalState(
+-  configuration: Set<AnyStateNode>,
+-  stateNode: AnyStateNode
++  configuration: Array<AnyStateNode>,
++  stateNode: AnyStateNode = configuration[0].machine.root
+ ): boolean {
+   if (stateNode.type === 'compound') {
+     return getChildren(stateNode).some(
+-      (s) => s.type === 'final' && configuration.has(s)
++      (s) => s.type === 'final' && configuration.includes(s)
+     );
+   }
+   if (stateNode.type === 'parallel') {
+@@ -1105,7 +1105,7 @@ function microstepProcedure(
+ 
+   const nextConfiguration = [...mutConfiguration];
+ 
+-  const done = isInFinalState(mutConfiguration, currentState.machine.root);
++  const done = isInFinalState(nextConfiguration);
+ 
+   if (done) {
+     nextState = resolveActionsAndContext(
+@@ -1216,17 +1216,18 @@ function enterStates(
+         )
+       );
+ 
+-      let ancestorMarker: typeof parent | undefined = parent.parent;
+-      while (ancestorMarker) {
+-        if (
+-          ancestorMarker.type === 'parallel' &&
+-          isInFinalState(mutConfiguration, ancestorMarker)
+-        ) {
+-          internalQueue.push(createDoneStateEvent(ancestorMarker.id));
+-          ancestorMarker = ancestorMarker.parent;
+-          continue;
++      if (parent.parent) {
++        const grandparent = parent.parent;
++
++        if (grandparent.type === 'parallel') {
++          if (
++            getChildren(grandparent).every((parentNode) =>
++              isInFinalState([...mutConfiguration], parentNode)
++            )
++          ) {
++            internalQueue.push(createDoneStateEvent(grandparent.id));
++          }
+         }
+-        break;
+       }
+     }
+   }
+diff --git a/packages/core/test/final.test.ts b/packages/core/test/final.test.ts
+index 699a3bf6e3..01b3435e9b 100644
+--- a/packages/core/test/final.test.ts
++++ b/packages/core/test/final.test.ts
+@@ -231,256 +231,4 @@ describe('final states', () => {
+ 
+     expect(spy).toHaveBeenCalledWith(1);
+   });
+-
+-  it('should emit a done state event for a parallel state when its parallel children reach their final states', () => {
+-    const machine = createMachine({
+-      initial: 'first',
+-      states: {
+-        first: {
+-          type: 'parallel',
+-          states: {
+-            alpha: {
+-              type: 'parallel',
+-              states: {
+-                one: {
+-                  initial: 'start',
+-                  states: {
+-                    start: {
+-                      on: {
+-                        finish_one_alpha: 'finish'
+-                      }
+-                    },
+-                    finish: {
+-                      type: 'final'
+-                    }
+-                  }
+-                },
+-                two: {
+-                  initial: 'start',
+-                  states: {
+-                    start: {
+-                      on: {
+-                        finish_two_alpha: 'finish'
+-                      }
+-                    },
+-                    finish: {
+-                      type: 'final'
+-                    }
+-                  }
+-                }
+-              }
+-            },
+-            beta: {
+-              type: 'parallel',
+-              states: {
+-                third: {
+-                  initial: 'start',
+-                  states: {
+-                    start: {
+-                      on: {
+-                        finish_three_beta: 'finish'
+-                      }
+-                    },
+-                    finish: {
+-                      type: 'final'
+-                    }
+-                  }
+-                },
+-                fourth: {
+-                  initial: 'start',
+-                  states: {
+-                    start: {
+-                      on: {
+-                        finish_four_beta: 'finish'
+-                      }
+-                    },
+-                    finish: {
+-                      type: 'final'
+-                    }
+-                  }
+-                }
+-              }
+-            }
+-          },
+-          onDone: 'done'
+-        },
+-        done: {
+-          type: 'final'
+-        }
+-      }
+-    });
+-
+-    const actorRef = createActor(machine).start();
+-
+-    actorRef.send({
+-      type: 'finish_one_alpha'
+-    });
+-    actorRef.send({
+-      type: 'finish_two_alpha'
+-    });
+-    actorRef.send({
+-      type: 'finish_three_beta'
+-    });
+-    actorRef.send({
+-      type: 'finish_four_beta'
+-    });
+-
+-    expect(actorRef.getSnapshot().status).toBe('done');
+-  });
+-
+-  it('should emit a done state event for a parallel state when its compound child reaches its final state when the other parallel child region is already in its final state', () => {
+-    const machine = createMachine({
+-      initial: 'first',
+-      states: {
+-        first: {
+-          type: 'parallel',
+-          states: {
+-            alpha: {
+-              type: 'parallel',
+-              states: {
+-                one: {
+-                  initial: 'start',
+-                  states: {
+-                    start: {
+-                      on: {
+-                        finish_one_alpha: 'finish'
+-                      }
+-                    },
+-                    finish: {
+-                      type: 'final'
+-                    }
+-                  }
+-                },
+-                two: {
+-                  initial: 'start',
+-                  states: {
+-                    start: {
+-                      on: {
+-                        finish_two_alpha: 'finish'
+-                      }
+-                    },
+-                    finish: {
+-                      type: 'final'
+-                    }
+-                  }
+-                }
+-              }
+-            },
+-            beta: {
+-              initial: 'three',
+-              states: {
+-                three: {
+-                  on: {
+-                    finish_beta: 'finish'
+-                  }
+-                },
+-                finish: {
+-                  type: 'final'
+-                }
+-              }
+-            }
+-          },
+-          onDone: 'done'
+-        },
+-        done: {
+-          type: 'final'
+-        }
+-      }
+-    });
+-
+-    const actorRef = createActor(machine).start();
+-
+-    // reach final state of a parallel state
+-    actorRef.send({
+-      type: 'finish_one_alpha'
+-    });
+-    actorRef.send({
+-      type: 'finish_two_alpha'
+-    });
+-
+-    // reach final state of a compound state
+-    actorRef.send({
+-      type: 'finish_beta'
+-    });
+-
+-    expect(actorRef.getSnapshot().status).toBe('done');
+-  });
+-
+-  it('should emit a done state event for a parallel state when its parallel child reaches its final state when the other compound child region is already in its final state', () => {
+-    const machine = createMachine({
+-      initial: 'first',
+-      states: {
+-        first: {
+-          type: 'parallel',
+-          states: {
+-            alpha: {
+-              type: 'parallel',
+-              states: {
+-                one: {
+-                  initial: 'start',
+-                  states: {
+-                    start: {
+-                      on: {
+-                        finish_one_alpha: 'finish'
+-                      }
+-                    },
+-                    finish: {
+-                      type: 'final'
+-                    }
+-                  }
+-                },
+-                two: {
+-                  initial: 'start',
+-                  states: {
+-                    start: {
+-                      on: {
+-                        finish_two_alpha: 'finish'
+-                      }
+-                    },
+-                    finish: {
+-                      type: 'final'
+-                    }
+-                  }
+-                }
+-              }
+-            },
+-            beta: {
+-              initial: 'three',
+-              states: {
+-                three: {
+-                  on: {
+-                    finish_beta: 'finish'
+-                  }
+-                },
+-                finish: {
+-                  type: 'final'
+-                }
+-              }
+-            }
+-          },
+-          onDone: 'done'
+-        },
+-        done: {
+-          type: 'final'
+-        }
+-      }
+-    });
+-
+-    const actorRef = createActor(machine).start();
+-
+-    // reach final state of a compound state
+-    actorRef.send({
+-      type: 'finish_beta'
+-    });
+-
+-    // reach final state of a parallel state
+-    actorRef.send({
+-      type: 'finish_one_alpha'
+-    });
+-    actorRef.send({
+-      type: 'finish_two_alpha'
+-    });
+-
+-    expect(actorRef.getSnapshot().status).toBe('done');
+-  });
+ });

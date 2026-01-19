@@ -1,0 +1,383 @@
+diff --git a/readme.md b/readme.md
+index aebc30c..65cd63c 100644
+--- a/readme.md
++++ b/readme.md
+@@ -822,6 +822,30 @@ Default: `flex`
+ 
+ Set this property to `none` to hide the element.
+ 
++##### overflowX
++
++Type: `string`\
++Allowed values: `visible` `hidden`\
++Default: `visible`
++
++Behavior for an element's overflow in horizontal direction.
++
++##### overflowY
++
++Type: `string`\
++Allowed values: `visible` `hidden`\
++Default: `visible`
++
++Behavior for an element's overflow in vertical direction.
++
++##### overflow
++
++Type: `string`\
++Allowed values: `visible` `hidden`\
++Default: `visible`
++
++Shortcut for setting `overflowX` and `overflowY` at the same time.
++
+ #### Borders
+ 
+ ##### borderStyle
+diff --git a/src/components/Box.tsx b/src/components/Box.tsx
+index 89fc36c..976d05d 100644
+--- a/src/components/Box.tsx
++++ b/src/components/Box.tsx
+@@ -46,6 +46,27 @@ export type Props = Except<Styles, 'textWrap'> & {
+ 	 * @default 0
+ 	 */
+ 	readonly paddingY?: number;
++
++	/**
++	 * Behavior for an element's overflow in both directions.
++	 *
++	 * @default 'visible'
++	 */
++	readonly overflow?: 'visible' | 'hidden';
++
++	/**
++	 * Behavior for an element's overflow in horizontal direction.
++	 *
++	 * @default 'visible'
++	 */
++	readonly overflowX?: 'visible' | 'hidden';
++
++	/**
++	 * Behavior for an element's overflow in vertical direction.
++	 *
++	 * @default 'visible'
++	 */
++	readonly overflowY?: 'visible' | 'hidden';
+ };
+ 
+ /**
+@@ -62,7 +83,10 @@ const Box = forwardRef<DOMElement, PropsWithChildren<Props>>(
+ 			paddingLeft: style.paddingLeft || style.paddingX || style.padding || 0,
+ 			paddingRight: style.paddingRight || style.paddingX || style.padding || 0,
+ 			paddingTop: style.paddingTop || style.paddingY || style.padding || 0,
+-			paddingBottom: style.paddingBottom || style.paddingY || style.padding || 0
++			paddingBottom:
++				style.paddingBottom || style.paddingY || style.padding || 0,
++			overflowX: style.overflowX || style.overflow || 'visible',
++			overflowY: style.overflowY || style.overflow || 'visible'
+ 		};
+ 
+ 		return (
+diff --git a/src/output.ts b/src/output.ts
+index 8f259fa..60df981 100644
+--- a/src/output.ts
++++ b/src/output.ts
+@@ -1,5 +1,6 @@
+ import sliceAnsi from 'slice-ansi';
+ import stringWidth from 'string-width';
++import widestLine from 'widest-line';
+ import {type OutputTransformer} from './render-node-to-output.js';
+ 
+ /**
+@@ -16,19 +17,37 @@ type Options = {
+ 	height: number;
+ };
+ 
+-type Writes = {
++type Operation = WriteOperation | ClipOperation | UnclipOperation;
++
++type WriteOperation = {
++	type: 'write';
+ 	x: number;
+ 	y: number;
+ 	text: string;
+ 	transformers: OutputTransformer[];
+ };
+ 
++type ClipOperation = {
++	type: 'clip';
++	clip: Clip;
++};
++
++type Clip = {
++	x1: number | undefined;
++	x2: number | undefined;
++	y1: number | undefined;
++	y2: number | undefined;
++};
++
++type UnclipOperation = {
++	type: 'unclip';
++};
++
+ export default class Output {
+ 	width: number;
+ 	height: number;
+ 
+-	// Initialize output array with a specific set of rows, so that margin/padding at the bottom is preserved
+-	private readonly writes: Writes[] = [];
++	private readonly operations: Operation[] = [];
+ 
+ 	constructor(options: Options) {
+ 		const {width, height} = options;
+@@ -49,41 +68,129 @@ export default class Output {
+ 			return;
+ 		}
+ 
+-		this.writes.push({x, y, text, transformers});
++		this.operations.push({
++			type: 'write',
++			x,
++			y,
++			text,
++			transformers
++		});
++	}
++
++	clip(clip: Clip) {
++		this.operations.push({
++			type: 'clip',
++			clip
++		});
++	}
++
++	unclip() {
++		this.operations.push({
++			type: 'unclip'
++		});
+ 	}
+ 
+ 	get(): {output: string; height: number} {
++		// Initialize output array with a specific set of rows, so that margin/padding at the bottom is preserved
+ 		const output: string[] = [];
+ 
+ 		for (let y = 0; y < this.height; y++) {
+ 			output.push(' '.repeat(this.width));
+ 		}
+ 
+-		for (const write of this.writes) {
+-			const {x, y, text, transformers} = write;
+-			const lines = text.split('\n');
+-			let offsetY = 0;
++		const clips: Clip[] = [];
++
++		for (const operation of this.operations) {
++			if (operation.type === 'clip') {
++				clips.push(operation.clip);
++			}
++
++			if (operation.type === 'unclip') {
++				clips.pop();
++			}
+ 
+-			for (let line of lines) {
+-				const currentLine = output[y + offsetY];
++			if (operation.type === 'write') {
++				const {text, transformers} = operation;
++				let {x, y} = operation;
++				let lines = text.split('\n');
+ 
+-				// Line can be missing if `text` is taller than height of pre-initialized `this.output`
+-				if (!currentLine) {
+-					continue;
+-				}
++				const clip = clips[clips.length - 1];
+ 
+-				const width = stringWidth(line);
++				if (clip) {
++					const clipHorizontally =
++						typeof clip?.x1 === 'number' && typeof clip?.x2 === 'number';
+ 
+-				for (const transformer of transformers) {
+-					line = transformer(line);
++					const clipVertically =
++						typeof clip?.y1 === 'number' && typeof clip?.y2 === 'number';
++
++					// If text is positioned outside of clipping area altogether,
++					// skip to the next operation to avoid unnecessary calculations
++					if (clipHorizontally) {
++						const width = widestLine(text);
++
++						if (x + width < clip.x1! || x > clip.x2!) {
++							continue;
++						}
++					}
++
++					if (clipVertically) {
++						const height = lines.length;
++
++						if (y + height < clip.y1! || y > clip.y2!) {
++							continue;
++						}
++					}
++
++					if (clipHorizontally) {
++						lines = lines.map(line => {
++							const from = x < clip.x1! ? clip.x1! - x : 0;
++							const width = stringWidth(line);
++							const to = x + width > clip.x2! ? clip.x2! - x : width;
++
++							return sliceAnsi(line, from, to);
++						});
++
++						if (x < clip.x1!) {
++							x = clip.x1!;
++						}
++					}
++
++					if (clipVertically) {
++						const from = y < clip.y1! ? clip.y1! - y : 0;
++						const height = lines.length;
++						const to = y + height > clip.y2! ? clip.y2! - y : height;
++
++						lines = lines.slice(from, to);
++
++						if (y < clip.y1!) {
++							y = clip.y1!;
++						}
++					}
+ 				}
+ 
+-				output[y + offsetY] =
+-					sliceAnsi(currentLine, 0, x) +
+-					line +
+-					sliceAnsi(currentLine, x + width);
++				let offsetY = 0;
++
++				for (let line of lines) {
++					const currentLine = output[y + offsetY];
++
++					// Line can be missing if `text` is taller than height of pre-initialized `this.output`
++					if (!currentLine) {
++						continue;
++					}
+ 
+-				offsetY++;
++					const width = stringWidth(line);
++
++					for (const transformer of transformers) {
++						line = transformer(line);
++					}
++
++					output[y + offsetY] =
++						sliceAnsi(currentLine, 0, x) +
++						line +
++						sliceAnsi(currentLine, x + width);
++
++					offsetY++;
++				}
+ 			}
+ 		}
+ 
+diff --git a/src/reconciler.ts b/src/reconciler.ts
+index 4bde433..b224ced 100644
+--- a/src/reconciler.ts
++++ b/src/reconciler.ts
+@@ -218,6 +218,7 @@ export default createReconciler<
+ 
+ 					for (const styleKey of styleKeys) {
+ 						// Always include `borderColor` and `borderStyle` to ensure border is rendered,
++						// and `overflowX` and `overflowY` to ensure content is clipped,
+ 						// otherwise resulting `updatePayload` may not contain them
+ 						// if they weren't changed during this update
+ 						if (styleKey === 'borderStyle' || styleKey === 'borderColor') {
+@@ -231,6 +232,8 @@ export default createReconciler<
+ 								newStyle.borderStyle;
+ 							(updatePayload['style'] as any).borderColor =
+ 								newStyle.borderColor;
++							(updatePayload['style'] as any).overflowX = newStyle.overflowX;
++							(updatePayload['style'] as any).overflowY = newStyle.overflowY;
+ 						}
+ 
+ 						if (newStyle[styleKey] !== oldStyle[styleKey]) {
+diff --git a/src/render-node-to-output.ts b/src/render-node-to-output.ts
+index fbba15c..b43a170 100644
+--- a/src/render-node-to-output.ts
++++ b/src/render-node-to-output.ts
+@@ -82,14 +82,45 @@ const renderNodeToOutput = (
+ 				}
+ 
+ 				text = applyPaddingToText(node, text);
++
+ 				output.write(x, y, text, {transformers: newTransformers});
+ 			}
+ 
+ 			return;
+ 		}
+ 
++		let clipped = false;
++
+ 		if (node.nodeName === 'ink-box') {
+ 			renderBorder(x, y, node, output);
++
++			const clipHorizontally = node.style.overflowX === 'hidden';
++			const clipVertically = node.style.overflowY === 'hidden';
++
++			if (clipHorizontally || clipVertically) {
++				const x1 = clipHorizontally
++					? x + yogaNode.getComputedBorder(Yoga.EDGE_LEFT)
++					: undefined;
++
++				const x2 = clipHorizontally
++					? x +
++					  yogaNode.getComputedWidth() -
++					  yogaNode.getComputedBorder(Yoga.EDGE_RIGHT)
++					: undefined;
++
++				const y1 = clipVertically
++					? y + yogaNode.getComputedBorder(Yoga.EDGE_TOP)
++					: undefined;
++
++				const y2 = clipVertically
++					? y +
++					  yogaNode.getComputedHeight() -
++					  yogaNode.getComputedBorder(Yoga.EDGE_BOTTOM)
++					: undefined;
++
++				output.clip({x1, x2, y1, y2});
++				clipped = true;
++			}
+ 		}
+ 
+ 		if (node.nodeName === 'ink-root' || node.nodeName === 'ink-box') {
+@@ -101,6 +132,10 @@ const renderNodeToOutput = (
+ 					skipStaticElements
+ 				});
+ 			}
++
++			if (clipped) {
++				output.unclip();
++			}
+ 		}
+ 	}
+ };
+diff --git a/src/styles.ts b/src/styles.ts
+index 81d95b2..3d9b1fe 100644
+--- a/src/styles.ts
++++ b/src/styles.ts
+@@ -141,6 +141,16 @@ export type Styles = {
+ 	 * Accepts the same values as `color` in <Text> component.
+ 	 */
+ 	readonly borderColor?: LiteralUnion<ForegroundColorName, string>;
++
++	/**
++	 * Behavior for an element's overflow in horizontal direction.
++	 */
++	readonly overflowX?: 'visible' | 'hidden';
++
++	/**
++	 * Behavior for an element's overflow in vertical direction.
++	 */
++	readonly overflowY?: 'visible' | 'hidden';
+ };
+ 
+ const applyPositionStyles = (node: Yoga.YogaNode, style: Styles): void => {

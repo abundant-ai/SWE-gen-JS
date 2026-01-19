@@ -1,0 +1,301 @@
+diff --git a/src/classes/child-processor.ts b/src/classes/child-processor.ts
+index 31c8fa37d0..4bca70f48c 100644
+--- a/src/classes/child-processor.ts
++++ b/src/classes/child-processor.ts
+@@ -1,9 +1,5 @@
+ import { ParentCommand } from '../enums';
+-import {
+-  MoveToWaitingChildrenOpts,
+-  Receiver,
+-  SandboxedJob,
+-} from '../interfaces';
++import { SandboxedJob, Receiver } from '../interfaces';
+ import { JobJsonSandbox, JobProgress } from '../types';
+ import { errorToJSON } from '../utils';
+ 
+@@ -125,7 +121,6 @@ export class ChildProcessor {
+   ): SandboxedJob {
+     const wrappedJob = {
+       ...job,
+-      queueQualifiedName: job.queueQualifiedName,
+       data: JSON.parse(job.data || '{}'),
+       opts: job.opts,
+       returnValue: JSON.parse(job.returnvalue || '{}'),
+@@ -169,29 +164,6 @@ export class ChildProcessor {
+           value: { token },
+         });
+       },
+-
+-      /*
+-       * Proxy `moveToWaitingChildren` function.
+-       */
+-      moveToWaitingChildren: async (
+-        token?: string,
+-        opts?: MoveToWaitingChildrenOpts,
+-      ): Promise<boolean> => {
+-        const requestId = Math.random().toString(36).substring(2, 15);
+-        await send({
+-          requestId,
+-          cmd: ParentCommand.MoveToWaitingChildren,
+-          value: { token, opts },
+-        });
+-
+-        return waitResponse(
+-          requestId,
+-          this.receiver,
+-          RESPONSE_TIMEOUT,
+-          'moveToWaitingChildren',
+-        ) as Promise<boolean>;
+-      },
+-
+       /*
+        * Proxy `updateData` function.
+        */
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index 6d803b96ba..82f8268528 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -581,7 +581,6 @@ export class Job<
+     return {
+       ...this.asJSON(),
+       queueName: this.queueName,
+-      queueQualifiedName: this.queueQualifiedName,
+       prefix: this.prefix,
+     };
+   }
+diff --git a/src/classes/sandbox.ts b/src/classes/sandbox.ts
+index 2c6ae6d95c..b66d7c37b1 100644
+--- a/src/classes/sandbox.ts
++++ b/src/classes/sandbox.ts
+@@ -55,19 +55,6 @@ const sandbox = <T, R, N extends string>(
+                   case ParentCommand.MoveToWait:
+                     await job.moveToWait(msg.value?.token);
+                     break;
+-                  case ParentCommand.MoveToWaitingChildren:
+-                    {
+-                      const value = await job.moveToWaitingChildren(
+-                        msg.value?.token,
+-                        msg.value?.opts,
+-                      );
+-                      child.send({
+-                        requestId: msg.requestId,
+-                        cmd: ChildCommand.MoveToWaitingChildrenResponse,
+-                        value,
+-                      });
+-                    }
+-                    break;
+                   case ParentCommand.Update:
+                     await job.updateData(msg.value);
+                     break;
+diff --git a/src/enums/child-command.ts b/src/enums/child-command.ts
+index 15bee00a27..a610e5206e 100644
+--- a/src/enums/child-command.ts
++++ b/src/enums/child-command.ts
+@@ -4,5 +4,4 @@ export enum ChildCommand {
+   Stop,
+   GetChildrenValuesResponse,
+   GetIgnoredChildrenFailuresResponse,
+-  MoveToWaitingChildrenResponse,
+ }
+diff --git a/src/enums/parent-command.ts b/src/enums/parent-command.ts
+index 7a910e9572..8c02c292ee 100644
+--- a/src/enums/parent-command.ts
++++ b/src/enums/parent-command.ts
+@@ -11,5 +11,4 @@ export enum ParentCommand {
+   Update,
+   GetChildrenValues,
+   GetIgnoredChildrenFailures,
+-  MoveToWaitingChildren,
+ }
+diff --git a/src/interfaces/sandboxed-job.ts b/src/interfaces/sandboxed-job.ts
+index c1040c7ad5..b3796bb227 100644
+--- a/src/interfaces/sandboxed-job.ts
++++ b/src/interfaces/sandboxed-job.ts
+@@ -1,5 +1,4 @@
+ import { JobJsonSandbox, JobProgress, JobsOptions } from '../types';
+-import { MoveToWaitingChildrenOpts } from './minimal-job';
+ 
+ /**
+  * @see {@link https://docs.bullmq.io/guide/workers/sandboxed-processors}
+@@ -8,13 +7,8 @@ export interface SandboxedJob<T = any, R = any>
+   extends Omit<JobJsonSandbox, 'data' | 'opts' | 'returnValue'> {
+   data: T;
+   opts: JobsOptions;
+-  queueQualifiedName: string;
+   moveToDelayed: (timestamp: number, token?: string) => Promise<void>;
+   moveToWait: (token?: string) => Promise<void>;
+-  moveToWaitingChildren: (
+-    token?: string,
+-    opts?: MoveToWaitingChildrenOpts,
+-  ) => Promise<boolean>;
+   log: (row: any) => void;
+   updateData: (data: any) => Promise<void>;
+   updateProgress: (value: JobProgress) => Promise<void>;
+diff --git a/src/types/job-json-sandbox.ts b/src/types/job-json-sandbox.ts
+index 47a2be411a..3181fbc3f8 100644
+--- a/src/types/job-json-sandbox.ts
++++ b/src/types/job-json-sandbox.ts
+@@ -2,6 +2,5 @@ import { JobJson } from '../interfaces';
+ 
+ export type JobJsonSandbox = JobJson & {
+   queueName: string;
+-  queueQualifiedName: string;
+   prefix: string;
+ };
+diff --git a/tests/fixtures/fixture_processor_move_to_wait_for_children.js b/tests/fixtures/fixture_processor_move_to_wait_for_children.js
+deleted file mode 100644
+index 8185cd1ad9..0000000000
+--- a/tests/fixtures/fixture_processor_move_to_wait_for_children.js
++++ /dev/null
+@@ -1,64 +0,0 @@
+-/**
+- * A processor file to be used in tests.
+- *
+- */
+-'use strict';
+-
+-const { WaitingChildrenError, Queue } = require('../../dist/cjs/classes');
+-const IORedis = require('ioredis');
+-const delay = require('./delay');
+-
+-const Step = {
+-  Initial: 'initial',
+-  WaitingChildren: 'waiting-children',
+-  Finish: 'finish',
+-};
+-
+-module.exports = async function (job, token) {
+-  let step = job.data.step ?? Step.Initial;
+-  while (step !== Step.Finish) {
+-    switch (step) {
+-      case Step.Initial: {
+-        await addChildJob(job);
+-        step = Step.WaitingChildren;
+-        await job.updateData({ ...job.data, step });
+-        break;
+-      }
+-      case Step.WaitingChildren: {
+-        const shouldWait = await job.moveToWaitingChildren(token);
+-        if (!shouldWait) {
+-          step = Step.Finish;
+-          await job.updateData({ ...job.data, step });
+-          return 'finished';
+-        } else {
+-          throw new WaitingChildrenError();
+-        }
+-      }
+-      default: {
+-        throw new Error('invalid step');
+-      }
+-    }
+-  }
+-};
+-
+-async function addChildJob(job) {
+-  const connection = new IORedis(job.data.redisHost, {
+-    maxRetriesPerRequest: null,
+-  });
+-  const queue = new Queue(job.data.queueName, {
+-    connection,
+-    prefix: job.prefix,
+-  });
+-  await queue.add(
+-    'child-job',
+-    { foo: 'bar' },
+-    {
+-      parent: {
+-        id: job.id,
+-        queue: job.queueQualifiedName,
+-      },
+-    },
+-  );
+-  await queue.close();
+-  await connection.quit();
+-}
+diff --git a/tests/test_sandboxed_process.ts b/tests/test_sandboxed_process.ts
+index 1f886c7c39..90435c3bb0 100644
+--- a/tests/test_sandboxed_process.ts
++++ b/tests/test_sandboxed_process.ts
+@@ -1044,82 +1044,6 @@ function sandboxProcessTests(
+       await worker.close();
+     });
+ 
+-    it('should process and move to wait for children', async () => {
+-      const processFile =
+-        __dirname + '/fixtures/fixture_processor_move_to_wait_for_children.js';
+-
+-      const childQueueName = `test-${v4()}`;
+-
+-      const parentWorker = new Worker(queueName, processFile, {
+-        autorun: false,
+-        connection,
+-        prefix,
+-        drainDelay: 1,
+-        useWorkerThreads,
+-      });
+-
+-      const childWorker = new Worker(
+-        childQueueName,
+-        () => {
+-          return delay(250);
+-        },
+-        {
+-          autorun: false,
+-          connection,
+-          prefix,
+-          drainDelay: 1,
+-        },
+-      );
+-      const childQueue = new Queue(childQueueName, { connection, prefix });
+-
+-      const waitingParent = new Promise<void>((resolve, reject) => {
+-        queueEvents.on('waiting-children', async ({ jobId }) => {
+-          try {
+-            if (jobId) {
+-              expect(jobId).to.be.equal('parent-job-id');
+-              resolve();
+-            }
+-          } catch (err) {
+-            console.log(err);
+-            reject(err);
+-          }
+-        });
+-      });
+-
+-      const completingParent = new Promise<void>((resolve, reject) => {
+-        parentWorker.on('completed', async (job: Job) => {
+-          expect(job.data.queueName).to.be.equal(childQueueName);
+-          expect(job.data.step).to.be.equal('finish');
+-          expect(job.returnvalue).to.be.equal('finished');
+-          resolve();
+-        });
+-      });
+-
+-      const completingChild = new Promise<void>((resolve, reject) => {
+-        childWorker.on('completed', async (job: Job) => {
+-          expect(job.data.foo).to.be.equal('bar');
+-          resolve();
+-        });
+-      });
+-
+-      await queue.add(
+-        'test',
+-        { redisHost, queueName: childQueueName },
+-        { jobId: 'parent-job-id' },
+-      );
+-
+-      parentWorker.run();
+-      childWorker.run();
+-
+-      await waitingParent;
+-      await completingChild;
+-      await completingParent;
+-      await parentWorker.close();
+-      await childWorker.close();
+-      await childQueue.close();
+-      await removeAllQueueData(new IORedis(redisHost), childQueueName);
+-    });
+-
+     describe('when env variables are provided', () => {
+       it('shares env variables', async () => {
+         const processFile = __dirname + '/fixtures/fixture_processor_env.js';

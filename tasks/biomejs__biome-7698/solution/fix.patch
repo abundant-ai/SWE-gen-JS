@@ -1,0 +1,501 @@
+diff --git a/.changeset/eager-suns-smoke.md b/.changeset/eager-suns-smoke.md
+new file mode 100644
+index 0000000000..76dabb768b
+--- /dev/null
++++ b/.changeset/eager-suns-smoke.md
+@@ -0,0 +1,5 @@
++---
++"@biomejs/biome": patch
++---
++
++Fixed an issue where the JUnit reporter returned a zero-based location. Now the location returned is one-based.
+diff --git a/.changeset/gentle-pots-hunt.md b/.changeset/gentle-pots-hunt.md
+new file mode 100644
+index 0000000000..d8582ffb6f
+--- /dev/null
++++ b/.changeset/gentle-pots-hunt.md
+@@ -0,0 +1,64 @@
++---
++"@biomejs/biome": minor
++---
++
++Added a new reporter named `rdjson`. This reporter prints diagnostics following the [RDJSON format](https://deepwiki.com/reviewdog/reviewdog/3.2-reviewdog-diagnostic-format):
++
++The following command:
++
++```shell
++biome check --reporter=rdjson
++```
++
++Will emit diagnostics in the following format:
++
++```json
++{
++  "source": {
++    "name": "Biome",
++    "url": "https://biomejs.dev"
++  },
++  "diagnostics": [
++    {
++      "code": {
++        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
++        "value": "lint/correctness/noUnusedImports"
++      },
++      "location": {
++        "path": "index.ts",
++        "range": {
++          "end": {
++            "column": 11,
++            "line": 0
++          },
++          "start": {
++            "column": 7,
++            "line": 0
++          }
++        }
++      },
++      "message": "This import is unused."
++    },
++    {
++      "code": {
++        "url": "https://biomejs.dev/linter/rules/no-unused-imports",
++        "value": "lint/correctness/noUnusedImports"
++      },
++      "location": {
++        "path": "index.ts",
++        "range": {
++          "end": {
++            "column": 10,
++            "line": 1
++          },
++          "start": {
++            "column": 9,
++            "line": 1
++          }
++        }
++      },
++      "message": "Several of these imports are unused."
++    }
++  ]
++}
++```
+diff --git a/crates/biome_cli/src/cli_options.rs b/crates/biome_cli/src/cli_options.rs
+index 5e315ec8fb..79ad1001d0 100644
+--- a/crates/biome_cli/src/cli_options.rs
++++ b/crates/biome_cli/src/cli_options.rs
+@@ -56,7 +56,7 @@ pub struct CliOptions {
+     /// Allows to change how diagnostics and summary are reported.
+     #[bpaf(
+         long("reporter"),
+-        argument("json|json-pretty|github|junit|summary|gitlab|checkstyle"),
++        argument("json|json-pretty|github|junit|summary|gitlab|checkstyle|rdjson"),
+         fallback(CliReporter::default())
+     )]
+     pub reporter: CliReporter,
+@@ -154,12 +154,14 @@ pub enum CliReporter {
+     GitHub,
+     /// Diagnostics and summary are printed in JUnit format
+     Junit,
+-    /// Reports linter diagnostics grouped by category and number of hits. Reports formatter diagnostics grouped by file.
++    /// Reports diagnostics grouped by category and number of hits. Reports formatter diagnostics grouped by file.
+     Summary,
+-    /// Reports linter diagnostics using the [GitLab Code Quality report](https://docs.gitlab.com/ee/ci/testing/code_quality.html#implement-a-custom-tool).
++    /// Reports diagnostics using the [GitLab Code Quality report](https://docs.gitlab.com/ee/ci/testing/code_quality.html#implement-a-custom-tool).
+     GitLab,
+     /// Reports diagnostics in Checkstyle XML format
+     Checkstyle,
++    /// Reports diagnostics using the [Reviewdog JSON format](https://deepwiki.com/reviewdog/reviewdog/3.2-reviewdog-diagnostic-format)
++    RdJson,
+ }
+ 
+ impl CliReporter {
+@@ -180,6 +182,7 @@ impl FromStr for CliReporter {
+             "junit" => Ok(Self::Junit),
+             "gitlab" => Ok(Self::GitLab),
+             "checkstyle" => Ok(Self::Checkstyle),
++            "rdjson" => Ok(Self::RdJson),
+             _ => Err(format!(
+                 "value {s:?} is not valid for the --reporter argument"
+             )),
+@@ -198,6 +201,7 @@ impl Display for CliReporter {
+             Self::Junit => f.write_str("junit"),
+             Self::GitLab => f.write_str("gitlab"),
+             Self::Checkstyle => f.write_str("checkstyle"),
++            Self::RdJson => f.write_str("rdjson"),
+         }
+     }
+ }
+diff --git a/crates/biome_cli/src/execute/mod.rs b/crates/biome_cli/src/execute/mod.rs
+index 347ce5cebf..16c3c1ca05 100644
+--- a/crates/biome_cli/src/execute/mod.rs
++++ b/crates/biome_cli/src/execute/mod.rs
+@@ -14,6 +14,7 @@ use crate::reporter::github::{GithubReporter, GithubReporterVisitor};
+ use crate::reporter::gitlab::{GitLabReporter, GitLabReporterVisitor};
+ use crate::reporter::json::{JsonReporter, JsonReporterVisitor};
+ use crate::reporter::junit::{JunitReporter, JunitReporterVisitor};
++use crate::reporter::rdjson::{RdJsonReporter, RdJsonReporterVisitor};
+ use crate::reporter::summary::{SummaryReporter, SummaryReporterVisitor};
+ use crate::reporter::terminal::{ConsoleReporter, ConsoleReporterVisitor};
+ use crate::{
+@@ -249,6 +250,8 @@ pub enum ReportMode {
+     GitLab,
+     /// Reports diagnostics in [Checkstyle XML format](https://checkstyle.org/).
+     Checkstyle,
++    /// Reports information in [reviewdog JSON format](https://deepwiki.com/reviewdog/reviewdog/3.2-reviewdog-diagnostic-format)
++    RdJson,
+ }
+ 
+ impl Default for ReportMode {
+@@ -272,6 +275,7 @@ impl From<CliReporter> for ReportMode {
+             CliReporter::Junit => Self::Junit,
+             CliReporter::GitLab => Self::GitLab {},
+             CliReporter::Checkstyle => Self::Checkstyle,
++            CliReporter::RdJson => Self::RdJson,
+         }
+     }
+ }
+@@ -718,6 +722,15 @@ pub fn execute_mode(
+             reporter
+                 .write(&mut crate::reporter::checkstyle::CheckstyleReporterVisitor::new(console))?;
+         }
++        ReportMode::RdJson => {
++            let reporter = RdJsonReporter {
++                diagnostics_payload,
++                execution: execution.clone(),
++                verbose: cli_options.verbose,
++                working_directory: fs.working_directory().clone(),
++            };
++            reporter.write(&mut RdJsonReporterVisitor(console))?;
++        }
+     }
+ 
+     // Processing emitted error diagnostics, exit with a non-zero code
+diff --git a/crates/biome_cli/src/reporter/junit.rs b/crates/biome_cli/src/reporter/junit.rs
+index 2b6aeddb28..bf42ea8988 100644
+--- a/crates/biome_cli/src/reporter/junit.rs
++++ b/crates/biome_cli/src/reporter/junit.rs
+@@ -90,8 +90,8 @@ impl ReporterVisitor for JunitReporterVisitor<'_> {
+ 
+                 status.set_description(format!(
+                     "line {row:?}, col {col:?}, {body}",
+-                    row = start.line_number.to_zero_indexed(),
+-                    col = start.column_number.to_zero_indexed(),
++                    row = start.line_number.get(),
++                    col = start.column_number.get(),
+                     body = message
+                 ));
+                 let mut case = TestCase::new(
+diff --git a/crates/biome_cli/src/reporter/mod.rs b/crates/biome_cli/src/reporter/mod.rs
+index 1ed2d9341d..fc78cb510a 100644
+--- a/crates/biome_cli/src/reporter/mod.rs
++++ b/crates/biome_cli/src/reporter/mod.rs
+@@ -3,6 +3,7 @@ pub(crate) mod github;
+ pub(crate) mod gitlab;
+ pub(crate) mod json;
+ pub(crate) mod junit;
++pub(crate) mod rdjson;
+ pub(crate) mod summary;
+ pub(crate) mod terminal;
+ 
+diff --git a/crates/biome_cli/src/reporter/rdjson.rs b/crates/biome_cli/src/reporter/rdjson.rs
+new file mode 100644
+index 0000000000..0ec9f288d3
+--- /dev/null
++++ b/crates/biome_cli/src/reporter/rdjson.rs
+@@ -0,0 +1,254 @@
++use crate::{DiagnosticsPayload, Execution, Reporter, ReporterVisitor, TraversalSummary};
++use biome_console::fmt::{Display, Formatter};
++use biome_console::{Console, ConsoleExt, MarkupBuf, markup};
++use biome_diagnostics::display::{SourceFile, markup_to_string};
++use biome_diagnostics::{Error, Location, LogCategory, PrintDescription, Visit};
++use camino::{Utf8Path, Utf8PathBuf};
++use serde::Serialize;
++
++pub(crate) struct RdJsonReporter {
++    pub(crate) diagnostics_payload: DiagnosticsPayload,
++    pub(crate) execution: Execution,
++    pub(crate) verbose: bool,
++    pub(crate) working_directory: Option<Utf8PathBuf>,
++}
++
++impl Reporter for RdJsonReporter {
++    fn write(self, visitor: &mut dyn ReporterVisitor) -> std::io::Result<()> {
++        visitor.report_diagnostics(
++            &self.execution,
++            self.diagnostics_payload,
++            self.verbose,
++            self.working_directory.as_deref(),
++        )?;
++        Ok(())
++    }
++}
++
++pub(crate) struct RdJsonReporterVisitor<'a>(pub(crate) &'a mut dyn Console);
++
++impl ReporterVisitor for RdJsonReporterVisitor<'_> {
++    fn report_summary(
++        &mut self,
++        _execution: &Execution,
++        _summary: TraversalSummary,
++        _verbose: bool,
++    ) -> std::io::Result<()> {
++        Ok(())
++    }
++
++    fn report_diagnostics(
++        &mut self,
++        _execution: &Execution,
++        payload: DiagnosticsPayload,
++        verbose: bool,
++        _working_directory: Option<&Utf8Path>,
++    ) -> std::io::Result<()> {
++        let rdjson_diagnostics: Vec<_> = payload
++            .diagnostics
++            .iter()
++            .filter_map(|diagnostic| {
++                if diagnostic.severity() >= payload.diagnostic_level {
++                    if diagnostic.tags().is_verbose() {
++                        if verbose {
++                            diagnostic_to_rdjson(diagnostic)
++                        } else {
++                            None
++                        }
++                    } else {
++                        diagnostic_to_rdjson(diagnostic)
++                    }
++                } else {
++                    None
++                }
++            })
++            .collect();
++
++        let report = RdJsonReport {
++            source: RdJsonSource {
++                name: "Biome",
++                url: "https://biomejs.dev",
++            },
++            diagnostics: rdjson_diagnostics,
++        };
++
++        let result = serde_json::to_string_pretty(&report)?;
++
++        self.0.log(markup! {
++            {result}
++        });
++
++        Ok(())
++    }
++}
++
++fn diagnostic_to_rdjson<'a>(diagnostic: &'a Error) -> Option<RdJsonDiagnostic<'a>> {
++    let message = PrintDescription(diagnostic).to_string();
++    let location = diagnostic.location();
++    let location = to_rdjson_location(&location);
++
++    let suggestions = to_rdjson_suggetions(diagnostic);
++    let category = diagnostic.category()?;
++    let code = RdJsonCode {
++        url: category.link().map(String::from),
++        value: category.name(),
++    };
++
++    Some(RdJsonDiagnostic {
++        code,
++        location,
++        message,
++        suggestions,
++    })
++}
++
++fn to_rdjson_location(location: &Location<'_>) -> Option<RdJsonLocation> {
++    let (Some(span), Some(source_code), Some(resource)) =
++        (location.span, location.source_code, location.resource)
++    else {
++        return None;
++    };
++    let resource = resource.as_file()?;
++    let source = SourceFile::new(source_code);
++    let start = source.location(span.start()).ok()?;
++    let end = source.location(span.end()).ok()?;
++    Some(RdJsonLocation {
++        path: resource.to_string(),
++        range: Some(RdJsonRange {
++            start: RdJsonLineColumn {
++                column: start.column_number.get(),
++                line: start.line_number.get(),
++            },
++            end: RdJsonLineColumn {
++                column: end.column_number.get(),
++                line: end.line_number.get(),
++            },
++        }),
++    })
++}
++
++struct SuggestionsVisitor {
++    suggestions: Vec<RdJsonSuggestion>,
++    current_message: Option<String>,
++    last_diagnostic_length: usize,
++}
++
++impl Visit for SuggestionsVisitor {
++    fn record_log(&mut self, _category: LogCategory, text: &dyn Display) -> std::io::Result<()> {
++        let message = {
++            let mut message = MarkupBuf::default();
++            let mut fmt = Formatter::new(&mut message);
++            fmt.write_markup(markup!({ { text } }))?;
++            markup_to_string(&message).expect("Invalid markup")
++        };
++        let current_diagnostic_length = self.suggestions.len();
++
++        if self.last_diagnostic_length != current_diagnostic_length {
++            let last_suggestion = self
++                .suggestions
++                .last_mut()
++                .expect("No suggestions to append to");
++            last_suggestion.text = message;
++        } else if let Some(current_message) = self.current_message.as_mut() {
++            current_message.push_str(&message);
++        } else {
++            self.current_message = Some(message);
++        }
++
++        Ok(())
++    }
++
++    fn record_frame(&mut self, location: Location<'_>) -> std::io::Result<()> {
++        let range = if let (Some(span), Some(source_code)) = (location.span, location.source_code) {
++            let source = SourceFile::new(source_code);
++            let start = source.location(span.start()).expect("Invalid span");
++            let end = source.location(span.end()).expect("Invalid span");
++
++            RdJsonRange {
++                end: RdJsonLineColumn {
++                    line: end.line_number.get(),
++                    column: end.column_number.get(),
++                },
++                start: RdJsonLineColumn {
++                    line: start.line_number.get(),
++                    column: start.column_number.get(),
++                },
++            }
++        } else {
++            RdJsonRange::default()
++        };
++
++        self.last_diagnostic_length = self.suggestions.len();
++        self.suggestions.push(RdJsonSuggestion {
++            text: self.current_message.take().unwrap_or_default(),
++            range,
++        });
++
++        Ok(())
++    }
++}
++
++fn to_rdjson_suggetions(diagnostic: &Error) -> Vec<RdJsonSuggestion> {
++    let mut visitor = SuggestionsVisitor {
++        suggestions: vec![],
++        last_diagnostic_length: 0,
++        current_message: None,
++    };
++
++    diagnostic.advices(&mut visitor).unwrap();
++
++    visitor.suggestions
++}
++
++#[derive(Serialize)]
++pub struct RdJsonReport<'a> {
++    source: RdJsonSource,
++    diagnostics: Vec<RdJsonDiagnostic<'a>>,
++}
++
++#[derive(Serialize)]
++struct RdJsonSource {
++    name: &'static str,
++    url: &'static str,
++}
++
++#[derive(Serialize)]
++struct RdJsonDiagnostic<'a> {
++    code: RdJsonCode<'a>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    location: Option<RdJsonLocation>,
++    message: String,
++    #[serde(skip_serializing_if = "Vec::is_empty")]
++    suggestions: Vec<RdJsonSuggestion>,
++}
++
++#[derive(Serialize)]
++struct RdJsonCode<'a> {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    url: Option<String>,
++    value: &'a str,
++}
++#[derive(Serialize)]
++struct RdJsonLocation {
++    path: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    range: Option<RdJsonRange>,
++}
++
++#[derive(Default, Serialize)]
++struct RdJsonRange {
++    end: RdJsonLineColumn,
++    start: RdJsonLineColumn,
++}
++
++#[derive(Serialize)]
++pub struct RdJsonSuggestion {
++    range: RdJsonRange,
++    text: String,
++}
++
++#[derive(Default, Serialize)]
++pub struct RdJsonLineColumn {
++    column: usize,
++    line: usize,
++}
+diff --git a/crates/biome_diagnostics/src/display.rs b/crates/biome_diagnostics/src/display.rs
+index c9949cfca2..2114a0d024 100644
+--- a/crates/biome_diagnostics/src/display.rs
++++ b/crates/biome_diagnostics/src/display.rs
+@@ -688,6 +688,15 @@ fn is_terminal_program(name: &str) -> bool {
+     }
+ }
+ 
++/// Prints [MarkupBuf] to a [String]
++pub fn markup_to_string(markup: &MarkupBuf) -> Option<String> {
++    let mut buffer = Vec::new();
++    let mut write = fmt::Termcolor(termcolor::NoColor::new(&mut buffer));
++    let mut fmt = fmt::Formatter::new(&mut write);
++    fmt.write_markup(markup! { {markup} }).ok()?;
++    String::from_utf8(buffer).ok()
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::io;
+diff --git a/crates/biome_diagnostics/src/display_github.rs b/crates/biome_diagnostics/src/display_github.rs
+index 98dfcec8af..d4fc52611a 100644
+--- a/crates/biome_diagnostics/src/display_github.rs
++++ b/crates/biome_diagnostics/src/display_github.rs
+@@ -1,4 +1,5 @@
+ use crate::display::frame::SourceFile;
++use crate::display::markup_to_string;
+ use crate::{Diagnostic, Resource, Severity, diagnostic::internal::AsDiagnostic};
+ use biome_console::{MarkupBuf, fmt, markup};
+ use biome_text_size::{TextRange, TextSize};
+@@ -119,11 +120,3 @@ fn escape_property<S: AsRef<str>>(value: S) -> String {
+     }
+     result
+ }
+-
+-fn markup_to_string(markup: &MarkupBuf) -> Option<String> {
+-    let mut buffer = Vec::new();
+-    let mut write = fmt::Termcolor(termcolor::NoColor::new(&mut buffer));
+-    let mut fmt = fmt::Formatter::new(&mut write);
+-    fmt.write_markup(markup! { {markup} }).ok()?;
+-    String::from_utf8(buffer).ok()
+-}

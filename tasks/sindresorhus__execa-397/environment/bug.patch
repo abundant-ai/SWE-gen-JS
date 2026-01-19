@@ -1,0 +1,189 @@
+diff --git a/index.d.ts b/index.d.ts
+index 76a20bf..83a9953 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -44,7 +44,7 @@ declare namespace execa {
+ 		This can be either an absolute path or a path relative to the `cwd` option.
+ 
+ 		Requires `preferLocal` to be `true`.
+-
++		
+ 		For example, this can be used together with [`get-node`](https://github.com/ehmicky/get-node) to run a specific Node.js version in a child process.
+ 
+ 		@default process.execPath
+@@ -336,21 +336,14 @@ declare namespace execa {
+ 		extends Error,
+ 			ExecaReturnBase<StdoutErrorType> {
+ 		/**
+-		Error message when the child process failed to run. In addition to the underlying error message, it also contains some information related to why the child process errored.
+-
+-		The child process stderr then stdout are appended to the end, separated with newlines and not interleaved.
++		The error message.
+ 		*/
+ 		message: string;
+ 
+ 		/**
+-		This is the same as the `message` property except it does not include the child process stdout/stderr.
+-		*/
+-		shortMessage: string;
+-
+-		/**
+-		Original error message. This is the same as the `message` property except it includes neither the child process stdout/stderr nor some additional information added by Execa.
++		Original error message. This is `undefined` unless the child process exited due to an `error` event or a timeout.
+ 
+-		This is `undefined` unless the child process exited due to an `error` event or a timeout.
++		The `message` property contains both the `originalMessage` and some additional information added by Execa.
+ 		*/
+ 		originalMessage?: string;
+ 	}
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 450cd40..c9845d1 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -40,7 +40,6 @@ try {
+ 	expectType<boolean>(execaError.killed);
+ 	expectType<string | undefined>(execaError.signal);
+ 	expectType<string | undefined>(execaError.signalDescription);
+-	expectType<string>(execaError.shortMessage);
+ 	expectType<string | undefined>(execaError.originalMessage);
+ }
+ 
+@@ -71,7 +70,6 @@ try {
+ 	expectType<boolean>(execaError.killed);
+ 	expectType<string | undefined>(execaError.signal);
+ 	expectType<string | undefined>(execaError.signalDescription);
+-	expectType<string>(execaError.shortMessage);
+ 	expectType<string | undefined>(execaError.originalMessage);
+ }
+ 
+diff --git a/lib/error.js b/lib/error.js
+index ea04b90..808ad43 100644
+--- a/lib/error.js
++++ b/lib/error.js
+@@ -47,18 +47,15 @@ const makeError = ({
+ 	const errorCode = error && error.code;
+ 
+ 	const prefix = getErrorPrefix({timedOut, timeout, errorCode, signal, signalDescription, exitCode, isCanceled});
+-	const execaMessage = `Command ${prefix}: ${command}`;
+-	const shortMessage = error instanceof Error ? `${execaMessage}\n${error.message}` : execaMessage;
+-	const message = [shortMessage, stderr, stdout].filter(Boolean).join('\n');
++	const message = `Command ${prefix}: ${command}`;
+ 
+ 	if (error instanceof Error) {
+ 		error.originalMessage = error.message;
+-		error.message = message;
++		error.message = `${message}\n${error.message}`;
+ 	} else {
+ 		error = new Error(message);
+ 	}
+ 
+-	error.shortMessage = shortMessage;
+ 	error.command = command;
+ 	error.exitCode = exitCode;
+ 	error.signal = signal;
+diff --git a/readme.md b/readme.md
+index 68d5986..0f01d61 100644
+--- a/readme.md
++++ b/readme.md
+@@ -60,13 +60,12 @@ const execa = require('execa');
+ 		/*
+ 		{
+ 			message: 'Command failed with ENOENT: unknown command spawn unknown ENOENT',
+-			errno: -2,
++			errno: 'ENOENT',
+ 			code: 'ENOENT',
+ 			syscall: 'spawn unknown',
+ 			path: 'unknown',
+ 			spawnargs: ['command'],
+ 			originalMessage: 'spawn unknown ENOENT',
+-			shortMessage: 'Command failed with ENOENT: unknown command spawn unknown ENOENT',
+ 			command: 'unknown command',
+ 			stdout: '',
+ 			stderr: '',
+@@ -113,13 +112,12 @@ try {
+ 	/*
+ 	{
+ 		message: 'Command failed with ENOENT: unknown command spawnSync unknown ENOENT',
+-		errno: -2,
++		errno: 'ENOENT',
+ 		code: 'ENOENT',
+ 		syscall: 'spawnSync unknown',
+ 		path: 'unknown',
+ 		spawnargs: ['command'],
+ 		originalMessage: 'spawnSync unknown ENOENT',
+-		shortMessage: 'Command failed with ENOENT: unknown command spawnSync unknown ENOENT',
+ 		command: 'unknown command',
+ 		stdout: '',
+ 		stderr: '',
+@@ -304,27 +302,13 @@ A human-friendly description of the signal that was used to terminate the proces
+ 
+ If a signal terminated the process, this property is defined and included in the error message. Otherwise it is `undefined`. It is also `undefined` when the signal is very uncommon which should seldomly happen.
+ 
+-#### message
+-
+-Type: `string`
+-
+-Error message when the child process failed to run. In addition to the [underlying error message](#originalMessage), it also contains some information related to why the child process errored.
+-
+-The child process [stderr](#stderr) then [stdout](#stdout) are appended to the end, separated with newlines and not interleaved.
+-
+-#### shortMessage
+-
+-Type: `string`
+-
+-This is the same as the [`message` property](#message) except it does not include the child process stdout/stderr.
+-
+ #### originalMessage
+ 
+ Type: `string | undefined`
+ 
+-Original error message. This is the same as the `message` property except it includes neither the child process stdout/stderr nor some additional information added by Execa.
++Original error message. This is `undefined` unless the child process exited due to an `error` event or a timeout.
+ 
+-This is `undefined` unless the child process exited due to an `error` event or a timeout.
++The `message` property contains both the `originalMessage` and some additional information added by Execa.
+ 
+ ### options
+ 
+diff --git a/test/error.js b/test/error.js
+index 386c650..7a79312 100644
+--- a/test/error.js
++++ b/test/error.js
+@@ -51,25 +51,7 @@ test('exitCode is 3', testExitCode, 3);
+ test('exitCode is 4', testExitCode, 4);
+ 
+ test('error.message contains the command', async t => {
+-	await t.throwsAsync(execa('exit', ['2', 'foo', 'bar']), {message: /exit 2 foo bar/});
+-});
+-
+-test('error.message contains stdout/stderr if available', async t => {
+-	const {message} = await t.throwsAsync(execa('echo-fail'));
+-	t.true(message.includes('stderr'));
+-	t.true(message.includes('stdout'));
+-});
+-
+-test('error.message does not contain stdout/stderr if not available', async t => {
+-	const {message} = await t.throwsAsync(execa('echo-fail', {stdio: 'ignore'}));
+-	t.false(message.includes('stderr'));
+-	t.false(message.includes('stdout'));
+-});
+-
+-test('error.shortMessage does not contain stdout/stderr', async t => {
+-	const {shortMessage} = await t.throwsAsync(execa('echo-fail'));
+-	t.false(shortMessage.includes('stderr'));
+-	t.false(shortMessage.includes('stdout'));
++	await t.throwsAsync(execa('exit', ['2', 'foo', 'bar'], {message: /exit 2 foo bar/}));
+ });
+ 
+ test('Original error.message is kept', async t => {
+diff --git a/test/fixtures/echo-fail b/test/fixtures/echo-fail
+deleted file mode 100755
+index 233f1d0..0000000
+--- a/test/fixtures/echo-fail
++++ /dev/null
+@@ -1,5 +0,0 @@
+-#!/usr/bin/env node
+-'use strict';
+-console.log('stdout');
+-console.error('stderr');
+-process.exit(1);

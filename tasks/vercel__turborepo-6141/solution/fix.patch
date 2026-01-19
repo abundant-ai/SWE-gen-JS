@@ -1,0 +1,505 @@
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+index a212bbaa10..1ed474fb26 100644
+--- a/.cargo/config.toml
++++ b/.cargo/config.toml
+@@ -29,4 +29,8 @@ rustflags = [
+   "-Zshare-generics=y",
+   "-Csymbol-mangling-version=v0",
+   "-Aclippy::too_many_arguments",
++  # Clippy's needless mut lint is buggy: https://github.com/rust-lang/rust-clippy/issues/11299
++  "-Aclippy::needless_pass_by_ref_mut",
++  # Clippy's partial_eq lint is buggy: https://github.com/rust-lang/rust-clippy/issues/11178
++  "-Aclippy::non_canonical_partial_ord_impl",
+ ]
+diff --git a/cli/internal/daemonclient/daemonclient.go b/cli/internal/daemonclient/daemonclient.go
+index 262d11e251..23a3fb5348 100644
+--- a/cli/internal/daemonclient/daemonclient.go
++++ b/cli/internal/daemonclient/daemonclient.go
+@@ -5,6 +5,8 @@ package daemonclient
+ import (
+ 	"context"
+ 	"path/filepath"
++	"runtime"
++	"strings"
+ 
+ 	"github.com/vercel/turbo/cli/internal/daemon/connector"
+ 	"github.com/vercel/turbo/cli/internal/fs/hash"
+@@ -32,12 +34,32 @@ func New(client *connector.Client) *DaemonClient {
+ 	}
+ }
+ 
++// formats a repo-relative glob to unix format with ':' characters handled.
++// On windows, ':' is an invalid path character, but you can, and Turborepo does,
++// read to and write from files that contain alternate data streams denoted by ':'.
++// In the case of windows and an alternate data stream, we want change notifications just
++// for the root file. Note that since ':' denotes a data stream for a _file_, it cannot
++// appear in a directory name. Thus, if we find one, we know it's in the filename.
++// See https://learn.microsoft.com/en-us/sysinternals/downloads/streams
++func formatRepoRelativeGlob(input string) string {
++	unixInput := filepath.ToSlash(input)
++	if runtime.GOOS == "windows" {
++		colonIndex := strings.Index(input, ":")
++		if colonIndex > -1 {
++			// we found an alternate data stream
++			unixInput = unixInput[:colonIndex]
++		}
++		return unixInput
++	}
++	return strings.ReplaceAll(unixInput, ":", "\\:")
++}
++
+ // GetChangedOutputs implements runcache.OutputWatcher.GetChangedOutputs
+ func (d *DaemonClient) GetChangedOutputs(ctx context.Context, hash string, repoRelativeOutputGlobs []string) ([]string, int, error) {
+ 	// The daemon expects globs to be unix paths
+ 	var outputGlobs []string
+ 	for _, outputGlob := range repoRelativeOutputGlobs {
+-		outputGlobs = append(outputGlobs, filepath.ToSlash(outputGlob))
++		outputGlobs = append(outputGlobs, formatRepoRelativeGlob(outputGlob))
+ 	}
+ 	resp, err := d.client.GetChangedOutputs(ctx, &turbodprotocol.GetChangedOutputsRequest{
+ 		Hash:        hash,
+@@ -55,10 +77,10 @@ func (d *DaemonClient) NotifyOutputsWritten(ctx context.Context, hash string, re
+ 	var inclusions []string
+ 	var exclusions []string
+ 	for _, inclusion := range repoRelativeOutputGlobs.Inclusions {
+-		inclusions = append(inclusions, filepath.ToSlash(inclusion))
++		inclusions = append(inclusions, formatRepoRelativeGlob(inclusion))
+ 	}
+ 	for _, exclusion := range repoRelativeOutputGlobs.Exclusions {
+-		exclusions = append(exclusions, filepath.ToSlash(exclusion))
++		exclusions = append(exclusions, formatRepoRelativeGlob(exclusion))
+ 	}
+ 	_, err := d.client.NotifyOutputsWritten(ctx, &turbodprotocol.NotifyOutputsWrittenRequest{
+ 		Hash:                 hash,
+diff --git a/cli/internal/runcache/runcache.go b/cli/internal/runcache/runcache.go
+index 2abf4f8af4..9e371cffee 100644
+--- a/cli/internal/runcache/runcache.go
++++ b/cli/internal/runcache/runcache.go
+@@ -123,7 +123,6 @@ func (tc *TaskCache) RestoreOutputs(ctx context.Context, prefixedUI *cli.Prefixe
+ 
+ 	if err != nil {
+ 		progressLogger.Warn(fmt.Sprintf("Failed to check if we can skip restoring outputs for %v: %v. Proceeding to check cache", tc.pt.TaskID, err))
+-		prefixedUI.Warn(ui.Dim(fmt.Sprintf("Failed to check if we can skip restoring outputs for %v: %v. Proceeding to check cache", tc.pt.TaskID, err)))
+ 		changedOutputGlobs = tc.repoRelativeGlobs.Inclusions
+ 	}
+ 
+diff --git a/crates/turbo-tasks-memory/src/aggregation_tree/bottom_tree.rs b/crates/turbo-tasks-memory/src/aggregation_tree/bottom_tree.rs
+index e3e2980992..b5ffdaad80 100644
+--- a/crates/turbo-tasks-memory/src/aggregation_tree/bottom_tree.rs
++++ b/crates/turbo-tasks-memory/src/aggregation_tree/bottom_tree.rs
+@@ -555,7 +555,7 @@ impl<T, I: Clone + Eq + Hash + IsEnabled> BottomTree<T, I> {
+     ) {
+         let mut state = self.state.write();
+         let change = aggregation_context.apply_change(&mut state.data, change);
+-        propagate_change_to_upper(&state, aggregation_context, change);
++        propagate_change_to_upper(&mut state, aggregation_context, change);
+     }
+ 
+     pub fn get_root_info<C: AggregationContext<Info = T, ItemRef = I>>(
+@@ -627,7 +627,7 @@ fn propagate_new_following_to_uppers<C: AggregationContext>(
+ }
+ 
+ fn propagate_change_to_upper<C: AggregationContext>(
+-    state: &RwLockWriteGuard<BottomTreeState<C::Info, C::ItemRef>>,
++    state: &mut RwLockWriteGuard<BottomTreeState<C::Info, C::ItemRef>>,
+     aggregation_context: &C,
+     change: Option<C::ItemChange>,
+ ) {
+@@ -642,7 +642,6 @@ fn propagate_change_to_upper<C: AggregationContext>(
+     }
+ }
+ 
+-#[allow(clippy::disallowed_methods)] // Allow VecDeque::new() in this test
+ #[cfg(test)]
+ fn visit_graph<C: AggregationContext>(
+     aggregation_context: &C,
+@@ -668,7 +667,6 @@ fn visit_graph<C: AggregationContext>(
+     (visited.len(), edges)
+ }
+ 
+-#[allow(clippy::disallowed_methods)] // Allow VecDeque::new() in this test
+ #[cfg(test)]
+ pub fn print_graph<C: AggregationContext>(
+     aggregation_context: &C,
+@@ -698,7 +696,7 @@ pub fn print_graph<C: AggregationContext>(
+     while let Some(item) = queue.pop_front() {
+         let tree = bottom_tree(aggregation_context, &item, height);
+         let name = name_fn(&item);
+-        let label = name.to_string();
++        let label = format!("{}", name);
+         let state = tree.state.read();
+         if color_upper {
+             print!(r#""{} {}" [color=red];"#, height - 1, name);
+diff --git a/crates/turbo-tasks-memory/src/aggregation_tree/top_tree.rs b/crates/turbo-tasks-memory/src/aggregation_tree/top_tree.rs
+index da21c55d4d..e55684c1a3 100644
+--- a/crates/turbo-tasks-memory/src/aggregation_tree/top_tree.rs
++++ b/crates/turbo-tasks-memory/src/aggregation_tree/top_tree.rs
+@@ -111,7 +111,7 @@ impl<T> TopTree<T> {
+     ) {
+         let mut state = self.state.lock();
+         let change = aggregation_context.apply_change(&mut state.data, change);
+-        propagate_change_to_upper(&state, aggregation_context, change);
++        propagate_change_to_upper(&mut state, aggregation_context, change);
+     }
+ 
+     pub fn get_root_info<C: AggregationContext<Info = T>>(
+@@ -147,7 +147,7 @@ impl<T> TopTree<T> {
+ }
+ 
+ fn propagate_change_to_upper<C: AggregationContext>(
+-    state: &MutexGuard<TopTreeState<C::Info>>,
++    state: &mut MutexGuard<TopTreeState<C::Info>>,
+     aggregation_context: &C,
+     change: Option<C::ItemChange>,
+ ) {
+diff --git a/crates/turbo-tasks/src/magic_any.rs b/crates/turbo-tasks/src/magic_any.rs
+index cdc697bfe1..2805511171 100644
+--- a/crates/turbo-tasks/src/magic_any.rs
++++ b/crates/turbo-tasks/src/magic_any.rs
+@@ -90,7 +90,7 @@ impl Eq for dyn MagicAny {}
+ 
+ impl PartialOrd for dyn MagicAny {
+     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+-        Some(self.cmp(other))
++        Some(self.magic_cmp(other))
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks/src/native_function.rs b/crates/turbo-tasks/src/native_function.rs
+index 658b0c8549..c95c8d4a64 100644
+--- a/crates/turbo-tasks/src/native_function.rs
++++ b/crates/turbo-tasks/src/native_function.rs
+@@ -91,7 +91,10 @@ impl Hash for &'static NativeFunction {
+ 
+ impl PartialOrd for &'static NativeFunction {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        Some(self.cmp(other))
++        PartialOrd::partial_cmp(
++            &(*self as *const NativeFunction),
++            &(*other as *const NativeFunction),
++        )
+     }
+ }
+ impl Ord for &'static NativeFunction {
+diff --git a/crates/turbo-tasks/src/task/concrete_task_input.rs b/crates/turbo-tasks/src/task/concrete_task_input.rs
+index e44e4f7ffa..24a10268f0 100644
+--- a/crates/turbo-tasks/src/task/concrete_task_input.rs
++++ b/crates/turbo-tasks/src/task/concrete_task_input.rs
+@@ -47,7 +47,10 @@ impl PartialEq for SharedReference {
+ impl Eq for SharedReference {}
+ impl PartialOrd for SharedReference {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        Some(self.cmp(other))
++        PartialOrd::partial_cmp(
++            &(&*self.1 as *const (dyn Any + Send + Sync)),
++            &(&*other.1 as *const (dyn Any + Send + Sync)),
++        )
+     }
+ }
+ impl Ord for SharedReference {
+diff --git a/crates/turbo-tasks/src/trait_ref.rs b/crates/turbo-tasks/src/trait_ref.rs
+index 27e3207531..db254e793c 100644
+--- a/crates/turbo-tasks/src/trait_ref.rs
++++ b/crates/turbo-tasks/src/trait_ref.rs
+@@ -49,7 +49,7 @@ impl<T> Eq for TraitRef<T> {}
+ 
+ impl<T> PartialOrd for TraitRef<T> {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        Some(self.cmp(other))
++        self.shared_reference.partial_cmp(&other.shared_reference)
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks/src/value.rs b/crates/turbo-tasks/src/value.rs
+index 639fbc2d18..4e2ff1b0c0 100644
+--- a/crates/turbo-tasks/src/value.rs
++++ b/crates/turbo-tasks/src/value.rs
+@@ -100,7 +100,7 @@ impl<T> std::hash::Hash for TransientInstance<T> {
+ 
+ impl<T> PartialOrd for TransientInstance<T> {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        Some(self.cmp(other))
++        self.inner.partial_cmp(&other.inner)
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks/src/value_type.rs b/crates/turbo-tasks/src/value_type.rs
+index 1a637f935d..d4f37d1568 100644
+--- a/crates/turbo-tasks/src/value_type.rs
++++ b/crates/turbo-tasks/src/value_type.rs
+@@ -58,7 +58,7 @@ impl PartialEq for ValueType {
+ 
+ impl PartialOrd for ValueType {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        Some(self.cmp(other))
++        (self as *const ValueType).partial_cmp(&(other as *const ValueType))
+     }
+ }
+ impl Ord for ValueType {
+@@ -225,7 +225,7 @@ impl PartialEq for TraitType {
+ 
+ impl PartialOrd for TraitType {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        Some(self.cmp(other))
++        (self as *const TraitType).partial_cmp(&(other as *const TraitType))
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks/src/vc/mod.rs b/crates/turbo-tasks/src/vc/mod.rs
+index 7039e89277..e388c32254 100644
+--- a/crates/turbo-tasks/src/vc/mod.rs
++++ b/crates/turbo-tasks/src/vc/mod.rs
+@@ -230,7 +230,7 @@ where
+     T: ?Sized + Send,
+ {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        Some(self.cmp(other))
++        self.node.partial_cmp(&other.node)
+     }
+ }
+ 
+diff --git a/crates/turbopack-core/src/chunk/containment_tree.rs b/crates/turbopack-core/src/chunk/containment_tree.rs
+index 33eafdc50f..5949be7f22 100644
+--- a/crates/turbopack-core/src/chunk/containment_tree.rs
++++ b/crates/turbopack-core/src/chunk/containment_tree.rs
+@@ -47,7 +47,7 @@ where
+ 
+         let orphan_values = Self::add_values_to_tree(&mut trees, values);
+ 
+-        let roots = Self::treeify(relationships, &trees);
++        let roots = Self::treeify(relationships, &mut trees);
+ 
+         // optimize tree by removing unnecessary nodes
+         Self::skip_unnecessary_nodes(&mut trees);
+@@ -146,7 +146,7 @@ where
+     /// Nest each tree by relationship, compute the roots
+     fn treeify(
+         relationships: Vec<(Option<K>, K)>,
+-        trees: &IndexMap<K, Rc<RefCell<Node<K, V>>>>,
++        trees: &mut IndexMap<K, Rc<RefCell<Node<K, V>>>>,
+     ) -> Vec<Rc<RefCell<Node<K, V>>>> {
+         relationships
+             .into_iter()
+diff --git a/crates/turbopack-dev/src/ecmascript/optimize.rs b/crates/turbopack-dev/src/ecmascript/optimize.rs
+index a47ce8eb4d..060a5a5fcf 100644
+--- a/crates/turbopack-dev/src/ecmascript/optimize.rs
++++ b/crates/turbopack-dev/src/ecmascript/optimize.rs
+@@ -139,12 +139,12 @@ async fn merge_duplicated_and_contained(
+ 
+     impl PartialOrd for FloatOrd {
+         fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+-            Some(self.cmp(other))
++            self.0.partial_cmp(&other.0)
+         }
+     }
+     impl Ord for FloatOrd {
+         fn cmp(&self, other: &Self) -> Ordering {
+-            self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
++            self.partial_cmp(other).unwrap_or(Ordering::Equal)
+         }
+     }
+ 
+diff --git a/crates/turbopack-ecmascript/src/analyzer/graph.rs b/crates/turbopack-ecmascript/src/analyzer/graph.rs
+index 2dafc012eb..4e823d756c 100644
+--- a/crates/turbopack-ecmascript/src/analyzer/graph.rs
++++ b/crates/turbopack-ecmascript/src/analyzer/graph.rs
+@@ -1644,7 +1644,7 @@ impl<'a> Analyzer<'a> {
+     fn add_conditional_effect(
+         &mut self,
+         test: &Expr,
+-        ast_path: &AstNodePath<AstParentNodeRef<'_>>,
++        ast_path: &mut AstNodePath<AstParentNodeRef<'_>>,
+         ast_kind: AstParentKind,
+         span: Span,
+         mut cond_kind: ConditionalKind,
+diff --git a/crates/turbopack-ecmascript/src/analyzer/mod.rs b/crates/turbopack-ecmascript/src/analyzer/mod.rs
+index e492a8b6c4..9def37b299 100644
+--- a/crates/turbopack-ecmascript/src/analyzer/mod.rs
++++ b/crates/turbopack-ecmascript/src/analyzer/mod.rs
+@@ -1370,10 +1370,6 @@ impl JsValue {
+                         "process",
+                         "The Node.js process module: https://nodejs.org/api/process.html",
+                     ),
+-                    WellKnownObjectKind::NodeProcessArgv => (
+-                        "process.argv",
+-                        "The Node.js process.argv property: https://nodejs.org/api/process.html#processargv",
+-                    ),
+                     WellKnownObjectKind::NodeProcessEnv => (
+                         "process.env",
+                         "The Node.js process.env property: https://nodejs.org/api/process.html#processenv",
+@@ -2964,7 +2960,6 @@ pub enum WellKnownObjectKind {
+     OsModule,
+     OsModuleDefault,
+     NodeProcess,
+-    NodeProcessArgv,
+     NodeProcessEnv,
+     NodePreGyp,
+     NodeExpressApp,
+@@ -2983,7 +2978,6 @@ impl WellKnownObjectKind {
+             Self::ChildProcess => Some(&["child_process"]),
+             Self::OsModule => Some(&["os"]),
+             Self::NodeProcess => Some(&["process"]),
+-            Self::NodeProcessArgv => Some(&["process", "argv"]),
+             Self::NodeProcessEnv => Some(&["process", "env"]),
+             Self::NodeBuffer => Some(&["Buffer"]),
+             Self::RequireCache => Some(&["require", "cache"]),
+diff --git a/crates/turbopack-ecmascript/src/analyzer/well_known.rs b/crates/turbopack-ecmascript/src/analyzer/well_known.rs
+index c3dce752cb..4e3e208064 100644
+--- a/crates/turbopack-ecmascript/src/analyzer/well_known.rs
++++ b/crates/turbopack-ecmascript/src/analyzer/well_known.rs
+@@ -666,7 +666,6 @@ pub fn child_process_module_member(kind: WellKnownObjectKind, prop: JsValue) ->
+         (WellKnownObjectKind::ChildProcess, Some("default")) => {
+             JsValue::WellKnownObject(WellKnownObjectKind::ChildProcessDefault)
+         }
+-
+         _ => JsValue::unknown(
+             JsValue::member(
+                 Box::new(JsValue::WellKnownObject(WellKnownObjectKind::ChildProcess)),
+@@ -715,7 +714,6 @@ async fn node_process_member(
+             .as_str()
+             .into(),
+         Some("cwd") => JsValue::WellKnownFunction(WellKnownFunctionKind::ProcessCwd),
+-        Some("argv") => JsValue::WellKnownObject(WellKnownObjectKind::NodeProcessArgv),
+         Some("env") => JsValue::WellKnownObject(WellKnownObjectKind::NodeProcessEnv),
+         _ => JsValue::unknown(
+             JsValue::member(
+diff --git a/crates/turbopack-ecmascript/src/references/mod.rs b/crates/turbopack-ecmascript/src/references/mod.rs
+index cea4ff1a76..d919380fdb 100644
+--- a/crates/turbopack-ecmascript/src/references/mod.rs
++++ b/crates/turbopack-ecmascript/src/references/mod.rs
+@@ -27,7 +27,6 @@ use constant_condition::{ConstantCondition, ConstantConditionValue};
+ use constant_value::ConstantValue;
+ use indexmap::IndexSet;
+ use lazy_static::lazy_static;
+-use num_traits::Zero;
+ use parking_lot::Mutex;
+ use regex::Regex;
+ use swc_core::{
+@@ -89,8 +88,7 @@ use super::{
+         graph::{create_graph, Effect},
+         linker::link,
+         well_known::replace_well_known,
+-        ConstantValue as JsConstantValue, JsValue, ObjectPart, WellKnownFunctionKind,
+-        WellKnownObjectKind,
++        JsValue, ObjectPart, WellKnownFunctionKind, WellKnownObjectKind,
+     },
+     errors,
+     parse::{parse, ParseResult},
+@@ -110,7 +108,7 @@ use crate::{
+         imports::{ImportedSymbol, Reexport},
+         parse_require_context,
+         top_level_await::has_top_level_await,
+-        ConstantNumber, ConstantString, ModuleValue, RequireContextValue,
++        ModuleValue, RequireContextValue,
+     },
+     chunk::EcmascriptExports,
+     code_gen::{
+@@ -1325,12 +1323,6 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
+         }
+         JsValue::WellKnownFunction(WellKnownFunctionKind::ChildProcessSpawnMethod(name)) => {
+             let args = linked_args(args).await?;
+-
+-            // Is this specifically `spawn(process.argv[0], ['-e', ...])`?
+-            if is_invoking_node_process_eval(&args) {
+-                return Ok(());
+-            }
+-
+             if !args.is_empty() {
+                 let mut show_dynamic_warning = false;
+                 let pat = js_value_to_pattern(&args[0]);
+@@ -2723,49 +2715,3 @@ fn detect_dynamic_export(p: &Program) -> DetectedDynamicExportType {
+         DetectedDynamicExportType::None
+     }
+ }
+-
+-/// Detects whether a list of arguments is specifically
+-/// `(process.argv[0], ['-e', ...])`. This is useful for detecting if a node
+-/// process is being spawned to interpret a string of JavaScript code, and does
+-/// not require static analysis.
+-fn is_invoking_node_process_eval(args: &[JsValue]) -> bool {
+-    if args.len() < 2 {
+-        return false;
+-    }
+-
+-    if let JsValue::Member(_, obj, constant) = &args[0] {
+-        // Is the first argument to spawn `process.argv[]`?
+-        if let (
+-            box JsValue::WellKnownObject(WellKnownObjectKind::NodeProcessArgv),
+-            box JsValue::Constant(JsConstantValue::Num(ConstantNumber(num))),
+-        ) = (obj, constant)
+-        {
+-            // Is it specifically `process.argv[0]`?
+-            if num.is_zero() {
+-                if let JsValue::Array {
+-                    total_nodes: _,
+-                    items,
+-                    mutable: _,
+-                } = &args[1]
+-                {
+-                    // Is `-e` one of the arguments passed to the program?
+-                    if items.iter().any(|e| {
+-                        if let JsValue::Constant(JsConstantValue::Str(ConstantString::Word(arg))) =
+-                            e
+-                        {
+-                            arg == "-e"
+-                        } else {
+-                            false
+-                        }
+-                    }) {
+-                        // If so, this is likely spawning node to evaluate a string, and
+-                        // does not need to be statically analyzed.
+-                        return true;
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-    false
+-}
+diff --git a/crates/turborepo-filewatch/src/globwatcher.rs b/crates/turborepo-filewatch/src/globwatcher.rs
+index 2a64ae924b..fb05222813 100644
+--- a/crates/turborepo-filewatch/src/globwatcher.rs
++++ b/crates/turborepo-filewatch/src/globwatcher.rs
+@@ -593,7 +593,12 @@ mod test {
+ 
+         let glob_watcher = GlobWatcher::new(&repo_root, cookie_jar, watcher.subscribe());
+ 
++        // On windows, we expect different sanitization before the
++        // globs are passed in, due to alternative data streams in files.
++        #[cfg(windows)]
+         let raw_includes = &["my-pkg/.next/next-file"];
++        #[cfg(not(windows))]
++        let raw_includes = &["my-pkg/.next/next-file\\:build"];
+         let raw_excludes: [&str; 0] = [];
+         let globs = GlobSet {
+             include: make_includes(raw_includes),
+@@ -618,10 +623,8 @@ mod test {
+         assert!(results.is_empty());
+ 
+         // Change the watched file
+-        repo_root
+-            .join_components(&["my-pkg", ".next", "next-file"])
+-            .create_with_contents("hello")
+-            .unwrap();
++        let watched_file = repo_root.join_components(&["my-pkg", ".next", "next-file:build"]);
++        watched_file.create_with_contents("hello").unwrap();
+         let results = glob_watcher
+             .get_changed_globs(hash.clone(), candidates.clone())
+             .await
+diff --git a/go.work b/go.work
+deleted file mode 100644
+index b2b0306060..0000000000
+--- a/go.work
++++ /dev/null
+@@ -1,3 +0,0 @@
+-go 1.20
+-
+-use ./cli
+diff --git a/rust-toolchain b/rust-toolchain
+index 38686d9d69..fe109472d2 100644
+--- a/rust-toolchain
++++ b/rust-toolchain
+@@ -1 +1 @@
+-nightly-2023-10-06
++nightly-2023-09-21

@@ -1,0 +1,457 @@
+diff --git a/.changeset/wicked-ties-warn.md b/.changeset/wicked-ties-warn.md
+new file mode 100644
+index 000000000..832322849
+--- /dev/null
++++ b/.changeset/wicked-ties-warn.md
+@@ -0,0 +1,5 @@
++---
++'@keystone-6/core': minor
++---
++
++The return types of `context.query` methods are now types based on the GraphQL return types rather than being `Record<string, any>`. Note all fields are optional because the types do not know what fields were selected in the `query` field.
+diff --git a/examples-staging/basic/schema.ts b/examples-staging/basic/schema.ts
+index 377f7d95c..9d8716118 100644
+--- a/examples-staging/basic/schema.ts
++++ b/examples-staging/basic/schema.ts
+@@ -217,7 +217,7 @@ export const extendGraphqlSchema = graphQLSchemaExtension<Keystone.Context>({
+     Mutation: {
+       createRandomPosts(root, args, context) {
+         const data = Array.from({ length: 238 }).map((x, i) => ({ title: `Post ${i}` }));
+-        return context.query.Post.createMany({ data });
++        return context.db.Post.createMany({ data });
+       },
+     },
+     Query: {
+diff --git a/examples/extend-graphql-schema/README.md b/examples/extend-graphql-schema/README.md
+index 6efdb0cd0..3afc6f340 100644
+--- a/examples/extend-graphql-schema/README.md
++++ b/examples/extend-graphql-schema/README.md
+@@ -79,6 +79,8 @@ We add a custom query to our schema using `type Query` in the `typeDefs`, and de
+ 
+ We add a custom type to our schema using `type Statisics` in the `typeDefs`, and defining `resolvers.Statisics`.
+ 
++Note that we're not doing any actual fetching inside `Query.stats`, we're doing all the fetching inside the fields of `Statistics` because inside of `Query.stats` we don't know what fields the user has requested. By fetching the data inside the individual field resolvers, we'll only fetch the data when the user has actually requested it.
++
+ ```typescript
+   extendGraphqlSchema: graphQLSchemaExtension({
+     typeDefs: `
+@@ -96,24 +98,35 @@ We add a custom type to our schema using `type Statisics` in the `typeDefs`, and
+       }`,
+     resolvers: {
+       Query: {
+-        stats: async (root, { id }, context) => {
+-          const draft = await context.query.Post.count({
+-            where: { author: { id }, status: 'draft' },
++        stats: async (root, { id }) => {
++          return { authorId: id };
++        },
++      },
++      Statistics: {
++        // The stats resolver returns an object which is passed to this resolver as
++        // the root value. We use that object to further resolve ths specific fields.
++        // In this case we want to take root.authorId and get the latest post for that author
++        //
++        // As above we use the context.db.Post API to achieve this.
++        latest: async (val, args, context) => {
++          const [post] = await context.db.Post.findMany({
++            take: 1,
++            orderBy: { publishDate: 'desc' },
++            where: { author: { id: { equals: val.authorId } } },
+           });
+-          const published = await context.query.Post.count({
+-            where: { author: { id }, status: 'published' },
++          return post;
++        },
++        draft: (val, args, context) => {
++          return context.query.Post.count({
++            where: { author: { id: { equals: val.authorId } }, status: { equals: 'draft' } },
+           });
+-          const { posts } = await context.query.Author.findOne({
+-            where: { id },
+-            query: 'posts(take: 1, orderBy: { publishDate: desc }) { id }',
++        },
++        published: (val, args, context) => {
++          return context.query.Post.count({
++            where: { author: { id: { equals: val.authorId } }, status: { equals: 'published' } },
+           });
+-          return { draft, published, latestPostId: posts ? posts[0].id : null };
+         },
+       },
+-      Statistics: {
+-        latest: (root, args, context) =>
+-          context.db.Post.findOne({ where: { id: root.latestPostId } }),
+-      },
+     },
+   }),
+ ```
+diff --git a/examples/extend-graphql-schema/custom-schema.ts b/examples/extend-graphql-schema/custom-schema.ts
+index d65950ac8..4a4dd6898 100644
+--- a/examples/extend-graphql-schema/custom-schema.ts
++++ b/examples/extend-graphql-schema/custom-schema.ts
+@@ -1,6 +1,7 @@
+ import { graphQLSchemaExtension } from '@keystone-6/core';
++import { Context } from '.keystone/types';
+ 
+-export const extendGraphqlSchema = graphQLSchemaExtension({
++export const extendGraphqlSchema = graphQLSchemaExtension<Context>({
+   typeDefs: `
+     type Mutation {
+       """ Publish a post """
+@@ -50,30 +51,34 @@ export const extendGraphqlSchema = graphQLSchemaExtension({
+           where: { author: { id: { equals: id } }, publishDate: { gt: cutoff } },
+         });
+       },
+-      stats: async (root, { id }, context) => {
+-        const draft = await context.query.Post.count({
+-          where: { author: { id: { equals: id } }, status: { equals: 'draft' } },
+-        });
+-        const published = await context.query.Post.count({
+-          where: { author: { id: { equals: id } }, status: { equals: 'published' } },
+-        });
+-        const { posts } = await context.query.Author.findOne({
+-          where: { id },
+-          query: 'posts(take: 1, orderBy: { publishDate: desc }) { id }',
+-        });
+-        return { draft, published, latestPostId: posts ? posts[0].id : null };
++      stats: async (root, { id }) => {
++        return { authorId: id };
+       },
+     },
+     Statistics: {
+       // The stats resolver returns an object which is passed to this resolver as
+       // the root value. We use that object to further resolve ths specific fields.
+-      // In this case we want to take root.latestPostId and resolve it as a Post object
++      // In this case we want to take root.authorId and get the latest post for that author
+       //
+       // As above we use the context.db.Post API to achieve this.
+-      latest: (root, args, context) =>
+-        context.db.Post.findOne({ where: { id: root.latestPostId } }),
+-      // We don't need to define resolvers for draft and published, as apollo will
+-      // return root.draft and root.published respectively.
++      latest: async (val, args, context) => {
++        const [post] = await context.db.Post.findMany({
++          take: 1,
++          orderBy: { publishDate: 'desc' },
++          where: { author: { id: { equals: val.authorId } } },
++        });
++        return post;
++      },
++      draft: (val, args, context) => {
++        return context.query.Post.count({
++          where: { author: { id: { equals: val.authorId } }, status: { equals: 'draft' } },
++        });
++      },
++      published: (val, args, context) => {
++        return context.query.Post.count({
++          where: { author: { id: { equals: val.authorId } }, status: { equals: 'published' } },
++        });
++      },
+     },
+   },
+ });
+diff --git a/packages/core/src/lib/schema-type-printer.tsx b/packages/core/src/lib/schema-type-printer.tsx
+index 9f48a5c0e..c53c76013 100644
+--- a/packages/core/src/lib/schema-type-printer.tsx
++++ b/packages/core/src/lib/schema-type-printer.tsx
+@@ -8,59 +8,111 @@ import {
+   GraphQLList,
+   GraphQLInputObjectType,
+   introspectionTypes,
++  GraphQLAbstractType,
++  GraphQLObjectType,
++  GraphQLUnionType,
++  GraphQLInterfaceType,
+ } from 'graphql';
+ import { getGqlNames } from '../types';
+ import { InitialisedList } from './core/types-for-lists';
+ 
+ const introspectionTypesSet = new Set(introspectionTypes);
+ 
+-let printEnumTypeDefinition = (type: GraphQLEnumType) => {
++function printEnumTypeDefinition(type: GraphQLEnumType) {
+   return `export type ${type.name} =\n${type
+     .getValues()
+     .map(x => `  | ${JSON.stringify(x.name)}`)
+     .join('\n')};`;
+-};
++}
+ 
+-function printInputTypesFromSchema(schema: GraphQLSchema, scalars: Record<string, string>) {
+-  let printTypeReferenceWithoutNullable = (
+-    type: GraphQLNamedType | GraphQLList<GraphQLType>
+-  ): string => {
+-    if (type instanceof GraphQLList) {
+-      return `ReadonlyArray<${printTypeReference(type.ofType)}> | ${printTypeReference(
+-        type.ofType
+-      )}`;
+-    }
+-    let name = type.name;
+-    if (type instanceof GraphQLScalarType) {
+-      if (scalars[name] === undefined) {
+-        return 'any';
+-      }
+-      return `Scalars[${JSON.stringify(name)}]`;
+-    }
+-    return name;
+-  };
+-  let printTypeReference = (type: GraphQLType): string => {
+-    if (type instanceof GraphQLNonNull) {
+-      return printTypeReferenceWithoutNullable(type.ofType);
+-    }
+-    return `${printTypeReferenceWithoutNullable(type)} | null`;
+-  };
+-  let printInputObjectTypeDefinition = (type: GraphQLInputObjectType) => {
+-    let str = `export type ${type.name} = {\n`;
+-    for (const field of Object.values(type.getFields())) {
+-      str += `  readonly ${field.name}${
+-        field.type instanceof GraphQLNonNull && field.defaultValue === undefined ? '' : '?'
+-      }: ${printTypeReference(field.type)};\n`;
+-    }
++function printNamedTypeReference(type: GraphQLNamedType): string {
++  let name = type.name;
++  if (type instanceof GraphQLScalarType) {
++    return `Scalars[${JSON.stringify(name)}]`;
++  }
++  return name;
++}
+ 
+-    str += '};';
+-    return str;
+-  };
+-  let typeString = 'type Scalars = {\n';
+-  for (let scalar in scalars) {
+-    typeString += `  readonly ${scalar}: ${scalars[scalar]};\n`;
++function printInputTypeReferenceWithoutNullable(
++  type: GraphQLNamedType | GraphQLList<GraphQLType>
++): string {
++  if (type instanceof GraphQLList) {
++    return `ReadonlyArray<${printInputTypeReference(type.ofType)}> | ${printInputTypeReference(
++      type.ofType
++    )}`;
+   }
+-  typeString += '};';
++  return printNamedTypeReference(type);
++}
++
++function printInputTypeReference(type: GraphQLType): string {
++  if (type instanceof GraphQLNonNull) {
++    return printInputTypeReferenceWithoutNullable(type.ofType);
++  }
++  return `${printInputTypeReferenceWithoutNullable(type)} | null`;
++}
++
++function printInputObjectTypeDefinition(type: GraphQLInputObjectType) {
++  let str = `export type ${type.name} = {\n`;
++  for (const field of Object.values(type.getFields())) {
++    str += `  readonly ${field.name}${
++      field.type instanceof GraphQLNonNull && field.defaultValue === undefined ? '' : '?'
++    }: ${printInputTypeReference(field.type)};\n`;
++  }
++  str += '};';
++  return str;
++}
++
++function printOutputTypeReferenceWithoutNullable(
++  type: GraphQLNamedType | GraphQLList<GraphQLType>
++): string {
++  if (type instanceof GraphQLList) {
++    return `ReadonlyArray<${printOutputTypeReference(type.ofType)}>`;
++  }
++  return printNamedTypeReference(type);
++}
++
++function printOutputTypeReference(type: GraphQLType): string {
++  if (type instanceof GraphQLNonNull) {
++    return printOutputTypeReferenceWithoutNullable(type.ofType);
++  }
++  return `${printOutputTypeReferenceWithoutNullable(type)} | null`;
++}
++
++function printOutputObjectType(type: GraphQLObjectType) {
++  let str = `export type ${type.name} = {\n  readonly __typename?: ${JSON.stringify(type.name)};\n`;
++  for (const field of Object.values(type.getFields())) {
++    str += `  readonly ${field.name}?: ${printOutputTypeReference(field.type)};\n`;
++  }
++  str += '};';
++  return str;
++}
++
++function printAbstractType(schema: GraphQLSchema, type: GraphQLAbstractType) {
++  return `export type ${type.name} = ${schema
++    .getPossibleTypes(type)
++    .map(x => x.name)
++    .join(' | ')};`;
++}
++
++function printOutputTypesFromSchema(schema: GraphQLSchema) {
++  let typeString = '';
++  for (const type of Object.values(schema.getTypeMap())) {
++    // We don't want to print TS types for the built-in GraphQL introspection types
++    // they won't be used for anything we want to print here.
++    if (introspectionTypesSet.has(type)) continue;
++    if (type instanceof GraphQLObjectType) {
++      typeString += '\n\n' + printOutputObjectType(type);
++    } else if (type instanceof GraphQLEnumType) {
++      typeString += '\n\n' + printEnumTypeDefinition(type);
++    } else if (type instanceof GraphQLUnionType || type instanceof GraphQLInterfaceType) {
++      typeString += '\n\n' + printAbstractType(schema, type);
++    }
++  }
++  return typeString;
++}
++
++function printInputTypesFromSchema(schema: GraphQLSchema) {
++  let typeString = '';
+   for (const type of Object.values(schema.getTypeMap())) {
+     // We don't want to print TS types for the built-in GraphQL introspection types
+     // they won't be used for anything we want to print here.
+@@ -75,21 +127,48 @@ function printInputTypesFromSchema(schema: GraphQLSchema, scalars: Record<string
+   return typeString + '\n\n';
+ }
+ 
++function printScalarTypes(scalars: Record<string, string>) {
++  // if a user uses their own scalar type, it'll be `unknown`
++  let types = `export type Scalars = {\n  readonly [key: string]: unknown;`;
++  for (const [name, type] of Object.entries(scalars)) {
++    types += `\n  readonly ${name}: ${type};`;
++  }
++  return types + '\n};';
++}
++
++const commonScalarTypes = {
++  ID: 'string',
++  Boolean: 'boolean',
++  String: 'string',
++  Int: 'number',
++  Float: 'number',
++  JSON: 'import("@keystone-6/core/types").JSONValue',
++};
++
++const inputScalarTypes = printScalarTypes({
++  ...commonScalarTypes,
++  Decimal: 'import("@keystone-6/core/types").Decimal | string',
++  DateTime: 'Date | string',
++});
++
++const externalOutputScalarTypes = printScalarTypes({
++  ...commonScalarTypes,
++  Decimal: 'string',
++  DateTime: 'string',
++});
++
+ export function printGeneratedTypes(
+   graphQLSchema: GraphQLSchema,
+   lists: Record<string, InitialisedList>
+ ) {
+-  let scalars = {
+-    ID: 'string',
+-    Boolean: 'boolean',
+-    String: 'string',
+-    Int: 'number',
+-    Float: 'number',
+-    JSON: 'import("@keystone-6/core/types").JSONValue',
+-    Decimal: 'import("@keystone-6/core/types").Decimal | string',
+-  };
+-
+-  const printedTypes = printInputTypesFromSchema(graphQLSchema, scalars);
++  const printedInputTypes = inputScalarTypes + printInputTypesFromSchema(graphQLSchema);
++  const printedOutputTypes =
++    'export declare namespace OutputTypes {\n' +
++    (externalOutputScalarTypes + printOutputTypesFromSchema(graphQLSchema))
++      .split('\n')
++      .map(x => (x.length ? '  ' + x : ''))
++      .join('\n') +
++    '\n}';
+ 
+   let allListsStr = '';
+   let listsNamespaceStr = '\nexport declare namespace Lists {';
+@@ -110,6 +189,9 @@ export function printGeneratedTypes(
+         .map(x => JSON.stringify(x))
+         .join(' | ')}
+       item: Item;
++      outputs: {
++        item: OutputTypes.${listKey};
++      };
+       inputs: {
+         where: ${gqlNames.whereInputName};
+         uniqueWhere: ${gqlNames.whereUniqueInputName};
+@@ -141,5 +223,5 @@ export type Lists = {
+   [Key in keyof TypeInfo['lists']]?: import('@keystone-6/core').ListConfig<TypeInfo['lists'][Key], any>
+ } & Record<string, import('@keystone-6/core').ListConfig<any, any>>;
+ `;
+-  return printedTypes + listsNamespaceStr + postlude;
++  return printedInputTypes + printedOutputTypes + listsNamespaceStr + postlude;
+ }
+diff --git a/packages/core/src/types/context.ts b/packages/core/src/types/context.ts
+index 078a37e26..fff4191a1 100644
+--- a/packages/core/src/types/context.ts
++++ b/packages/core/src/types/context.ts
+@@ -44,12 +44,12 @@ export type KeystoneListsAPI<KeystoneListsTypeInfo extends Record<string, BaseLi
+           | KeystoneListsTypeInfo[Key]['inputs']['orderBy']
+           | readonly KeystoneListsTypeInfo[Key]['inputs']['orderBy'][];
+       } & ResolveFields
+-    ): Promise<readonly Record<string, any>[]>;
++    ): Promise<readonly KeystoneListsTypeInfo[Key]['outputs']['item'][]>;
+     findOne(
+       args: {
+         readonly where: KeystoneListsTypeInfo[Key]['inputs']['uniqueWhere'];
+       } & ResolveFields
+-    ): Promise<Record<string, any>>;
++    ): Promise<KeystoneListsTypeInfo[Key]['outputs']['item']>;
+     count(args?: {
+       readonly where?: KeystoneListsTypeInfo[Key]['inputs']['where'];
+     }): Promise<number>;
+@@ -58,7 +58,7 @@ export type KeystoneListsAPI<KeystoneListsTypeInfo extends Record<string, BaseLi
+         readonly where: KeystoneListsTypeInfo[Key]['inputs']['uniqueWhere'];
+         readonly data: KeystoneListsTypeInfo[Key]['inputs']['update'];
+       } & ResolveFields
+-    ): Promise<Record<string, any>>;
++    ): Promise<KeystoneListsTypeInfo[Key]['outputs']['item']>;
+     updateMany(
+       args: {
+         readonly data: readonly {
+@@ -66,25 +66,25 @@ export type KeystoneListsAPI<KeystoneListsTypeInfo extends Record<string, BaseLi
+           readonly data: KeystoneListsTypeInfo[Key]['inputs']['update'];
+         }[];
+       } & ResolveFields
+-    ): Promise<Record<string, any>[]>;
++    ): Promise<KeystoneListsTypeInfo[Key]['outputs']['item'][]>;
+     createOne(
+       args: { readonly data: KeystoneListsTypeInfo[Key]['inputs']['create'] } & ResolveFields
+-    ): Promise<Record<string, any>>;
++    ): Promise<KeystoneListsTypeInfo[Key]['outputs']['item']>;
+     createMany(
+       args: {
+         readonly data: readonly KeystoneListsTypeInfo[Key]['inputs']['create'][];
+       } & ResolveFields
+-    ): Promise<Record<string, any>[]>;
++    ): Promise<KeystoneListsTypeInfo[Key]['outputs']['item'][]>;
+     deleteOne(
+       args: {
+         readonly where: KeystoneListsTypeInfo[Key]['inputs']['uniqueWhere'];
+       } & ResolveFields
+-    ): Promise<Record<string, any> | null>;
++    ): Promise<KeystoneListsTypeInfo[Key]['outputs']['item']>;
+     deleteMany(
+       args: {
+         readonly where: readonly KeystoneListsTypeInfo[Key]['inputs']['uniqueWhere'][];
+       } & ResolveFields
+-    ): Promise<Record<string, any>[]>;
++    ): Promise<KeystoneListsTypeInfo[Key]['outputs']['item'][]>;
+   };
+ };
+ 
+diff --git a/packages/core/src/types/type-info.ts b/packages/core/src/types/type-info.ts
+index 460acb8e4..08bcddd24 100644
+--- a/packages/core/src/types/type-info.ts
++++ b/packages/core/src/types/type-info.ts
+@@ -7,6 +7,9 @@ export type BaseListTypeInfo = {
+   key: string;
+   fields: string;
+   item: BaseItem;
++  outputs: {
++    item: Record<string, any>;
++  };
+   inputs: {
+     create: GraphQLInput;
+     update: GraphQLInput;

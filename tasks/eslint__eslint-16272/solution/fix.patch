@@ -1,0 +1,165 @@
+diff --git a/Makefile.js b/Makefile.js
+index 1f3536873..25e6345cb 100644
+--- a/Makefile.js
++++ b/Makefile.js
+@@ -287,6 +287,13 @@ function generateRelease() {
+     generateBlogPost(releaseInfo);
+     commitSiteToGit(`v${releaseInfo.version}`);
+ 
++    echo("Updating version in docs package");
++    const docsPackagePath = path.join(__dirname, "docs", "package.json");
++    const docsPackage = require(docsPackagePath);
++
++    docsPackage.version = releaseInfo.version;
++    fs.writeFileSync(docsPackagePath, `${JSON.stringify(docsPackage, null, 4)}\n`);
++
+     echo("Updating commit with docs data");
+     exec("git add docs/ && git commit --amend --no-edit");
+     exec(`git tag -a -f v${releaseInfo.version} -m ${releaseInfo.version}`);
+@@ -538,7 +545,7 @@ target.lintDocsJS = function([fix = false] = []) {
+     let errors = 0;
+ 
+     echo("Validating JavaScript files in the docs directory");
+-    const lastReturn = exec(`${ESLINT}${fix ? "--fix" : ""} docs`);
++    const lastReturn = exec(`${ESLINT}${fix ? "--fix" : ""} docs/.eleventy.js`);
+ 
+     if (lastReturn.code !== 0) {
+         errors++;
+diff --git a/docs/package.json b/docs/package.json
+index 558d41f97..6137ce86a 100644
+--- a/docs/package.json
++++ b/docs/package.json
+@@ -1,7 +1,7 @@
+ {
+     "name": "docs-eslint",
+     "private": true,
+-    "version": "1.0.0",
++    "version": "8.23.0",
+     "description": "",
+     "main": "index.js",
+     "keywords": [],
+diff --git a/docs/src/_data/eslintVersion.js b/docs/src/_data/eslintVersion.js
+index cd60276b3..24964276c 100644
+--- a/docs/src/_data/eslintVersion.js
++++ b/docs/src/_data/eslintVersion.js
+@@ -14,7 +14,7 @@ const path = require("path");
+ // Initialization
+ //-----------------------------------------------------------------------------
+ 
+-const pkgPath = path.resolve(__dirname, "../../../package.json");
++const pkgPath = path.resolve(__dirname, "../../package.json");
+ const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+ const { ESLINT_VERSION } = process.env;
+ 
+@@ -23,7 +23,7 @@ const { ESLINT_VERSION } = process.env;
+ //-----------------------------------------------------------------------------
+ 
+ /*
+- * Because we want to differentiate between the development branch and the 
++ * Because we want to differentiate between the development branch and the
+  * most recent release, we need a way to override the version. The
+  * ESLINT_VERSION environment variable allows us to set this to override
+  * the value displayed on the website. The most common case is we will set
+diff --git a/eslint.config.js b/eslint.config.js
+index 8df362209..2156ebe1e 100644
+--- a/eslint.config.js
++++ b/eslint.config.js
+@@ -77,10 +77,11 @@ function createInternalFilesPatterns(pattern = null) {
+ }
+ 
+ module.exports = [
+-    ...compat.extends("eslint", "plugin:eslint-plugin/recommended"),
++    ...compat.extends("eslint"),
+     {
+         plugins: {
+-            "internal-rules": internalPlugin
++            "internal-rules": internalPlugin,
++            "eslint-plugin": eslintPlugin
+         },
+         languageOptions: {
+             ecmaVersion: "latest"
+@@ -96,20 +97,6 @@ module.exports = [
+             }
+         },
+         rules: {
+-            "eslint-plugin/consistent-output": "error",
+-            "eslint-plugin/no-deprecated-context-methods": "error",
+-            "eslint-plugin/no-only-tests": "error",
+-            "eslint-plugin/prefer-message-ids": "error",
+-            "eslint-plugin/prefer-output-null": "error",
+-            "eslint-plugin/prefer-placeholders": "error",
+-            "eslint-plugin/prefer-replace-text": "error",
+-            "eslint-plugin/report-message-format": ["error", "[^a-z].*\\.$"],
+-            "eslint-plugin/require-meta-docs-description": "error",
+-            "eslint-plugin/require-meta-has-suggestions": "error",
+-            "eslint-plugin/require-meta-schema": "error",
+-            "eslint-plugin/require-meta-type": "error",
+-            "eslint-plugin/test-case-property-ordering": "error",
+-            "eslint-plugin/test-case-shorthand-strings": "error",
+             "internal-rules/multiline-comment-style": "error"
+         }
+     },
+diff --git a/lib/eslint/eslint-helpers.js b/lib/eslint/eslint-helpers.js
+index 442686e56..8001ddd32 100644
+--- a/lib/eslint/eslint-helpers.js
++++ b/lib/eslint/eslint-helpers.js
+@@ -15,6 +15,7 @@ const fsp = fs.promises;
+ const isGlob = require("is-glob");
+ const globby = require("globby");
+ const hash = require("../cli-engine/hash");
++const minimatch = require("minimatch");
+ 
+ //-----------------------------------------------------------------------------
+ // Errors
+@@ -126,7 +127,7 @@ async function findFiles({
+     const filePaths = patterns.map(filePath => path.resolve(cwd, filePath));
+     const stats = await Promise.all(
+         filePaths.map(
+-            filePath => fsp.stat(filePath).catch(() => {})
++            filePath => fsp.stat(filePath).catch(() => { })
+         )
+     );
+ 
+@@ -157,6 +158,11 @@ async function findFiles({
+                             return false;
+                         }
+ 
++                        // patterns starting with ** always apply
++                        if (filePattern.startsWith("**")) {
++                            return true;
++                        }
++
+                         // patterns ending with * are not used for file search
+                         if (filePattern.endsWith("*")) {
+                             return false;
+@@ -167,11 +173,27 @@ async function findFiles({
+                             return false;
+                         }
+ 
+-                        // check if the pattern would be inside the cwd or not
++                        // check if the pattern would be inside the config base path or not
+                         const fullFilePattern = path.join(cwd, filePattern);
+-                        const relativeFilePattern = path.relative(configs.basePath, fullFilePattern);
++                        const patternRelativeToConfigBasePath = path.relative(configs.basePath, fullFilePattern);
++
++                        if (patternRelativeToConfigBasePath.startsWith("..")) {
++                            return false;
++                        }
++
++                        // check if the pattern matches
++                        if (minimatch(filePath, path.dirname(fullFilePattern), { partial: true })) {
++                            return true;
++                        }
++
++                        // check if the pattern is inside the directory or not
++                        const patternRelativeToFilePath = path.relative(filePath, fullFilePattern);
++
++                        if (patternRelativeToFilePath.startsWith("..")) {
++                            return false;
++                        }
+ 
+-                        return !relativeFilePattern.startsWith("..");
++                        return true;
+                     })
+                     .map(filePattern => {
+                         if (filePattern.startsWith("**")) {

@@ -1,0 +1,335 @@
+diff --git a/.changeset/friendly-jars-joke.md b/.changeset/friendly-jars-joke.md
+deleted file mode 100644
+index 93991c5d23..0000000000
+--- a/.changeset/friendly-jars-joke.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': patch
+----
+-
+-Fixed an issue with `onSnapshot` not working after rehydration.
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index cc320ca8ff..ddc40cc704 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -468,8 +468,7 @@ export function getPersistedState<
+     childrenJson[id as keyof typeof childrenJson] = {
+       state: child.getPersistedState(options),
+       src: child.src,
+-      systemId: child._systemId,
+-      syncSnapshot: child._syncSnapshot
++      systemId: child._systemId
+     };
+   }
+ 
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index cad7a8e5b9..6850f5e18c 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -537,7 +537,6 @@ export class StateMachine<
+       {
+         src: string | AnyActorLogic;
+         state: Snapshot<unknown>;
+-        syncSnapshot?: boolean;
+         systemId?: string;
+       }
+     > = (snapshot as any).children;
+@@ -560,7 +559,6 @@ export class StateMachine<
+       const actorRef = createActor(logic, {
+         id: actorId,
+         parent: _actorScope?.self,
+-        syncSnapshot: actorData.syncSnapshot,
+         state: actorState,
+         src,
+         systemId: actorData.systemId
+diff --git a/packages/core/src/actions/spawn.ts b/packages/core/src/actions/spawn.ts
+index 39c8d802cf..33bb03fc58 100644
+--- a/packages/core/src/actions/spawn.ts
++++ b/packages/core/src/actions/spawn.ts
+@@ -61,7 +61,6 @@ function resolveSpawn(
+       id: resolvedId,
+       src,
+       parent: actorScope?.self,
+-      syncSnapshot,
+       systemId,
+       input:
+         typeof input === 'function'
+@@ -72,6 +71,20 @@ function resolveSpawn(
+             })
+           : input
+     });
++
++    if (syncSnapshot) {
++      actorRef.subscribe({
++        next: (snapshot: Snapshot<unknown>) => {
++          if (snapshot.status === 'active') {
++            actorScope.self.send({
++              type: `xstate.snapshot.${id}`,
++              snapshot
++            });
++          }
++        },
++        error: () => {}
++      });
++    }
+   }
+ 
+   if (isDevelopment && !actorRef) {
+diff --git a/packages/core/src/interpreter.ts b/packages/core/src/interpreter.ts
+index e60e74c4a3..5ae9dbe1b5 100644
+--- a/packages/core/src/interpreter.ts
++++ b/packages/core/src/interpreter.ts
+@@ -108,7 +108,6 @@ export class Actor<TLogic extends AnyActorLogic>
+ 
+   // Actor Ref
+   public _parent?: ActorRef<any, any>;
+-  public _syncSnapshot?: boolean;
+   public ref: ActorRef<EventFromLogic<TLogic>, SnapshotFrom<TLogic>>;
+   // TODO: add typings for system
+   private _actorScope: ActorScope<
+@@ -144,8 +143,7 @@ export class Actor<TLogic extends AnyActorLogic>
+       ...options
+     } as ActorOptions<TLogic> & typeof defaultOptions;
+ 
+-    const { clock, logger, parent, syncSnapshot, id, systemId, inspect } =
+-      resolvedOptions;
++    const { clock, logger, parent, id, systemId, inspect } = resolvedOptions;
+ 
+     this.system = parent?.system ?? createSystem(this);
+ 
+@@ -159,7 +157,6 @@ export class Actor<TLogic extends AnyActorLogic>
+     this.logger = logger;
+     this.clock = clock;
+     this._parent = parent;
+-    this._syncSnapshot = syncSnapshot;
+     this.options = resolvedOptions;
+     this.src = resolvedOptions.src ?? logic;
+     this.ref = this;
+@@ -358,20 +355,6 @@ export class Actor<TLogic extends AnyActorLogic>
+       return this;
+     }
+ 
+-    if (this._syncSnapshot) {
+-      this.subscribe({
+-        next: (snapshot: Snapshot<unknown>) => {
+-          if (snapshot.status === 'active') {
+-            this._parent!.send({
+-              type: `xstate.snapshot.${this.id}`,
+-              snapshot
+-            });
+-          }
+-        },
+-        error: () => {}
+-      });
+-    }
+-
+     this.system._register(this.sessionId, this);
+     if (this._systemId) {
+       this.system._set(this._systemId, this);
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index fdc8e53054..3f24d9bf65 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -75,7 +75,6 @@ export function createSpawner(
+       const actorRef = createActor(logic, {
+         id: options.id,
+         parent: actorScope.self,
+-        syncSnapshot: options.syncSnapshot,
+         input:
+           typeof input === 'function'
+             ? input({
+@@ -87,20 +86,46 @@ export function createSpawner(
+         src,
+         systemId
+       }) as any;
+-
+       spawnedChildren[actorRef.id] = actorRef;
+ 
++      if (options.syncSnapshot) {
++        actorRef.subscribe({
++          next: (snapshot: Snapshot<unknown>) => {
++            if (snapshot.status === 'active') {
++              actorScope.self.send({
++                type: `xstate.snapshot.${actorRef.id}`,
++                snapshot
++              });
++            }
++          },
++          error: () => {}
++        });
++      }
+       return actorRef;
+     } else {
+       const actorRef = createActor(src, {
+         id: options.id,
+         parent: actorScope.self,
+-        syncSnapshot: options.syncSnapshot,
+         input: options.input,
+         src,
+         systemId
+       });
+ 
++      if (options.syncSnapshot) {
++        actorRef.subscribe({
++          next: (snapshot: Snapshot<unknown>) => {
++            if (snapshot.status === 'active') {
++              actorScope.self.send({
++                type: `xstate.snapshot.${actorRef.id}`,
++                snapshot,
++                id: actorRef.id
++              });
++            }
++          },
++          error: () => {}
++        });
++      }
++
+       return actorRef;
+     }
+   };
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 7dfe481d18..1b1932774e 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -1667,10 +1667,6 @@ export interface ActorOptions<TLogic extends AnyActorLogic> {
+    * @internal
+    */
+   parent?: ActorRef<any, any>;
+-  /**
+-   * @internal
+-   */
+-  syncSnapshot?: boolean;
+   /**
+    * The custom `id` for referencing this service.
+    */
+@@ -1704,7 +1700,10 @@ export interface ActorOptions<TLogic extends AnyActorLogic> {
+    *
+    * @see https://stately.ai/docs/persistence
+    */
+-  state?: Snapshot<unknown>;
++  // state?:
++  //   | PersistedStateFrom<TActorLogic>
++  //   | InternalStateFrom<TActorLogic>;
++  state?: any;
+ 
+   /**
+    * The source definition.
+diff --git a/packages/core/test/rehydration.test.ts b/packages/core/test/rehydration.test.ts
+index c99cf92099..a6e8f52202 100644
+--- a/packages/core/test/rehydration.test.ts
++++ b/packages/core/test/rehydration.test.ts
+@@ -1,10 +1,4 @@
+-import { BehaviorSubject } from 'rxjs';
+-import {
+-  createMachine,
+-  createActor,
+-  fromPromise,
+-  fromObservable
+-} from '../src/index.ts';
++import { createMachine, createActor, fromPromise } from '../src/index.ts';
+ 
+ describe('rehydration', () => {
+   describe('using persisted state', () => {
+@@ -321,47 +315,4 @@ describe('rehydration', () => {
+     actorRef2.start();
+     expect(spy).toHaveBeenCalled();
+   });
+-
+-  it('should continue syncing snapshots', () => {
+-    const subject = new BehaviorSubject(0);
+-    const subjectLogic = fromObservable(() => subject);
+-
+-    const spy = jest.fn();
+-
+-    const machine = createMachine(
+-      {
+-        types: {} as {
+-          actors: {
+-            src: 'service';
+-            logic: typeof subjectLogic;
+-          };
+-        },
+-
+-        invoke: [
+-          {
+-            src: 'service',
+-            onSnapshot: {
+-              actions: [({ event }) => spy(event.snapshot.context)]
+-            }
+-          }
+-        ]
+-      },
+-      {
+-        actors: {
+-          service: subjectLogic
+-        }
+-      }
+-    );
+-
+-    createActor(machine, {
+-      state: createActor(machine).getPersistedState()
+-    }).start();
+-
+-    spy.mockClear();
+-
+-    subject.next(42);
+-    subject.next(100);
+-
+-    expect(spy.mock.calls).toEqual([[42], [100]]);
+-  });
+ });
+diff --git a/packages/xstate-react/test/useActor.test.tsx b/packages/xstate-react/test/useActor.test.tsx
+index ef6dfc212b..935be2b5ce 100644
+--- a/packages/xstate-react/test/useActor.test.tsx
++++ b/packages/xstate-react/test/useActor.test.tsx
+@@ -1,4 +1,3 @@
+-import { BehaviorSubject } from 'rxjs';
+ import { act, fireEvent, screen } from '@testing-library/react';
+ import * as React from 'react';
+ import { useState } from 'react';
+@@ -14,7 +13,7 @@ import {
+   createMachine,
+   raise
+ } from 'xstate';
+-import { fromCallback, fromObservable, fromPromise } from 'xstate/actors';
++import { fromCallback, fromPromise } from 'xstate/actors';
+ import { useActor, useSelector } from '../src/index.ts';
+ import { describeEachReactMode } from './utils.tsx';
+ 
+@@ -996,35 +995,4 @@ describeEachReactMode('useActor (%s)', ({ suiteKey, render }) => {
+ 
+     expect(spy).toHaveBeenCalledTimes(suiteKey === 'strict' ? 2 : 1);
+   });
+-
+-  it('should work with `onSnapshot`', () => {
+-    const subject = new BehaviorSubject(0);
+-
+-    const spy = jest.fn();
+-
+-    const machine = createMachine({
+-      invoke: [
+-        {
+-          src: fromObservable(() => subject),
+-          onSnapshot: {
+-            actions: [({ event }) => spy((event.snapshot as any).context)]
+-          }
+-        }
+-      ]
+-    });
+-
+-    const App = () => {
+-      useActor(machine);
+-      return null;
+-    };
+-
+-    render(<App />);
+-
+-    spy.mockClear();
+-
+-    subject.next(42);
+-    subject.next(100);
+-
+-    expect(spy.mock.calls).toEqual([[42], [100]]);
+-  });
+ });

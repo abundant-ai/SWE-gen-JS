@@ -1,0 +1,183 @@
+diff --git a/packages/common/enums/version-type.enum.ts b/packages/common/enums/version-type.enum.ts
+index 981986e87..abe4c6416 100644
+--- a/packages/common/enums/version-type.enum.ts
++++ b/packages/common/enums/version-type.enum.ts
+@@ -5,4 +5,5 @@ export enum VersioningType {
+   URI,
+   HEADER,
+   MEDIA_TYPE,
++  CUSTOM,
+ }
+diff --git a/packages/common/interfaces/version-options.interface.ts b/packages/common/interfaces/version-options.interface.ts
+index 3c214e64a..b3da60ad3 100644
+--- a/packages/common/interfaces/version-options.interface.ts
++++ b/packages/common/interfaces/version-options.interface.ts
+@@ -55,6 +55,20 @@ export interface MediaTypeVersioningOptions {
+   key: string;
+ }
+ 
++export interface CustomVersioningOptions {
++  type: VersioningType.CUSTOM;
++
++  /**
++   * A function that accepts a request object (specific to the underlying platform, ie Express or Fastify)
++   * and returns a single version value or an ordered array of versions, in order from HIGHEST to LOWEST.
++   *
++   * Ex. Returned version array = ['3.1', '3.0', '2.5', '2', '1.9']
++   *
++   * Use type assertion or narrowing to identify the specific request type.
++   */
++  extractor: (request: unknown) => string | string[];
++}
++
+ interface VersioningCommonOptions {
+   /**
+    * The default version to be used as a fallback when you did not provide some
+@@ -67,4 +81,9 @@ interface VersioningCommonOptions {
+  * @publicApi
+  */
+ export type VersioningOptions = VersioningCommonOptions &
+-  (HeaderVersioningOptions | UriVersioningOptions | MediaTypeVersioningOptions);
++  (
++    | HeaderVersioningOptions
++    | UriVersioningOptions
++    | MediaTypeVersioningOptions
++    | CustomVersioningOptions
++  );
+diff --git a/packages/core/router/router-explorer.ts b/packages/core/router/router-explorer.ts
+index 153bf29b4..fc8f4eaec 100644
+--- a/packages/core/router/router-explorer.ts
++++ b/packages/core/router/router-explorer.ts
+@@ -353,6 +353,38 @@ export class RouterExplorer {
+       if (versioningOptions.type === VersioningType.URI) {
+         return handler(req, res, next);
+       }
++
++      // Custom Extractor Versioning Handler
++      if (versioningOptions.type === VersioningType.CUSTOM) {
++        const extractedVersion = versioningOptions.extractor(req);
++
++        if (Array.isArray(version)) {
++          if (
++            Array.isArray(extractedVersion) &&
++            version.filter(extractedVersion.includes).length
++          ) {
++            return handler(req, res, next);
++          } else if (
++            isString(extractedVersion) &&
++            version.includes(extractedVersion)
++          ) {
++            return handler(req, res, next);
++          }
++        } else {
++          if (
++            Array.isArray(extractedVersion) &&
++            extractedVersion.includes(version)
++          ) {
++            return handler(req, res, next);
++          } else if (
++            isString(extractedVersion) &&
++            version === extractedVersion
++          ) {
++            return handler(req, res, next);
++          }
++        }
++      }
++
+       // Media Type (Accept Header) Versioning Handler
+       if (versioningOptions.type === VersioningType.MEDIA_TYPE) {
+         const MEDIA_TYPE_HEADER = 'Accept';
+diff --git a/packages/platform-express/adapters/express-adapter.ts b/packages/platform-express/adapters/express-adapter.ts
+index bb2ae7337..34076a32f 100644
+--- a/packages/platform-express/adapters/express-adapter.ts
++++ b/packages/platform-express/adapters/express-adapter.ts
+@@ -196,6 +196,42 @@ export class ExpressAdapter extends AbstractHttpAdapter {
+       if (versioningOptions.type === VersioningType.URI) {
+         return handler(req, res, next);
+       }
++
++      // Custom Extractor Versioning Handler
++      if (versioningOptions.type === VersioningType.CUSTOM) {
++        const extractedVersion = versioningOptions.extractor(req);
++
++        if (Array.isArray(version)) {
++          if (
++            Array.isArray(extractedVersion) &&
++            version.filter(v => extractedVersion.includes(v)).length
++          ) {
++            return handler(req, res, next);
++          } else if (
++            isString(extractedVersion) &&
++            version.includes(extractedVersion)
++          ) {
++            return handler(req, res, next);
++          }
++        } else if (isString(version)) {
++          //Known bug here - if there are multiple versions supported across separate
++          //handlers/controllers, we can't select the highest matching handler.
++          //Since this code is evaluated per-handler, then we can't see if the highest
++          //specified version exists in a different handler.
++          if (
++            Array.isArray(extractedVersion) &&
++            extractedVersion.includes(version)
++          ) {
++            return handler(req, res, next);
++          } else if (
++            isString(extractedVersion) &&
++            version === extractedVersion
++          ) {
++            return handler(req, res, next);
++          }
++        }
++      }
++
+       // Media Type (Accept Header) Versioning Handler
+       if (versioningOptions.type === VersioningType.MEDIA_TYPE) {
+         const MEDIA_TYPE_HEADER = 'Accept';
+diff --git a/packages/platform-fastify/adapters/fastify-adapter.ts b/packages/platform-fastify/adapters/fastify-adapter.ts
+index 77ac6ae16..9b556e4d2 100644
+--- a/packages/platform-fastify/adapters/fastify-adapter.ts
++++ b/packages/platform-fastify/adapters/fastify-adapter.ts
+@@ -114,23 +114,24 @@ export class FastifyAdapter<
+       }
+     },
+     storage() {
+-      const versions = new Map();
++      const versions = new Map<string, unknown>();
+       return {
+         get(version: string | Array<string>) {
++          if (Array.isArray(version)) {
++            return versions.get(version.find(v => versions.has(v))) || null;
++          }
+           return versions.get(version) || null;
+         },
+-        set(
+-          versionOrVersions: string | Array<string>,
+-          store: Map<string, any>,
+-        ) {
+-          const storeVersionConstraint = version =>
++        set(versionOrVersions: string | Array<string>, store: unknown) {
++          const storeVersionConstraint = (version: string) =>
+             versions.set(version, store);
+           if (Array.isArray(versionOrVersions))
+             versionOrVersions.forEach(storeVersionConstraint);
+           else storeVersionConstraint(versionOrVersions);
+         },
+         del(version: string | Array<string>) {
+-          versions.delete(version);
++          if (Array.isArray(version)) version.forEach(v => versions.delete(v));
++          else versions.delete(version);
+         },
+         empty() {
+           versions.clear();
+@@ -166,6 +167,10 @@ export class FastifyAdapter<
+           return customHeaderVersionParameter;
+         }
+       }
++      // Custom Versioning Handler
++      else if (this.versioningOptions.type === VersioningType.CUSTOM) {
++        return this.versioningOptions.extractor(req);
++      }
+       return undefined;
+     },
+     mustMatchWhenDerived: false,

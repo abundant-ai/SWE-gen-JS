@@ -1,0 +1,361 @@
+diff --git a/.changeset/pink-pandas-promise.md b/.changeset/pink-pandas-promise.md
+new file mode 100644
+index 0000000000..1d088cffd5
+--- /dev/null
++++ b/.changeset/pink-pandas-promise.md
+@@ -0,0 +1,5 @@
++---
++'xstate': minor
++---
++
++Allow the `TGuard` type to flow into actions. Thanks to that `choose` can benefit from strongly-typed guards.
+diff --git a/packages/core/src/actions/choose.ts b/packages/core/src/actions/choose.ts
+index 673ac52345..38f498f6d4 100644
+--- a/packages/core/src/actions/choose.ts
++++ b/packages/core/src/actions/choose.ts
+@@ -19,7 +19,15 @@ function resolve(
+   {
+     branches
+   }: {
+-    branches: Array<ChooseBranch<MachineContext, EventObject>>;
++    branches: Array<
++      ChooseBranch<
++        MachineContext,
++        EventObject,
++        EventObject,
++        ParameterizedObject,
++        ParameterizedObject
++      >
++    >;
+   }
+ ) {
+   const matchedActions = branches.find((condition) => {
+@@ -37,10 +45,17 @@ export function choose<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TAction extends ParameterizedObject
++  TAction extends ParameterizedObject,
++  TGuard extends ParameterizedObject
+ >(
+   branches: ReadonlyArray<
+-    ChooseBranch<TContext, TExpressionEvent, TEvent, NoInfer<TAction>>
++    ChooseBranch<
++      TContext,
++      TExpressionEvent,
++      TEvent,
++      NoInfer<TAction>,
++      NoInfer<TGuard>
++    >
+   >
+ ) {
+   function choose(
+@@ -59,5 +74,6 @@ export function choose<
+   return choose as {
+     (args: ActionArgs<TContext, TExpressionEvent, TExpressionAction>): void;
+     _out_TAction?: TAction;
++    _out_TGuard?: TGuard;
+   };
+ }
+diff --git a/packages/core/src/actions/pure.ts b/packages/core/src/actions/pure.ts
+index 4d810a73c8..39e4045c16 100644
+--- a/packages/core/src/actions/pure.ts
++++ b/packages/core/src/actions/pure.ts
+@@ -43,7 +43,8 @@ export function pure<
+   TExpressionAction extends ParameterizedObject | undefined =
+     | ParameterizedObject
+     | undefined,
+-  TAction extends ParameterizedObject = ParameterizedObject
++  TAction extends ParameterizedObject = ParameterizedObject,
++  TGuard extends ParameterizedObject = ParameterizedObject
+ >(
+   getActions: ({
+     context,
+@@ -57,7 +58,8 @@ export function pure<
+         TExpressionEvent,
+         NoInfer<TEvent>,
+         undefined,
+-        NoInfer<TAction>
++        NoInfer<TAction>,
++        NoInfer<TGuard>
+       >
+     | undefined
+ ) {
+@@ -74,6 +76,7 @@ export function pure<
+   return pure as {
+     (args: ActionArgs<TContext, TExpressionEvent, TExpressionAction>): void;
+     _out_TAction?: TAction;
++    _out_TGuard?: TGuard;
+     _out_TEvent?: TEvent;
+   };
+ }
+diff --git a/packages/core/src/guards.ts b/packages/core/src/guards.ts
+index bb53bf6a90..31a58ad08e 100644
+--- a/packages/core/src/guards.ts
++++ b/packages/core/src/guards.ts
+@@ -40,10 +40,19 @@ export type Guard<
+   | TGuard
+   | GuardPredicate<TContext, TExpressionEvent, TExpressionGuard, TGuard>;
+ 
+-export type UnknownGuard = Guard<
++export type UnknownGuard = UnknownReferencedGuard | UnknownInlineGuard;
++
++type UnknownReferencedGuard = Guard<
++  MachineContext,
++  EventObject,
++  ParameterizedObject,
++  ParameterizedObject
++>;
++
++type UnknownInlineGuard = Guard<
+   MachineContext,
+   EventObject,
+-  ParameterizedObject | undefined,
++  undefined,
+   ParameterizedObject
+ >;
+ 
+@@ -200,7 +209,7 @@ export function evaluateGuard<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject
+ >(
+-  guard: UnknownGuard,
++  guard: UnknownGuard | UnknownInlineGuard,
+   context: TContext,
+   event: TExpressionEvent,
+   state: AnyState
+@@ -210,20 +219,9 @@ export function evaluateGuard<
+ 
+   const resolved = isInline
+     ? guard
+-    : // the existing type of `.guards` assumes non-nullable `TExpressionGuard`
+-      // it's fine to cast this here to get a common type and lack of errors in the rest of the code
+-      // our logic below makes sure that we call those 2 "variants" correctly
+-      (
+-        machine.implementations.guards as Record<
+-          string,
+-          GuardPredicate<
+-            MachineContext,
+-            EventObject,
+-            ParameterizedObject | undefined,
+-            ParameterizedObject
+-          >
+-        >
+-      )[typeof guard === 'string' ? guard : guard.type];
++    : machine.implementations.guards[
++        typeof guard === 'string' ? guard : guard.type
++      ];
+ 
+   if (!isInline && !resolved) {
+     throw new Error(
+@@ -234,7 +232,7 @@ export function evaluateGuard<
+   }
+ 
+   if (typeof resolved !== 'function') {
+-    return evaluateGuard(resolved, context, event, state);
++    return evaluateGuard(resolved!, context, event, state);
+   }
+ 
+   const guardArgs = {
+@@ -248,7 +246,10 @@ export function evaluateGuard<
+   };
+ 
+   if (!('check' in resolved)) {
+-    return resolved(guardArgs);
++    // the existing type of `.guards` assumes non-nullable `TExpressionGuard`
++    // inline guards expect `TExpressionGuard` to be set to `undefined`
++    // it's fine to cast this here, our logic makes sure that we call those 2 "variants" correctly
++    return resolved(guardArgs as never);
+   }
+ 
+   const builtinGuard = resolved as unknown as BuiltinGuard;
+diff --git a/packages/core/src/scxml.ts b/packages/core/src/scxml.ts
+index 1d018cbe6f..9c25fb0d62 100644
+--- a/packages/core/src/scxml.ts
++++ b/packages/core/src/scxml.ts
+@@ -176,7 +176,7 @@ function createGuard<
+ 
+ function mapAction(
+   element: XMLElement
+-): ActionFunction<any, any, any, any, any> {
++): ActionFunction<any, any, any, any, any, any> {
+   switch (element.name) {
+     case 'raise': {
+       return raise({
+@@ -322,8 +322,8 @@ return ${element.attributes!.expr};
+ 
+ function mapActions(
+   elements: XMLElement[]
+-): ActionFunction<any, any, any, any, any>[] {
+-  const mapped: ActionFunction<any, any, any, any, any>[] = [];
++): ActionFunction<any, any, any, any, any, any>[] {
++  const mapped: ActionFunction<any, any, any, any, any, any>[] = [];
+ 
+   for (const element of elements) {
+     if (element.type === 'comment') {
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 23af0f3e59..4bb9942c6a 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1420,6 +1420,7 @@ export function resolveActionsAndContext<
+               EventObject,
+               EventObject,
+               ParameterizedObject | undefined,
++              ParameterizedObject,
+               ParameterizedObject
+             >
+           >
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 92362b95be..d6aa7d9593 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -154,11 +154,13 @@ export type ActionFunction<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TAction extends ParameterizedObject
++  TAction extends ParameterizedObject,
++  TGuard extends ParameterizedObject
+ > = {
+   (args: ActionArgs<TContext, TExpressionEvent, TExpressionAction>): void;
+   _out_TEvent?: TEvent;
+   _out_TAction?: TAction;
++  _out_TGuard?: TGuard;
+ };
+ 
+ export interface ChooseBranch<
+@@ -166,13 +168,17 @@ export interface ChooseBranch<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject = TExpressionEvent,
+   TAction extends ParameterizedObject = ParameterizedObject,
+-  TExpressionGuard extends ParameterizedObject | undefined =
+-    | ParameterizedObject
+-    | undefined,
+   TGuard extends ParameterizedObject = ParameterizedObject
+ > {
+-  guard?: Guard<TContext, TExpressionEvent, TExpressionGuard, TGuard>;
+-  actions: Actions<TContext, TExpressionEvent, TEvent, undefined, TAction>;
++  guard?: Guard<TContext, TExpressionEvent, undefined, TGuard>;
++  actions: Actions<
++    TContext,
++    TExpressionEvent,
++    TEvent,
++    undefined,
++    TAction,
++    TGuard
++  >;
+ }
+ 
+ export type NoRequiredParams<T extends ParameterizedObject> = T extends any
+@@ -186,7 +192,8 @@ export type Action<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TAction extends ParameterizedObject
++  TAction extends ParameterizedObject,
++  TGuard extends ParameterizedObject
+ > =
+   | NoRequiredParams<TAction>
+   | TAction
+@@ -195,7 +202,8 @@ export type Action<
+       TExpressionEvent,
+       TEvent,
+       TExpressionAction,
+-      TAction
++      TAction,
++      TGuard
+     >;
+ 
+ export type UnknownAction = Action<
+@@ -203,6 +211,7 @@ export type UnknownAction = Action<
+   EventObject,
+   EventObject,
+   ParameterizedObject | undefined,
++  ParameterizedObject,
+   ParameterizedObject
+ >;
+ 
+@@ -211,9 +220,10 @@ export type Actions<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TAction extends ParameterizedObject
++  TAction extends ParameterizedObject,
++  TGuard extends ParameterizedObject
+ > = SingleOrArray<
+-  Action<TContext, TExpressionEvent, TEvent, TExpressionAction, TAction>
++  Action<TContext, TExpressionEvent, TEvent, TExpressionAction, TAction, TGuard>
+ >;
+ 
+ export type StateKey = string | AnyState;
+@@ -240,7 +250,14 @@ export interface TransitionConfig<
+   TGuard extends ParameterizedObject
+ > {
+   guard?: Guard<TContext, TExpressionEvent, undefined, TGuard>;
+-  actions?: Actions<TContext, TExpressionEvent, TEvent, undefined, TAction>;
++  actions?: Actions<
++    TContext,
++    TExpressionEvent,
++    TEvent,
++    undefined,
++    TAction,
++    TGuard
++  >;
+   reenter?: boolean;
+   target?: TransitionTarget | undefined;
+   meta?: Record<string, any>;
+@@ -640,11 +657,11 @@ export interface StateNodeConfig<
+   /**
+    * The action(s) to be executed upon entering the state node.
+    */
+-  entry?: Actions<TContext, TEvent, TEvent, undefined, TAction>;
++  entry?: Actions<TContext, TEvent, TEvent, undefined, TAction, TGuard>;
+   /**
+    * The action(s) to be executed upon exiting the state node.
+    */
+-  exit?: Actions<TContext, TEvent, TEvent, undefined, TAction>;
++  exit?: Actions<TContext, TEvent, TEvent, undefined, TAction, TGuard>;
+   /**
+    * The potential transition(s) to be taken upon reaching a final child state node.
+    *
+@@ -802,14 +819,16 @@ export type SimpleOrStateNodeConfig<
+ export type ActionFunctionMap<
+   TContext extends MachineContext,
+   TEvent extends EventObject,
+-  TAction extends ParameterizedObject = ParameterizedObject
++  TAction extends ParameterizedObject = ParameterizedObject,
++  TGuard extends ParameterizedObject = ParameterizedObject
+ > = {
+   [K in TAction['type']]?: ActionFunction<
+     TContext,
+     TEvent,
+     TEvent,
+     TAction extends { type: K } ? TAction : never,
+-    TAction
++    TAction,
++    TGuard
+   >;
+ };
+ 
+@@ -873,14 +892,19 @@ type MachineImplementationsActions<
+     'eventsCausingActions'
+   >,
+   TIndexedEvents = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedEvents'>,
+-  TIndexedActions = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedActions'>
++  TIndexedActions = Prop<
++    Prop<TResolvedTypesMeta, 'resolved'>,
++    'indexedActions'
++  >,
++  TIndexedGuards = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedGuards'>
+ > = {
+   [K in keyof TIndexedActions]?: ActionFunction<
+     TContext,
+     MaybeNarrowedEvent<TIndexedEvents, TEventsCausingActions, K>,
+     Cast<Prop<TIndexedEvents, keyof TIndexedEvents>, EventObject>,
+     Cast<TIndexedActions[K], ParameterizedObject>,
+-    Cast<Prop<TIndexedActions, keyof TIndexedActions>, ParameterizedObject>
++    Cast<Prop<TIndexedActions, keyof TIndexedActions>, ParameterizedObject>,
++    Cast<Prop<TIndexedGuards, keyof TIndexedGuards>, ParameterizedObject>
+   >;
+ };
+ 

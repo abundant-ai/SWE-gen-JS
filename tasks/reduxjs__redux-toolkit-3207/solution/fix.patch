@@ -1,0 +1,246 @@
+diff --git a/docs/api/configureStore.mdx b/docs/api/configureStore.mdx
+index 6f37c89a..e3199c66 100644
+--- a/docs/api/configureStore.mdx
++++ b/docs/api/configureStore.mdx
+@@ -18,7 +18,7 @@ to the store setup for a better development experience.
+ 
+ ```ts no-transpile
+ type ConfigureEnhancersCallback = (
+-  defaultEnhancers: StoreEnhancer[]
++  defaultEnhancers: EnhancerArray<[StoreEnhancer]>
+ ) => StoreEnhancer[]
+ 
+ interface ConfigureStoreOptions<
+@@ -107,7 +107,8 @@ a list of the specific options that are available.
+ Defaults to `true`.
+ 
+ #### `trace`
+-The Redux DevTools Extension recently added [support for showing action stack traces](https://github.com/reduxjs/redux-devtools/blob/main/extension/docs/Features/Trace.md) that show exactly where each action was dispatched. 
++
++The Redux DevTools Extension recently added [support for showing action stack traces](https://github.com/reduxjs/redux-devtools/blob/main/extension/docs/Features/Trace.md) that show exactly where each action was dispatched.
+ Capturing the traces can add a bit of overhead, so the DevTools Extension allows users to configure whether action stack traces are captured by [setting the 'trace' argument](https://github.com/reduxjs/redux-devtools/blob/main/extension/docs/API/Arguments.md#trace).
+ If the DevTools are enabled by passing `true` or an object, then `configureStore` will default to enabling capturing action stack traces in development mode only.
+ 
+@@ -129,7 +130,7 @@ If defined as a callback function, it will be called with the existing array of
+ and should return a new array of enhancers. This is primarily useful for cases where a store enhancer needs to be added
+ in front of `applyMiddleware`, such as `redux-first-router` or `redux-offline`.
+ 
+-Example: `enhancers: (defaultEnhancers) => [offline, ...defaultEnhancers]` will result in a final setup
++Example: `enhancers: (defaultEnhancers) => defaultEnhancers.prepend(offline)` will result in a final setup
+ of `[offline, applyMiddleware, devToolsExtension]`.
+ 
+ ## Usage
+@@ -195,7 +196,7 @@ const preloadedState = {
+   visibilityFilter: 'SHOW_COMPLETED',
+ }
+ 
+-const debounceNotify = _.debounce(notify => notify());
++const debounceNotify = _.debounce((notify) => notify())
+ 
+ const store = configureStore({
+   reducer,
+diff --git a/packages/toolkit/src/configureStore.ts b/packages/toolkit/src/configureStore.ts
+index aae2307c..f89a8608 100644
+--- a/packages/toolkit/src/configureStore.ts
++++ b/packages/toolkit/src/configureStore.ts
+@@ -24,7 +24,9 @@ import type {
+   NoInfer,
+   ExtractDispatchExtensions,
+   ExtractStoreExtensions,
++  ExtractStateExtensions,
+ } from './tsHelpers'
++import { EnhancerArray } from './utils'
+ 
+ const IS_PRODUCTION = process.env.NODE_ENV === 'production'
+ 
+@@ -34,8 +36,8 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production'
+  * @public
+  */
+ export type ConfigureEnhancersCallback<E extends Enhancers = Enhancers> = (
+-    defaultEnhancers: readonly StoreEnhancer[]
+-) => [...E]
++  defaultEnhancers: EnhancerArray<[StoreEnhancer<{}, {}>]>
++) => E
+ 
+ /**
+  * Options for `configureStore()`.
+@@ -107,7 +109,7 @@ type Enhancers = ReadonlyArray<StoreEnhancer>
+ export interface ToolkitStore<
+   S = any,
+   A extends Action = AnyAction,
+-  M extends Middlewares<S> = Middlewares<S>,
++  M extends Middlewares<S> = Middlewares<S>
+ > extends Store<S, A> {
+   /**
+    * The `dispatch` method of your store, enhanced by all its middlewares.
+@@ -128,7 +130,8 @@ export type EnhancedStore<
+   A extends Action = AnyAction,
+   M extends Middlewares<S> = Middlewares<S>,
+   E extends Enhancers = Enhancers
+-> = ToolkitStore<S, A, M> & ExtractStoreExtensions<E>
++> = ToolkitStore<S & ExtractStateExtensions<E>, A, M> &
++  ExtractStoreExtensions<E>
+ 
+ /**
+  * A friendly abstraction over the standard Redux `createStore()` function.
+@@ -197,12 +200,13 @@ export function configureStore<
+     })
+   }
+ 
+-  let storeEnhancers: Enhancers = [middlewareEnhancer]
++  const defaultEnhancers = new EnhancerArray(middlewareEnhancer)
++  let storeEnhancers: Enhancers = defaultEnhancers
+ 
+   if (Array.isArray(enhancers)) {
+     storeEnhancers = [middlewareEnhancer, ...enhancers]
+   } else if (typeof enhancers === 'function') {
+-    storeEnhancers = enhancers(storeEnhancers)
++    storeEnhancers = enhancers(defaultEnhancers)
+   }
+ 
+   const composedEnhancer = finalCompose(...storeEnhancers) as StoreEnhancer<any>
+diff --git a/packages/toolkit/src/index.ts b/packages/toolkit/src/index.ts
+index 2ea3e138..2937987f 100644
+--- a/packages/toolkit/src/index.ts
++++ b/packages/toolkit/src/index.ts
+@@ -103,7 +103,7 @@ export type {
+   // types
+   ActionReducerMapBuilder,
+ } from './mapBuilders'
+-export { MiddlewareArray } from './utils'
++export { MiddlewareArray, EnhancerArray } from './utils'
+ 
+ export { createEntityAdapter } from './entities/create_adapter'
+ export type {
+diff --git a/packages/toolkit/src/tsHelpers.ts b/packages/toolkit/src/tsHelpers.ts
+index 3e8dc20f..5ffc0196 100644
+--- a/packages/toolkit/src/tsHelpers.ts
++++ b/packages/toolkit/src/tsHelpers.ts
+@@ -1,5 +1,5 @@
+ import type { Middleware, StoreEnhancer } from 'redux'
+-import type { MiddlewareArray } from './utils'
++import type { EnhancerArray, MiddlewareArray } from './utils'
+ 
+ /**
+  * return True if T is `any`, otherwise return False
+@@ -101,9 +101,56 @@ export type ExtractDispatchExtensions<M> = M extends MiddlewareArray<
+   ? ExtractDispatchFromMiddlewareTuple<[...M], {}>
+   : never
+ 
+-export type ExtractStoreExtensions<E> = E extends any[]
+-  ? UnionToIntersection<E[number] extends StoreEnhancer<infer Ext> ? Ext extends {} ? Ext : {} : {}>
+-  : {}
++type ExtractStoreExtensionsFromEnhancerTuple<
++  EnhancerTuple extends any[],
++  Acc extends {}
++> = EnhancerTuple extends [infer Head, ...infer Tail]
++  ? ExtractStoreExtensionsFromEnhancerTuple<
++      Tail,
++      Acc & (Head extends StoreEnhancer<infer Ext> ? IsAny<Ext, {}, Ext> : {})
++    >
++  : Acc
++
++export type ExtractStoreExtensions<E> = E extends EnhancerArray<
++  infer EnhancerTuple
++>
++  ? ExtractStoreExtensionsFromEnhancerTuple<EnhancerTuple, {}>
++  : E extends ReadonlyArray<StoreEnhancer>
++  ? UnionToIntersection<
++      E[number] extends StoreEnhancer<infer Ext>
++        ? Ext extends {}
++          ? IsAny<Ext, {}, Ext>
++          : {}
++        : {}
++    >
++  : never
++
++type ExtractStateExtensionsFromEnhancerTuple<
++  EnhancerTuple extends any[],
++  Acc extends {}
++> = EnhancerTuple extends [infer Head, ...infer Tail]
++  ? ExtractStateExtensionsFromEnhancerTuple<
++      Tail,
++      Acc &
++        (Head extends StoreEnhancer<any, infer StateExt>
++          ? IsAny<StateExt, {}, StateExt>
++          : {})
++    >
++  : Acc
++
++export type ExtractStateExtensions<E> = E extends EnhancerArray<
++  infer EnhancerTuple
++>
++  ? ExtractStateExtensionsFromEnhancerTuple<EnhancerTuple, {}>
++  : E extends ReadonlyArray<StoreEnhancer>
++  ? UnionToIntersection<
++      E[number] extends StoreEnhancer<any, infer StateExt>
++        ? StateExt extends {}
++          ? IsAny<StateExt, {}, StateExt>
++          : {}
++        : {}
++    >
++  : never
+ 
+ /**
+  * Helper type. Passes T out again, but boxes it in a way that it cannot
+diff --git a/packages/toolkit/src/utils.ts b/packages/toolkit/src/utils.ts
+index 40957c27..2d378429 100644
+--- a/packages/toolkit/src/utils.ts
++++ b/packages/toolkit/src/utils.ts
+@@ -1,5 +1,5 @@
+ import createNextState, { isDraftable } from 'immer'
+-import type { Middleware } from 'redux'
++import type { Middleware, StoreEnhancer } from 'redux'
+ 
+ export function getTimeMeasureUtils(maxDelay: number, fnName: string) {
+   let elapsed = 0
+@@ -70,6 +70,49 @@ export class MiddlewareArray<
+   }
+ }
+ 
++/**
++ * @public
++ */
++export class EnhancerArray<
++  Enhancers extends StoreEnhancer<any, any>[]
++> extends Array<Enhancers[number]> {
++  constructor(...items: Enhancers)
++  constructor(...args: any[]) {
++    super(...args)
++    Object.setPrototypeOf(this, EnhancerArray.prototype)
++  }
++
++  static get [Symbol.species]() {
++    return EnhancerArray as any
++  }
++
++  concat<AdditionalEnhancers extends ReadonlyArray<StoreEnhancer<any, any>>>(
++    items: AdditionalEnhancers
++  ): EnhancerArray<[...Enhancers, ...AdditionalEnhancers]>
++
++  concat<AdditionalEnhancers extends ReadonlyArray<StoreEnhancer<any, any>>>(
++    ...items: AdditionalEnhancers
++  ): EnhancerArray<[...Enhancers, ...AdditionalEnhancers]>
++  concat(...arr: any[]) {
++    return super.concat.apply(this, arr)
++  }
++
++  prepend<AdditionalEnhancers extends ReadonlyArray<StoreEnhancer<any, any>>>(
++    items: AdditionalEnhancers
++  ): EnhancerArray<[...AdditionalEnhancers, ...Enhancers]>
++
++  prepend<AdditionalEnhancers extends ReadonlyArray<StoreEnhancer<any, any>>>(
++    ...items: AdditionalEnhancers
++  ): EnhancerArray<[...AdditionalEnhancers, ...Enhancers]>
++
++  prepend(...arr: any[]) {
++    if (arr.length === 1 && Array.isArray(arr[0])) {
++      return new EnhancerArray(...arr[0].concat(this))
++    }
++    return new EnhancerArray(...arr.concat(this))
++  }
++}
++
+ export function freezeDraftable<T>(val: T) {
+   return isDraftable(val) ? createNextState(val, () => {}) : val
+ }

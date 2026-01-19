@@ -1,0 +1,36 @@
+#!/bin/bash
+
+cd /app/src
+
+# Start Redis server in the background
+redis-server --daemonize yes --port 6379
+
+# Wait for Redis to be ready
+sleep 2
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+# This removes the obsolete test added by bug.patch that doesn't work with v5
+mkdir -p "tests"
+cp "/tests/test_connection.ts" "tests/test_connection.ts"
+
+# Remove all other test files to ensure only our target tests run
+cd tests && ls test_*.ts | grep -v -E "(test_connection.ts)" | xargs rm -f && cd ..
+
+# Rebuild TypeScript after fix.patch is applied (Oracle agent applies it before running tests)
+# In BASE state (ioredis v4), this will fail with type errors
+# In HEAD state (ioredis v5 + fix.patch), this should succeed
+if yarn build 2>&1 | tee /tmp/build.log | grep -q "^src/.*: error TS"; then
+  echo "TypeScript compilation failed with errors"
+  test_status=1
+else
+  # Run TypeScript tests (only runs if build succeeded)
+  NODE_ENV=test npx ts-mocha -p tsconfig-cjs.json --require ./mocha.setup.ts --spec tests/test_connection.ts --timeout 20000
+  test_status=$?
+fi
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

@@ -1,0 +1,204 @@
+diff --git a/.changeset/great-kangaroos-confess.md b/.changeset/great-kangaroos-confess.md
+deleted file mode 100644
+index 330b73dbd1..0000000000
+--- a/.changeset/great-kangaroos-confess.md
++++ /dev/null
+@@ -1,19 +0,0 @@
+----
+-'xstate': major
+----
+-
+-You can now add a `systemId` to spawned actors to reference them anywhere in the system.
+-
+-```ts
+-const machine = createMachine({
+-  // ...
+-  context: ({ spawn }) => ({
+-    actorRef: spawn(
+-      createMachine({
+-        // ...
+-      }),
+-      { systemId: 'actorRef' }
+-    )
+-  })
+-});
+-```
+diff --git a/.vscode/launch.json b/.vscode/launch.json
+index 4881710c6c..fc0eaffecf 100644
+--- a/.vscode/launch.json
++++ b/.vscode/launch.json
+@@ -6,7 +6,13 @@
+       "request": "launch",
+       "name": "Jest Current File",
+       "program": "${workspaceFolder}/node_modules/.bin/jest",
+-      "args": ["${file}", "--config", "jest.config.js", "--no-cache"],
++      "args": [
++        "${file}",
++        "--config",
++        "jest.config.js",
++        "--no-cache",
++        "--testTimeout=2147483647"
++      ],
+       "console": "integratedTerminal",
+       "internalConsoleOptions": "neverOpen",
+       "disableOptimisticBPs": true,
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index 3ea553f2ae..0f76a2d177 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -22,7 +22,6 @@ export function createSpawner<
+   mutCapturedActions: InvokeActionObject[]
+ ): Spawner {
+   return (src, options = {}) => {
+-    const { systemId } = options;
+     if (isString(src)) {
+       const referenced = resolveReferencedActor(machine.options.actors[src]);
+ 
+@@ -51,8 +50,7 @@ export function createSpawner<
+             src: actorRef, // TODO
+             ref: actorRef,
+             meta: undefined,
+-            input,
+-            systemId
++            input
+           }) as any as InvokeActionObject
+         );
+ 
+@@ -68,8 +66,7 @@ export function createSpawner<
+       const actorRef = interpret(src, {
+         id: options.id || 'anonymous',
+         parent: self,
+-        input: options.input,
+-        systemId
++        input: options.input
+       });
+ 
+       mutCapturedActions.push(
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 3dd75386a7..792ea2694e 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -128,7 +128,6 @@ export type Spawner = <T extends ActorBehavior<any, any> | string>( // TODO: rea
+   behavior: T,
+   options?: Partial<{
+     id: string;
+-    systemId?: string;
+     input: any;
+   }>
+ ) => T extends ActorBehavior<infer TActorEvent, infer TActorEmitted>
+diff --git a/packages/core/test/system.test.ts b/packages/core/test/system.test.ts
+index 87451a8ba5..9421d5cd6d 100644
+--- a/packages/core/test/system.test.ts
++++ b/packages/core/test/system.test.ts
+@@ -5,12 +5,11 @@ import {
+   assign,
+   createMachine,
+   interpret,
+-  sendTo,
+-  stop
++  sendTo
+ } from '../src/index.ts';
+ 
+ describe('system', () => {
+-  it('should register an invoked actor', (done) => {
++  it('should register an actor (implicit system)', (done) => {
+     type MySystem = ActorSystem<{
+       actors: {
+         receiver: ActorRef<{ type: 'HELLO' }>;
+@@ -52,56 +51,7 @@ describe('system', () => {
+     interpret(machine).start();
+   });
+ 
+-  it('should register a spawned actor', (done) => {
+-    type MySystem = ActorSystem<{
+-      actors: {
+-        receiver: ActorRef<{ type: 'HELLO' }>;
+-      };
+-    }>;
+-
+-    const machine = createMachine({
+-      id: 'parent',
+-      context: ({ spawn }) => ({
+-        ref: spawn(
+-          fromCallback((_, receive) => {
+-            receive((event) => {
+-              expect(event.type).toBe('HELLO');
+-              done();
+-            });
+-          }),
+-          { systemId: 'receiver' }
+-        )
+-      }),
+-      on: {
+-        toggle: {
+-          actions: assign({
+-            machineRef: ({ spawn }) => {
+-              return spawn(
+-                createMachine({
+-                  id: 'childmachine',
+-                  entry: ({ system }) => {
+-                    const receiver = (system as MySystem)?.get('receiver');
+-
+-                    if (receiver) {
+-                      receiver.send({ type: 'HELLO' });
+-                    } else {
+-                      throw new Error('no');
+-                    }
+-                  }
+-                })
+-              );
+-            }
+-          })
+-        }
+-      }
+-    });
+-
+-    const actor = interpret(machine).start();
+-
+-    actor.send({ type: 'toggle' });
+-  });
+-
+-  it('system can be immediately accessed outside the actor', () => {
++  it('system can be immediatelly accessed outside the actor', () => {
+     const machine = createMachine({
+       invoke: {
+         systemId: 'someChild',
+@@ -121,7 +71,7 @@ describe('system', () => {
+     expect(actor.system.get('test')).toBe(actor);
+   });
+ 
+-  it('should remove invoked actor from receptionist if stopped', () => {
++  it('should remove actor from receptionist if stopped', () => {
+     const machine = createMachine({
+       initial: 'active',
+       states: {
+@@ -147,29 +97,6 @@ describe('system', () => {
+     expect(actor.system.get('test')).toBeUndefined();
+   });
+ 
+-  it('should remove spawned actor from receptionist if stopped', () => {
+-    const machine = createMachine({
+-      context: ({ spawn }) => ({
+-        ref: spawn(createMachine({}), {
+-          systemId: 'test'
+-        })
+-      }),
+-      on: {
+-        toggle: {
+-          actions: stop(({ context }) => context.ref)
+-        }
+-      }
+-    });
+-
+-    const actor = interpret(machine).start();
+-
+-    expect(actor.system.get('test')).toBeDefined();
+-
+-    actor.send({ type: 'toggle' });
+-
+-    expect(actor.system.get('test')).toBeUndefined();
+-  });
+-
+   it('should throw an error if an actor with the system ID already exists', () => {
+     const machine = createMachine({
+       initial: 'inactive',

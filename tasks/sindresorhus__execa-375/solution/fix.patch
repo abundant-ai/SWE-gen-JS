@@ -1,0 +1,311 @@
+diff --git a/index.d.ts b/index.d.ts
+index 2050cfa..f0c431b 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -228,11 +228,6 @@ declare namespace execa {
+ 		*/
+ 		exitCode: number;
+ 
+-		/**
+-		The textual exit code of the process that was run.
+-		*/
+-		exitCodeName: string;
+-
+ 		/**
+ 		The output of the process on stdout.
+ 		*/
+diff --git a/index.js b/index.js
+index 0de3369..f60593f 100644
+--- a/index.js
++++ b/index.js
+@@ -104,15 +104,15 @@ const execa = (file, args, options) => {
+ 	spawned.cancel = spawnedCancel.bind(null, spawned, context);
+ 
+ 	const handlePromise = async () => {
+-		const [{error, code, signal, timedOut}, stdoutResult, stderrResult, allResult] = await getSpawnedResult(spawned, parsed.options, processDone);
++		const [{error, exitCode, signal, timedOut}, stdoutResult, stderrResult, allResult] = await getSpawnedResult(spawned, parsed.options, processDone);
+ 		const stdout = handleOutput(parsed.options, stdoutResult);
+ 		const stderr = handleOutput(parsed.options, stderrResult);
+ 		const all = handleOutput(parsed.options, allResult);
+ 
+-		if (error || code !== 0 || signal !== null) {
++		if (error || exitCode !== 0 || signal !== null) {
+ 			const returnedError = makeError({
+ 				error,
+-				code,
++				exitCode,
+ 				signal,
+ 				stdout,
+ 				stderr,
+@@ -134,7 +134,6 @@ const execa = (file, args, options) => {
+ 		return {
+ 			command,
+ 			exitCode: 0,
+-			exitCodeName: 'SUCCESS',
+ 			stdout,
+ 			stderr,
+ 			all,
+@@ -181,13 +180,16 @@ module.exports.sync = (file, args, options) => {
+ 		});
+ 	}
+ 
+-	result.stdout = handleOutput(parsed.options, result.stdout, result.error);
+-	result.stderr = handleOutput(parsed.options, result.stderr, result.error);
++	const stdout = handleOutput(parsed.options, result.stdout, result.error);
++	const stderr = handleOutput(parsed.options, result.stderr, result.error);
+ 
+ 	if (result.error || result.status !== 0 || result.signal !== null) {
+ 		const error = makeError({
+-			...result,
+-			code: result.status,
++			stdout,
++			stderr,
++			error: result.error,
++			signal: result.signal,
++			exitCode: result.status,
+ 			command,
+ 			parsed,
+ 			timedOut: result.error && result.error.code === 'ETIMEDOUT',
+@@ -205,9 +207,8 @@ module.exports.sync = (file, args, options) => {
+ 	return {
+ 		command,
+ 		exitCode: 0,
+-		exitCodeName: 'SUCCESS',
+-		stdout: result.stdout,
+-		stderr: result.stderr,
++		stdout,
++		stderr,
+ 		failed: false,
+ 		timedOut: false,
+ 		isCanceled: false,
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 74ff581..938067f 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -17,7 +17,6 @@ try {
+ 	const unicornsResult = await execaPromise;
+ 	expectType<string>(unicornsResult.command);
+ 	expectType<number>(unicornsResult.exitCode);
+-	expectType<string>(unicornsResult.exitCodeName);
+ 	expectType<string>(unicornsResult.stdout);
+ 	expectType<string>(unicornsResult.stderr);
+ 	expectType<string | undefined>(unicornsResult.all);
+@@ -31,7 +30,6 @@ try {
+ 
+ 	expectType<string>(execaError.message);
+ 	expectType<number>(execaError.exitCode);
+-	expectType<string>(execaError.exitCodeName);
+ 	expectType<string>(execaError.stdout);
+ 	expectType<string>(execaError.stderr);
+ 	expectType<string | undefined>(execaError.all);
+@@ -47,7 +45,6 @@ try {
+ 	const unicornsResult = execa.sync('unicorns');
+ 	expectType<string>(unicornsResult.command);
+ 	expectType<number>(unicornsResult.exitCode);
+-	expectType<string>(unicornsResult.exitCodeName);
+ 	expectType<string>(unicornsResult.stdout);
+ 	expectType<string>(unicornsResult.stderr);
+ 	expectError(unicornsResult.all);
+@@ -61,7 +58,6 @@ try {
+ 
+ 	expectType<string>(execaError.message);
+ 	expectType<number>(execaError.exitCode);
+-	expectType<string>(execaError.exitCodeName);
+ 	expectType<string>(execaError.stdout);
+ 	expectType<string>(execaError.stderr);
+ 	expectError(execaError.all);
+diff --git a/lib/error.js b/lib/error.js
+index f071c5f..b651823 100644
+--- a/lib/error.js
++++ b/lib/error.js
+@@ -1,20 +1,5 @@
+ 'use strict';
+-const os = require('os');
+-const util = require('util');
+-
+-const getCode = (error, code) => {
+-	if (error && error.code) {
+-		return [error.code, os.constants.errno[error.code]];
+-	}
+-
+-	if (Number.isInteger(code)) {
+-		return [util.getSystemErrorName(-code), code];
+-	}
+-
+-	return [];
+-};
+-
+-const getErrorPrefix = ({timedOut, timeout, signal, exitCodeName, exitCode, isCanceled}) => {
++const getErrorPrefix = ({timedOut, timeout, errorCode, signal, exitCode, isCanceled}) => {
+ 	if (timedOut) {
+ 		return `timed out after ${timeout} milliseconds`;
+ 	}
+@@ -23,12 +8,16 @@ const getErrorPrefix = ({timedOut, timeout, signal, exitCodeName, exitCode, isCa
+ 		return 'was canceled';
+ 	}
+ 
+-	if (signal) {
++	if (errorCode !== undefined) {
++		return `failed with ${errorCode}`;
++	}
++
++	if (signal !== undefined) {
+ 		return `was killed with ${signal}`;
+ 	}
+ 
+ 	if (exitCode !== undefined) {
+-		return `failed with exit code ${exitCode} (${exitCodeName})`;
++		return `failed with exit code ${exitCode}`;
+ 	}
+ 
+ 	return 'failed';
+@@ -40,16 +29,21 @@ const makeError = ({
+ 	all,
+ 	error,
+ 	signal,
+-	code,
++	exitCode,
+ 	command,
+ 	timedOut,
+ 	isCanceled,
+ 	killed,
+ 	parsed: {options: {timeout}}
+ }) => {
+-	const [exitCodeName, exitCode] = getCode(error, code);
++	// `signal` and `exitCode` emitted on `spawned.on('exit')` event can be `null`.
++	// We normalize them to `undefined`
++	exitCode = exitCode === null ? undefined : exitCode;
++	signal = signal === null ? undefined : signal;
++
++	const errorCode = error && error.code;
+ 
+-	const prefix = getErrorPrefix({timedOut, timeout, signal, exitCodeName, exitCode, isCanceled});
++	const prefix = getErrorPrefix({timedOut, timeout, errorCode, signal, exitCode, isCanceled});
+ 	const message = `Command ${prefix}: ${command}`;
+ 
+ 	if (error instanceof Error) {
+@@ -60,9 +54,8 @@ const makeError = ({
+ 	}
+ 
+ 	error.command = command;
+-	delete error.code;
+ 	error.exitCode = exitCode;
+-	error.exitCodeName = exitCodeName;
++	error.signal = signal;
+ 	error.stdout = stdout;
+ 	error.stderr = stderr;
+ 
+@@ -78,9 +71,6 @@ const makeError = ({
+ 	error.timedOut = Boolean(timedOut);
+ 	error.isCanceled = isCanceled;
+ 	error.killed = killed && !timedOut;
+-	// `signal` emitted on `spawned.on('exit')` event can be `null`. We normalize
+-	// it to `undefined`
+-	error.signal = signal || undefined;
+ 
+ 	return error;
+ };
+diff --git a/lib/promise.js b/lib/promise.js
+index 6bafb54..34773d5 100644
+--- a/lib/promise.js
++++ b/lib/promise.js
+@@ -29,8 +29,8 @@ const mergePromise = (spawned, promise) => {
+ // Use promises instead of `child_process` events
+ const getSpawnedPromise = spawned => {
+ 	return new Promise((resolve, reject) => {
+-		spawned.on('exit', (code, signal) => {
+-			resolve({code, signal});
++		spawned.on('exit', (exitCode, signal) => {
++			resolve({exitCode, signal});
+ 		});
+ 
+ 		spawned.on('error', error => {
+diff --git a/lib/stream.js b/lib/stream.js
+index 2a87068..102004c 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -74,7 +74,7 @@ const getSpawnedResult = async ({stdout, stderr, all}, {encoding, buffer, maxBuf
+ 		return await Promise.all([processDone, stdoutPromise, stderrPromise, allPromise]);
+ 	} catch (error) {
+ 		return Promise.all([
+-			{error, code: error.code, signal: error.signal, timedOut: error.timedOut},
++			{error, signal: error.signal, timedOut: error.timedOut},
+ 			getBufferedData(stdout, stdoutPromise),
+ 			getBufferedData(stderr, stderrPromise),
+ 			getBufferedData(all, allPromise)
+diff --git a/readme.md b/readme.md
+index 44b9ee2..3e494e7 100644
+--- a/readme.md
++++ b/readme.md
+@@ -53,19 +53,19 @@ const execa = require('execa');
+ 
+ 	// Catching an error
+ 	try {
+-		await execa('wrong', ['command']);
++		await execa('unknown', ['command']);
+ 	} catch (error) {
+ 		console.log(error);
+ 		/*
+ 		{
+-			message: 'Command failed with exit code 2 (ENOENT): wrong command spawn wrong ENOENT',
+-			errno: -2,
+-			syscall: 'spawn wrong',
+-			path: 'wrong',
++			message: 'Command failed with ENOENT: unknown command spawn unknown ENOENT',
++			errno: 'ENOENT',
++			code: 'ENOENT',
++			syscall: 'spawn unknown',
++			path: 'unknown',
+ 			spawnargs: ['command'],
+-			command: 'wrong command',
+-			exitCode: 2,
+-			exitCodeName: 'ENOENT',
++			originalMessage: 'spawn unknown ENOENT',
++			command: 'unknown command',
+ 			stdout: '',
+ 			stderr: '',
+ 			all: '',
+@@ -92,21 +92,22 @@ const execa = require('execa');
+ 
+ // Catching an error with a sync method
+ try {
+-	execa.sync('wrong', ['command']);
++	execa.sync('unknown', ['command']);
+ } catch (error) {
+ 	console.log(error);
+ 	/*
+ 	{
+-		message: 'Command failed with exit code 2 (ENOENT): wrong command spawnSync wrong ENOENT',
+-		errno: -2,
+-		syscall: 'spawnSync wrong',
+-		path: 'wrong',
++		message: 'Command failed with ENOENT: unknown command spawnSync unknown ENOENT',
++		errno: 'ENOENT',
++		code: 'ENOENT',
++		syscall: 'spawnSync unknown',
++		path: 'unknown',
+ 		spawnargs: ['command'],
+-		command: 'wrong command',
+-		exitCode: 2,
+-		exitCodeName: 'ENOENT',
++		originalMessage: 'spawnSync unknown ENOENT',
++		command: 'unknown command',
+ 		stdout: '',
+ 		stderr: '',
++		all: '',
+ 		failed: true,
+ 		timedOut: false,
+ 		isCanceled: false,
+@@ -219,12 +220,6 @@ Type: `number`
+ 
+ The numeric exit code of the process that was run.
+ 
+-#### exitCodeName
+-
+-Type: `string`
+-
+-The textual exit code of the process that was run.
+-
+ #### stdout
+ 
+ Type: `string | Buffer`

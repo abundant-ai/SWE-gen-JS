@@ -1,0 +1,264 @@
+diff --git a/docs/src/maintain/manage-issues.md b/docs/src/maintain/manage-issues.md
+index 803451b4c..b1bbf3be7 100644
+--- a/docs/src/maintain/manage-issues.md
++++ b/docs/src/maintain/manage-issues.md
+@@ -41,7 +41,7 @@ All of ESLint's issues, across all GitHub repositories, are managed on our [Tria
+ * **RFC Opened**: An RFC is opened to address these issues
+ * **Blocked**: The issue can't move forward due to some dependency
+ * **Ready to Implement**: These issues have all the details necessary to start implementation
+-* **Implementing**: There is an open pull request for each of these issues
++* **PR Opened**: There is an open pull request for each of these issues
+ * **Completed**: The issue has been closed (either via pull request merge or by the team manually closing the issue)
+ 
+ We make every attempt to automate movement between as many columns as we can, but sometimes moving issues needs to be done manually.
+@@ -64,7 +64,7 @@ The steps for triaging an issue are:
+         * If the issue is actually a question (rather than something the dev team needs to change), please [convert it to a discussion](https://docs.github.com/en/free-pro-team@latest/discussions/managing-discussions-for-your-community/moderating-discussions#converting-an-issue-to-a-discussion). You can continue the conversation as a discussion.
+         * If the issue is reporting a bug, try to reproduce the issue following the instructions in the issue. If you can reproduce the bug, please add the "repro:yes" label. (The bot will automatically remove the "repro:needed" label.) If you can't reproduce the bug, ask the author for more information about their environment or to clarify reproduction steps.
+         * If the issue is reporting something that works as intended, please add the "works as intended" label and close the issue.
+-        * Please add labels describing the part of ESLint affected:
++        * For all issues, please add labels describing the part of ESLint affected:
+             * **3rd party plugin**: Related to third-party functionality (plugins, parsers, rules, etc.)
+             * **build**: Related to commands run during a build (testing, linting, release scripts, etc.)
+             * **cli**: Related to command line input or output, or to `CLIEngine`
+@@ -72,16 +72,6 @@ The steps for triaging an issue are:
+             * **documentation**: Related to content on eslint.org
+             * **infrastructure**: Related to resources needed for builds or deployment (VMs, CI tools, bots, etc.)
+             * **rule**: Related to core rules
+-        * Please assign an initial priority based on the importance of the issue. If you're not sure, use your best judgment. We can always change the priority later.
+-            * **P1**: Urgent and important, we need to address this immediately.
+-            * **P2**: Important but not urgent. Should be handled by a TSC member or reviewer.
+-            * **P3**: Nice to have but not important. Can be handled by any team member.
+-            * **P4**: A good idea that we'd like to have but may take a while for the team to get to it.
+-            * **P5**: A good idea that the core team can't commit to. Will likely need to be done by an outside contributor.
+-        * Please assign an initial impact assessement (make your best guess):
+-            * **Low**: Doesn't affect many users.
+-            * **Medium**: Affects most users or has a noticeable effect on user experience.
+-            * **High**: Affects a lot of users, is a breaking change, or otherwise will be very noticeable to users.
+         * If you can't properly triage the issue, move the issue back to the "Needs Triage" column in the Triage project so someone else can triage it.
+         * If you have triaged the issue, move the issue to the "Ready for Dev Team" column in the Triage project.
+ 
+diff --git a/lib/cli.js b/lib/cli.js
+index afd1e65cb..a14930e9b 100644
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -19,12 +19,11 @@ const fs = require("fs"),
+     path = require("path"),
+     { promisify } = require("util"),
+     { ESLint } = require("./eslint"),
+-    { FlatESLint } = require("./eslint/flat-eslint"),
++    { FlatESLint, shouldUseFlatConfig } = require("./eslint/flat-eslint"),
+     createCLIOptions = require("./options"),
+     log = require("./shared/logging"),
+     RuntimeInfo = require("./shared/runtime-info");
+ const { Legacy: { naming } } = require("@eslint/eslintrc");
+-const { findFlatConfigFile } = require("./eslint/flat-eslint");
+ const { ModuleImporter } = require("@humanwhocodes/module-importer");
+ 
+ const debug = require("debug")("eslint:cli");
+@@ -275,31 +274,6 @@ async function printResults(engine, results, format, outputFile, resultsMeta) {
+     return true;
+ }
+ 
+-/**
+- * Returns whether flat config should be used.
+- * @param {boolean} [allowFlatConfig] Whether or not to allow flat config.
+- * @returns {Promise<boolean>} Where flat config should be used.
+- */
+-async function shouldUseFlatConfig(allowFlatConfig) {
+-    if (!allowFlatConfig) {
+-        return false;
+-    }
+-
+-    switch (process.env.ESLINT_USE_FLAT_CONFIG) {
+-        case "true":
+-            return true;
+-        case "false":
+-            return false;
+-        default:
+-
+-            /*
+-             * If neither explicitly enabled nor disabled, then use the presence
+-             * of a flat config file to determine enablement.
+-             */
+-            return !!(await findFlatConfigFile(process.cwd()));
+-    }
+-}
+-
+ //------------------------------------------------------------------------------
+ // Public Interface
+ //------------------------------------------------------------------------------
+@@ -329,7 +303,7 @@ const cli = {
+          * switch to flat config we can remove this logic.
+          */
+ 
+-        const usingFlatConfig = await shouldUseFlatConfig(allowFlatConfig);
++        const usingFlatConfig = allowFlatConfig && await shouldUseFlatConfig();
+ 
+         debug("Using flat config?", usingFlatConfig);
+ 
+diff --git a/lib/eslint/eslint-helpers.js b/lib/eslint/eslint-helpers.js
+index 29a9b4a9b..54b0c69d7 100644
+--- a/lib/eslint/eslint-helpers.js
++++ b/lib/eslint/eslint-helpers.js
+@@ -758,9 +758,6 @@ function processOptions({
+     if (typeof ignore !== "boolean") {
+         errors.push("'ignore' must be a boolean.");
+     }
+-    if (!isArrayOfNonEmptyString(ignorePatterns) && ignorePatterns !== null) {
+-        errors.push("'ignorePatterns' must be an array of non-empty strings or null.");
+-    }
+     if (typeof overrideConfig !== "object") {
+         errors.push("'overrideConfig' must be an object or null.");
+     }
+diff --git a/lib/eslint/flat-eslint.js b/lib/eslint/flat-eslint.js
+index 82177fff9..0195769df 100644
+--- a/lib/eslint/flat-eslint.js
++++ b/lib/eslint/flat-eslint.js
+@@ -76,7 +76,7 @@ const LintResultCache = require("../cli-engine/lint-result-cache");
+  * @property {string[]} [fixTypes] Array of rule types to apply fixes for.
+  * @property {boolean} [globInputPaths] Set to false to skip glob resolution of input file paths to lint (default: true). If false, each input file paths is assumed to be a non-glob path to an existing file.
+  * @property {boolean} [ignore] False disables all ignore patterns except for the default ones.
+- * @property {string[]} [ignorePatterns] Ignore file patterns to use in addition to config ignores. These patterns are relative to `cwd`.
++ * @property {string[]} [ignorePatterns] Ignore file patterns to use in addition to config ignores.
+  * @property {ConfigData} [overrideConfig] Override config object, overrides all configs used with this instance
+  * @property {boolean|string} [overrideConfigFile] Searches for default config file when falsy;
+  *      doesn't do any config file lookup when `true`; considered to be a config filename
+@@ -261,7 +261,7 @@ function compareResultsByFilePath(a, b) {
+  * Searches from the current working directory up until finding the
+  * given flat config filename.
+  * @param {string} cwd The current working directory to search from.
+- * @returns {Promise<string|undefined>} The filename if found or `undefined` if not.
++ * @returns {Promise<string|null>} The filename if found or `null` if not.
+  */
+ function findFlatConfigFile(cwd) {
+     return findUp(
+@@ -326,7 +326,7 @@ async function loadFlatConfigFile(filePath) {
+  * as override config file is not explicitly set to `false`, it will search
+  * upwards from the cwd for a file named `eslint.config.js`.
+  * @param {import("./eslint").ESLintOptions} options The ESLint instance options.
+- * @returns {{configFilePath:string|undefined,basePath:string,error:Error|null}} Location information for
++ * @returns {{configFilePath:string,basePath:string,error:Error|null}} Location information for
+  *      the config file.
+  */
+ async function locateConfigFileToUse({ configFile, cwd }) {
+@@ -404,39 +404,45 @@ async function calculateConfigArray(eslint, {
+     // add in any configured defaults
+     configs.push(...slots.defaultConfigs);
+ 
+-    // append command line ignore patterns
+-    if (ignorePatterns && ignorePatterns.length > 0) {
+-
+-        let relativeIgnorePatterns;
++    let allIgnorePatterns = [];
+ 
+-        /*
+-         * If the config file basePath is different than the cwd, then
+-         * the ignore patterns won't work correctly. Here, we adjust the
+-         * ignore pattern to include the correct relative path. Patterns
+-         * passed as `ignorePatterns` are relative to the cwd, whereas
+-         * the config file basePath can be an ancestor of the cwd.
+-         */
+-        if (basePath === cwd) {
+-            relativeIgnorePatterns = ignorePatterns;
++    // append command line ignore patterns
++    if (ignorePatterns) {
++        if (typeof ignorePatterns === "string") {
++            allIgnorePatterns.push(ignorePatterns);
+         } else {
++            allIgnorePatterns.push(...ignorePatterns);
++        }
++    }
++
++    /*
++     * If the config file basePath is different than the cwd, then
++     * the ignore patterns won't work correctly. Here, we adjust the
++     * ignore pattern to include the correct relative path. Patterns
++     * loaded from ignore files are always relative to the cwd, whereas
++     * the config file basePath can be an ancestor of the cwd.
++     */
++    if (basePath !== cwd && allIgnorePatterns.length) {
+ 
+-            const relativeIgnorePath = path.relative(basePath, cwd);
++        const relativeIgnorePath = path.relative(basePath, cwd);
+ 
+-            relativeIgnorePatterns = ignorePatterns.map(pattern => {
+-                const negated = pattern.startsWith("!");
+-                const basePattern = negated ? pattern.slice(1) : pattern;
++        allIgnorePatterns = allIgnorePatterns.map(pattern => {
++            const negated = pattern.startsWith("!");
++            const basePattern = negated ? pattern.slice(1) : pattern;
+ 
+-                return (negated ? "!" : "") +
++            return (negated ? "!" : "") +
+                 path.posix.join(relativeIgnorePath, basePattern);
+-            });
+-        }
++        });
++    }
++
++    if (allIgnorePatterns.length) {
+ 
+         /*
+          * Ignore patterns are added to the end of the config array
+          * so they can override default ignores.
+          */
+         configs.push({
+-            ignores: relativeIgnorePatterns
++            ignores: allIgnorePatterns
+         });
+     }
+ 
+@@ -1206,11 +1212,31 @@ class FlatESLint {
+     }
+ }
+ 
++/**
++ * Returns whether flat config should be used.
++ * @returns {Promise<boolean>} Whether flat config should be used.
++ */
++async function shouldUseFlatConfig() {
++    switch (process.env.ESLINT_USE_FLAT_CONFIG) {
++        case "true":
++            return true;
++        case "false":
++            return false;
++        default:
++
++            /*
++             * If neither explicitly enabled nor disabled, then use the presence
++             * of a flat config file to determine enablement.
++             */
++            return !!(await findFlatConfigFile(process.cwd()));
++    }
++}
++
+ //------------------------------------------------------------------------------
+ // Public Interface
+ //------------------------------------------------------------------------------
+ 
+ module.exports = {
+     FlatESLint,
+-    findFlatConfigFile
++    shouldUseFlatConfig
+ };
+diff --git a/lib/unsupported-api.js b/lib/unsupported-api.js
+index c1daf54d6..b688608ca 100644
+--- a/lib/unsupported-api.js
++++ b/lib/unsupported-api.js
+@@ -12,7 +12,7 @@
+ //-----------------------------------------------------------------------------
+ 
+ const { FileEnumerator } = require("./cli-engine/file-enumerator");
+-const { FlatESLint } = require("./eslint/flat-eslint");
++const { FlatESLint, shouldUseFlatConfig } = require("./eslint/flat-eslint");
+ const FlatRuleTester = require("./rule-tester/flat-rule-tester");
+ 
+ //-----------------------------------------------------------------------------
+@@ -22,6 +22,7 @@ const FlatRuleTester = require("./rule-tester/flat-rule-tester");
+ module.exports = {
+     builtinRules: require("./rules"),
+     FlatESLint,
++    shouldUseFlatConfig,
+     FlatRuleTester,
+     FileEnumerator
+ };

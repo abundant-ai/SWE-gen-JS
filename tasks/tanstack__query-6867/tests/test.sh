@@ -1,0 +1,36 @@
+#!/bin/bash
+
+cd /app/src
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "packages/eslint-plugin-query/src/__tests__"
+cp "/tests/packages/eslint-plugin-query/src/__tests__/exhaustive-deps.test.ts" "packages/eslint-plugin-query/src/__tests__/exhaustive-deps.test.ts"
+mkdir -p "packages/eslint-plugin-query/src/__tests__"
+cp "/tests/packages/eslint-plugin-query/src/__tests__/no-rest-destructuring.test.ts" "packages/eslint-plugin-query/src/__tests__/no-rest-destructuring.test.ts"
+mkdir -p "packages/eslint-plugin-query/src/__tests__"
+cp "/tests/packages/eslint-plugin-query/src/__tests__/stable-query-client.test.ts" "packages/eslint-plugin-query/src/__tests__/stable-query-client.test.ts"
+mkdir -p "packages/eslint-plugin-query/src/__tests__"
+cp "/tests/packages/eslint-plugin-query/src/__tests__/test-utils.ts" "packages/eslint-plugin-query/src/__tests__/test-utils.ts"
+
+# Reset NX cache to avoid cache integrity issues after copying files
+npx nx reset
+
+# Rebuild packages after copying test files
+cd /app/src/packages/query-core
+pnpm run build
+cd /app/src/packages/eslint-plugin-query
+pnpm run build
+cd /app/src
+
+# Run the specific test files for this PR
+cd /app/src/packages/eslint-plugin-query
+pnpm run test:lib src/__tests__/exhaustive-deps.test.ts src/__tests__/no-rest-destructuring.test.ts src/__tests__/stable-query-client.test.ts src/__tests__/test-utils.ts
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+  exit 0
+else
+  echo 0 > /logs/verifier/reward.txt
+  exit 1
+fi

@@ -1,0 +1,328 @@
+diff --git a/packages/common/index.ts b/packages/common/index.ts
+index 6a6107762..ed51fa1bb 100644
+--- a/packages/common/index.ts
++++ b/packages/common/index.ts
+@@ -31,6 +31,7 @@ export {
+   INestApplication,
+   INestApplicationContext,
+   INestMicroservice,
++  InjectionToken,
+   IntrospectionResult,
+   MessageEvent,
+   MiddlewareConsumer,
+@@ -44,6 +45,7 @@ export {
+   OnApplicationShutdown,
+   OnModuleDestroy,
+   OnModuleInit,
++  OptionalFactoryDependency,
+   Paramtype,
+   PipeTransform,
+   Provider,
+diff --git a/packages/common/interfaces/modules/index.ts b/packages/common/interfaces/modules/index.ts
+index 612adb82b..458f952a3 100644
+--- a/packages/common/interfaces/modules/index.ts
++++ b/packages/common/interfaces/modules/index.ts
+@@ -1,6 +1,8 @@
+ export * from './dynamic-module.interface';
+ export * from './forward-reference.interface';
++export * from './injection-token.interface';
+ export * from './introspection-result.interface';
+ export * from './module-metadata.interface';
+ export * from './nest-module.interface';
++export * from './optional-factory-dependency.interface';
+ export * from './provider.interface';
+diff --git a/packages/common/interfaces/modules/injection-token.interface.ts b/packages/common/interfaces/modules/injection-token.interface.ts
+new file mode 100644
+index 000000000..01aa7b1a9
+--- /dev/null
++++ b/packages/common/interfaces/modules/injection-token.interface.ts
+@@ -0,0 +1,9 @@
++import { Abstract } from '../abstract.interface';
++import { Type } from '../type.interface';
++
++export type InjectionToken =
++  | string
++  | symbol
++  | Type<any>
++  | Abstract<any>
++  | Function;
+diff --git a/packages/common/interfaces/modules/optional-factory-dependency.interface.ts b/packages/common/interfaces/modules/optional-factory-dependency.interface.ts
+new file mode 100644
+index 000000000..be2ebb298
+--- /dev/null
++++ b/packages/common/interfaces/modules/optional-factory-dependency.interface.ts
+@@ -0,0 +1,6 @@
++import { InjectionToken } from './injection-token.interface';
++
++export type OptionalFactoryDependency = {
++  token: InjectionToken;
++  optional: boolean;
++};
+diff --git a/packages/common/interfaces/modules/provider.interface.ts b/packages/common/interfaces/modules/provider.interface.ts
+index c868b3c97..df331b97c 100644
+--- a/packages/common/interfaces/modules/provider.interface.ts
++++ b/packages/common/interfaces/modules/provider.interface.ts
+@@ -1,6 +1,7 @@
+-import { Abstract } from '../abstract.interface';
+ import { Scope } from '../scope-options.interface';
+ import { Type } from '../type.interface';
++import { InjectionToken } from './injection-token.interface';
++import { OptionalFactoryDependency } from './optional-factory-dependency.interface';
+ 
+ /**
+  *
+@@ -36,7 +37,7 @@ export interface ClassProvider<T = any> {
+   /**
+    * Injection token
+    */
+-  provide: string | symbol | Type<any> | Abstract<any> | Function;
++  provide: InjectionToken;
+   /**
+    * Type (class name) of provider (instance to be injected).
+    */
+@@ -66,7 +67,7 @@ export interface ValueProvider<T = any> {
+   /**
+    * Injection token
+    */
+-  provide: string | symbol | Type<any> | Abstract<any> | Function;
++  provide: InjectionToken;
+   /**
+    * Instance of a provider to be injected.
+    */
+@@ -97,7 +98,7 @@ export interface FactoryProvider<T = any> {
+   /**
+    * Injection token
+    */
+-  provide: string | symbol | Type<any> | Abstract<any> | Function;
++  provide: InjectionToken;
+   /**
+    * Factory function that returns an instance of the provider to be injected.
+    */
+@@ -105,7 +106,7 @@ export interface FactoryProvider<T = any> {
+   /**
+    * Optional list of providers to be injected into the context of the Factory function.
+    */
+-  inject?: Array<Type<any> | string | symbol | Abstract<any> | Function>;
++  inject?: Array<InjectionToken | OptionalFactoryDependency>;
+   /**
+    * Optional enum defining lifetime of the provider that is returned by the Factory function.
+    */
+@@ -131,7 +132,7 @@ export interface ExistingProvider<T = any> {
+   /**
+    * Injection token
+    */
+-  provide: string | symbol | Type<any> | Abstract<any> | Function;
++  provide: InjectionToken;
+   /**
+    * Provider to be aliased by the Injection token.
+    */
+diff --git a/packages/core/injector/injector.ts b/packages/core/injector/injector.ts
+index 67996afb3..5d89eef7d 100644
+--- a/packages/core/injector/injector.ts
++++ b/packages/core/injector/injector.ts
+@@ -1,4 +1,9 @@
+-import { Logger, LoggerService } from '@nestjs/common';
++import {
++  InjectionToken,
++  Logger,
++  LoggerService,
++  OptionalFactoryDependency,
++} from '@nestjs/common';
+ import {
+   OPTIONAL_DEPS_METADATA,
+   OPTIONAL_PROPERTY_DEPS_METADATA,
+@@ -34,7 +39,7 @@ import { InstanceToken, Module } from './module';
+ /**
+  * The type of an injectable dependency
+  */
+-export type InjectorDependency = Type<any> | Function | string | symbol;
++export type InjectorDependency = InjectionToken;
+ 
+ /**
+  * The property-based dependency
+@@ -119,7 +124,7 @@ export class Injector {
+       const properties = await this.resolveProperties(
+         wrapper,
+         moduleRef,
+-        inject,
++        inject as InjectionToken[],
+         contextId,
+         wrapper,
+         inquirer,
+@@ -137,7 +142,7 @@ export class Injector {
+     await this.resolveConstructorParams<T>(
+       wrapper,
+       moduleRef,
+-      inject,
++      inject as InjectionToken[],
+       callback,
+       contextId,
+       wrapper,
+@@ -246,12 +251,11 @@ export class Injector {
+       );
+       return callback(deps);
+     }
+-    const dependencies = isNil(inject)
+-      ? this.reflectConstructorParams(wrapper.metatype as Type<any>)
+-      : inject;
+-    const optionalDependenciesIds = isNil(inject)
+-      ? this.reflectOptionalParams(wrapper.metatype as Type<any>)
+-      : [];
++
++    const isFactoryProvider = !isNil(inject);
++    const [dependencies, optionalDependenciesIds] = isFactoryProvider
++      ? this.getFactoryProviderDependencies(wrapper)
++      : this.getClassDependencies(wrapper);
+ 
+     let isResolved = true;
+     const resolveParam = async (param: unknown, index: number) => {
+@@ -292,6 +296,47 @@ export class Injector {
+     isResolved && (await callback(instances));
+   }
+ 
++  public getClassDependencies<T>(
++    wrapper: InstanceWrapper<T>,
++  ): [InjectorDependency[], number[]] {
++    const ctorRef = wrapper.metatype as Type<any>;
++    return [
++      this.reflectConstructorParams(ctorRef),
++      this.reflectOptionalParams(ctorRef),
++    ];
++  }
++
++  public getFactoryProviderDependencies<T>(
++    wrapper: InstanceWrapper<T>,
++  ): [InjectorDependency[], number[]] {
++    const optionalDependenciesIds = [];
++    const isOptionalFactoryDep = (
++      item: InjectionToken | OptionalFactoryDependency,
++    ): item is OptionalFactoryDependency =>
++      !isUndefined((item as OptionalFactoryDependency).token) &&
++      !isUndefined((item as OptionalFactoryDependency).optional);
++
++    const mapFactoryProviderInjectArray = (
++      item: InjectionToken | OptionalFactoryDependency,
++      index: number,
++    ): InjectionToken => {
++      if (typeof item !== 'object') {
++        return item;
++      }
++      if (isOptionalFactoryDep(item)) {
++        if (item.optional) {
++          optionalDependenciesIds.push(index);
++        }
++        return item?.token;
++      }
++      return item;
++    };
++    return [
++      wrapper.inject?.map?.(mapFactoryProviderInjectArray),
++      optionalDependenciesIds,
++    ];
++  }
++
+   public reflectConstructorParams<T>(type: Type<T>): any[] {
+     const paramtypes = Reflect.getMetadata(PARAMTYPES_METADATA, type) || [];
+     const selfParams = this.reflectSelfParams<T>(type);
+diff --git a/packages/core/injector/instance-wrapper.ts b/packages/core/injector/instance-wrapper.ts
+index 9d9d29579..18ba4714c 100644
+--- a/packages/core/injector/instance-wrapper.ts
++++ b/packages/core/injector/instance-wrapper.ts
+@@ -43,7 +43,7 @@ export class InstanceWrapper<T = any> {
+ 
+   public scope?: Scope = Scope.DEFAULT;
+   public metatype: Type<T> | Function;
+-  public inject?: (string | symbol | Function | Type<any>)[];
++  public inject?: FactoryProvider['inject'];
+   public forwardRef?: boolean;
+ 
+   private readonly values = new WeakMap<ContextId, InstancePerContext<T>>();
+diff --git a/packages/core/injector/module.ts b/packages/core/injector/module.ts
+index ed3102a01..461fd0899 100644
+--- a/packages/core/injector/module.ts
++++ b/packages/core/injector/module.ts
+@@ -1,11 +1,11 @@
+ import {
+-  Abstract,
+   ClassProvider,
+   Controller,
+   DynamicModule,
+   ExistingProvider,
+   FactoryProvider,
+   Injectable,
++  InjectionToken,
+   NestModule,
+   Provider,
+   ValueProvider,
+@@ -31,12 +31,11 @@ import { NestContainer } from './container';
+ import { InstanceWrapper } from './instance-wrapper';
+ import { ModuleRef } from './module-ref';
+ 
+-export type InstanceToken =
+-  | string
+-  | symbol
+-  | Type<any>
+-  | Abstract<any>
+-  | Function;
++/**
++ * @note
++ * Left for backward compatibility
++ */
++export type InstanceToken = InjectionToken;
+ 
+ export class Module {
+   private readonly _id: string;
+diff --git a/packages/core/scanner.ts b/packages/core/scanner.ts
+index c318dba07..63d02a6c2 100644
+--- a/packages/core/scanner.ts
++++ b/packages/core/scanner.ts
+@@ -1,18 +1,17 @@
+ import {
+-  Abstract,
+   DynamicModule,
+   flatten,
+   ForwardReference,
+-  Provider,
+   Logger,
++  Provider,
+ } from '@nestjs/common';
+ import {
++  CATCH_WATERMARK,
++  CONTROLLER_WATERMARK,
+   EXCEPTION_FILTERS_METADATA,
+   GUARDS_METADATA,
+-  INTERCEPTORS_METADATA,
+   INJECTABLE_WATERMARK,
+-  CONTROLLER_WATERMARK,
+-  CATCH_WATERMARK,
++  INTERCEPTORS_METADATA,
+   MODULE_METADATA,
+   PIPES_METADATA,
+   ROUTE_ARGS_METADATA,
+@@ -23,6 +22,7 @@ import {
+   ExceptionFilter,
+   ExistingProvider,
+   FactoryProvider,
++  InjectionToken,
+   NestInterceptor,
+   PipeTransform,
+   Scope,
+@@ -41,8 +41,8 @@ import { iterate } from 'iterare';
+ import { ApplicationConfig } from './application-config';
+ import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from './constants';
+ import { CircularDependencyException } from './errors/exceptions/circular-dependency.exception';
+-import { InvalidModuleException } from './errors/exceptions/invalid-module.exception';
+ import { InvalidClassModuleException } from './errors/exceptions/invalid-class-module.exception';
++import { InvalidModuleException } from './errors/exceptions/invalid-module.exception';
+ import { UndefinedModuleException } from './errors/exceptions/undefined-module.exception';
+ import { getClassScope } from './helpers/get-class-scope';
+ import { NestContainer } from './injector/container';
+@@ -54,7 +54,7 @@ import { MetadataScanner } from './metadata-scanner';
+ interface ApplicationProviderWrapper {
+   moduleKey: string;
+   providerKey: string;
+-  type: string | symbol | Type<any> | Abstract<any> | Function;
++  type: InjectionToken;
+   scope?: Scope;
+ }
+ 

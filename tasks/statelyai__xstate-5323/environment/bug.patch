@@ -1,0 +1,268 @@
+diff --git a/.changeset/proud-bananas-do.md b/.changeset/proud-bananas-do.md
+deleted file mode 100644
+index a719a87afa..0000000000
+--- a/.changeset/proud-bananas-do.md
++++ /dev/null
+@@ -1,30 +0,0 @@
+----
+-'@xstate/store': minor
+----
+-
+-Added support for effect-only transitions that don't trigger state updates. Now, when a transition returns the same state but includes effects, subscribers won't be notified of a state change, but the effects will still be executed. This helps prevent unnecessary re-renders while maintaining side effect functionality.
+-
+-```ts
+-it('should not trigger update if the snapshot is the same even if there are effects', () => {
+-  const store = createStore({
+-    context: { count: 0 },
+-    on: {
+-      doNothing: (ctx, _, enq) => {
+-        enq.effect(() => {
+-          // …
+-        });
+-        return ctx; // Context is the same, so no update is triggered
+-        // This is the same as not returning anything (void)
+-      }
+-    }
+-  });
+-
+-  const spy = vi.fn();
+-  store.subscribe(spy);
+-
+-  store.trigger.doNothing();
+-  store.trigger.doNothing();
+-
+-  expect(spy).toHaveBeenCalledTimes(0);
+-});
+-```
+diff --git a/packages/xstate-store/src/store.ts b/packages/xstate-store/src/store.ts
+index 1836b14e77..f620b0f0eb 100644
+--- a/packages/xstate-store/src/store.ts
++++ b/packages/xstate-store/src/store.ts
+@@ -7,6 +7,7 @@ import {
+   ExtractEvents,
+   InteropSubscribable,
+   Observer,
++  Recipe,
+   Store,
+   StoreAssigner,
+   StoreContext,
+@@ -28,6 +29,20 @@ const symbolObservable: typeof Symbol.observable = (() =>
+   (typeof Symbol === 'function' && Symbol.observable) ||
+   '@@observable')() as any;
+ 
++/**
++ * Updates a context object using a recipe function.
++ *
++ * @param context - The current context
++ * @param recipe - A function that describes how to update the context
++ * @returns The updated context
++ */
++function setter<TContext extends StoreContext>(
++  context: TContext,
++  recipe: Recipe<TContext, TContext>
++): TContext {
++  return recipe(context);
++}
++
+ const inspectionObservers = new WeakMap<
+   Store<any, any, any>,
+   Set<Observer<StoreInspectionEvent>>
+@@ -62,20 +77,20 @@ function createStoreCore<
+   const transition = logic.transition;
+ 
+   function receive(event: StoreEvent) {
+-    const [nextSnapshot, effects] = transition(currentSnapshot, event);
+-    currentSnapshot = nextSnapshot;
++    let effects: StoreEffect<TEmitted>[];
++    [currentSnapshot, effects] = transition(currentSnapshot, event);
+ 
+     inspectionObservers.get(store)?.forEach((observer) => {
+       observer.next?.({
+         type: '@xstate.snapshot',
+         event,
+-        snapshot: nextSnapshot,
++        snapshot: currentSnapshot,
+         actorRef: store,
+         rootId: store.sessionId
+       });
+     });
+ 
+-    atom.set(nextSnapshot);
++    atom.set(currentSnapshot);
+ 
+     for (const effect of effects) {
+       if (typeof effect === 'function') {
+@@ -407,7 +422,7 @@ export function createStoreTransition<
+     event: ExtractEvents<TEventPayloadMap>
+   ): [StoreSnapshot<TContext>, StoreEffect<TEmitted>[]] => {
+     type StoreEvent = ExtractEvents<TEventPayloadMap>;
+-    const currentContext = snapshot.context;
++    let currentContext = snapshot.context;
+     const assigner = transitions?.[event.type as StoreEvent['type']];
+     const effects: StoreEffect<TEmitted>[] = [];
+ 
+@@ -431,22 +446,43 @@ export function createStoreTransition<
+       return [snapshot, effects];
+     }
+ 
+-    const nextContext = producer
+-      ? producer(currentContext, (draftContext) =>
+-          (assigner as StoreProducerAssigner<TContext, StoreEvent, TEmitted>)(
+-            draftContext,
+-            event,
+-            enqueue
++    if (typeof assigner === 'function') {
++      currentContext = producer
++        ? producer(currentContext, (draftContext) =>
++            (assigner as StoreProducerAssigner<TContext, StoreEvent, TEmitted>)(
++              draftContext,
++              event,
++              enqueue
++            )
+           )
+-        )
+-      : (assigner(currentContext, event as any, enqueue) ?? currentContext);
++        : setter(currentContext, (draftContext) =>
++            Object.assign(
++              {},
++              currentContext,
++              assigner?.(
++                draftContext,
++                event as any, // TODO: help me
++                enqueue
++              )
++            )
++          );
++    } else {
++      const partialUpdate: Record<string, unknown> = {};
++      for (const key of Object.keys(assigner)) {
++        const propAssignment = assigner[key];
++        partialUpdate[key] =
++          typeof propAssignment === 'function'
++            ? (propAssignment as StoreAssigner<TContext, StoreEvent, TEmitted>)(
++                currentContext,
++                event,
++                enqueue
++              )
++            : propAssignment;
++      }
++      currentContext = Object.assign({}, currentContext, partialUpdate);
++    }
+ 
+-    return [
+-      nextContext === currentContext
+-        ? snapshot
+-        : { ...snapshot, context: nextContext },
+-      effects
+-    ];
++    return [{ ...snapshot, context: currentContext }, effects];
+   };
+ }
+ 
+diff --git a/packages/xstate-store/src/types.ts b/packages/xstate-store/src/types.ts
+index df7c45d65e..017b75c2ff 100644
+--- a/packages/xstate-store/src/types.ts
++++ b/packages/xstate-store/src/types.ts
+@@ -6,6 +6,8 @@ export type ExtractEvents<T extends EventPayloadMap> = Values<{
+   [K in keyof T & string]: T[K] & { type: K };
+ }>;
+ 
++export type Recipe<T, TReturn> = (state: T) => TReturn;
++
+ type AllKeys<T> = T extends any ? keyof T : never;
+ 
+ type EmitterFunction<TEmittedEvent extends EventObject> = (
+diff --git a/packages/xstate-store/test/store.test.ts b/packages/xstate-store/test/store.test.ts
+index b826adb040..52a188bae6 100644
+--- a/packages/xstate-store/test/store.test.ts
++++ b/packages/xstate-store/test/store.test.ts
+@@ -446,43 +446,6 @@ it('effects can be enqueued', async () => {
+   expect(store.getSnapshot().context.count).toEqual(0);
+ });
+ 
+-it('effect-only transitions should execute effects', () => {
+-  const spy = vi.fn();
+-  const store = createStore({
+-    context: { count: 0 },
+-    on: {
+-      justEffect: (ctx, _, enq) => {
+-        enq.effect(spy);
+-      }
+-    }
+-  });
+-
+-  store.trigger.justEffect();
+-
+-  expect(spy).toHaveBeenCalledTimes(1);
+-});
+-
+-it('emits-only transitions should emit events', () => {
+-  const spy = vi.fn();
+-  const store = createStore({
+-    context: { count: 0 },
+-    emits: {
+-      emitted: () => {}
+-    },
+-    on: {
+-      justEmit: (ctx, _, enq) => {
+-        enq.emit.emitted();
+-      }
+-    }
+-  });
+-
+-  store.on('emitted', spy);
+-
+-  store.trigger.justEmit();
+-
+-  expect(spy).toHaveBeenCalledTimes(1);
+-});
+-
+ it('async effects can be enqueued', async () => {
+   const store = createStore({
+     context: {
+@@ -835,45 +798,6 @@ it('can be created with a logic object', () => {
+   store.getSnapshot().context.count satisfies string;
+ });
+ 
+-it('should not trigger update if the snapshot is the same', () => {
+-  const store = createStore({
+-    context: { count: 0 },
+-    on: {
+-      doNothing: (ctx) => ctx
+-    }
+-  });
+-
+-  const spy = vi.fn();
+-  store.subscribe(spy);
+-
+-  store.trigger.doNothing();
+-  store.trigger.doNothing();
+-
+-  expect(spy).toHaveBeenCalledTimes(0);
+-});
+-
+-it('should not trigger update if the snapshot is the same even if there are effects', () => {
+-  const store = createStore({
+-    context: { count: 0 },
+-    on: {
+-      doNothing: (ctx, _, enq) => {
+-        enq.effect(() => {
+-          // …
+-        });
+-        return ctx;
+-      }
+-    }
+-  });
+-
+-  const spy = vi.fn();
+-  store.subscribe(spy);
+-
+-  store.trigger.doNothing();
+-  store.trigger.doNothing();
+-
+-  expect(spy).toHaveBeenCalledTimes(0);
+-});
+-
+ describe('types', () => {
+   it('AnyStoreConfig', () => {
+     function transformStoreConfig(_config: AnyStoreConfig): void {}

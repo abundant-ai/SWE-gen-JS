@@ -1,0 +1,549 @@
+diff --git a/.changeset/group-by-nesting-feature.md b/.changeset/group-by-nesting-feature.md
+new file mode 100644
+index 0000000000..328be09b52
+--- /dev/null
++++ b/.changeset/group-by-nesting-feature.md
+@@ -0,0 +1,51 @@
++---
++"@biomejs/biome": minor
++---
++
++Added `groupByNesting` option to the `useSortedKeys` assist. When enabled, object keys are grouped by their value's nesting depth before sorting alphabetically.
++
++Simple values (primitives, single-line arrays, and single-line objects) are sorted first, followed by nested values (multi-line arrays and multi-line objects).
++
++#### Example
++
++To enable this option, configure it in your `biome.json`:
++
++```json
++{
++  "linter": {
++    "rules": {
++      "source": {
++        "useSortedKeys": {
++          "options": {
++            "groupByNesting": true
++          }
++        }
++      }
++    }
++  }
++}
++```
++
++With this option, the following unsorted object:
++
++```js
++const object = {
++  "name": "Sample",
++  "details": {
++    "description": "nested"
++  },
++  "id": 123
++}
++```
++
++Will be sorted as:
++
++```js
++const object ={
++  "id": 123,
++  "name": "Sample",
++  "details": {
++    "description": "nested"
++  }
++}
++```
+diff --git a/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs b/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs
+index eea816874f..972bfd86a4 100644
+--- a/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs
++++ b/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs
+@@ -1,4 +1,4 @@
+-use std::{borrow::Cow, ops::Not};
++use std::{borrow::Cow, cmp::Ordering, ops::Not};
+ 
+ use biome_analyze::{
+     Ast, FixKind, Rule, RuleAction, RuleDiagnostic, RuleSource,
+@@ -10,8 +10,10 @@ use biome_console::markup;
+ use biome_deserialize::TextRange;
+ use biome_diagnostics::{Applicability, category};
+ use biome_js_factory::make;
+-use biome_js_syntax::{JsObjectExpression, JsObjectMemberList, T};
+-use biome_rowan::{AstNode, BatchMutationExt, TriviaPieceKind};
++use biome_js_syntax::{
++    AnyJsExpression, AnyJsObjectMember, JsLanguage, JsObjectExpression, JsObjectMemberList, T,
++};
++use biome_rowan::{AstNode, BatchMutationExt, SyntaxResult, SyntaxToken, TriviaPieceKind};
+ use biome_rule_options::use_sorted_keys::{SortOrder, UseSortedKeysOptions};
+ use biome_string_case::comparable_token::ComparableToken;
+ 
+@@ -129,6 +131,31 @@ declare_source_rule! {
+     /// };
+     /// ```
+     ///
++    /// ### `groupByNesting`
++    /// When enabled, groups object keys by their value's nesting depth before sorting alphabetically.
++    /// Simple values (primitives, single-line arrays, and single-line objects) are sorted first,
++    /// followed by nested values (multi-line arrays and multi-line objects).
++    ///
++    /// > Default: `false`
++    ///
++    ///
++    /// ```json,options
++    /// {
++    ///     "options": {
++    ///         "groupByNesting": true
++    ///     }
++    /// }
++    /// ```
++    /// ```js,use_options,expect_diagnostic
++    /// const obj = {
++    ///     name: "Sample",
++    ///     details: {
++    ///         description: "nested"
++    ///     },
++    ///     id: 123
++    /// };
++    /// ```
++    ///
+     pub UseSortedKeys {
+         version: "2.0.0",
+         name: "useSortedKeys",
+@@ -139,6 +166,67 @@ declare_source_rule! {
+     }
+ }
+ 
++/// Checks if an object/array spans multiple lines by examining CST trivia.
++/// For non-empty containers, checks the first token of the members/elements.
++/// For empty containers, checks the closing brace/bracket token.
++fn has_multiline_content(
++    members_first_token: Option<SyntaxToken<JsLanguage>>,
++    closing_token: SyntaxResult<SyntaxToken<JsLanguage>>,
++) -> bool {
++    members_first_token.map_or_else(
++        || {
++            closing_token
++                .map(|token| token.has_leading_newline())
++                .unwrap_or(false)
++        },
++        |token| token.has_leading_newline(),
++    )
++}
++
++/// Determines the nesting depth of a JavaScript expression for grouping purposes.
++fn get_nesting_depth(value: &AnyJsExpression) -> Ordering {
++    match value {
++        AnyJsExpression::JsObjectExpression(obj) => {
++            let members = obj.members();
++            if has_multiline_content(members.syntax().first_token(), obj.r_curly_token()) {
++                Ordering::Greater
++            } else {
++                Ordering::Equal
++            }
++        }
++        AnyJsExpression::JsArrayExpression(array) => {
++            let elements = array.elements();
++            if has_multiline_content(elements.syntax().first_token(), array.r_brack_token()) {
++                Ordering::Greater
++            } else {
++                Ordering::Equal
++            }
++        }
++        // Function and class expressions are treated as nested
++        AnyJsExpression::JsArrowFunctionExpression(_)
++        | AnyJsExpression::JsFunctionExpression(_)
++        | AnyJsExpression::JsClassExpression(_) => Ordering::Greater,
++        _ => Ordering::Equal,
++    }
++}
++
++/// Determines the nesting depth for an object member:
++/// - properties: based on value expression;
++/// - methods/getters/setters: treat as nested (1);
++/// - spreads/computed or unnamed: non-sortable (None).
++fn get_member_depth(node: &AnyJsObjectMember) -> Option<Ordering> {
++    match node {
++        AnyJsObjectMember::JsPropertyObjectMember(prop) => {
++            let value = prop.value().ok()?;
++            Some(get_nesting_depth(&value))
++        }
++        AnyJsObjectMember::JsMethodObjectMember(_)
++        | AnyJsObjectMember::JsGetterObjectMember(_)
++        | AnyJsObjectMember::JsSetterObjectMember(_) => Some(Ordering::Greater),
++        _ => None,
++    }
++}
++
+ impl Rule for UseSortedKeys {
+     type Query = Ast<JsObjectMemberList>;
+     type State = ();
+@@ -153,23 +241,46 @@ impl Rule for UseSortedKeys {
+             SortOrder::Lexicographic => ComparableToken::lexicographic_cmp,
+         };
+ 
+-        is_separated_list_sorted_by(
+-            ctx.query(),
+-            |node| node.name().map(ComparableToken::new),
+-            comparator,
+-        )
+-        .ok()?
+-        .not()
+-        .then_some(())
++        if options.group_by_nesting.unwrap_or(false) {
++            is_separated_list_sorted_by(
++                ctx.query(),
++                |node| {
++                    let depth = get_member_depth(node)?;
++                    let name = node.name().map(ComparableToken::new)?;
++                    Some((depth, name))
++                },
++                |(d1, n1), (d2, n2)| d1.cmp(d2).then_with(|| comparator(n1, n2)),
++            )
++            .ok()?
++            .not()
++            .then_some(())
++        } else {
++            is_separated_list_sorted_by(
++                ctx.query(),
++                |node| node.name().map(ComparableToken::new),
++                comparator,
++            )
++            .ok()?
++            .not()
++            .then_some(())
++        }
+     }
+ 
+     fn diagnostic(ctx: &RuleContext<Self>, _state: &Self::State) -> Option<RuleDiagnostic> {
++        let options = ctx.options();
++        let message = if options.group_by_nesting.unwrap_or(false) {
++            markup! {
++                "The object properties are not sorted by nesting level and key."
++            }
++        } else {
++            markup! {
++                "The object properties are not sorted by key."
++            }
++        };
+         Some(RuleDiagnostic::new(
+             category!("assist/source/useSortedKeys"),
+             ctx.query().range(),
+-            markup! {
+-                "The object properties are not sorted by key."
+-            },
++            message,
+         ))
+     }
+ 
+@@ -190,13 +301,27 @@ impl Rule for UseSortedKeys {
+             SortOrder::Lexicographic => ComparableToken::lexicographic_cmp,
+         };
+ 
+-        let new_list = sorted_separated_list_by(
+-            list,
+-            |node| node.name().map(ComparableToken::new),
+-            || make::token(T![,]).with_trailing_trivia([(TriviaPieceKind::Whitespace, " ")]),
+-            comparator,
+-        )
+-        .ok()?;
++        let new_list = if options.group_by_nesting.unwrap_or(false) {
++            sorted_separated_list_by(
++                list,
++                |node| {
++                    let depth = get_member_depth(node)?;
++                    let name = node.name().map(ComparableToken::new)?;
++                    Some((depth, name))
++                },
++                || make::token(T![,]).with_trailing_trivia([(TriviaPieceKind::Whitespace, " ")]),
++                |(d1, n1), (d2, n2)| d1.cmp(d2).then_with(|| comparator(n1, n2)),
++            )
++            .ok()?
++        } else {
++            sorted_separated_list_by(
++                list,
++                |node| node.name().map(ComparableToken::new),
++                || make::token(T![,]).with_trailing_trivia([(TriviaPieceKind::Whitespace, " ")]),
++                comparator,
++            )
++            .ok()?
++        };
+ 
+         let mut mutation = ctx.root().begin();
+         mutation.replace_node_discard_trivia(list.clone(), new_list);
+diff --git a/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs b/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs
+index ce9d21bf36..c2a944bc17 100644
+--- a/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs
++++ b/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs
+@@ -6,11 +6,13 @@ use biome_analyze::{
+ use biome_console::markup;
+ use biome_diagnostics::category;
+ use biome_json_factory::make;
+-use biome_json_syntax::{JsonMemberList, JsonObjectValue, T, TextRange};
+-use biome_rowan::{AstNode, BatchMutationExt};
++use biome_json_syntax::{
++    AnyJsonValue, JsonLanguage, JsonMemberList, JsonObjectValue, T, TextRange,
++};
++use biome_rowan::{AstNode, BatchMutationExt, SyntaxResult, SyntaxToken};
+ use biome_rule_options::use_sorted_keys::{SortOrder, UseSortedKeysOptions};
+ use biome_string_case::comparable_token::ComparableToken;
+-use std::ops::Not;
++use std::{cmp::Ordering, ops::Not};
+ 
+ declare_source_rule! {
+     /// Sort the keys of a JSON object in natural order.
+@@ -75,6 +77,30 @@ declare_source_rule! {
+     /// }
+     /// ```
+     ///
++    /// ### `groupByNesting`
++    /// When enabled, groups object keys by their value's nesting depth before sorting alphabetically.
++    /// Simple values (primitives, single-line arrays, and single-line objects) are sorted first,
++    /// followed by nested values (multi-line arrays and multi-line objects).
++    ///
++    /// > Default: `false`
++    ///
++    /// ```json,options
++    /// {
++    ///     "options": {
++    ///         "groupByNesting": true
++    ///     }
++    /// }
++    /// ```
++    /// ```json,use_options,expect_diagnostic
++    /// {
++    ///     "name": "Sample",
++    ///     "details": {
++    ///         "description": "nested"
++    ///     },
++    ///     "id": 123
++    /// }
++    /// ```
++    ///
+     pub UseSortedKeys {
+         version: "1.9.0",
+         name: "useSortedKeys",
+@@ -83,6 +109,48 @@ declare_source_rule! {
+     }
+ }
+ 
++/// Checks if an object/array spans multiple lines by examining CST trivia.
++/// For non-empty containers, checks the first token of the members/elements.
++/// For empty containers, checks the closing brace/bracket token.
++fn has_multiline_content(
++    members_first_token: Option<SyntaxToken<JsonLanguage>>,
++    closing_token: SyntaxResult<SyntaxToken<JsonLanguage>>,
++) -> bool {
++    members_first_token.map_or_else(
++        || {
++            closing_token
++                .map(|token| token.has_leading_newline())
++                .unwrap_or(false)
++        },
++        |token| token.has_leading_newline(),
++    )
++}
++
++/// Determines the nesting depth of a JSON value for grouping purposes.
++/// Multi-line objects and multi-line arrays are considered nested (depth 1).
++/// Primitives, single-line arrays, and single-line objects are considered simple (depth 0).
++fn get_nesting_depth(value: &AnyJsonValue) -> Ordering {
++    match value {
++        AnyJsonValue::JsonObjectValue(obj) => {
++            let members = obj.json_member_list();
++            if has_multiline_content(members.syntax().first_token(), obj.r_curly_token()) {
++                Ordering::Greater
++            } else {
++                Ordering::Equal
++            }
++        }
++        AnyJsonValue::JsonArrayValue(array) => {
++            let elements = array.elements();
++            if has_multiline_content(elements.syntax().first_token(), array.r_brack_token()) {
++                Ordering::Greater
++            } else {
++                Ordering::Equal
++            }
++        }
++        _ => Ordering::Equal, // primitives: string, number, boolean, null
++    }
++}
++
+ impl Rule for UseSortedKeys {
+     type Query = Ast<JsonMemberList>;
+     type State = ();
+@@ -97,29 +165,58 @@ impl Rule for UseSortedKeys {
+             SortOrder::Lexicographic => ComparableToken::lexicographic_cmp,
+         };
+ 
+-        is_separated_list_sorted_by(
+-            ctx.query(),
+-            |node| {
+-                node.name()
+-                    .ok()?
+-                    .inner_string_text()
+-                    .ok()
+-                    .map(ComparableToken::new)
+-            },
+-            comparator,
+-        )
+-        .ok()?
+-        .not()
+-        .then_some(())
++        if options.group_by_nesting.unwrap_or(false) {
++            is_separated_list_sorted_by(
++                ctx.query(),
++                |node| {
++                    let value = node.value().ok()?;
++                    let depth = get_nesting_depth(&value);
++                    let name = node
++                        .name()
++                        .ok()?
++                        .inner_string_text()
++                        .ok()
++                        .map(ComparableToken::new)?;
++                    Some((depth, name))
++                },
++                |(d1, n1), (d2, n2)| d1.cmp(d2).then_with(|| comparator(n1, n2)),
++            )
++            .ok()?
++            .not()
++            .then_some(())
++        } else {
++            is_separated_list_sorted_by(
++                ctx.query(),
++                |node| {
++                    node.name()
++                        .ok()?
++                        .inner_string_text()
++                        .ok()
++                        .map(ComparableToken::new)
++                },
++                comparator,
++            )
++            .ok()?
++            .not()
++            .then_some(())
++        }
+     }
+ 
+     fn diagnostic(ctx: &RuleContext<Self>, state: &Self::State) -> Option<RuleDiagnostic> {
++        let options = ctx.options();
++        let message = if options.group_by_nesting.unwrap_or(false) {
++            markup! {
++                "The members are not sorted by nesting level and key."
++            }
++        } else {
++            markup! {
++                "The members are not sorted by key."
++            }
++        };
+         Some(RuleDiagnostic::new(
+             category!("assist/source/useSortedKeys"),
+             Self::text_range(ctx, state),
+-            markup! {
+-                "The members are not sorted by key."
+-            },
++            message,
+         ))
+     }
+ 
+@@ -140,19 +237,39 @@ impl Rule for UseSortedKeys {
+             SortOrder::Lexicographic => ComparableToken::lexicographic_cmp,
+         };
+ 
+-        let new_list = sorted_separated_list_by(
+-            list,
+-            |node| {
+-                node.name()
+-                    .ok()?
+-                    .inner_string_text()
+-                    .ok()
+-                    .map(ComparableToken::new)
+-            },
+-            || make::token(T![,]),
+-            comparator,
+-        )
+-        .ok()?;
++        let new_list = if options.group_by_nesting.unwrap_or(false) {
++            sorted_separated_list_by(
++                list,
++                |node| {
++                    let value = node.value().ok()?;
++                    let depth = get_nesting_depth(&value);
++                    let name = node
++                        .name()
++                        .ok()?
++                        .inner_string_text()
++                        .ok()
++                        .map(ComparableToken::new)?;
++                    Some((depth, name))
++                },
++                || make::token(T![,]),
++                |(d1, n1), (d2, n2)| d1.cmp(d2).then_with(|| comparator(n1, n2)),
++            )
++            .ok()?
++        } else {
++            sorted_separated_list_by(
++                list,
++                |node| {
++                    node.name()
++                        .ok()?
++                        .inner_string_text()
++                        .ok()
++                        .map(ComparableToken::new)
++                },
++                || make::token(T![,]),
++                comparator,
++            )
++            .ok()?
++        };
+ 
+         let mut mutation = ctx.root().begin();
+         mutation.replace_node_discard_trivia(list.clone(), new_list);
+diff --git a/crates/biome_rule_options/src/use_sorted_keys.rs b/crates/biome_rule_options/src/use_sorted_keys.rs
+index 9a80f7caec..47ad351b38 100644
+--- a/crates/biome_rule_options/src/use_sorted_keys.rs
++++ b/crates/biome_rule_options/src/use_sorted_keys.rs
+@@ -8,4 +8,9 @@ use serde::{Deserialize, Serialize};
+ pub struct UseSortedKeysOptions {
+     #[serde(skip_serializing_if = "Option::<_>::is_none")]
+     pub sort_order: Option<SortOrder>,
++    /// When enabled, groups object keys by their value's nesting depth before sorting.
++    /// Simple values (primitives, single-line arrays, single-line objects) are sorted first,
++    /// followed by nested values (multi-line objects, multi-line arrays).
++    #[serde(skip_serializing_if = "Option::<_>::is_none")]
++    pub group_by_nesting: Option<bool>,
+ }
+diff --git a/packages/@biomejs/backend-jsonrpc/src/workspace.ts b/packages/@biomejs/backend-jsonrpc/src/workspace.ts
+index ef941a2fc0..facd692756 100644
+--- a/packages/@biomejs/backend-jsonrpc/src/workspace.ts
++++ b/packages/@biomejs/backend-jsonrpc/src/workspace.ts
+@@ -4323,6 +4323,12 @@ export interface UseSortedAttributesOptions {
+ }
+ export type UseSortedInterfaceMembersOptions = {};
+ export interface UseSortedKeysOptions {
++	/**
++	* When enabled, groups object keys by their value's nesting depth before sorting.
++Simple values (primitives, single-line arrays, single-line objects) are sorted first,
++followed by nested values (multi-line objects, multi-line arrays). 
++	 */
++	groupByNesting?: boolean;
+ 	sortOrder?: SortOrder;
+ }
+ export type UseSortedPropertiesOptions = {};
+diff --git a/packages/@biomejs/biome/configuration_schema.json b/packages/@biomejs/biome/configuration_schema.json
+index 453e92eb32..5188464cc5 100644
+--- a/packages/@biomejs/biome/configuration_schema.json
++++ b/packages/@biomejs/biome/configuration_schema.json
+@@ -12470,6 +12470,10 @@
+ 		"UseSortedKeysOptions": {
+ 			"type": "object",
+ 			"properties": {
++				"groupByNesting": {
++					"description": "When enabled, groups object keys by their value's nesting depth before sorting.\nSimple values (primitives, single-line arrays, single-line objects) are sorted first,\nfollowed by nested values (multi-line objects, multi-line arrays).",
++					"type": ["boolean", "null"]
++				},
+ 				"sortOrder": {
+ 					"anyOf": [{ "$ref": "#/$defs/SortOrder" }, { "type": "null" }]
+ 				}

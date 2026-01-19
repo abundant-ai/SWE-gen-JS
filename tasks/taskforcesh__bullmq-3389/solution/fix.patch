@@ -1,0 +1,144 @@
+diff --git a/src/classes/child-processor.ts b/src/classes/child-processor.ts
+index 4bca70f48c..31c8fa37d0 100644
+--- a/src/classes/child-processor.ts
++++ b/src/classes/child-processor.ts
+@@ -1,5 +1,9 @@
+ import { ParentCommand } from '../enums';
+-import { SandboxedJob, Receiver } from '../interfaces';
++import {
++  MoveToWaitingChildrenOpts,
++  Receiver,
++  SandboxedJob,
++} from '../interfaces';
+ import { JobJsonSandbox, JobProgress } from '../types';
+ import { errorToJSON } from '../utils';
+ 
+@@ -121,6 +125,7 @@ export class ChildProcessor {
+   ): SandboxedJob {
+     const wrappedJob = {
+       ...job,
++      queueQualifiedName: job.queueQualifiedName,
+       data: JSON.parse(job.data || '{}'),
+       opts: job.opts,
+       returnValue: JSON.parse(job.returnvalue || '{}'),
+@@ -164,6 +169,29 @@ export class ChildProcessor {
+           value: { token },
+         });
+       },
++
++      /*
++       * Proxy `moveToWaitingChildren` function.
++       */
++      moveToWaitingChildren: async (
++        token?: string,
++        opts?: MoveToWaitingChildrenOpts,
++      ): Promise<boolean> => {
++        const requestId = Math.random().toString(36).substring(2, 15);
++        await send({
++          requestId,
++          cmd: ParentCommand.MoveToWaitingChildren,
++          value: { token, opts },
++        });
++
++        return waitResponse(
++          requestId,
++          this.receiver,
++          RESPONSE_TIMEOUT,
++          'moveToWaitingChildren',
++        ) as Promise<boolean>;
++      },
++
+       /*
+        * Proxy `updateData` function.
+        */
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index 82f8268528..6d803b96ba 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -581,6 +581,7 @@ export class Job<
+     return {
+       ...this.asJSON(),
+       queueName: this.queueName,
++      queueQualifiedName: this.queueQualifiedName,
+       prefix: this.prefix,
+     };
+   }
+diff --git a/src/classes/sandbox.ts b/src/classes/sandbox.ts
+index b66d7c37b1..2c6ae6d95c 100644
+--- a/src/classes/sandbox.ts
++++ b/src/classes/sandbox.ts
+@@ -55,6 +55,19 @@ const sandbox = <T, R, N extends string>(
+                   case ParentCommand.MoveToWait:
+                     await job.moveToWait(msg.value?.token);
+                     break;
++                  case ParentCommand.MoveToWaitingChildren:
++                    {
++                      const value = await job.moveToWaitingChildren(
++                        msg.value?.token,
++                        msg.value?.opts,
++                      );
++                      child.send({
++                        requestId: msg.requestId,
++                        cmd: ChildCommand.MoveToWaitingChildrenResponse,
++                        value,
++                      });
++                    }
++                    break;
+                   case ParentCommand.Update:
+                     await job.updateData(msg.value);
+                     break;
+diff --git a/src/enums/child-command.ts b/src/enums/child-command.ts
+index a610e5206e..15bee00a27 100644
+--- a/src/enums/child-command.ts
++++ b/src/enums/child-command.ts
+@@ -4,4 +4,5 @@ export enum ChildCommand {
+   Stop,
+   GetChildrenValuesResponse,
+   GetIgnoredChildrenFailuresResponse,
++  MoveToWaitingChildrenResponse,
+ }
+diff --git a/src/enums/parent-command.ts b/src/enums/parent-command.ts
+index 8c02c292ee..7a910e9572 100644
+--- a/src/enums/parent-command.ts
++++ b/src/enums/parent-command.ts
+@@ -11,4 +11,5 @@ export enum ParentCommand {
+   Update,
+   GetChildrenValues,
+   GetIgnoredChildrenFailures,
++  MoveToWaitingChildren,
+ }
+diff --git a/src/interfaces/sandboxed-job.ts b/src/interfaces/sandboxed-job.ts
+index b3796bb227..c1040c7ad5 100644
+--- a/src/interfaces/sandboxed-job.ts
++++ b/src/interfaces/sandboxed-job.ts
+@@ -1,4 +1,5 @@
+ import { JobJsonSandbox, JobProgress, JobsOptions } from '../types';
++import { MoveToWaitingChildrenOpts } from './minimal-job';
+ 
+ /**
+  * @see {@link https://docs.bullmq.io/guide/workers/sandboxed-processors}
+@@ -7,8 +8,13 @@ export interface SandboxedJob<T = any, R = any>
+   extends Omit<JobJsonSandbox, 'data' | 'opts' | 'returnValue'> {
+   data: T;
+   opts: JobsOptions;
++  queueQualifiedName: string;
+   moveToDelayed: (timestamp: number, token?: string) => Promise<void>;
+   moveToWait: (token?: string) => Promise<void>;
++  moveToWaitingChildren: (
++    token?: string,
++    opts?: MoveToWaitingChildrenOpts,
++  ) => Promise<boolean>;
+   log: (row: any) => void;
+   updateData: (data: any) => Promise<void>;
+   updateProgress: (value: JobProgress) => Promise<void>;
+diff --git a/src/types/job-json-sandbox.ts b/src/types/job-json-sandbox.ts
+index 3181fbc3f8..47a2be411a 100644
+--- a/src/types/job-json-sandbox.ts
++++ b/src/types/job-json-sandbox.ts
+@@ -2,5 +2,6 @@ import { JobJson } from '../interfaces';
+ 
+ export type JobJsonSandbox = JobJson & {
+   queueName: string;
++  queueQualifiedName: string;
+   prefix: string;
+ };

@@ -1,0 +1,259 @@
+diff --git a/packages/action-listener-middleware/src/index.ts b/packages/action-listener-middleware/src/index.ts
+index e32ef109..f4b41658 100644
+--- a/packages/action-listener-middleware/src/index.ts
++++ b/packages/action-listener-middleware/src/index.ts
+@@ -32,7 +32,7 @@ import type {
+   ForkedTaskExecutor,
+   ForkedTask,
+ } from './types'
+-import { assertFunction, catchRejection } from './utils'
++import { assertFunction } from './utils'
+ import { TaskAbortError } from './exceptions'
+ import {
+   runTask,
+@@ -161,10 +161,7 @@ const createTakePattern = <S>(
+     }
+   }
+ 
+-  return ((
+-    predicate: AnyActionListenerPredicate<S>,
+-    timeout: number | undefined
+-  ) => catchRejection(take(predicate, timeout))) as TakePattern<S>
++  return take as TakePattern<S>
+ }
+ 
+ /** Accepts the possible options for creating a listener, and returns a formatted listener entry */
+diff --git a/packages/action-listener-middleware/src/task.ts b/packages/action-listener-middleware/src/task.ts
+index dbf92a0d..efa1e12e 100644
+--- a/packages/action-listener-middleware/src/task.ts
++++ b/packages/action-listener-middleware/src/task.ts
+@@ -1,6 +1,6 @@
+ import { TaskAbortError } from './exceptions'
+ import type { TaskResult } from './types'
+-import { noop, catchRejection } from './utils'
++import { noop } from './utils'
+ 
+ /**
+  * Synchronously raises {@link TaskAbortError} if the task tied to the input `signal` has been cancelled.
+@@ -23,17 +23,20 @@ export const promisifyAbortSignal = (
+   signal: AbortSignal,
+   reason?: string
+ ): Promise<never> => {
+-  return catchRejection(
+-    new Promise<never>((_, reject) => {
+-      const notifyRejection = () => reject(new TaskAbortError(reason))
++  const promise = new Promise<never>((_, reject) => {
++    const notifyRejection = () => reject(new TaskAbortError(reason))
+ 
+-      if (signal.aborted) {
+-        notifyRejection()
+-      } else {
+-        signal.addEventListener('abort', notifyRejection, { once: true })
+-      }
+-    })
+-  )
++    if (signal.aborted) {
++      notifyRejection()
++    } else {
++      signal.addEventListener('abort', notifyRejection, { once: true })
++    }
++  })
++
++  // We do not want 'unhandledRejection' warnings or crashes caused by cancelled tasks
++  promise.catch(noop)
++
++  return promise
+ }
+ 
+ /**
+@@ -71,13 +74,11 @@ export const runTask = async <T>(
+  * @returns
+  */
+ export const createPause = <T>(signal: AbortSignal) => {
+-  return (promise: Promise<T>): Promise<T> => {
+-    return catchRejection(
+-      Promise.race([promisifyAbortSignal(signal), promise]).then((output) => {
+-        validateActive(signal)
+-        return output
+-      })
+-    )
++  return async (promise: Promise<T>): Promise<T> => {
++    validateActive(signal)
++    const result = await Promise.race([promisifyAbortSignal(signal), promise])
++    validateActive(signal)
++    return result
+   }
+ }
+ 
+diff --git a/packages/action-listener-middleware/src/tests/fork.test.ts b/packages/action-listener-middleware/src/tests/fork.test.ts
+index 2f21a4a7..dded5513 100644
+--- a/packages/action-listener-middleware/src/tests/fork.test.ts
++++ b/packages/action-listener-middleware/src/tests/fork.test.ts
+@@ -296,52 +296,6 @@ describe('fork', () => {
+         error: new TaskAbortError(),
+       })
+     })
+-
+-    test('fork.delay does not trigger unhandledRejections for completed or cancelled tasks', async () => {
+-      let deferredCompletedEvt = deferred()
+-      let deferredCancelledEvt = deferred()
+-
+-      // Unfortunately we cannot test declaratively unhandleRejections in jest: https://github.com/facebook/jest/issues/5620
+-      // This test just fails if an `unhandledRejection` occurs.
+-      middleware.addListener({
+-        actionCreator: increment,
+-        listener: async (_, listenerApi) => {
+-          const completedTask = listenerApi.fork(async (forkApi) => {
+-            forkApi.signal.addEventListener(
+-              'abort',
+-              deferredCompletedEvt.resolve,
+-              { once: true }
+-            )
+-            forkApi.delay(100) // missing await
+-
+-            return 4
+-          })
+-
+-          deferredCompletedEvt.resolve(await completedTask.result)
+-
+-          const godotPauseTrigger = deferred()
+-
+-          const cancelledTask = listenerApi.fork(async (forkApi) => {
+-            forkApi.signal.addEventListener(
+-              'abort',
+-              deferredCompletedEvt.resolve,
+-              { once: true }
+-            )
+-            forkApi.delay(1_000) // missing await
+-            await forkApi.pause(godotPauseTrigger)
+-            return 4
+-          })
+-
+-          await Promise.resolve()
+-          cancelledTask.cancel()
+-          deferredCancelledEvt.resolve(await cancelledTask.result)
+-        },
+-      })
+-
+-      store.dispatch(increment())
+-      expect(await deferredCompletedEvt).toBeDefined()
+-      expect(await deferredCancelledEvt).toBeDefined()
+-    })
+   })
+ 
+   test('forkApi.pause rejects if task is cancelled', async () => {
+diff --git a/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts b/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
+index 8574d66f..3ceb68f0 100644
+--- a/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
++++ b/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
+@@ -623,47 +623,6 @@ describe('createActionListenerMiddleware', () => {
+ 
+       expect(reducer.mock.calls).toEqual([[{}, testAction1('a')]])
+     })
+-
+-    test('listenerApi.delay does not trigger unhandledRejections for completed or cancelled listners', async () => {
+-      let deferredCompletedEvt = deferred()
+-      let deferredCancelledEvt = deferred()
+-      const godotPauseTrigger = deferred()
+-
+-      // Unfortunately we cannot test declaratively unhandleRejections in jest: https://github.com/facebook/jest/issues/5620
+-      // This test just fails if an `unhandledRejection` occurs.
+-      middleware.addListener({
+-        actionCreator: increment,
+-        listener: async (_, listenerApi) => {
+-          listenerApi.unsubscribe()
+-          listenerApi.signal.addEventListener(
+-            'abort',
+-            deferredCompletedEvt.resolve,
+-            { once: true }
+-          )
+-          listenerApi.delay(100) // missing await
+-        },
+-      })
+-
+-      middleware.addListener({
+-        actionCreator: increment,
+-        listener: async (_, listenerApi) => {
+-          listenerApi.cancelPrevious()
+-          listenerApi.signal.addEventListener(
+-            'abort',
+-            deferredCancelledEvt.resolve,
+-            { once: true }
+-          )
+-          listenerApi.delay(100) // missing await
+-          listenerApi.pause(godotPauseTrigger)
+-        },
+-      })
+-
+-      store.dispatch(increment())
+-      store.dispatch(increment())
+-
+-      expect(await deferredCompletedEvt).toBeDefined()
+-      expect(await deferredCancelledEvt).toBeDefined()
+-    })
+   })
+ 
+   describe('Error handling', () => {
+@@ -917,45 +876,6 @@ describe('createActionListenerMiddleware', () => {
+ 
+       expect(finalCount).toBe(2)
+     })
+-
+-    test('take does not trigger unhandledRejections for completed or cancelled tasks', async () => {
+-      let deferredCompletedEvt = deferred()
+-      let deferredCancelledEvt = deferred()
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
+-      const godotPauseTrigger = deferred()
+-
+-      middleware.addListener({
+-        predicate: () => true,
+-        listener: async (_, listenerApi) => {
+-          listenerApi.unsubscribe() // run once
+-          listenerApi.signal.addEventListener(
+-            'abort',
+-            deferredCompletedEvt.resolve
+-          )
+-          listenerApi.take(() => true) // missing await
+-        },
+-      })
+-
+-      middleware.addListener({
+-        predicate: () => true,
+-        listener: async (_, listenerApi) => {
+-          listenerApi.cancelPrevious()
+-          listenerApi.signal.addEventListener(
+-            'abort',
+-            deferredCancelledEvt.resolve
+-          )
+-          listenerApi.take(() => true) // missing await
+-          await listenerApi.pause(godotPauseTrigger)
+-        },
+-      })
+-
+-      store.dispatch({ type: 'type' })
+-      store.dispatch({ type: 'type' })
+-      expect(await deferredCompletedEvt).toBeDefined()
+-    })
+   })
+ 
+   describe('Job API', () => {
+diff --git a/packages/action-listener-middleware/src/utils.ts b/packages/action-listener-middleware/src/utils.ts
+index cc8044fe..631ad078 100644
+--- a/packages/action-listener-middleware/src/utils.ts
++++ b/packages/action-listener-middleware/src/utils.ts
+@@ -11,12 +11,3 @@ export const assertFunction: (
+ }
+ 
+ export const noop = () => {}
+-
+-export const catchRejection = <T>(
+-  promise: Promise<T>,
+-  onError = noop
+-): Promise<T> => {
+-  promise.catch(onError)
+-
+-  return promise
+-}

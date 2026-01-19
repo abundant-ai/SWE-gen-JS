@@ -1,0 +1,772 @@
+diff --git a/changelog_unreleased/json/17269.md b/changelog_unreleased/json/17269.md
+deleted file mode 100644
+index 844860667..000000000
+--- a/changelog_unreleased/json/17269.md
++++ /dev/null
+@@ -1,15 +0,0 @@
+-#### Allow format comment-only JSONC files (#17269 by @fisker)
+-
+-<!-- prettier-ignore -->
+-```jsonc
+-// Input
+-// Comment
+-
+-// Prettier stable
+-SyntaxError: Unexpected token (1:11)
+-> 1 | // Comment
+-    |           ^
+-
+-// Prettier main
+-// Comment
+-```
+diff --git a/src/language-js/print/estree.js b/src/language-js/print/estree.js
+index 3e5c93882..97ce1dc52 100644
+--- a/src/language-js/print/estree.js
++++ b/src/language-js/print/estree.js
+@@ -101,7 +101,7 @@ function printEstree(path, options, print, args) {
+     case "JsExpressionRoot":
+       return print("node");
+     case "JsonRoot":
+-      return [printDanglingComments(path, options), print("node"), hardline];
++      return [print("node"), hardline];
+     case "File":
+       return printHtmlBinding(path, options, print) ?? print("program");
+     // Babel extension.
+diff --git a/src/language-json/parser-json.js b/src/language-json/parser-json.js
+index 9ef5b96d6..c4673438e 100644
+--- a/src/language-json/parser-json.js
++++ b/src/language-json/parser-json.js
+@@ -1,76 +1,35 @@
+-import { parse, parseExpression } from "@babel/parser";
++import { parseExpression } from "@babel/parser";
+ import createError from "../common/parser-create-error.js";
+ import createBabelParseError from "../language-js/parse/utils/create-babel-parse-error.js";
+ import createParser from "../language-js/parse/utils/create-parser.js";
+ import wrapBabelExpression from "../language-js/parse/utils/wrap-babel-expression.js";
+ import isNonEmptyArray from "../utils/is-non-empty-array.js";
+ 
+-const babelParseOptions = {
+-  tokens: true,
+-  ranges: true,
+-  attachComment: false,
+-};
+-
+-function parseEmptyJson(text) {
+-  const file = parse(text, babelParseOptions);
+-
+-  const { program } = file;
+-
+-  // Not an empty JSON
+-  /* c8 ignore next */
+-  if (
+-    !(
+-      program.body.length === 0 &&
+-      program.directives.length === 0 &&
+-      !program.interpreter
+-    )
+-  ) {
+-    return;
+-  }
+-
+-  return file;
+-}
+-
+-function parseJson(text, options = {}) {
+-  const { allowComments = true, allowEmpty = false } = options;
+-
+-  let ast;
+-  try {
+-    ast = parseExpression(text, babelParseOptions);
+-  } catch (/** @type {any} */ error) {
+-    if (
+-      allowEmpty &&
+-      error.code === "BABEL_PARSER_SYNTAX_ERROR" &&
+-      error.reasonCode === "UnexpectedToken" &&
+-      error.pos === text.length
+-    ) {
+-      try {
+-        ast = parseEmptyJson(text);
+-      } catch {
+-        // No op
+-      }
+-    }
+-
+-    if (!ast) {
++function createJsonParse(options = {}) {
++  const { allowComments = true } = options;
++
++  return function parse(text) {
++    let ast;
++    try {
++      ast = parseExpression(text, {
++        tokens: true,
++        ranges: true,
++        attachComment: false,
++      });
++    } catch (/** @type {any} */ error) {
+       throw createBabelParseError(error);
+     }
+-  }
+ 
+-  // @ts-expect-error
+-  if (!allowComments && isNonEmptyArray(ast.comments)) {
+     // @ts-expect-error
+-    throw createJsonError(ast.comments[0], "Comment");
+-  }
+-
+-  ast = wrapBabelExpression(ast, { type: "JsonRoot", text });
++    if (!allowComments && isNonEmptyArray(ast.comments)) {
++      // @ts-expect-error
++      throw createJsonError(ast.comments[0], "Comment");
++    }
+ 
+-  if (ast.node.type === "File") {
+-    delete ast.node;
+-  } else {
+-    assertJsonNode(ast.node);
+-  }
++    assertJsonNode(ast);
+ 
+-  return ast;
++    return wrapBabelExpression(ast, { type: "JsonRoot", text });
++  };
+ }
+ 
+ function createJsonError(node, description) {
+@@ -172,15 +131,19 @@ function assertJsonNode(node) {
+   }
+ }
+ 
++const parseJson = createJsonParse();
++
+ const jsonParsers = {
+   json: createParser({
+-    parse: (text) => parseJson(text),
+-    hasPragma: () => true,
++    parse: parseJson,
++    hasPragma() {
++      return true;
++    },
+   }),
+-  json5: createParser((text) => parseJson(text)),
+-  jsonc: createParser((text) => parseJson(text, { allowEmpty: true })),
++  json5: createParser(parseJson),
++  jsonc: createParser(parseJson),
+   "json-stringify": createParser({
+-    parse: (text) => parseJson(text, { allowComments: false }),
++    parse: createJsonParse({ allowComments: false }),
+     astFormat: "estree-json",
+   }),
+ };
+diff --git a/src/main/comments/attach.js b/src/main/comments/attach.js
+index 6bf14c22d..c545053f7 100644
+--- a/src/main/comments/attach.js
++++ b/src/main/comments/attach.js
+@@ -193,7 +193,7 @@ function attachComments(ast, options) {
+         addLeadingComment(ast, comment);
+         continue;
+       }
+-      if (locEnd(comment) > locEnd(ast)) {
++      if (locEnd(comment) - locEnd(ast) >= 0) {
+         addTrailingComment(ast, comment);
+         continue;
+       }
+diff --git a/tests/format/json/jsonc/empty/__snapshots__/format.test.js.snap b/tests/format/json/jsonc/empty/__snapshots__/format.test.js.snap
+deleted file mode 100644
+index 3ad099f80..000000000
+--- a/tests/format/json/jsonc/empty/__snapshots__/format.test.js.snap
++++ /dev/null
+@@ -1,47 +0,0 @@
+-// Jest Snapshot v1, https://goo.gl/fbAQLP
+-
+-exports[`snippet: #0 [json] format 1`] = `
+-"Unexpected token (4:29)
+-  2 |     /** Block comment 1 */
+-  3 |     // Line comment 2
+-> 4 |       /** Block comment 3 */
+-    |                             ^
+-Cause: Unexpected token (4:28)"
+-`;
+-
+-exports[`snippet: #0 [json-stringify] format 1`] = `
+-"Unexpected token (4:29)
+-  2 |     /** Block comment 1 */
+-  3 |     // Line comment 2
+-> 4 |       /** Block comment 3 */
+-    |                             ^
+-Cause: Unexpected token (4:28)"
+-`;
+-
+-exports[`snippet: #0 [json5] format 1`] = `
+-"Unexpected token (4:29)
+-  2 |     /** Block comment 1 */
+-  3 |     // Line comment 2
+-> 4 |       /** Block comment 3 */
+-    |                             ^
+-Cause: Unexpected token (4:28)"
+-`;
+-
+-exports[`snippet: #0 format 1`] = `
+-====================================options=====================================
+-parsers: ["jsonc", "json", "json5", "json-stringify"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-// Line comment 1
+-    /** Block comment 1 */
+-    // Line comment 2
+-      /** Block comment 3 */
+-=====================================output=====================================
+-// Line comment 1
+-/** Block comment 1 */
+-// Line comment 2
+-/** Block comment 3 */
+-
+-================================================================================
+-`;
+diff --git a/tests/format/json/jsonc/empty/format.test.js b/tests/format/json/jsonc/empty/format.test.js
+deleted file mode 100644
+index 555a03cec..000000000
+--- a/tests/format/json/jsonc/empty/format.test.js
++++ /dev/null
+@@ -1,25 +0,0 @@
+-import { outdent } from "outdent";
+-
+-runFormatTest(
+-  {
+-    importMeta: import.meta,
+-    snippets: [
+-      // "// Only line comment",
+-      // "/* Only block comment */",
+-      outdent`
+-        // Line comment 1
+-            /** Block comment 1 */
+-            // Line comment 2
+-              /** Block comment 3 */
+-      `,
+-    ],
+-  },
+-  ["jsonc", "json", "json5", "json-stringify"],
+-  {
+-    errors: {
+-      json: true,
+-      json5: true,
+-      "json-stringify": true,
+-    },
+-  },
+-);
+diff --git a/tests/format/misc/errors/json/__snapshots__/format.test.js.snap b/tests/format/misc/errors/json/__snapshots__/format.test.js.snap
+index 2ef2b12c5..e272aad3b 100644
+--- a/tests/format/misc/errors/json/__snapshots__/format.test.js.snap
++++ b/tests/format/misc/errors/json/__snapshots__/format.test.js.snap
+@@ -13,46 +13,18 @@ exports[`snippet: #0 [json] format 2`] = `
+ Cause: A 'set' accessor must have exactly one formal parameter. (1:8)"
+ `;
+ 
+-exports[`snippet: #0 [json] format 3`] = `
+-"Unexpected token (1:2)
+-> 1 | [
+-    |  ^
+-Cause: Unexpected token (1:1)"
+-`;
+-
+ exports[`snippet: #0 [json-stringify] format 1`] = `
+ "Shorthand property is not allowed in JSON. (1:2)
+ > 1 | {foo}
+     |  ^^^"
+ `;
+ 
+-exports[`snippet: #0 [json-stringify] format 2`] = `
+-"Unexpected token (1:2)
+-> 1 | [
+-    |  ^
+-Cause: Unexpected token (1:1)"
+-`;
+-
+ exports[`snippet: #0 [json5] format 1`] = `
+ "Shorthand property is not allowed in JSON. (1:2)
+ > 1 | {foo}
+     |  ^^^"
+ `;
+ 
+-exports[`snippet: #0 [json5] format 2`] = `
+-"Unexpected token (1:2)
+-> 1 | [
+-    |  ^
+-Cause: Unexpected token (1:1)"
+-`;
+-
+-exports[`snippet: #0 [jsonc] format 1`] = `
+-"Unexpected token (1:2)
+-> 1 | [
+-    |  ^
+-Cause: Unexpected token (1:1)"
+-`;
+-
+ exports[`snippet: #1 [json] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {["foo"]:"bar"}
+@@ -66,46 +38,18 @@ exports[`snippet: #1 [json] format 2`] = `
+ Cause: Private name #bar is not defined. (1:20)"
+ `;
+ 
+-exports[`snippet: #1 [json] format 3`] = `
+-"Unexpected token (1:1)
+-> 1 | ;
+-    | ^
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #1 [json-stringify] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {["foo"]:"bar"}
+     |   ^^^^^"
+ `;
+ 
+-exports[`snippet: #1 [json-stringify] format 2`] = `
+-"Unexpected token (1:1)
+-> 1 | ;
+-    | ^
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #1 [json5] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {["foo"]:"bar"}
+     |   ^^^^^"
+ `;
+ 
+-exports[`snippet: #1 [json5] format 2`] = `
+-"Unexpected token (1:1)
+-> 1 | ;
+-    | ^
+-Cause: Unexpected token (1:0)"
+-`;
+-
+-exports[`snippet: #1 [jsonc] format 1`] = `
+-"Unexpected token (1:1)
+-> 1 | ;
+-    | ^
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #2 [json] format 1`] = `
+ "Operator '~' is not allowed in JSON. (1:9)
+ > 1 | {"foo": ~1}
+@@ -119,46 +63,18 @@ exports[`snippet: #2 [json] format 2`] = `
+ Cause: 'await' is only allowed within async functions and at the top levels of modules. (1:13)"
+ `;
+ 
+-exports[`snippet: #2 [json] format 3`] = `
+-"Unexpected token (1:9)
+-> 1 | "string";
+-    |         ^
+-Cause: Unexpected token (1:8)"
+-`;
+-
+ exports[`snippet: #2 [json-stringify] format 1`] = `
+ "Operator '~' is not allowed in JSON. (1:9)
+ > 1 | {"foo": ~1}
+     |         ^^"
+ `;
+ 
+-exports[`snippet: #2 [json-stringify] format 2`] = `
+-"Unexpected token (1:9)
+-> 1 | "string";
+-    |         ^
+-Cause: Unexpected token (1:8)"
+-`;
+-
+ exports[`snippet: #2 [json5] format 1`] = `
+ "Operator '~' is not allowed in JSON. (1:9)
+ > 1 | {"foo": ~1}
+     |         ^^"
+ `;
+ 
+-exports[`snippet: #2 [json5] format 2`] = `
+-"Unexpected token (1:9)
+-> 1 | "string";
+-    |         ^
+-Cause: Unexpected token (1:8)"
+-`;
+-
+-exports[`snippet: #2 [jsonc] format 1`] = `
+-"Unexpected token (1:9)
+-> 1 | "string";
+-    |         ^
+-Cause: Unexpected token (1:8)"
+-`;
+-
+ exports[`snippet: #3 [json] format 1`] = `
+ "'LogicalExpression' is not allowed in JSON. (1:9)
+ > 1 | {"foo": false || "bar"}
+@@ -171,50 +87,18 @@ exports[`snippet: #3 [json] format 2`] = `
+     |  ^"
+ `;
+ 
+-exports[`snippet: #3 [json] format 3`] = `
+-"Unexpected token (2:1)
+-  1 | "string"
+-> 2 | ;
+-    | ^
+-Cause: Unexpected token (2:0)"
+-`;
+-
+ exports[`snippet: #3 [json-stringify] format 1`] = `
+ "'LogicalExpression' is not allowed in JSON. (1:9)
+ > 1 | {"foo": false || "bar"}
+     |         ^^^^^^^^^^^^^^"
+ `;
+ 
+-exports[`snippet: #3 [json-stringify] format 2`] = `
+-"Unexpected token (2:1)
+-  1 | "string"
+-> 2 | ;
+-    | ^
+-Cause: Unexpected token (2:0)"
+-`;
+-
+ exports[`snippet: #3 [json5] format 1`] = `
+ "'LogicalExpression' is not allowed in JSON. (1:9)
+ > 1 | {"foo": false || "bar"}
+     |         ^^^^^^^^^^^^^^"
+ `;
+ 
+-exports[`snippet: #3 [json5] format 2`] = `
+-"Unexpected token (2:1)
+-  1 | "string"
+-> 2 | ;
+-    | ^
+-Cause: Unexpected token (2:0)"
+-`;
+-
+-exports[`snippet: #3 [jsonc] format 1`] = `
+-"Unexpected token (2:1)
+-  1 | "string"
+-> 2 | ;
+-    | ^
+-Cause: Unexpected token (2:0)"
+-`;
+-
+ exports[`snippet: #4 [json] format 1`] = `
+ "'ArrowFunctionExpression' is not allowed in JSON. (1:9)
+ > 1 | {"foo": () => {}}
+@@ -228,46 +112,18 @@ exports[`snippet: #4 [json] format 2`] = `
+ Cause: 'import' and 'export' may only appear at the top level. (1:13)"
+ `;
+ 
+-exports[`snippet: #4 [json] format 3`] = `
+-"Unexpected token (1:15)
+-> 1 | /* comment */[
+-    |               ^
+-Cause: Unexpected token (1:14)"
+-`;
+-
+ exports[`snippet: #4 [json-stringify] format 1`] = `
+ "'ArrowFunctionExpression' is not allowed in JSON. (1:9)
+ > 1 | {"foo": () => {}}
+     |         ^^^^^^^^"
+ `;
+ 
+-exports[`snippet: #4 [json-stringify] format 2`] = `
+-"Unexpected token (1:15)
+-> 1 | /* comment */[
+-    |               ^
+-Cause: Unexpected token (1:14)"
+-`;
+-
+ exports[`snippet: #4 [json5] format 1`] = `
+ "'ArrowFunctionExpression' is not allowed in JSON. (1:9)
+ > 1 | {"foo": () => {}}
+     |         ^^^^^^^^"
+ `;
+ 
+-exports[`snippet: #4 [json5] format 2`] = `
+-"Unexpected token (1:15)
+-> 1 | /* comment */[
+-    |               ^
+-Cause: Unexpected token (1:14)"
+-`;
+-
+-exports[`snippet: #4 [jsonc] format 1`] = `
+-"Unexpected token (1:15)
+-> 1 | /* comment */[
+-    |               ^
+-Cause: Unexpected token (1:14)"
+-`;
+-
+ exports[`snippet: #5 [json] format 1`] = `
+ "Expecting Unicode escape sequence \\uXXXX. (1:10)
+ > 1 | packages\\the-hub\\cypress\\fixtures\\gridConfiguration.json
+@@ -282,13 +138,6 @@ exports[`snippet: #5 [json] format 2`] = `
+ Cause: Unexpected token (1:0)"
+ `;
+ 
+-exports[`snippet: #5 [json] format 3`] = `
+-"Unexpected token (1:14)
+-> 1 | /* comment */;
+-    |              ^
+-Cause: Unexpected token (1:13)"
+-`;
+-
+ exports[`snippet: #5 [json-stringify] format 1`] = `
+ "Expecting Unicode escape sequence \\uXXXX. (1:10)
+ > 1 | packages\\the-hub\\cypress\\fixtures\\gridConfiguration.json
+@@ -296,13 +145,6 @@ exports[`snippet: #5 [json-stringify] format 1`] = `
+ Cause: Expecting Unicode escape sequence \\uXXXX. (1:9)"
+ `;
+ 
+-exports[`snippet: #5 [json-stringify] format 2`] = `
+-"Unexpected token (1:14)
+-> 1 | /* comment */;
+-    |              ^
+-Cause: Unexpected token (1:13)"
+-`;
+-
+ exports[`snippet: #5 [json5] format 1`] = `
+ "Expecting Unicode escape sequence \\uXXXX. (1:10)
+ > 1 | packages\\the-hub\\cypress\\fixtures\\gridConfiguration.json
+@@ -310,20 +152,6 @@ exports[`snippet: #5 [json5] format 1`] = `
+ Cause: Expecting Unicode escape sequence \\uXXXX. (1:9)"
+ `;
+ 
+-exports[`snippet: #5 [json5] format 2`] = `
+-"Unexpected token (1:14)
+-> 1 | /* comment */;
+-    |              ^
+-Cause: Unexpected token (1:13)"
+-`;
+-
+-exports[`snippet: #5 [jsonc] format 1`] = `
+-"Unexpected token (1:14)
+-> 1 | /* comment */;
+-    |              ^
+-Cause: Unexpected token (1:13)"
+-`;
+-
+ exports[`snippet: #6 [json] format 1`] = `
+ "'BinaryExpression' is not allowed in JSON. (1:1)
+ > 1 | 1+2
+@@ -337,46 +165,18 @@ exports[`snippet: #6 [json] format 2`] = `
+ Cause: Unexpected token, expected "," (1:2)"
+ `;
+ 
+-exports[`snippet: #6 [json] format 3`] = `
+-"Unexpected token (1:22)
+-> 1 | /* comment */"string";
+-    |                      ^
+-Cause: Unexpected token (1:21)"
+-`;
+-
+ exports[`snippet: #6 [json-stringify] format 1`] = `
+ "'BinaryExpression' is not allowed in JSON. (1:1)
+ > 1 | 1+2
+     | ^^^"
+ `;
+ 
+-exports[`snippet: #6 [json-stringify] format 2`] = `
+-"Unexpected token (1:22)
+-> 1 | /* comment */"string";
+-    |                      ^
+-Cause: Unexpected token (1:21)"
+-`;
+-
+ exports[`snippet: #6 [json5] format 1`] = `
+ "'BinaryExpression' is not allowed in JSON. (1:1)
+ > 1 | 1+2
+     | ^^^"
+ `;
+ 
+-exports[`snippet: #6 [json5] format 2`] = `
+-"Unexpected token (1:22)
+-> 1 | /* comment */"string";
+-    |                      ^
+-Cause: Unexpected token (1:21)"
+-`;
+-
+-exports[`snippet: #6 [jsonc] format 1`] = `
+-"Unexpected token (1:22)
+-> 1 | /* comment */"string";
+-    |                      ^
+-Cause: Unexpected token (1:21)"
+-`;
+-
+ exports[`snippet: #7 [json] format 1`] = `
+ "Shorthand property is not allowed in JSON. (1:2)
+ > 1 | {Infinity}
+@@ -389,50 +189,18 @@ exports[`snippet: #7 [json] format 2`] = `
+     |                        ^"
+ `;
+ 
+-exports[`snippet: #7 [json] format 3`] = `
+-"Unexpected token (2:1)
+-  1 | /* comment */"string"
+-> 2 | ;
+-    | ^
+-Cause: Unexpected token (2:0)"
+-`;
+-
+ exports[`snippet: #7 [json-stringify] format 1`] = `
+ "Shorthand property is not allowed in JSON. (1:2)
+ > 1 | {Infinity}
+     |  ^^^^^^^^"
+ `;
+ 
+-exports[`snippet: #7 [json-stringify] format 2`] = `
+-"Unexpected token (2:1)
+-  1 | /* comment */"string"
+-> 2 | ;
+-    | ^
+-Cause: Unexpected token (2:0)"
+-`;
+-
+ exports[`snippet: #7 [json5] format 1`] = `
+ "Shorthand property is not allowed in JSON. (1:2)
+ > 1 | {Infinity}
+     |  ^^^^^^^^"
+ `;
+ 
+-exports[`snippet: #7 [json5] format 2`] = `
+-"Unexpected token (2:1)
+-  1 | /* comment */"string"
+-> 2 | ;
+-    | ^
+-Cause: Unexpected token (2:0)"
+-`;
+-
+-exports[`snippet: #7 [jsonc] format 1`] = `
+-"Unexpected token (2:1)
+-  1 | /* comment */"string"
+-> 2 | ;
+-    | ^
+-Cause: Unexpected token (2:0)"
+-`;
+-
+ exports[`snippet: #8 [json] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {[key]: 1}
+@@ -445,46 +213,18 @@ exports[`snippet: #8 [json] format 2`] = `
+     |  ^"
+ `;
+ 
+-exports[`snippet: #8 [json] format 3`] = `
+-"Unexpected token (1:1)
+-> 1 | #!/usr/bin/env node
+-    | ^
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #8 [json-stringify] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {[key]: 1}
+     |   ^^^"
+ `;
+ 
+-exports[`snippet: #8 [json-stringify] format 2`] = `
+-"Unexpected token (1:1)
+-> 1 | #!/usr/bin/env node
+-    | ^
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #8 [json5] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {[key]: 1}
+     |   ^^^"
+ `;
+ 
+-exports[`snippet: #8 [json5] format 2`] = `
+-"Unexpected token (1:1)
+-> 1 | #!/usr/bin/env node
+-    | ^
+-Cause: Unexpected token (1:0)"
+-`;
+-
+-exports[`snippet: #8 [jsonc] format 1`] = `
+-"Unexpected token (1:1)
+-> 1 | #!/usr/bin/env node
+-    | ^
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #9 [json] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {[key()]: 1}
+@@ -497,50 +237,18 @@ exports[`snippet: #9 [json] format 2`] = `
+     |      ^"
+ `;
+ 
+-exports[`snippet: #9 [json] format 3`] = `
+-"Unexpected token (1:1)
+-> 1 | #!/usr/bin/env node
+-    | ^
+-  2 | []
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #9 [json-stringify] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {[key()]: 1}
+     |   ^^^^^"
+ `;
+ 
+-exports[`snippet: #9 [json-stringify] format 2`] = `
+-"Unexpected token (1:1)
+-> 1 | #!/usr/bin/env node
+-    | ^
+-  2 | []
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #9 [json5] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {[key()]: 1}
+     |   ^^^^^"
+ `;
+ 
+-exports[`snippet: #9 [json5] format 2`] = `
+-"Unexpected token (1:1)
+-> 1 | #!/usr/bin/env node
+-    | ^
+-  2 | []
+-Cause: Unexpected token (1:0)"
+-`;
+-
+-exports[`snippet: #9 [jsonc] format 1`] = `
+-"Unexpected token (1:1)
+-> 1 | #!/usr/bin/env node
+-    | ^
+-  2 | []
+-Cause: Unexpected token (1:0)"
+-`;
+-
+ exports[`snippet: #10 [json] format 1`] = `
+ "Computed key is not allowed in JSON. (1:3)
+ > 1 | {['CallExpression']: 1}
+diff --git a/tests/format/misc/errors/json/format.test.js b/tests/format/misc/errors/json/format.test.js
+index b80f424ac..131b43ff2 100644
+--- a/tests/format/misc/errors/json/format.test.js
++++ b/tests/format/misc/errors/json/format.test.js
+@@ -101,22 +101,3 @@ runFormatTest(
+   },
+   ["json"],
+ );
+-
+-runFormatTest(
+-  {
+-    importMeta: import.meta,
+-    snippets: [
+-      "[",
+-      ";",
+-      '"string";',
+-      '"string"\n;',
+-      "/* comment */[",
+-      "/* comment */;",
+-      '/* comment */"string";',
+-      '/* comment */"string"\n;',
+-      "#!/usr/bin/env node",
+-      "#!/usr/bin/env node\n[]",
+-    ],
+-  },
+-  ["json", "json5", "jsonc", "json-stringify"],
+-);

@@ -1,0 +1,247 @@
+diff --git a/README.md b/README.md
+index 2bbb32a..0646b71 100644
+--- a/README.md
++++ b/README.md
+@@ -135,6 +135,8 @@ const parsedUser = await userSchema.validate(
+     - [`string.email(message?: string | function): Schema`](#stringemailmessage-string--function-schema)
+     - [`string.url(message?: string | function): Schema`](#stringurlmessage-string--function-schema)
+     - [`string.uuid(message?: string | function): Schema`](#stringuuidmessage-string--function-schema)
++    - [`string.datetime(options?: {message?: string | function, allowOffset?: boolean, precision?: number})`](#stringdatetimeoptions-message-string--function-allowoffset-boolean-precision-number)
++    - [`string.datetime(message?: string | function)`](#stringdatetimemessage-string--function)
+     - [`string.ensure(): Schema`](#stringensure-schema)
+     - [`string.trim(message?: string | function): Schema`](#stringtrimmessage-string--function-schema)
+     - [`string.lowercase(message?: string | function): Schema`](#stringlowercasemessage-string--function-schema)
+@@ -649,8 +651,8 @@ declare module 'yup' {
+   // Define your desired `SchemaMetadata` interface by merging the
+   // `CustomSchemaMetadata` interface.
+   export interface CustomSchemaMetadata {
+-    placeholderText?: string
+-    tooltipText?: string
++    placeholderText?: string;
++    tooltipText?: string;
+     // …
+   }
+ }
+@@ -1364,6 +1366,19 @@ Validates the value as a valid URL via a regex.
+ 
+ Validates the value as a valid UUID via a regex.
+ 
++#### `string.datetime(options?: {message?: string | function, allowOffset?: boolean, precision?: number})`
++
++Validates the value as an ISO datetime via a regex. Defaults to UTC validation; timezone offsets are not permitted (see `options.allowOffset`).
++
++Unlike `.date()`, `datetime` will not convert the string to a `Date` object. `datetime` also provides greater customization over the required format of the datetime string than `date` does.
++
++`options.allowOffset`: Allow a time zone offset. False requires UTC 'Z' timezone. _(default: false)_
++`options.precision`: Require a certain sub-second precision on the date. _(default: null -- any (or no) sub-second precision)_
++
++#### `string.datetime(message?: string | function)`
++
++An alternate signature for `string.datetime` that can be used when you don't need to pass options other than `message`.
++
+ #### `string.ensure(): Schema`
+ 
+ Transforms `undefined` and `null` values to an empty string along with
+@@ -1464,6 +1479,8 @@ await schema.isValid(new Date()); // => true
+ The default `cast` logic of `date` is pass the value to the `Date` constructor, failing that, it will attempt
+ to parse the date as an ISO date string.
+ 
++> If you would like ISO strings to not be cast to a `Date` object, use `.datetime()` instead.
++
+ Failed casts return an invalid Date.
+ 
+ #### `date.min(limit: Date | string | Ref, message?: string | function): Schema`
+diff --git a/src/locale.ts b/src/locale.ts
+index d097c83..6b70f68 100644
+--- a/src/locale.ts
++++ b/src/locale.ts
+@@ -20,6 +20,9 @@ export interface StringLocale {
+   email?: Message<{ regex: RegExp }>;
+   url?: Message<{ regex: RegExp }>;
+   uuid?: Message<{ regex: RegExp }>;
++  datetime?: Message;
++  datetime_offset?: Message;
++  datetime_precision?: Message<{ precision: number }>;
+   trim?: Message;
+   lowercase?: Message;
+   uppercase?: Message;
+@@ -100,6 +103,11 @@ export let string: Required<StringLocale> = {
+   email: '${path} must be a valid email',
+   url: '${path} must be a valid URL',
+   uuid: '${path} must be a valid UUID',
++  datetime: '${path} must be a valid ISO date-time',
++  datetime_precision:
++    '${path} must be a valid ISO date-time with a sub-second precision of exactly ${precision} digits',
++  datetime_offset:
++    '${path} must be a valid ISO date-time with UTC "Z" timezone',
+   trim: '${path} must be a trimmed string',
+   lowercase: '${path} must be a lowercase string',
+   uppercase: '${path} must be a upper case string',
+diff --git a/src/string.ts b/src/string.ts
+index bfcade2..c193d00 100644
+--- a/src/string.ts
++++ b/src/string.ts
+@@ -14,6 +14,7 @@ import type {
+   Optionals,
+ } from './util/types';
+ import Schema from './schema';
++import { parseDateStruct } from './util/parseIsoDate';
+ 
+ // Taken from HTML spec: https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
+ let rEmail =
+@@ -28,6 +29,13 @@ let rUrl =
+ let rUUID =
+   /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
+ 
++let yearMonthDay = '^\\d{4}-\\d{2}-\\d{2}';
++let hourMinuteSecond = '\\d{2}:\\d{2}:\\d{2}';
++let zOrOffset = '(([+-]\\d{2}(:?\\d{2})?)|Z)';
++let rIsoDateTime = new RegExp(
++  `${yearMonthDay}T${hourMinuteSecond}(\\.\\d+)?${zOrOffset}$`,
++);
++
+ let isTrimmed = (value: Maybe<string>) =>
+   isAbsent(value) || value === value.trim();
+ 
+@@ -37,6 +45,14 @@ export type MatchOptions = {
+   name?: string;
+ };
+ 
++export type DateTimeOptions = {
++  message: Message<{ allowOffset?: boolean; precision?: number }>;
++  /** Allow a time zone offset. False requires UTC 'Z' timezone. (default: false) */
++  allowOffset?: boolean;
++  /** Require a certain sub-second precision on the date. (default: undefined -- any or no sub-second precision) */
++  precision?: number;
++};
++
+ let objStringTag = {}.toString();
+ 
+ function create(): StringSchema;
+@@ -200,6 +216,54 @@ export default class StringSchema<
+     });
+   }
+ 
++  datetime(options?: DateTimeOptions | DateTimeOptions['message']) {
++    let message: DateTimeOptions['message'] = '';
++    let allowOffset: DateTimeOptions['allowOffset'];
++    let precision: DateTimeOptions['precision'];
++
++    if (options) {
++      if (typeof options === 'object') {
++        ({
++          message = '',
++          allowOffset = false,
++          precision = undefined,
++        } = options as DateTimeOptions);
++      } else {
++        message = options;
++      }
++    }
++
++    return this.matches(rIsoDateTime, {
++      name: 'datetime',
++      message: message || locale.datetime,
++      excludeEmptyString: true,
++    })
++      .test({
++        name: 'datetime_offset',
++        message: message || locale.datetime_offset,
++        params: { allowOffset },
++        skipAbsent: true,
++        test: (value: Maybe<string>) => {
++          if (!value || allowOffset) return true;
++          const struct = parseDateStruct(value);
++          if (!struct) return false;
++          return !!struct.z;
++        },
++      })
++      .test({
++        name: 'datetime_precision',
++        message: message || locale.datetime_precision,
++        params: { precision },
++        skipAbsent: true,
++        test: (value: Maybe<string>) => {
++          if (!value || precision == undefined) return true;
++          const struct = parseDateStruct(value);
++          if (!struct) return false;
++          return struct.precision === precision;
++        },
++      });
++  }
++
+   //-- transforms --
+   ensure(): StringSchema<NonNullable<TType>> {
+     return this.default('' as Defined<TType>).transform((val) =>
+diff --git a/src/util/parseIsoDate.ts b/src/util/parseIsoDate.ts
+index d53c5cc..d5f7975 100644
+--- a/src/util/parseIsoDate.ts
++++ b/src/util/parseIsoDate.ts
+@@ -10,32 +10,9 @@
+ //                1 YYYY                2 MM        3 DD              4 HH     5 mm        6 ss           7 msec         8 Z 9 ±   10 tzHH    11 tzmm
+ const isoReg = /^(\d{4}|[+-]\d{6})(?:-?(\d{2})(?:-?(\d{2}))?)?(?:[ T]?(\d{2}):?(\d{2})(?::?(\d{2})(?:[,.](\d{1,}))?)?(?:(Z)|([+-])(\d{2})(?::?(\d{2}))?)?)?$/;
+ 
+-function toNumber(str: string, defaultValue = 0) {
+-  return Number(str) || defaultValue;
+-}
+-
+ export function parseIsoDate(date: string): number {
+-  const regexResult = isoReg.exec(date);
+-  if (!regexResult) return Date.parse ? Date.parse(date) : Number.NaN;
+-
+-  // use of toNumber() avoids NaN timestamps caused by “undefined”
+-  // values being passed to Date constructor
+-  const struct = {
+-    year: toNumber(regexResult[1]),
+-    month: toNumber(regexResult[2], 1) - 1,
+-    day: toNumber(regexResult[3], 1),
+-    hour: toNumber(regexResult[4]),
+-    minute: toNumber(regexResult[5]),
+-    second: toNumber(regexResult[6]),
+-    millisecond: regexResult[7]
+-      ? // allow arbitrary sub-second precision beyond milliseconds
+-        toNumber(regexResult[7].substring(0, 3))
+-      : 0,
+-    z: regexResult[8] || undefined,
+-    plusMinus: regexResult[9] || undefined,
+-    hourOffset: toNumber(regexResult[10]),
+-    minuteOffset: toNumber(regexResult[11]),
+-  };
++  const struct = parseDateStruct(date);
++  if (!struct) return Date.parse ? Date.parse(date) : Number.NaN;
+ 
+   // timestamps without timezone identifiers should be considered local time
+   if (struct.z === undefined && struct.plusMinus === undefined) {
+@@ -66,3 +43,32 @@ export function parseIsoDate(date: string): number {
+     struct.millisecond,
+   );
+ }
++
++export function parseDateStruct(date: string) {
++  const regexResult = isoReg.exec(date);
++  if (!regexResult) return null;
++
++  // use of toNumber() avoids NaN timestamps caused by “undefined”
++  // values being passed to Date constructor
++  return {
++    year: toNumber(regexResult[1]),
++    month: toNumber(regexResult[2], 1) - 1,
++    day: toNumber(regexResult[3], 1),
++    hour: toNumber(regexResult[4]),
++    minute: toNumber(regexResult[5]),
++    second: toNumber(regexResult[6]),
++    millisecond: regexResult[7]
++      ? // allow arbitrary sub-second precision beyond milliseconds
++        toNumber(regexResult[7].substring(0, 3))
++      : 0,
++    precision: regexResult[7]?.length ?? undefined,
++    z: regexResult[8] || undefined,
++    plusMinus: regexResult[9] || undefined,
++    hourOffset: toNumber(regexResult[10]),
++    minuteOffset: toNumber(regexResult[11]),
++  };
++}
++
++function toNumber(str: string, defaultValue = 0) {
++  return Number(str) || defaultValue;
++}

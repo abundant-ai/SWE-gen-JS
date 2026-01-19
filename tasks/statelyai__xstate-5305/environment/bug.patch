@@ -1,0 +1,908 @@
+diff --git a/.changeset/warm-tips-cut.md b/.changeset/warm-tips-cut.md
+deleted file mode 100644
+index 12e21250c6..0000000000
+--- a/.changeset/warm-tips-cut.md
++++ /dev/null
+@@ -1,39 +0,0 @@
+----
+-'@xstate/store': minor
+----
+-
+-Added undo/redo functionality to XState Store via the `undoRedo` higher-order store logic:
+-
+-- Adds `undo` and `redo` events to stores
+-- Supports grouping related events into transactions using `transactionId`
+-- Maintains event history for precise state reconstruction
+-
+-- Automatically clears redo stack when new events occur
+-
+-```ts
+-import { createStore } from '@xstate/store';
+-import { undoRedo } from '@xstate/store/undo';
+-
+-const store = createStore(
+-  undoRedo({
+-    context: { count: 0 },
+-    on: {
+-      inc: (ctx) => ({ count: ctx.count + 1 }),
+-      dec: (ctx) => ({ count: ctx.count - 1 })
+-    }
+-  })
+-);
+-
+-store.trigger.inc();
+-// count: 1
+-store.trigger.inc();
+-// count: 2
+-store.trigger.undo();
+-// count: 1
+-store.trigger.undo();
+-// count: 0
+-store.trigger.redo();
+-// count: 1
+-store.trigger.redo();
+-// count: 2
+-```
+diff --git a/packages/xstate-store/src/store.ts b/packages/xstate-store/src/store.ts
+index c47a02d527..2fda9b080a 100644
+--- a/packages/xstate-store/src/store.ts
++++ b/packages/xstate-store/src/store.ts
+@@ -18,10 +18,7 @@ import {
+   StoreSnapshot,
+   Selector,
+   Selection,
+-  InternalBaseAtom,
+-  StoreLogic,
+-  StoreTransition,
+-  AnyStoreLogic
++  InternalBaseAtom
+ } from './types';
+ 
+ const symbolObservable: typeof Symbol.observable = (() =>
+@@ -49,17 +46,32 @@ const inspectionObservers = new WeakMap<
+ 
+ function createStoreCore<
+   TContext extends StoreContext,
+-  TSnapshot extends StoreSnapshot<any>,
+   TEventPayloadMap extends EventPayloadMap,
+   TEmitted extends EventObject
+ >(
+-  logic: StoreLogic<TSnapshot, ExtractEvents<TEventPayloadMap>, TEmitted>,
+-  emits?: Record<string, (payload: any) => void> // TODO: improve this type
++  initialContext: TContext,
++  transitions: {
++    [K in keyof TEventPayloadMap & string]: StoreAssigner<
++      NoInfer<TContext>,
++      { type: K } & TEventPayloadMap[K],
++      TEmitted
++    >;
++  },
++  emits?: Record<string, (payload: any) => void>, // TODO: improve this type
++  producer?: (
++    context: NoInfer<TContext>,
++    recipe: (context: NoInfer<TContext>) => void
++  ) => NoInfer<TContext>
+ ): Store<TContext, ExtractEvents<TEventPayloadMap>, TEmitted> {
+   type StoreEvent = ExtractEvents<TEventPayloadMap>;
+   let listeners: Map<TEmitted['type'], Set<any>> | undefined;
+-  const initialSnapshot = logic.getInitialSnapshot();
+-  let currentSnapshot: TSnapshot = initialSnapshot;
++  const initialSnapshot: StoreSnapshot<TContext> = {
++    context: initialContext,
++    status: 'active',
++    output: undefined,
++    error: undefined
++  };
++  let currentSnapshot: StoreSnapshot<TContext> = initialSnapshot;
+   const atom = createAtom<StoreSnapshot<TContext>>(currentSnapshot);
+ 
+   const emit = (ev: TEmitted) => {
+@@ -73,7 +85,7 @@ function createStoreCore<
+     }
+   };
+ 
+-  const transition = logic.transition;
++  const transition = createStoreTransition(transitions, producer);
+ 
+   function receive(event: StoreEvent) {
+     let effects: StoreEffect<TEmitted>[];
+@@ -125,7 +137,7 @@ function createStoreCore<
+         }
+       };
+     },
+-    transition: logic.transition as any, // TODO: fix this
++    transition,
+     sessionId: uniqueId(),
+     send(event) {
+       inspectionObservers.get(store)?.forEach((observer) => {
+@@ -217,6 +229,18 @@ export type TransitionsFromEventPayloadMap<
+   >;
+ };
+ 
++type CreateStoreParameterTypes<
++  TContext extends StoreContext,
++  TEventPayloadMap extends EventPayloadMap,
++  TEmitted extends EventPayloadMap
++> = [definition: StoreConfig<TContext, TEventPayloadMap, TEmitted>];
++
++type CreateStoreReturnType<
++  TContext extends StoreContext,
++  TEventPayloadMap extends EventPayloadMap,
++  TEmitted extends EventPayloadMap
++> = Store<TContext, ExtractEvents<TEventPayloadMap>, ExtractEvents<TEmitted>>;
++
+ /**
+  * Creates a **store** that has its own internal state and can be sent events
+  * that update its internal state based on transitions.
+@@ -225,10 +249,9 @@ export type TransitionsFromEventPayloadMap<
+  *
+  * ```ts
+  * const store = createStore({
+- *   context: { count: 0, name: 'Ada' },
++ *   context: { count: 0 },
+  *   on: {
+  *     inc: (context, event: { by: number }) => ({
+- *       ...context,
+  *       count: context.count + event.by
+  *     })
+  *   }
+@@ -239,7 +262,7 @@ export type TransitionsFromEventPayloadMap<
+  * });
+  *
+  * store.send({ type: 'inc', by: 5 });
+- * // Logs { context: { count: 5, name: 'Ada' }, status: 'active', ... }
++ * // Logs { context: { count: 5 }, status: 'active', ... }
+  * ```
+  *
+  * @param config - The store configuration object
+@@ -249,47 +272,72 @@ export type TransitionsFromEventPayloadMap<
+  * @returns A store instance with methods to send events and subscribe to state
+  *   changes
+  */
+-export function createStore<
++function _createStore<
+   TContext extends StoreContext,
+   TEventPayloadMap extends EventPayloadMap,
+-  TEmittedPayloadMap extends EventPayloadMap
+->(
+-  definition: StoreConfig<TContext, TEventPayloadMap, TEmittedPayloadMap>
+-): Store<
+-  TContext,
+-  ExtractEvents<TEventPayloadMap>,
+-  ExtractEvents<TEmittedPayloadMap>
+->;
+-export function createStore<
+-  TContext extends StoreContext,
+-  TEvent extends EventObject,
+-  TEmittedPayloadMap extends EventPayloadMap
++  TEmitted extends EventPayloadMap
+ >(
+-  logic: StoreLogic<
+-    StoreSnapshot<TContext>,
+-    TEvent,
+-    ExtractEvents<TEmittedPayloadMap>
++  ...[{ context, on, emits }]: CreateStoreParameterTypes<
++    TContext,
++    TEventPayloadMap,
++    TEmitted
+   >
+-): Store<TContext, TEvent, ExtractEvents<TEmittedPayloadMap>>;
+-export function createStore(
+-  definitionOrLogic: StoreConfig<any, any, any> | AnyStoreLogic
+-) {
+-  if ('transition' in definitionOrLogic) {
+-    return createStoreCore(definitionOrLogic);
+-  }
+-  const transition = createStoreTransition(definitionOrLogic.on);
+-  const logic: AnyStoreLogic = {
+-    getInitialSnapshot: () => ({
+-      status: 'active' as const,
+-      context: definitionOrLogic.context,
+-      output: undefined,
+-      error: undefined
+-    }),
+-    transition
+-  } satisfies AnyStoreLogic;
+-  return createStoreCore(logic, definitionOrLogic.emits);
++): CreateStoreReturnType<TContext, TEventPayloadMap, TEmitted> {
++  return createStoreCore(context, on, emits);
+ }
+ 
++// those overloads are exactly the same, we only duplicate them so TypeScript can:
++// 1. assign contextual parameter types during inference attempt for the first overload when the source object is still context-sensitive and often non-inferable
++// 2. infer correctly during inference attempt for the second overload when the parameter types are already "known"
++export const createStore: {
++  /**
++   * Creates a **store** that has its own internal state and can be sent events
++   * that update its internal state based on transitions.
++   *
++   * @example
++   *
++   * ```ts
++   * const store = createStore({
++   *   context: { count: 0, name: 'Ada' },
++   *   on: {
++   *     inc: (context, event: { by: number }) => ({
++   *       ...context,
++   *       count: context.count + event.by
++   *     })
++   *   }
++   * });
++   *
++   * store.subscribe((snapshot) => {
++   *   console.log(snapshot);
++   * });
++   *
++   * store.send({ type: 'inc', by: 5 });
++   * // Logs { context: { count: 5, name: 'Ada' }, status: 'active', ... }
++   * ```
++   *
++   * @param config - The store configuration object
++   * @param config.context - The initial state of the store
++   * @param config.on - An object mapping event types to transition functions
++   * @param config.emits - An object mapping emitted event types to handlers
++   * @returns A store instance with methods to send events and subscribe to
++   *   state changes
++   */
++  <
++    TContext extends StoreContext,
++    TEventPayloadMap extends EventPayloadMap,
++    TEmitted extends EventPayloadMap
++  >(
++    ...args: CreateStoreParameterTypes<TContext, TEventPayloadMap, TEmitted>
++  ): CreateStoreReturnType<TContext, TEventPayloadMap, TEmitted>;
++  <
++    TContext extends StoreContext,
++    TEventPayloadMap extends EventPayloadMap,
++    TEmitted extends EventPayloadMap
++  >(
++    ...args: CreateStoreParameterTypes<TContext, TEventPayloadMap, TEmitted>
++  ): CreateStoreReturnType<TContext, TEventPayloadMap, TEmitted>;
++} = _createStore;
++
+ function _createStoreConfig<
+   TContext extends StoreContext,
+   TEventPayloadMap extends EventPayloadMap,
+@@ -371,18 +419,7 @@ export function createStoreWithProducer<
+   ExtractEvents<TEventPayloadMap>,
+   ExtractEvents<TEmittedPayloadMap>
+ > {
+-  const transition = createStoreTransition(config.on, producer);
+-  const logic = {
+-    getInitialSnapshot: () => ({
+-      status: 'active' as const,
+-      context: config.context,
+-      output: undefined,
+-      error: undefined
+-    }),
+-    transition
+-  } satisfies AnyStoreLogic;
+-
+-  return createStoreCore(logic, config.emits);
++  return createStoreCore(config.context, config.on, config.emits, producer);
+ }
+ 
+ declare global {
+@@ -417,7 +454,7 @@ export function createStoreTransition<
+     context: TContext,
+     recipe: (context: TContext) => void
+   ) => TContext
+-): StoreTransition<TContext, ExtractEvents<TEventPayloadMap>, TEmitted> {
++) {
+   return (
+     snapshot: StoreSnapshot<TContext>,
+     event: ExtractEvents<TEventPayloadMap>
+diff --git a/packages/xstate-store/src/types.ts b/packages/xstate-store/src/types.ts
+index ee16929c94..a02cec60a6 100644
+--- a/packages/xstate-store/src/types.ts
++++ b/packages/xstate-store/src/types.ts
+@@ -77,7 +77,7 @@ export type StoreSnapshot<TContext> = Snapshot<undefined> & {
+  * - Is observable
+  */
+ export interface Store<
+-  TContext extends StoreContext,
++  TContext,
+   TEvent extends EventObject,
+   TEmitted extends EventObject
+ > extends Subscribable<StoreSnapshot<TContext>>,
+@@ -143,18 +143,12 @@ export interface Store<
+    * });
+    * ```
+    */
+-  transition: StoreTransition<TContext, TEvent, TEmitted>;
++  transition: (
++    state: StoreSnapshot<TContext>,
++    event: TEvent
++  ) => [StoreSnapshot<TContext>, StoreEffect<TEmitted>[]];
+ }
+ 
+-export type StoreTransition<
+-  TContext extends StoreContext,
+-  TEvent extends EventObject,
+-  TEmitted extends EventObject
+-> = (
+-  state: StoreSnapshot<TContext>,
+-  event: TEvent
+-) => [StoreSnapshot<TContext>, StoreEffect<TEmitted>[]];
+-
+ export type StoreConfig<
+   TContext extends StoreContext,
+   TEventPayloadMap extends EventPayloadMap,
+@@ -413,30 +407,3 @@ export interface ReadonlyAtom<T> extends BaseAtom<T> {}
+ type DistributiveOmit<T, K extends PropertyKey> = T extends any
+   ? Omit<T, K>
+   : never;
+-
+-export type StoreLogic<
+-  TSnapshot extends StoreSnapshot<any>,
+-  TEvent extends EventObject,
+-  TEmitted extends EventObject
+-> = {
+-  getInitialSnapshot: () => TSnapshot;
+-  transition: (
+-    snapshot: TSnapshot,
+-    event: TEvent
+-  ) => [TSnapshot, StoreEffect<TEmitted>[]];
+-};
+-export type AnyStoreLogic = StoreLogic<any, any, any>;
+-
+-export type AnyStoreConfig = StoreConfig<any, any, any>;
+-export type EventFromStoreConfig<TStore extends AnyStoreConfig> =
+-  TStore extends StoreConfig<any, infer TEventPayloadMap, any>
+-    ? ExtractEvents<TEventPayloadMap>
+-    : never;
+-
+-export type EmitsFromStoreConfig<TStore extends AnyStoreConfig> =
+-  TStore extends StoreConfig<any, any, infer TEmitted>
+-    ? ExtractEvents<TEmitted>
+-    : never;
+-
+-export type ContextFromStoreConfig<TStore extends AnyStoreConfig> =
+-  TStore extends StoreConfig<infer TContext, any, any> ? TContext : never;
+diff --git a/packages/xstate-store/src/undo.ts b/packages/xstate-store/src/undo.ts
+deleted file mode 100644
+index a6441a84ea..0000000000
+--- a/packages/xstate-store/src/undo.ts
++++ /dev/null
+@@ -1,228 +0,0 @@
+-import {
+-  AnyStoreLogic,
+-  EmitsFromStoreConfig,
+-  EventObject,
+-  EventPayloadMap,
+-  ExtractEvents,
+-  StoreConfig,
+-  StoreContext,
+-  StoreLogic,
+-  StoreSnapshot
+-} from './types';
+-import { createStoreTransition } from './store';
+-
+-type UndoEvent<TEvent extends EventObject> = {
+-  event: TEvent;
+-  transactionId?: string;
+-};
+-
+-/**
+- * Creates store logic with undo/redo functionality.
+- *
+- * It maintains an event history and allows reverting to previous states by
+- * replaying events from the beginning up to a certain point.
+- *
+- * @example
+- *
+- * ```ts
+- * // Basic usage - each event is its own transaction
+- * const store = createStore(
+- *   undoRedo({
+- *     context: { count: 0 },
+- *     on: {
+- *       inc: (ctx) => ({ count: ctx.count + 1 }),
+- *       dec: (ctx) => ({ count: ctx.count - 1 })
+- *     }
+- *   })
+- * );
+- *
+- * store.trigger.inc(); // count = 1
+- * store.trigger.inc(); // count = 2
+- * store.trigger.undo(); // count = 1 (undoes last inc)
+- * store.trigger.redo(); // count = 2 (redoes the inc)
+- * ```
+- *
+- * @example
+- *
+- * ```ts
+- * // Grouped events by transaction ID
+- * const store = createStore(
+- *   undoRedo(
+- *     {
+- *       context: { count: 0 },
+- *       on: {
+- *         inc: (ctx) => ({ count: ctx.count + 1 }),
+- *         dec: (ctx) => ({ count: ctx.count - 1 })
+- *       }
+- *     },
+- *     {
+- *       getTransactionId: (event) => event.type
+- *     }
+- *   )
+- * );
+- *
+- * store.send({ type: 'inc' }); // count = 1 (1st transaction)
+- * store.send({ type: 'inc' }); // count = 2 (1st transaction)
+- * store.send({ type: 'dec' }); // count = 1 (2nd transaction)
+- * store.send({ type: 'dec' }); // count = 0 (2nd transaction)
+- *
+- * store.trigger.undo(); // count = 1 (undoes both dec events)
+- * store.trigger.undo(); // count = 0 (undoes both inc events)
+- * ```
+- *
+- * @returns Store logic with additional `undo` and `redo` event handlers
+- */
+-export function undoRedo<
+-  TContext extends StoreContext,
+-  TEventPayloadMap extends EventPayloadMap,
+-  TEmittedPayloadMap extends EventPayloadMap
+->(
+-  storeConfig: StoreConfig<TContext, TEventPayloadMap, TEmittedPayloadMap>,
+-  options?: {
+-    getTransactionId?: (event: ExtractEvents<TEventPayloadMap>) => string;
+-  }
+-): StoreLogic<
+-  StoreSnapshot<TContext>,
+-  ExtractEvents<TEventPayloadMap> | { type: 'undo' } | { type: 'redo' },
+-  EmitsFromStoreConfig<any>
+-> {
+-  type TEvent = ExtractEvents<TEventPayloadMap>;
+-  const logic: AnyStoreLogic = {
+-    getInitialSnapshot: () => ({
+-      status: 'active',
+-      context: storeConfig.context,
+-      output: undefined,
+-      error: undefined
+-    }),
+-    transition: createStoreTransition(storeConfig.on)
+-  };
+-
+-  const enhancedLogic: AnyStoreLogic = {
+-    getInitialSnapshot: () => ({
+-      status: 'active',
+-      context: storeConfig.context,
+-      output: undefined,
+-      error: undefined,
+-      events: [],
+-      undoStack: []
+-    }),
+-    transition: (snapshot, event) => {
+-      if (event.type === 'undo') {
+-        const events = snapshot.events.slice();
+-        const undoStack = snapshot.undoStack.slice();
+-        if (!events.length) {
+-          return [
+-            {
+-              ...snapshot,
+-              events,
+-              undoStack
+-            },
+-            []
+-          ];
+-        }
+-
+-        // Get the transaction ID of the last event
+-        const lastTransactionId = events[events.length - 1].transactionId;
+-
+-        // Remove all events with the same transaction ID
+-        // If transactionId is undefined, only remove the last event
+-        const eventsToUndo: UndoEvent<TEvent>[] = [];
+-        if (lastTransactionId === undefined) {
+-          // When no transaction ID is provided, each event is its own transaction
+-          const event = events.pop()!;
+-          eventsToUndo.unshift(event);
+-          undoStack.push(event);
+-        } else {
+-          // Remove all events with the same transaction ID
+-          while (true) {
+-            const event = events.pop()!;
+-            eventsToUndo.unshift(event);
+-            undoStack.push(event);
+-            if (
+-              lastTransactionId === undefined ||
+-              !events.length ||
+-              events[events.length - 1].transactionId !== lastTransactionId
+-            ) {
+-              break;
+-            }
+-          }
+-        }
+-
+-        // Replay remaining events to get to the new state
+-        let state = {
+-          ...logic.getInitialSnapshot(),
+-          events,
+-          undoStack
+-        };
+-
+-        for (const { event } of events) {
+-          const [newState, _effects] = logic.transition(state, event);
+-          state = {
+-            ...newState,
+-            events,
+-            undoStack
+-          };
+-        }
+-
+-        return [state, []];
+-      }
+-
+-      if (event.type === 'redo') {
+-        const events = snapshot.events.slice();
+-        const undoStack = snapshot.undoStack.slice();
+-        if (!undoStack.length) {
+-          return [
+-            {
+-              ...snapshot,
+-              events,
+-              undoStack
+-            },
+-            []
+-          ];
+-        }
+-
+-        const lastTransactionId = undoStack[undoStack.length - 1].transactionId;
+-        let state = {
+-          ...snapshot,
+-          events,
+-          undoStack
+-        };
+-        const allEffects: any[] = [];
+-
+-        while (
+-          undoStack.length > 0 &&
+-          undoStack[undoStack.length - 1].transactionId === lastTransactionId
+-        ) {
+-          const undoEvent = undoStack.pop()!;
+-          events.push(undoEvent);
+-          const [newState, effects] = logic.transition(state, undoEvent.event);
+-          state = {
+-            ...newState,
+-            events,
+-            undoStack
+-          };
+-          allEffects.push(...effects);
+-        }
+-
+-        return [state, allEffects];
+-      }
+-
+-      const events = snapshot.events.slice();
+-      const [state, effects] = logic.transition(snapshot, event);
+-      return [
+-        {
+-          ...state,
+-          events: events.concat({
+-            event,
+-            transactionId: options?.getTransactionId?.(event)
+-          }),
+-          // Clear the undo stack when new events occur
+-          undoStack: []
+-        },
+-        effects
+-      ];
+-    }
+-  };
+-
+-  return enhancedLogic;
+-}
+diff --git a/packages/xstate-store/test/store.test.ts b/packages/xstate-store/test/store.test.ts
+index 0039dc37c0..95e2af72bd 100644
+--- a/packages/xstate-store/test/store.test.ts
++++ b/packages/xstate-store/test/store.test.ts
+@@ -1,16 +1,6 @@
+ import { produce } from 'immer';
+-import {
+-  createStore,
+-  createStoreConfig,
+-  createStoreWithProducer
+-} from '../src/index.ts';
++import { createStore, createStoreWithProducer } from '../src/index.ts';
+ import { createBrowserInspector } from '@statelyai/inspect';
+-import { undoRedo } from '../src/undo.ts';
+-import {
+-  AnyStoreConfig,
+-  ContextFromStoreConfig,
+-  EventFromStoreConfig
+-} from '../src/types.ts';
+ 
+ it('updates a store with an event without mutating original context', () => {
+   const context = { count: 0 };
+@@ -726,98 +716,3 @@ describe('store.transition', () => {
+     expect(typeof effects[0]).toBe('function');
+   });
+ });
+-
+-it('can be created with a logic object', () => {
+-  const store = createStore({
+-    getInitialSnapshot: () => ({
+-      context: { count: 0 },
+-      status: 'active' as const,
+-      output: undefined,
+-      error: undefined
+-    }),
+-    transition: (
+-      snapshot,
+-      event: {
+-        type: 'inc';
+-      }
+-    ) => {
+-      if (event.type === 'inc') {
+-        return [
+-          { ...snapshot, context: { count: snapshot.context.count + 1 } },
+-          []
+-        ];
+-      }
+-      return [snapshot, []];
+-    }
+-  });
+-
+-  expect(store.getSnapshot().context).toEqual({ count: 0 });
+-
+-  store.trigger.inc();
+-
+-  expect(store.getSnapshot().context).toEqual({ count: 1 });
+-
+-  // @ts-expect-error
+-  store.trigger.unknown();
+-
+-  store.getSnapshot().context.count satisfies number;
+-
+-  // @ts-expect-error
+-  store.getSnapshot().context.count satisfies string;
+-});
+-
+-describe('types', () => {
+-  it('AnyStoreConfig', () => {
+-    function transformStoreConfig(_config: AnyStoreConfig): void {}
+-
+-    transformStoreConfig({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx) => ({ count: ctx.count + 1 })
+-      }
+-    });
+-
+-    // @ts-expect-error
+-    transformStoreConfig({});
+-  });
+-
+-  it('EventFromStoreConfig', () => {
+-    const storeConfig = createStoreConfig({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx, event: { by: number }) => ({ count: ctx.count + event.by })
+-      }
+-    });
+-
+-    let ev: EventFromStoreConfig<typeof storeConfig> = {
+-      type: 'inc',
+-      by: 1
+-    };
+-
+-    ev satisfies {
+-      type: 'inc';
+-      by: number;
+-    };
+-
+-    // @ts-expect-error
+-    ev satisfies { type: 'unknown' };
+-  });
+-
+-  it('ContextFromStoreConfig', () => {
+-    const storeConfig = createStoreConfig({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx) => ({ count: ctx.count + 1 })
+-      }
+-    });
+-
+-    type Context = ContextFromStoreConfig<typeof storeConfig>;
+-
+-    const context: Context = { count: 0 };
+-
+-    context.count satisfies number;
+-
+-    // @ts-expect-error
+-    context.count satisfies string;
+-  });
+-});
+diff --git a/packages/xstate-store/test/undo.test.ts b/packages/xstate-store/test/undo.test.ts
+deleted file mode 100644
+index b960202c5e..0000000000
+--- a/packages/xstate-store/test/undo.test.ts
++++ /dev/null
+@@ -1,186 +0,0 @@
+-import { createStore } from '../src/index.ts';
+-import { undoRedo } from '../src/undo.ts';
+-
+-it('should undo a single event', () => {
+-  const store = createStore(
+-    undoRedo({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx) => ({ count: ctx.count + 1 })
+-      }
+-    })
+-  );
+-
+-  store.trigger.inc();
+-  expect(store.getSnapshot().context.count).toBe(1);
+-
+-  store.trigger.undo();
+-  expect(store.getSnapshot().context.count).toBe(0);
+-});
+-
+-it('should redo a previously undone event', () => {
+-  const store = createStore(
+-    undoRedo({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx) => ({ count: ctx.count + 1 })
+-      }
+-    })
+-  );
+-
+-  store.trigger.inc();
+-  store.trigger.undo();
+-  store.trigger.redo();
+-  expect(store.getSnapshot().context.count).toBe(1);
+-});
+-
+-it('should group events by transaction ID', () => {
+-  const store = createStore(
+-    undoRedo(
+-      {
+-        context: { count: 0 },
+-        on: {
+-          inc: (ctx) => ({ count: ctx.count + 1 }),
+-          dec: (ctx) => ({ count: ctx.count - 1 })
+-        }
+-      },
+-      {
+-        getTransactionId: (event) => {
+-          return event.type;
+-        }
+-      }
+-    )
+-  );
+-
+-  // First transaction
+-  store.send({ type: 'inc' });
+-  store.send({ type: 'inc' });
+-  expect(store.getSnapshot().context.count).toBe(2);
+-
+-  // Second transaction
+-  store.send({ type: 'dec' });
+-  store.send({ type: 'dec' });
+-  expect(store.getSnapshot().context.count).toBe(0);
+-
+-  // Undo second transaction (both decrements)
+-  store.send({ type: 'undo' });
+-  expect(store.getSnapshot().context.count).toBe(2);
+-
+-  // Undo first transaction (both increments)
+-  store.send({ type: 'undo' });
+-  expect(store.getSnapshot().context.count).toBe(0);
+-});
+-
+-it('should maintain correct state when interleaving undo/redo with new events', () => {
+-  const store = createStore(
+-    undoRedo({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx) => ({ count: ctx.count + 1 }),
+-        dec: (ctx) => ({ count: ctx.count - 1 })
+-      }
+-    })
+-  );
+-
+-  store.trigger.inc(); // 1
+-  expect(store.getSnapshot().context.count).toBe(1);
+-  store.trigger.inc(); // 2
+-  expect(store.getSnapshot().context.count).toBe(2);
+-  store.trigger.undo(); // 1
+-  expect(store.getSnapshot().context.count).toBe(1);
+-  store.send({ type: 'dec' }); // 0
+-  expect(store.getSnapshot().context.count).toBe(0);
+-  store.trigger.undo(); // 1
+-  expect(store.getSnapshot().context.count).toBe(1);
+-  store.send({ type: 'redo' }); // 0
+-  expect(store.getSnapshot().context.count).toBe(0);
+-
+-  expect(store.getSnapshot().context.count).toBe(0);
+-});
+-
+-it('should do nothing when undoing with empty history', () => {
+-  const store = createStore(
+-    undoRedo({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx) => ({ count: ctx.count + 1 })
+-      }
+-    })
+-  );
+-
+-  const initialSnapshot = store.getSnapshot();
+-  store.send({ type: 'undo' });
+-  expect(store.getSnapshot()).toEqual(initialSnapshot);
+-});
+-
+-it('should do nothing when redoing with empty undo stack', () => {
+-  const store = createStore(
+-    undoRedo({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx) => ({ count: ctx.count + 1 })
+-      }
+-    })
+-  );
+-
+-  const initialSnapshot = store.getSnapshot();
+-  store.send({ type: 'redo' });
+-  expect(store.getSnapshot()).toEqual(initialSnapshot);
+-});
+-
+-it('should clear redo stack when new events occur after undo', () => {
+-  const store = createStore(
+-    undoRedo({
+-      context: { count: 0 },
+-      on: {
+-        inc: (ctx) => ({ count: ctx.count + 1 }),
+-        dec: (ctx) => ({ count: ctx.count - 1 })
+-      }
+-    })
+-  );
+-
+-  store.send({ type: 'inc' }); // 1
+-  expect(store.getSnapshot().context.count).toBe(1);
+-  store.send({ type: 'inc' }); // 2
+-  expect(store.getSnapshot().context.count).toBe(2);
+-  store.send({ type: 'undo' }); // 1
+-  expect(store.getSnapshot().context.count).toBe(1);
+-  store.send({ type: 'dec' }); // 0
+-
+-  // Redo should not work as we added a new event after undo
+-  store.send({ type: 'redo' });
+-  expect(store.getSnapshot().context.count).toBe(0);
+-});
+-
+-it('should preserve emitted events during undo/redo', () => {
+-  type Events = { type: 'inc' };
+-
+-  const store = createStore(
+-    undoRedo({
+-      context: { count: 0 },
+-      emits: {
+-        changed: (_: { value: number }) => {}
+-      },
+-      on: {
+-        inc: (ctx, _: Events, enq) => {
+-          enq.emit.changed({ value: ctx.count + 1 });
+-          return { count: ctx.count + 1 };
+-        }
+-      }
+-    })
+-  );
+-
+-  const emittedEvents: any[] = [];
+-  store.on('changed', (event) => {
+-    emittedEvents.push(event);
+-  });
+-
+-  store.send({ type: 'inc' });
+-  store.send({ type: 'undo' });
+-  store.send({ type: 'redo' });
+-
+-  expect(emittedEvents).toEqual([
+-    { type: 'changed', value: 1 },
+-    { type: 'changed', value: 1 }
+-  ]);
+-});

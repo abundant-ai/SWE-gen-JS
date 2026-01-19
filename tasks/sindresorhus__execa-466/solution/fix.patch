@@ -1,0 +1,233 @@
+diff --git a/index.d.ts b/index.d.ts
+index 3470a12..417d535 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -252,10 +252,20 @@ declare namespace execa {
+ 
+ 	interface ExecaReturnBase<StdoutStderrType> {
+ 		/**
+-		The file and arguments that were run.
++		The file and arguments that were run, for logging purposes.
++
++		This is not escaped and should not be executed directly as a process, including using `execa()` or `execa.command()`.
+ 		*/
+ 		command: string;
+ 
++		/**
++		Same as `command` but escaped.
++
++		This is meant to be copy and pasted into a shell, for debugging purposes.
++		Since the escaping is fairly basic, this should not be executed directly as a process, including using `execa()` or `execa.command()`.
++		*/
++		escapedCommand: string;
++
+ 		/**
+ 		The numeric exit code of the process that was run.
+ 		*/
+diff --git a/index.js b/index.js
+index bbf0d29..6fc9f12 100644
+--- a/index.js
++++ b/index.js
+@@ -10,7 +10,7 @@ const normalizeStdio = require('./lib/stdio');
+ const {spawnedKill, spawnedCancel, setupTimeout, validateTimeout, setExitHandler} = require('./lib/kill');
+ const {handleInput, getSpawnedResult, makeAllStream, validateInputSync} = require('./lib/stream');
+ const {mergePromise, getSpawnedPromise} = require('./lib/promise');
+-const {joinCommand, parseCommand} = require('./lib/command');
++const {joinCommand, parseCommand, getEscapedCommand} = require('./lib/command');
+ 
+ const DEFAULT_MAX_BUFFER = 1000 * 1000 * 100;
+ 
+@@ -74,6 +74,7 @@ const handleOutput = (options, value, error) => {
+ const execa = (file, args, options) => {
+ 	const parsed = handleArguments(file, args, options);
+ 	const command = joinCommand(file, args);
++	const escapedCommand = getEscapedCommand(file, args);
+ 
+ 	validateTimeout(parsed.options);
+ 
+@@ -89,6 +90,7 @@ const execa = (file, args, options) => {
+ 			stderr: '',
+ 			all: '',
+ 			command,
++			escapedCommand,
+ 			parsed,
+ 			timedOut: false,
+ 			isCanceled: false,
+@@ -121,6 +123,7 @@ const execa = (file, args, options) => {
+ 				stderr,
+ 				all,
+ 				command,
++				escapedCommand,
+ 				parsed,
+ 				timedOut,
+ 				isCanceled: context.isCanceled,
+@@ -136,6 +139,7 @@ const execa = (file, args, options) => {
+ 
+ 		return {
+ 			command,
++			escapedCommand,
+ 			exitCode: 0,
+ 			stdout,
+ 			stderr,
+@@ -161,6 +165,7 @@ module.exports = execa;
+ module.exports.sync = (file, args, options) => {
+ 	const parsed = handleArguments(file, args, options);
+ 	const command = joinCommand(file, args);
++	const escapedCommand = getEscapedCommand(file, args);
+ 
+ 	validateInputSync(parsed.options);
+ 
+@@ -174,6 +179,7 @@ module.exports.sync = (file, args, options) => {
+ 			stderr: '',
+ 			all: '',
+ 			command,
++			escapedCommand,
+ 			parsed,
+ 			timedOut: false,
+ 			isCanceled: false,
+@@ -192,6 +198,7 @@ module.exports.sync = (file, args, options) => {
+ 			signal: result.signal,
+ 			exitCode: result.status,
+ 			command,
++			escapedCommand,
+ 			parsed,
+ 			timedOut: result.error && result.error.code === 'ETIMEDOUT',
+ 			isCanceled: false,
+@@ -207,6 +214,7 @@ module.exports.sync = (file, args, options) => {
+ 
+ 	return {
+ 		command,
++		escapedCommand,
+ 		exitCode: 0,
+ 		stdout,
+ 		stderr,
+diff --git a/index.test-d.ts b/index.test-d.ts
+index edce1e1..b5da697 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -16,6 +16,7 @@ try {
+ 
+ 	const unicornsResult = await execaPromise;
+ 	expectType<string>(unicornsResult.command);
++	expectType<string>(unicornsResult.escapedCommand);
+ 	expectType<number>(unicornsResult.exitCode);
+ 	expectType<string>(unicornsResult.stdout);
+ 	expectType<string>(unicornsResult.stderr);
+@@ -47,6 +48,7 @@ try {
+ try {
+ 	const unicornsResult = execa.sync('unicorns');
+ 	expectType<string>(unicornsResult.command);
++	expectType<string>(unicornsResult.escapedCommand);
+ 	expectType<number>(unicornsResult.exitCode);
+ 	expectType<string>(unicornsResult.stdout);
+ 	expectType<string>(unicornsResult.stderr);
+diff --git a/lib/command.js b/lib/command.js
+index 190ce16..ab8887e 100644
+--- a/lib/command.js
++++ b/lib/command.js
+@@ -1,14 +1,33 @@
+ 'use strict';
+-const SPACES_REGEXP = / +/g;
+-
+-const joinCommand = (file, args = []) => {
++const normalizeArgs = (file, args = []) => {
+ 	if (!Array.isArray(args)) {
+-		return file;
++		return [file];
++	}
++
++	return [file, ...args];
++};
++
++const NO_ESCAPE_REGEXP = /^[\w.-]+$/;
++const DOUBLE_QUOTES_REGEXP = /"/g;
++
++const escapeArg = arg => {
++	if (NO_ESCAPE_REGEXP.test(arg)) {
++		return arg;
+ 	}
+ 
+-	return [file, ...args].join(' ');
++	return `"${arg.replace(DOUBLE_QUOTES_REGEXP, '\\"')}"`;
+ };
+ 
++const joinCommand = (file, args) => {
++	return normalizeArgs(file, args).join(' ');
++};
++
++const getEscapedCommand = (file, args) => {
++	return normalizeArgs(file, args).map(arg => escapeArg(arg)).join(' ');
++};
++
++const SPACES_REGEXP = / +/g;
++
+ // Handle `execa.command()`
+ const parseCommand = command => {
+ 	const tokens = [];
+@@ -28,5 +47,6 @@ const parseCommand = command => {
+ 
+ module.exports = {
+ 	joinCommand,
++	getEscapedCommand,
+ 	parseCommand
+ };
+diff --git a/lib/error.js b/lib/error.js
+index 09cd081..4214467 100644
+--- a/lib/error.js
++++ b/lib/error.js
+@@ -33,6 +33,7 @@ const makeError = ({
+ 	signal,
+ 	exitCode,
+ 	command,
++	escapedCommand,
+ 	timedOut,
+ 	isCanceled,
+ 	killed,
+@@ -61,6 +62,7 @@ const makeError = ({
+ 
+ 	error.shortMessage = shortMessage;
+ 	error.command = command;
++	error.escapedCommand = escapedCommand;
+ 	error.exitCode = exitCode;
+ 	error.signal = signal;
+ 	error.signalDescription = signalDescription;
+diff --git a/readme.md b/readme.md
+index 383064b..843edbc 100644
+--- a/readme.md
++++ b/readme.md
+@@ -68,6 +68,7 @@ const execa = require('execa');
+ 			originalMessage: 'spawn unknown ENOENT',
+ 			shortMessage: 'Command failed with ENOENT: unknown command spawn unknown ENOENT',
+ 			command: 'unknown command',
++			escapedCommand: 'unknown command',
+ 			stdout: '',
+ 			stderr: '',
+ 			all: '',
+@@ -121,6 +122,7 @@ try {
+ 		originalMessage: 'spawnSync unknown ENOENT',
+ 		shortMessage: 'Command failed with ENOENT: unknown command spawnSync unknown ENOENT',
+ 		command: 'unknown command',
++		escapedCommand: 'unknown command',
+ 		stdout: '',
+ 		stderr: '',
+ 		all: '',
+@@ -234,7 +236,18 @@ The child process [fails](#failed) when:
+ 
+ Type: `string`
+ 
+-The file and arguments that were run.
++The file and arguments that were run, for logging purposes.
++
++This is not escaped and should not be executed directly as a process, including using [`execa()`](#execafile-arguments-options) or [`execa.command()`](#execacommandcommand-options).
++
++#### escapedCommand
++
++Type: `string`
++
++Same as [`command`](#command) but escaped.
++
++This is meant to be copy and pasted into a shell, for debugging purposes.
++Since the escaping is fairly basic, this should not be executed directly as a process, including using [`execa()`](#execafile-arguments-options) or [`execa.command()`](#execacommandcommand-options).
+ 
+ #### exitCode
+ 

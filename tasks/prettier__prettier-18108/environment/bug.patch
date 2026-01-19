@@ -1,0 +1,411 @@
+diff --git a/changelog_unreleased/javascript/18108.md b/changelog_unreleased/javascript/18108.md
+deleted file mode 100644
+index 05e03e671..000000000
+--- a/changelog_unreleased/javascript/18108.md
++++ /dev/null
+@@ -1,25 +0,0 @@
+-#### Improve comment printing around empty statement (#18108 by @fisker)
+-
+-<!-- prettier-ignore -->
+-```jsx
+-// Input
+-for (
+-  index = 0;
+-  doSomething(foo[index]) !== bar && doSomething(foo[index]) !== baz;
+-  index ++
+-) /* No op */;
+-
+-// Prettier stable
+-for (
+-  index = 0;
+-  doSomething(foo[index]) !== bar && doSomething(foo[index]) !== baz;
+-  index++ /* No op */
+-);
+-
+-// Prettier main
+-for (
+-  index = 0;
+-  doSomething(foo[index]) !== bar && doSomething(foo[index]) !== baz;
+-  index++
+-) /* No op */ ;
+-```
+diff --git a/src/language-js/clean.js b/src/language-js/clean.js
+index d49d36539..6fc821c41 100644
+--- a/src/language-js/clean.js
++++ b/src/language-js/clean.js
+@@ -1,6 +1,5 @@
+ import {
+   isArrayExpression,
+-  isMeaningfulEmptyStatement,
+   isNumericLiteral,
+   isStringLiteral,
+ } from "./utils/index.js";
+@@ -27,7 +26,7 @@ const removeTemplateElementsValue = (node) => {
+   }
+ };
+ 
+-function clean(original, cloned, parent) {
++function clean(original, cloned) {
+   if (original.type === "Program") {
+     delete cloned.sourceType;
+   }
+@@ -40,10 +39,7 @@ function clean(original, cloned, parent) {
+   }
+ 
+   // We remove extra `;` and add them when needed
+-  if (
+-    original.type === "EmptyStatement" &&
+-    !isMeaningfulEmptyStatement({ node: original, parent })
+-  ) {
++  if (original.type === "EmptyStatement") {
+     return null;
+   }
+ 
+diff --git a/src/language-js/comments/printer-methods.js b/src/language-js/comments/printer-methods.js
+index a3bc7f412..daf0ab056 100644
+--- a/src/language-js/comments/printer-methods.js
++++ b/src/language-js/comments/printer-methods.js
+@@ -4,7 +4,6 @@ import {
+   getFunctionParameters,
+   hasNodeIgnoreComment,
+   isJsxElement,
+-  isMeaningfulEmptyStatement,
+   isMethod,
+   isUnionType,
+ } from "../utils/index.js";
+@@ -15,6 +14,7 @@ import {
+  */
+ 
+ const isNodeCantAttachComment = createTypeCheckFunction([
++  "EmptyStatement",
+   "TemplateElement",
+   // There is no similar node in Babel AST
+   // ```ts
+@@ -84,20 +84,12 @@ const isClassMethodCantAttachComment = (node, [parent]) =>
+ @returns {boolean}
+ */
+ function canAttachComment(node, ancestors) {
+-  if (
++  return !(
+     isNodeCantAttachComment(node) ||
+     isChildWontPrint(node, ancestors) ||
+     // @ts-expect-error -- safe
+     isClassMethodCantAttachComment(node, ancestors)
+-  ) {
+-    return false;
+-  }
+-
+-  if (node.type === "EmptyStatement") {
+-    return isMeaningfulEmptyStatement({ node, parent: ancestors[0] });
+-  }
+-
+-  return true;
++  );
+ }
+ 
+ /**
+diff --git a/src/language-js/print/estree.js b/src/language-js/print/estree.js
+index 2ccd0309c..d8dd34d1b 100644
+--- a/src/language-js/print/estree.js
++++ b/src/language-js/print/estree.js
+@@ -18,7 +18,6 @@ import {
+   isArrayExpression,
+   isCallExpression,
+   isLiteral,
+-  isMeaningfulEmptyStatement,
+   isMemberExpression,
+   isMethod,
+   isNextLineEmpty,
+@@ -102,6 +101,8 @@ function printEstree(path, options, print, args) {
+     // Babel extension.
+     case "File":
+       return printHtmlBinding(path, options, print) ?? print("program");
++    case "EmptyStatement":
++      return "";
+     case "ExpressionStatement":
+       return printExpressionStatement(path, options, print);
+ 
+@@ -492,11 +493,11 @@ function printEstree(path, options, print, args) {
+         options.semi ? ";" : "",
+       ];
+     case "LabeledStatement":
+-      return [
+-        print("label"),
+-        `:${node.body.type === "EmptyStatement" && !hasComment(node.body, CommentCheckFlags.Leading) ? "" : " "}`,
+-        print("body"),
+-      ];
++      if (node.body.type === "EmptyStatement") {
++        return [print("label"), ":;"];
++      }
++
++      return [print("label"), ": ", print("body")];
+     case "TryStatement":
+       return [
+         "try ",
+@@ -626,11 +627,6 @@ function printEstree(path, options, print, args) {
+     case "VoidPattern":
+       return "void";
+ 
+-    case "EmptyStatement":
+-      if (isMeaningfulEmptyStatement(path)) {
+-        return ";";
+-      }
+-    // Fall through
+     case "InterpreterDirective": // Printed as comment
+     default:
+       /* c8 ignore next */
+diff --git a/src/language-js/print/misc.js b/src/language-js/print/misc.js
+index e8ad0e422..bf08be750 100644
+--- a/src/language-js/print/misc.js
++++ b/src/language-js/print/misc.js
+@@ -1,10 +1,5 @@
+ import { indent, line } from "../../document/builders.js";
+-import {
+-  CommentCheckFlags,
+-  hasComment,
+-  isCallExpression,
+-  isMemberExpression,
+-} from "../utils/index.js";
++import { isCallExpression, isMemberExpression } from "../utils/index.js";
+ import { printTypeAnnotationProperty } from "./type-annotation.js";
+ 
+ /**
+@@ -101,7 +96,7 @@ function printBindExpressionCallee(path, options, print) {
+ 
+ function adjustClause(node, clause, forceSpace) {
+   if (node.type === "EmptyStatement") {
+-    return hasComment(node, CommentCheckFlags.Leading) ? [" ", clause] : clause;
++    return ";";
+   }
+ 
+   if (node.type === "BlockStatement" || forceSpace) {
+diff --git a/src/language-js/utils/index.js b/src/language-js/utils/index.js
+index bbd1bc05b..61672144d 100644
+--- a/src/language-js/utils/index.js
++++ b/src/language-js/utils/index.js
+@@ -1144,5 +1144,4 @@ export {
+   shouldPrintComma,
+   startsWithNoLookaheadToken,
+ };
+-export { default as isMeaningfulEmptyStatement } from "./is-meaningful-empty-statement.js";
+ export { default as isNodeMatches } from "./is-node-matches.js";
+diff --git a/src/language-js/utils/is-meaningful-empty-statement.js b/src/language-js/utils/is-meaningful-empty-statement.js
+deleted file mode 100644
+index e5d1242a2..000000000
+--- a/src/language-js/utils/is-meaningful-empty-statement.js
++++ /dev/null
+@@ -1,26 +0,0 @@
+-/* The argument is a duck type of AstPath, so we can use it in comment attach and ast massage */
+-function isMeaningfulEmptyStatement({ node, parent }) {
+-  if (node?.type !== "EmptyStatement") {
+-    return false;
+-  }
+-
+-  if (parent.type === "IfStatement") {
+-    return parent.consequent === node || parent.alternate === node;
+-  }
+-
+-  if (
+-    parent.type === "DoWhileStatement" ||
+-    parent.type === "ForInStatement" ||
+-    parent.type === "ForOfStatement" ||
+-    parent.type === "ForStatement" ||
+-    parent.type === "LabeledStatement" ||
+-    parent.type === "WithStatement" ||
+-    parent.type === "WhileStatement"
+-  ) {
+-    return parent.body === node;
+-  }
+-
+-  return false;
+-}
+-
+-export default isMeaningfulEmptyStatement;
+diff --git a/tests/format/js/comments/__snapshots__/format.test.js.snap b/tests/format/js/comments/__snapshots__/format.test.js.snap
+index 9bc3d111f..a4835402b 100644
+--- a/tests/format/js/comments/__snapshots__/format.test.js.snap
++++ b/tests/format/js/comments/__snapshots__/format.test.js.snap
+@@ -1703,10 +1703,11 @@ for // comment
+ for /* comment */(;;);
+ 
+ =====================================output=====================================
+-for (;;) // comment
+-;
++// comment
++for (;;);
+ 
+-for (;;) /* comment */ ;
++/* comment */
++for (;;);
+ 
+ ================================================================================
+ `;
+@@ -1723,10 +1724,11 @@ for // comment
+ for /* comment */(;;);
+ 
+ =====================================output=====================================
+-for (;;) // comment
+-;
++// comment
++for (;;);
+ 
+-for (;;) /* comment */ ;
++/* comment */
++for (;;);
+ 
+ ================================================================================
+ `;
+diff --git a/tests/format/js/explicit-resource-management/__snapshots__/format.test.js.snap b/tests/format/js/explicit-resource-management/__snapshots__/format.test.js.snap
+index efe996c67..9318ad720 100644
+--- a/tests/format/js/explicit-resource-management/__snapshots__/format.test.js.snap
++++ b/tests/format/js/explicit-resource-management/__snapshots__/format.test.js.snap
+@@ -34,7 +34,7 @@ printWidth: 80
+ /*1*/ for /* 2 */ await /*3*/ ( /*4*/ using /*5*/ fo /*6*/ of /*7*/ of /*8*/) /*9*/;
+ 
+ =====================================output=====================================
+-/*1*/ for await (/* 2 */ /*3*/ /*4*/ using /*5*/ fo /*6*/ of /*7*/ of /*8*/) /*9*/ ;
++/*1*/ for await (/* 2 */ /*3*/ /*4*/ using /*5*/ fo /*6*/ of /*7*/ of /*8*/ /*9*/);
+ 
+ ================================================================================
+ `;
+@@ -649,16 +649,17 @@ async function f() {
+   }
+   {
+     /*0*/ for (
+-      /*1*/ /*2*/ await using /*3*/ /*4*/ b /*5*/ = /*6*/ x /*7*/ /*8*/ /*9*/;
++      /*1*/ /*2*/ await using /*3*/ /*4*/ b /*5*/ =
++          /*6*/ x /*7*/ /*8*/ /*9*/ /*10*/;
+       ;
+ 
+-    ) /*10*/ ;
++    );
+   }
+   {
+-    /*0*/ for (/*1*/ /*2*/ await using /*3*/ /*4*/ b /*5*/ of /*6*/ x /*7*/) /*8*/ ;
++    /*0*/ for (/*1*/ /*2*/ await using /*3*/ /*4*/ b /*5*/ of /*6*/ x /*7*/ /*8*/);
+   }
+   {
+-    /*0*/ for await (/*1*/ /*2*/ /*3*/ await using /*4*/ /*5*/ b /*6*/ of /*7*/ x /*8*/) /*9*/ ;
++    /*0*/ for await (/*1*/ /*2*/ /*3*/ await using /*4*/ /*5*/ b /*6*/ of /*7*/ x /*8*/ /*9*/);
+   }
+ }
+ 
+diff --git a/tests/format/js/for/9812-unstable.js b/tests/format/js/for/9812-unstable.js
+index c7ec7608e..fb334ddb5 100644
+--- a/tests/format/js/for/9812-unstable.js
++++ b/tests/format/js/for/9812-unstable.js
+@@ -5,7 +5,3 @@ for(x of y)
+ for(x of y)
+ // comment
+ {}
+-
+-for(x of y)
+-// comment
+-;
+diff --git a/tests/format/js/for/9812.js b/tests/format/js/for/9812.js
+index fdbd503b2..d9c6d5316 100644
+--- a/tests/format/js/for/9812.js
++++ b/tests/format/js/for/9812.js
+@@ -2,6 +2,10 @@ for (const p of ['fullName', 'organ', 'position', 'rank'])
+   // comment
+   form.setValue(`${prefix}.data.${p}`, response[p])
+ 
++for(x of y)
++// comment
++;
++
+ for(x of y)
+   // comment
+   bar();
+diff --git a/tests/format/js/for/__snapshots__/format.test.js.snap b/tests/format/js/for/__snapshots__/format.test.js.snap
+index 30b864e01..350175e25 100644
+--- a/tests/format/js/for/__snapshots__/format.test.js.snap
++++ b/tests/format/js/for/__snapshots__/format.test.js.snap
+@@ -10,6 +10,10 @@ for (const p of ['fullName', 'organ', 'position', 'rank'])
+   // comment
+   form.setValue(\`\${prefix}.data.\${p}\`, response[p])
+ 
++for(x of y)
++// comment
++;
++
+ for(x of y)
+   // comment
+   bar();
+@@ -63,6 +67,9 @@ for (const p of ["fullName", "organ", "position", "rank"])
+   // comment
+   form.setValue(\`\${prefix}.data.\${p}\`, response[p]);
+ 
++// comment
++for (x of y);
++
+ for (x of y)
+   // comment
+   bar();
+@@ -128,10 +135,6 @@ for(x of y)
+ // comment
+ {}
+ 
+-for(x of y)
+-// comment
+-;
+-
+ =====================================output=====================================
+ for (x of y) // comment
+ {
+@@ -142,9 +145,6 @@ for (x of y) // comment
+ {
+ }
+ 
+-for (x of y) // comment
+-;
+-
+ ================================================================================
+ `;
+ 
+diff --git a/tests/format/js/if/__snapshots__/format.test.js.snap b/tests/format/js/if/__snapshots__/format.test.js.snap
+index 39af73281..28495b8a0 100644
+--- a/tests/format/js/if/__snapshots__/format.test.js.snap
++++ b/tests/format/js/if/__snapshots__/format.test.js.snap
+@@ -254,7 +254,7 @@ function a() {
+   else return 2;
+ 
+   if (a)
+-    if (b); /* comment 6f */
++    if (b /* comment 6f */);
+     else return 2;
+ }
+ 
+diff --git a/tests/format/js/label/__snapshots__/format.test.js.snap b/tests/format/js/label/__snapshots__/format.test.js.snap
+index dcc55812a..de94d2e41 100644
+--- a/tests/format/js/label/__snapshots__/format.test.js.snap
++++ b/tests/format/js/label/__snapshots__/format.test.js.snap
+@@ -55,17 +55,9 @@ printWidth: 80
+ a:;
+ b
+ 
+-a: /* comment */;
+-a: ;/* comment */
+-a /* comment */:;
+-
+ =====================================output=====================================
+ a:;
+ b;
+ 
+-a: /* comment */ ;
+-a:; /* comment */
+-a /* comment */:;
+-
+ ================================================================================
+ `;
+diff --git a/tests/format/js/label/empty_label.js b/tests/format/js/label/empty_label.js
+index 24020c100..294408ee3 100644
+--- a/tests/format/js/label/empty_label.js
++++ b/tests/format/js/label/empty_label.js
+@@ -1,6 +1,2 @@
+ a:;
+ b
+-
+-a: /* comment */;
+-a: ;/* comment */
+-a /* comment */:;

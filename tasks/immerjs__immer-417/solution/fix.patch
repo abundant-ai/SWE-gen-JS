@@ -1,0 +1,90 @@
+diff --git a/readme.md b/readme.md
+index 92a4499..3e2b32a 100644
+--- a/readme.md
++++ b/readme.md
+@@ -548,6 +548,8 @@ isDraft(nextState) // => false
+ 
+ Immer automatically freezes any state trees that are modified using `produce`. This protects against accidental modifications of the state tree outside of a producer. This comes with a performance impact, so it is recommended to disable this option in production. It is by default enabled. By default, it is turned on during local development and turned off in production. Use `setAutoFreeze(true / false)` to explicitly turn this feature on or off.
+ 
++_⚠️ If auto freezing is enabled, recipes are not entirely side-effect free: Any plain object or array that ends up in the produced result, will be frozen, even when these objects were not frozen before the start of the producer! ⚠️_
++
+ ## Immer on older JavaScript environments?
+ 
+ By default `produce` tries to use proxies for optimal performance. However, on older JavaScript engines `Proxy` is not available. For example, when running Microsoft Internet Explorer or React Native (< v0.59) on Android. In such cases, Immer will fallback to an ES5 compatible implementation which works identical, but is a bit slower.
+diff --git a/src/common.js b/src/common.js
+index 6abb39e..65f5e15 100644
+--- a/src/common.js
++++ b/src/common.js
+@@ -120,3 +120,10 @@ export function clone(obj) {
+ 	for (const key in obj) cloned[key] = clone(obj[key])
+ 	return cloned
+ }
++
++export function deepFreeze(obj) {
++	if (!isDraftable(obj) || isDraft(obj) || Object.isFrozen(obj)) return
++	Object.freeze(obj)
++	if (Array.isArray(obj)) obj.forEach(deepFreeze)
++	else for (const key in obj) deepFreeze(obj[key])
++}
+diff --git a/src/immer.js b/src/immer.js
+index 2159bbc..2727f7c 100644
+--- a/src/immer.js
++++ b/src/immer.js
+@@ -11,7 +11,8 @@ import {
+ 	isEnumerable,
+ 	shallowCopy,
+ 	DRAFT_STATE,
+-	NOTHING
++	NOTHING,
++	deepFreeze
+ } from "./common"
+ import {ImmerScope} from "./scope"
+ 
+@@ -87,8 +88,10 @@ export class Immer {
+ 			return this.processResult(result, scope)
+ 		} else {
+ 			result = recipe(base)
+-			if (result === undefined) return base
+-			return result !== NOTHING ? result : undefined
++			if (result === NOTHING) return undefined
++			if (result === undefined) result = base
++			this.maybeFreeze(result, true)
++			return result
+ 		}
+ 	}
+ 	produceWithPatches(arg1, arg2, arg3) {
+@@ -170,6 +173,7 @@ export class Immer {
+ 			if (isDraftable(result)) {
+ 				// Finalize the result in case it contains (or is) a subset of the draft.
+ 				result = this.finalize(result, null, scope)
++				this.maybeFreeze(result)
+ 			}
+ 			if (scope.patches) {
+ 				scope.patches.push({
+@@ -209,6 +213,7 @@ export class Immer {
+ 			return draft
+ 		}
+ 		if (!state.modified) {
++			this.maybeFreeze(state.base, true)
+ 			return state.base
+ 		}
+ 		if (!state.finalized) {
+@@ -299,6 +304,7 @@ export class Immer {
+ 			// Search new objects for unfinalized drafts. Frozen objects should never contain drafts.
+ 			else if (isDraftable(value) && !Object.isFrozen(value)) {
+ 				each(value, finalizeProperty)
++				this.maybeFreeze(value)
+ 			}
+ 
+ 			if (isDraftProp && this.onAssign) {
+@@ -309,4 +315,10 @@ export class Immer {
+ 		each(root, finalizeProperty)
+ 		return root
+ 	}
++	maybeFreeze(value, deep = false) {
++		if (this.autoFreeze && !isDraft(value)) {
++			if (deep) deepFreeze(value)
++			else Object.freeze(value)
++		}
++	}
+ }

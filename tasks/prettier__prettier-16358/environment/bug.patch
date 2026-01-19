@@ -1,0 +1,185 @@
+diff --git a/changelog_unreleased/handlebars/16358.md b/changelog_unreleased/handlebars/16358.md
+deleted file mode 100644
+index 39f91fd2c..000000000
+--- a/changelog_unreleased/handlebars/16358.md
++++ /dev/null
+@@ -1,13 +0,0 @@
+-#### Fix handlebars path expressions starts with `@` (#16358 by @Princeyadav05)
+-
+-<!-- prettier-ignore -->
+-```hbs
+-{{! Input }}
+-<div>{{@x.y.z}}</div>
+-
+-{{! Prettier stable }}
+-<div>{{@x}}</div>
+-
+-{{! Prettier main }}
+-<div>{{@x.y.z}}</div>
+-```
+diff --git a/src/language-handlebars/clean.js b/src/language-handlebars/clean.js
+index cbf58e77f..04ac8aa60 100644
+--- a/src/language-handlebars/clean.js
++++ b/src/language-handlebars/clean.js
+@@ -32,10 +32,6 @@ function clean(original, cloned /*, parent*/) {
+   if (original.type === "AttrNode" && original.name.toLowerCase() === "class") {
+     delete cloned.value;
+   }
+-
+-  if (original.type === "PathExpression") {
+-    cloned.head = original.head.original;
+-  }
+ }
+ 
+ clean.ignoredProperties = new Set(["loc", "selfClosing"]);
+diff --git a/src/language-handlebars/printer-glimmer.js b/src/language-handlebars/printer-glimmer.js
+index 53a4f2b99..ff1fdb2eb 100644
+--- a/src/language-handlebars/printer-glimmer.js
++++ b/src/language-handlebars/printer-glimmer.js
+@@ -366,7 +366,10 @@ function print(path, options, print) {
+       ];
+     }
+     case "PathExpression":
+-      return printPathExpression(node);
++      return printPathExpression(node, print);
++
++    case "AtHead":
++      return node.name;
+ 
+     case "BooleanLiteral":
+       return String(node.value);
+@@ -386,7 +389,6 @@ function print(path, options, print) {
+     case "NullLiteral":
+       return "null";
+ 
+-    case "AtHead": // Handled in `printPathExpression`
+     case "VarHead": // Handled in `printPathExpression`
+     case "ThisHead": // Handled in `printPathExpression`
+     default:
+@@ -782,23 +784,21 @@ const PATH_EXPRESSION_FORBIDDEN_IN_FIRST_PART = new Set([
+   "null",
+   "undefined",
+ ]);
+-const isPathExpressionPartNeedBrackets = (part, index) => {
+-  if (index === 0 && part.startsWith("@")) {
+-    return false;
++const isPathExpressionPartNeedBrackets = (part, index) =>
++  (index !== 0 && PATH_EXPRESSION_FORBIDDEN_IN_FIRST_PART.has(part)) ||
++  /\s/.test(part) ||
++  /^\d/.test(part) ||
++  Array.prototype.some.call(part, (character) =>
++    PATH_EXPRESSION_FORBIDDEN_CHARACTERS.has(character),
++  );
++function printPathExpression(node, print) {
++  if (node.head.type === "AtHead") {
++    return print("head");
+   }
+ 
+-  return (
+-    (index !== 0 && PATH_EXPRESSION_FORBIDDEN_IN_FIRST_PART.has(part)) ||
+-    /\s/.test(part) ||
+-    /^\d/.test(part) ||
+-    Array.prototype.some.call(part, (character) =>
+-      PATH_EXPRESSION_FORBIDDEN_CHARACTERS.has(character),
+-    )
+-  );
+-};
+-function printPathExpression(node) {
+-  // check if node is a legacy path expression and leave it alone
+   if (node.tail.length === 0 && node.original.includes("/")) {
++    // check if node has data, or
++    // check if node is a legacy path expression (and leave it alone)
+     return node.original;
+   }
+ 
+diff --git a/src/language-handlebars/visitor-keys.evaluate.js b/src/language-handlebars/visitor-keys.evaluate.js
+index 0c86c8e91..4d2df7bf0 100644
+--- a/src/language-handlebars/visitor-keys.evaluate.js
++++ b/src/language-handlebars/visitor-keys.evaluate.js
+@@ -1 +1,11 @@
+-export { visitorKeys as default } from "@glimmer/syntax";
++import { visitorKeys as glimmerVisitorKeys } from "@glimmer/syntax";
++
++const visitorKeys = {
++  VarHead: [],
++  ThisHead: [],
++  AtHead: [],
++  ...glimmerVisitorKeys,
++  PathExpression: [...glimmerVisitorKeys.PathExpression, "head"],
++};
++
++export default visitorKeys;
+diff --git a/tests/format/handlebars/path-expressions/__snapshots__/format.test.js.snap b/tests/format/handlebars/path-expressions/__snapshots__/format.test.js.snap
+index 0efe291d4..1e2af028a 100644
+--- a/tests/format/handlebars/path-expressions/__snapshots__/format.test.js.snap
++++ b/tests/format/handlebars/path-expressions/__snapshots__/format.test.js.snap
+@@ -42,10 +42,6 @@ printWidth: 80
+   {{array.2.[@#].[1]}}
+   {{array.2.[a b]}}
+   {{this.test}}
+-  {{@x.y.z}}
+-  {{@array.[true]}}
+-  {{@array.2.[@#].[1]}}
+-  {{@array.2.[a b]}}
+   {{#if @foo}}
+   {{/if}}
+   <!-- legacy path format, which glimmer does not parse - we don't want to wrap with brackets -->
+@@ -58,10 +54,6 @@ printWidth: 80
+   {{array.[2].[@#].[1]}}
+   {{array.[2].[a b]}}
+   {{this.test}}
+-  {{@x.y.z}}
+-  {{@array.[true]}}
+-  {{@array.[2].[@#].[1]}}
+-  {{@array.[2].[a b]}}
+   {{#if @foo}}{{/if}}
+   <!-- legacy path format, which glimmer does not parse - we don't want to wrap with brackets -->
+   {{foo/bar/baz ab=cd}}
+diff --git a/tests/format/handlebars/path-expressions/literal-expressions.hbs b/tests/format/handlebars/path-expressions/literal-expressions.hbs
+index 9b665d207..ea2b3caec 100644
+--- a/tests/format/handlebars/path-expressions/literal-expressions.hbs
++++ b/tests/format/handlebars/path-expressions/literal-expressions.hbs
+@@ -3,10 +3,6 @@
+   {{array.2.[@#].[1]}}
+   {{array.2.[a b]}}
+   {{this.test}}
+-  {{@x.y.z}}
+-  {{@array.[true]}}
+-  {{@array.2.[@#].[1]}}
+-  {{@array.2.[a b]}}
+   {{#if @foo}}
+   {{/if}}
+   <!-- legacy path format, which glimmer does not parse - we don't want to wrap with brackets -->
+diff --git a/tests/unit/__snapshots__/visitor-keys.js.snap b/tests/unit/__snapshots__/visitor-keys.js.snap
+index d783e8526..5727c1a17 100644
+--- a/tests/unit/__snapshots__/visitor-keys.js.snap
++++ b/tests/unit/__snapshots__/visitor-keys.js.snap
+@@ -1165,6 +1165,7 @@ exports[`visitor keys estree-json 1`] = `
+ 
+ exports[`visitor keys glimmer 1`] = `
+ {
++  "AtHead": [],
+   "AttrNode": [
+     "value",
+   ],
+@@ -1208,7 +1209,9 @@ exports[`visitor keys glimmer 1`] = `
+   ],
+   "NullLiteral": [],
+   "NumberLiteral": [],
+-  "PathExpression": [],
++  "PathExpression": [
++    "head",
++  ],
+   "StringLiteral": [],
+   "SubExpression": [
+     "path",
+@@ -1219,7 +1222,9 @@ exports[`visitor keys glimmer 1`] = `
+     "body",
+   ],
+   "TextNode": [],
++  "ThisHead": [],
+   "UndefinedLiteral": [],
++  "VarHead": [],
+ }
+ `;
+ 

@@ -1,0 +1,717 @@
+diff --git a/.changeset/chilly-timers-kiss.md b/.changeset/chilly-timers-kiss.md
+deleted file mode 100644
+index d7b78e7e21..0000000000
+--- a/.changeset/chilly-timers-kiss.md
++++ /dev/null
+@@ -1,29 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-You can now `spawn(...)` actors directly outside of `assign(...)` action creators:
+-
+-```ts
+-import { createMachine, spawn } from 'xstate';
+-
+-const listenerMachine = createMachine({
+-  // ...
+-});
+-
+-const parentMachine = createMachine({
+-  // ...
+-  on: {
+-    'listener.create': {
+-      entry: spawn(listenerMachine, { id: 'listener' })
+-    }
+-  }
+-  // ...
+-});
+-
+-const actor = createActor(parentMachine).start();
+-
+-actor.send({ type: 'listener.create' });
+-
+-actor.getSnapshot().children.listener; // ActorRefFrom<typeof listenerMachine>
+-```
+diff --git a/packages/core/src/actions.ts b/packages/core/src/actions.ts
+index 21af6111b2..69dd1e3eb7 100644
+--- a/packages/core/src/actions.ts
++++ b/packages/core/src/actions.ts
+@@ -16,4 +16,3 @@ export {
+   type SendToAction
+ } from './actions/send.ts';
+ export { stop, type StopAction } from './actions/stop.ts';
+-export { spawn, type SpawnAction } from './actions/spawn.ts';
+diff --git a/packages/core/src/actions/spawn.ts b/packages/core/src/actions/invoke.ts
+similarity index 53%
+rename from packages/core/src/actions/spawn.ts
+rename to packages/core/src/actions/invoke.ts
+index d06ca291b4..240bf252ac 100644
+--- a/packages/core/src/actions/spawn.ts
++++ b/packages/core/src/actions/invoke.ts
+@@ -12,22 +12,11 @@ import {
+   MachineContext,
+   ParameterizedObject,
+   AnyActorLogic,
+-  Snapshot,
+-  ProvidedActor,
+-  IsLiteralString,
+-  InputFrom,
+-  UnifiedArg
++  Snapshot
+ } from '../types.ts';
+ import { resolveReferencedActor } from '../utils.ts';
+ 
+-type ResolvableActorId<
+-  TContext extends MachineContext,
+-  TExpressionEvent extends EventObject,
+-  TEvent extends EventObject,
+-  TId extends string | undefined
+-> = TId | ((args: UnifiedArg<TContext, TExpressionEvent, TEvent>) => TId);
+-
+-function resolveSpawn(
++function resolveInvoke(
+   actorContext: AnyActorContext,
+   state: AnyState,
+   actionArgs: ActionArgs<any, any, any, any>,
+@@ -38,7 +27,7 @@ function resolveSpawn(
+     input,
+     syncSnapshot
+   }: {
+-    id: ResolvableActorId<MachineContext, EventObject, EventObject, string>;
++    id: string;
+     systemId: string | undefined;
+     src: AnyActorLogic | string;
+     input?: unknown;
+@@ -49,7 +38,6 @@ function resolveSpawn(
+     typeof src === 'string'
+       ? resolveReferencedActor(state.machine, src)
+       : { src, input: undefined };
+-  const resolvedId = typeof id === 'function' ? id(actionArgs) : id;
+ 
+   let actorRef: AnyActorRef | undefined;
+ 
+@@ -57,7 +45,7 @@ function resolveSpawn(
+     // TODO: inline `input: undefined` should win over the referenced one
+     const configuredInput = input || referenced.input;
+     actorRef = createActor(referenced.src, {
+-      id: resolvedId,
++      id,
+       src: typeof src === 'string' ? src : undefined,
+       parent: actorContext?.self,
+       systemId,
+@@ -81,7 +69,9 @@ function resolveSpawn(
+             });
+           }
+         },
+-        error: () => {}
++        error: () => {
++          /* TODO */
++        }
+       });
+     }
+   }
+@@ -95,7 +85,7 @@ function resolveSpawn(
+     cloneState(state, {
+       children: {
+         ...state.children,
+-        [resolvedId]: actorRef!
++        [id]: actorRef!
+       }
+     }),
+     {
+@@ -105,7 +95,7 @@ function resolveSpawn(
+   ];
+ }
+ 
+-function executeSpawn(
++function executeInvoke(
+   actorContext: AnyActorContext,
+   { id, actorRef }: { id: string; actorRef: AnyActorRef }
+ ) {
+@@ -126,79 +116,35 @@ function executeSpawn(
+   });
+ }
+ 
+-export interface SpawnAction<
++// we don't export this since it's an internal action that is not meant to be used in the user's code
++interface InvokeAction<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TEvent extends EventObject,
+-  TActor extends ProvidedActor
++  TEvent extends EventObject
+ > {
+   (_: ActionArgs<TContext, TExpressionEvent, TExpressionAction, TEvent>): void;
+-  _out_TActor?: TActor;
+ }
+ 
+-type DistributeActors<
+-  TContext extends MachineContext,
+-  TExpressionEvent extends EventObject,
+-  TEvent extends EventObject,
+-  TActor extends ProvidedActor
+-> = TActor extends any
+-  ? 'id' extends keyof TActor
+-    ? [
+-        src: TActor['src'],
+-        options: {
+-          id: ResolvableActorId<
+-            TContext,
+-            TExpressionEvent,
+-            TEvent,
+-            TActor['id']
+-          >;
+-          systemId?: string;
+-          input?: InputFrom<TActor['logic']>;
+-          syncSnapshot?: boolean;
+-        }
+-      ]
+-    : [
+-        src: TActor['src'],
+-        options?: {
+-          id?: ResolvableActorId<TContext, TExpressionEvent, TEvent, string>;
+-          systemId?: string;
+-          input?: InputFrom<TActor['logic']>;
+-          syncSnapshot?: boolean;
+-        }
+-      ]
+-  : never;
+-
+-type SpawnArguments<
+-  TContext extends MachineContext,
+-  TExpressionEvent extends EventObject,
+-  TEvent extends EventObject,
+-  TActor extends ProvidedActor
+-> = IsLiteralString<TActor['src']> extends true
+-  ? DistributeActors<TContext, TExpressionEvent, TEvent, TActor>
+-  : [
+-      src: string | AnyActorLogic,
+-      options?: {
+-        id?: ResolvableActorId<TContext, TExpressionEvent, TEvent, string>;
+-        systemId?: string;
+-        input?: unknown;
+-        syncSnapshot?: boolean;
+-      }
+-    ];
+-
+-export function spawn<
++export function invoke<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TEvent extends EventObject,
+-  TActor extends ProvidedActor
+->(
+-  ...[
+-    src,
+-    { id, systemId, input, syncSnapshot = false } = {} as any
+-  ]: SpawnArguments<TContext, TExpressionEvent, TEvent, TActor>
+-): SpawnAction<TContext, TExpressionEvent, TExpressionAction, TEvent, TActor> {
+-  function spawn(
++  TEvent extends EventObject
++>({
++  id,
++  systemId,
++  src,
++  input,
++  onSnapshot
++}: {
++  id: string;
++  systemId: string | undefined;
++  src: AnyActorLogic | string;
++  input?: unknown;
++  onSnapshot?: {}; // TODO: transition object
++}): InvokeAction<TContext, TExpressionEvent, TExpressionAction, TEvent> {
++  function invoke(
+     _: ActionArgs<TContext, TExpressionEvent, TExpressionAction, TEvent>
+   ) {
+     if (isDevelopment) {
+@@ -206,15 +152,15 @@ export function spawn<
+     }
+   }
+ 
+-  spawn.type = 'xstate.spawn';
+-  spawn.id = id;
+-  spawn.systemId = systemId;
+-  spawn.src = src;
+-  spawn.input = input;
+-  spawn.syncSnapshot = syncSnapshot;
++  invoke.type = 'xstate.invoke';
++  invoke.id = id;
++  invoke.systemId = systemId;
++  invoke.src = src;
++  invoke.input = input;
++  invoke.syncSnapshot = !!onSnapshot;
+ 
+-  spawn.resolve = resolveSpawn;
+-  spawn.execute = executeSpawn;
++  invoke.resolve = resolveInvoke;
++  invoke.execute = executeInvoke;
+ 
+-  return spawn;
++  return invoke;
+ }
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index 3dc913f7ce..5bb50d4f8f 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -15,7 +15,7 @@ import {
+ } from './types.ts';
+ import { resolveReferencedActor } from './utils.ts';
+ 
+-export type SpawnOptions<
++type SpawnOptions<
+   TActor extends ProvidedActor,
+   TSrc extends TActor['src']
+ > = TActor extends {
+@@ -104,7 +104,9 @@ export function createSpawner(
+               });
+             }
+           },
+-          error: () => {}
++          error: () => {
++            /* TODO */
++          }
+         });
+       }
+       return actorRef;
+@@ -129,7 +131,9 @@ export function createSpawner(
+               });
+             }
+           },
+-          error: () => {}
++          error: () => {
++            /* TODO */
++          }
+         });
+       }
+ 
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 4e85c8c7b6..65473e8f4c 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -4,7 +4,7 @@ import type { StateNode } from './StateNode.ts';
+ import { raise } from './actions.ts';
+ import { createAfterEvent, createDoneStateEvent } from './eventUtils.ts';
+ import { cancel } from './actions/cancel.ts';
+-import { spawn } from './actions/spawn.ts';
++import { invoke } from './actions/invoke.ts';
+ import { stop } from './actions/stop.ts';
+ import {
+   XSTATE_INIT,
+@@ -1148,12 +1148,7 @@ function enterStates(
+     actions.push(...stateNodeToEnter.entry);
+ 
+     for (const invokeDef of stateNodeToEnter.invoke) {
+-      actions.push(
+-        spawn(invokeDef.src, {
+-          ...invokeDef,
+-          syncSnapshot: !!invokeDef.onSnapshot
+-        })
+-      );
++      actions.push(invoke(invokeDef));
+     }
+ 
+     if (statesForDefaultEntry.has(stateNodeToEnter)) {
+diff --git a/packages/core/test/spawn.test.ts b/packages/core/test/spawn.test.ts
+deleted file mode 100644
+index 3f7fa2c24c..0000000000
+--- a/packages/core/test/spawn.test.ts
++++ /dev/null
+@@ -1,115 +0,0 @@
+-import { interval } from 'rxjs';
+-import {
+-  ActorRefFrom,
+-  createActor,
+-  createMachine,
+-  fromObservable,
+-  fromPromise,
+-  sendTo,
+-  spawn
+-} from '../src';
+-
+-describe('spawn action', () => {
+-  it('can spawn', () => {
+-    const actor = createActor(
+-      createMachine({
+-        entry: spawn(
+-          fromPromise(() => Promise.resolve(42)),
+-          { id: 'child' }
+-        )
+-      })
+-    );
+-
+-    actor.start();
+-
+-    expect(actor.getSnapshot().children.child).toBeDefined();
+-  });
+-
+-  it('can spawn from named actor', () => {
+-    const fetchNum = fromPromise(({ input }: { input: number }) =>
+-      Promise.resolve(input * 2)
+-    );
+-    const actor = createActor(
+-      createMachine({
+-        types: {
+-          actors: {} as {
+-            src: 'fetchNum';
+-            logic: typeof fetchNum;
+-          }
+-        },
+-        entry: spawn('fetchNum', { id: 'child', input: 21 })
+-      }).provide({
+-        actors: { fetchNum }
+-      })
+-    );
+-
+-    actor.start();
+-
+-    expect(actor.getSnapshot().children.child).toBeDefined();
+-  });
+-
+-  it('should accept `syncSnapshot` option', (done) => {
+-    const observableLogic = fromObservable(() => interval(10));
+-    const observableMachine = createMachine({
+-      id: 'observable',
+-      initial: 'idle',
+-      context: {
+-        observableRef: undefined! as ActorRefFrom<typeof observableLogic>
+-      },
+-      states: {
+-        idle: {
+-          entry: spawn(observableLogic, {
+-            id: 'int',
+-            syncSnapshot: true
+-          }),
+-          on: {
+-            'xstate.snapshot.int': {
+-              target: 'success',
+-              guard: ({ event }) => event.snapshot.context === 5
+-            }
+-          }
+-        },
+-        success: {
+-          type: 'final'
+-        }
+-      }
+-    });
+-
+-    const observableService = createActor(observableMachine);
+-    observableService.subscribe({
+-      complete: () => {
+-        done();
+-      }
+-    });
+-
+-    observableService.start();
+-  });
+-
+-  it('should handle a dynamic id', () => {
+-    const spy = jest.fn();
+-
+-    const child = createMachine({
+-      on: {
+-        FOO: {
+-          actions: spy
+-        }
+-      }
+-    });
+-
+-    const machine = createMachine({
+-      context: {
+-        childId: 'myChild'
+-      },
+-      entry: [
+-        spawn(child, { id: ({ context }) => context.childId }),
+-        sendTo('myChild', {
+-          type: 'FOO'
+-        })
+-      ]
+-    });
+-
+-    createActor(machine).start();
+-
+-    expect(spy).toHaveBeenCalledTimes(1);
+-  });
+-});
+diff --git a/packages/core/test/types.test.ts b/packages/core/test/types.test.ts
+index 88c961eb95..bcea863c40 100644
+--- a/packages/core/test/types.test.ts
++++ b/packages/core/test/types.test.ts
+@@ -16,8 +16,7 @@ import {
+   not,
+   pure,
+   sendTo,
+-  stateIn,
+-  spawn
++  stateIn
+ } from '../src/index';
+ 
+ function noop(_x: unknown) {
+@@ -746,263 +745,7 @@ describe('interpreter', () => {
+   });
+ });
+ 
+-describe('spawn action', () => {
+-  it('should reject actor outside of the defined ones at usage site', () => {
+-    const child = fromPromise(() => Promise.resolve('foo'));
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry:
+-        // @ts-expect-error
+-        spawn('other')
+-    });
+-  });
+-
+-  it('should accept a defined actor at usage site', () => {
+-    const child = fromPromise(() => Promise.resolve('foo'));
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child')
+-    });
+-  });
+-
+-  it('should allow valid configured actor id', () => {
+-    const child = createMachine({});
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          id: 'ok1' | 'ok2';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', { id: 'ok1' })
+-    });
+-  });
+-
+-  it('should disallow invalid actor id', () => {
+-    const child = createMachine({});
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          id: 'ok1' | 'ok2';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+-        // @ts-expect-error
+-        id: 'child'
+-      })
+-    });
+-  });
+-
+-  it('should require id to be specified when it was configured', () => {
+-    const child = createMachine({});
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          id: 'ok1' | 'ok2';
+-          logic: typeof child;
+-        };
+-      },
+-      entry:
+-        // @ts-expect-error
+-        spawn('child')
+-    });
+-  });
+-
+-  it(`shouldn't require id to be specified when it was not configured`, () => {
+-    const child = createMachine({});
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child')
+-    });
+-  });
+-
+-  it(`should allow id to be specified when it was not configured`, () => {
+-    const child = createMachine({});
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', { id: 'someId' })
+-    });
+-  });
+-
+-  it(`should not allow anonymous inline actors outside of the configured ones`, () => {
+-    const child1 = createMachine({
+-      context: {
+-        counter: 0
+-      }
+-    });
+-
+-    const child2 = createMachine({
+-      context: {
+-        answer: ''
+-      }
+-    });
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child1;
+-        };
+-      },
+-      entry:
+-        // @ts-expect-error
+-        spawn(child2)
+-    });
+-  });
+-
+-  it(`should reject static wrong input`, () => {
+-    const child = fromPromise(({}: { input: number }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+-        // @ts-expect-error
+-        input: 'hello'
+-      })
+-    });
+-  });
+-
+-  it(`should allow static correct input`, () => {
+-    const child = fromPromise(({}: { input: number }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+-        input: 42
+-      })
+-    });
+-  });
+-
+-  it(`should allow static input that is a subtype of the expected one`, () => {
+-    const child = fromPromise(({}: { input: number | string }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+-        input: 42
+-      })
+-    });
+-  });
+-
+-  it(`should reject static input that is a supertype of the expected one`, () => {
+-    const child = fromPromise(({}: { input: number }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+-        // @ts-expect-error
+-        input: Math.random() > 0.5 ? 'string' : 42
+-      })
+-    });
+-  });
+-
+-  it(`should reject an attempt to provide dynamic input`, () => {
+-    const child = fromPromise(({}: { input: number }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+-        // @ts-expect-error
+-        input: () => 42
+-      })
+-    });
+-  });
+-
+-  it(`should reject a valid input of a different provided actor`, () => {
+-    const child1 = fromPromise(({}: { input: number }) => Promise.resolve(100));
+-
+-    const child2 = fromPromise(({}: { input: string }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors:
+-          | {
+-              src: 'child1';
+-              logic: typeof child1;
+-            }
+-          | {
+-              src: 'child2';
+-              logic: typeof child2;
+-            };
+-      },
+-      entry:
+-        // @ts-expect-error
+-        spawn('child1', {
+-          input: 'hello'
+-        })
+-    });
+-  });
+-});
+-
+-describe('spawner in assign', () => {
++describe('spawn', () => {
+   it('spawned actor ref should be compatible with the result of ActorRefFrom', () => {
+     const createChild = () => createMachine({});
+ 

@@ -1,0 +1,342 @@
+diff --git a/.changeset/mean-pianos-explode.md b/.changeset/mean-pianos-explode.md
+new file mode 100644
+index 0000000000..bd4ec8506b
+--- /dev/null
++++ b/.changeset/mean-pianos-explode.md
+@@ -0,0 +1,37 @@
++---
++'xstate': minor
++---
++
++The `onSnapshot: { ... }` transition object is now supported for invoked machines, observables, promises, and transition functions:
++
++```ts
++const machine = createMachine({
++  // ...
++  invoke: [
++    {
++      src: createMachine({ ... }),
++      onSnapshot: {
++        actions: (context, event) => {
++          event.snapshot; // machine state
++        }
++      }
++    },
++    {
++      src: fromObservable(() => ...),
++      onSnapshot: {
++        actions: (context, event) => {
++          event.snapshot; // observable value
++        }
++      }
++    },
++    {
++      src: fromTransition((state, event) => { ... }, /* ... */),
++      onSnapshot: {
++        actions: (context, event) => {
++          event.snapshot; // transition function return value
++        }
++      }
++    }
++  ]
++});
++```
+diff --git a/packages/core/src/Machine.ts b/packages/core/src/Machine.ts
+index 7a3cf1afbf..3b1ddf69a5 100644
+--- a/packages/core/src/Machine.ts
++++ b/packages/core/src/Machine.ts
+@@ -8,7 +8,11 @@ import {
+   Prop,
+   AnyEventObject
+ } from './types.ts';
+-import { TypegenConstraint, ResolveTypegenMeta } from './typegenTypes.ts';
++import {
++  TypegenConstraint,
++  ResolveTypegenMeta,
++  TypegenDisabled
++} from './typegenTypes.ts';
+ import { StateMachine } from './StateMachine.ts';
+ 
+ export function createMachine<
+@@ -21,7 +25,10 @@ export function createMachine<
+   TTag extends string,
+   TInput,
+   TOutput extends NonReducibleUnknown,
+-  TTypesMeta extends TypegenConstraint
++  // it's important to have at least one default type parameter here
++  // it allows us to benefit from contextual type instantiation as it makes us to pass the hasInferenceCandidatesOrDefault check in the compiler
++  // we should be able to remove this when we start inferring TConfig, with it we'll always have an inference candidate
++  TTypesMeta extends TypegenConstraint = TypegenDisabled
+ >(
+   config: MachineConfig<
+     TContext,
+diff --git a/packages/core/src/actions/invoke.ts b/packages/core/src/actions/invoke.ts
+index c1307c3021..51398c0873 100644
+--- a/packages/core/src/actions/invoke.ts
++++ b/packages/core/src/actions/invoke.ts
+@@ -10,7 +10,8 @@ import {
+   AnyState,
+   EventObject,
+   MachineContext,
+-  ParameterizedObject
++  ParameterizedObject,
++  Snapshot
+ } from '../types.ts';
+ import { resolveReferencedActor } from '../utils.ts';
+ 
+@@ -22,12 +23,14 @@ function resolveInvoke(
+     id,
+     systemId,
+     src,
+-    input
++    input,
++    syncSnapshot
+   }: {
+     id: string;
+     systemId: string | undefined;
+     src: string;
+     input?: unknown;
++    syncSnapshot: boolean;
+   }
+ ) {
+   const referenced = resolveReferencedActor(
+@@ -53,6 +56,22 @@ function resolveInvoke(
+             })
+           : configuredInput
+     });
++
++    if (syncSnapshot) {
++      actorRef.subscribe({
++        next: (snapshot: Snapshot<unknown>) => {
++          if (snapshot.status === 'active') {
++            actorContext.self.send({
++              type: `xstate.snapshot.${id}`,
++              snapshot
++            });
++          }
++        },
++        error: () => {
++          /* TODO */
++        }
++      });
++    }
+   }
+ 
+   if (isDevelopment && !actorRef) {
+@@ -114,12 +133,14 @@ export function invoke<
+   id,
+   systemId,
+   src,
+-  input
++  input,
++  onSnapshot
+ }: {
+   id: string;
+   systemId: string | undefined;
+   src: string;
+   input?: unknown;
++  onSnapshot?: {}; // TODO: transition object
+ }): InvokeAction<TContext, TExpressionEvent, TExpressionAction, TEvent> {
+   function invoke(
+     _: ActionArgs<TContext, TExpressionEvent, TExpressionAction, TEvent>
+@@ -134,6 +155,7 @@ export function invoke<
+   invoke.systemId = systemId;
+   invoke.src = src;
+   invoke.input = input;
++  invoke.syncSnapshot = !!onSnapshot;
+ 
+   invoke.resolve = resolveInvoke;
+   invoke.execute = executeInvoke;
+diff --git a/packages/core/src/actors/observable.ts b/packages/core/src/actors/observable.ts
+index 929000f153..952aac8c09 100644
+--- a/packages/core/src/actors/observable.ts
++++ b/packages/core/src/actors/observable.ts
+@@ -56,19 +56,10 @@ export function fromObservable<TContext, TInput>(
+ 
+       switch (event.type) {
+         case nextEventType: {
+-          const newSnapshot = {
++          return {
+             ...snapshot,
+             context: event.data as TContext
+           };
+-          // match the exact timing of events sent by machines
+-          // send actions are not executed immediately
+-          defer(() => {
+-            self._parent?.send({
+-              type: `xstate.snapshot.${id}`,
+-              data: newSnapshot
+-            });
+-          });
+-          return newSnapshot;
+         }
+         case errorEventType:
+           return {
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index 66e9658c40..dd9a29d914 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -10,6 +10,7 @@ import {
+   InputFrom,
+   IsLiteralString,
+   ProvidedActor,
++  Snapshot,
+   TODO
+ } from './types.ts';
+ import { resolveReferencedActor } from './utils.ts';
+@@ -26,6 +27,7 @@ type SpawnOptions<
+           id: TActor['id'];
+           systemId?: string;
+           input?: InputFrom<TActor['logic']>;
++          syncSnapshot?: boolean;
+         }
+       ]
+     : [
+@@ -33,6 +35,7 @@ type SpawnOptions<
+           id?: string;
+           systemId?: string;
+           input?: InputFrom<TActor['logic']>;
++          syncSnapshot?: boolean;
+         }
+       ]
+   : never;
+@@ -51,6 +54,7 @@ export type Spawner<TActor extends ProvidedActor> = IsLiteralString<
+         id?: string;
+         systemId?: string;
+         input?: unknown;
++        syncSnapshot?: boolean;
+       }
+     ) => TLogic extends string ? AnyActorRef : ActorRefFrom<TLogic>;
+ 
+@@ -76,7 +80,7 @@ export function createSpawner(
+       const input = 'input' in options ? options.input : referenced.input;
+ 
+       // TODO: this should also receive `src`
+-      const actor = createActor(referenced.src, {
++      const actorRef = createActor(referenced.src, {
+         id: options.id,
+         parent: actorContext.self,
+         input:
+@@ -89,16 +93,51 @@ export function createSpawner(
+             : input,
+         systemId
+       }) as any;
+-      spawnedChildren[actor.id] = actor;
+-      return actor;
++      spawnedChildren[actorRef.id] = actorRef;
++
++      if (options.syncSnapshot) {
++        actorRef.subscribe({
++          next: (snapshot: Snapshot<unknown>) => {
++            if (snapshot.status === 'active') {
++              actorContext.self.send({
++                type: `xstate.snapshot.${actorRef.id}`,
++                snapshot
++              });
++            }
++          },
++          error: () => {
++            /* TODO */
++          }
++        });
++      }
++      return actorRef;
+     } else {
+       // TODO: this should also receive `src`
+-      return createActor(src, {
++      const actorRef = createActor(src, {
+         id: options.id,
+         parent: actorContext.self,
+         input: options.input,
+         systemId
+       });
++
++      if (options.syncSnapshot) {
++        actorRef.subscribe({
++          next: (snapshot: Snapshot<unknown>) => {
++            if (snapshot.status === 'active') {
++              actorContext.self.send({
++                type: `xstate.snapshot.${actorRef.id}`,
++                snapshot,
++                id: actorRef.id
++              });
++            }
++          },
++          error: () => {
++            /* TODO */
++          }
++        });
++      }
++
++      return actorRef;
+     }
+   };
+   return (src, options) => {
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index da0353234e..0a0c35ac28 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -402,7 +402,7 @@ export interface InvokeDefinition<
+     | SingleOrArray<
+         TransitionConfig<
+           TContext,
+-          SnapshotEvent<unknown>,
++          SnapshotEvent,
+           TEvent,
+           TActor,
+           TAction,
+@@ -715,7 +715,7 @@ export type InvokeConfig<
+         | SingleOrArray<
+             TransitionConfigOrTarget<
+               TContext,
+-              SnapshotEvent<any>, // TODO: consider replacing with `unknown`
++              SnapshotEvent,
+               TEvent,
+               TActor,
+               TAction,
+@@ -1373,7 +1373,7 @@ export type MachineConfig<
+   // TODO: make it conditionally required
+   output?: Mapper<TContext, DoneStateEvent, TOutput, TEvent> | TOutput;
+ }) &
+-  (Equals<TContext, MachineContext> extends true
++  (MachineContext extends TContext
+     ? { context?: InitialContext<LowInfer<TContext>, TActor, TInput> }
+     : { context: InitialContext<LowInfer<TContext>, TActor, TInput> });
+ 
+@@ -1443,9 +1443,11 @@ export interface ErrorActorEvent<TErrorData = unknown> extends EventObject {
+   data: TErrorData;
+ }
+ 
+-export interface SnapshotEvent<TData = unknown> extends EventObject {
++export interface SnapshotEvent<
++  TSnapshot extends Snapshot<unknown> = Snapshot<unknown>
++> extends EventObject {
+   type: `xstate.snapshot.${string}`;
+-  data: TData;
++  snapshot: TSnapshot;
+ }
+ 
+ export interface DoneStateEvent<TOutput = unknown> extends EventObject {
+@@ -1973,22 +1975,6 @@ export interface ActorContext<
+ 
+ export type AnyActorContext = ActorContext<any, any, any>;
+ 
+-export type ActorStatusObject<TOutput> =
+-  | {
+-      status: 'done';
+-      output: TOutput;
+-    }
+-  | {
+-      status: 'error';
+-      error: unknown;
+-    }
+-  | {
+-      status: 'stopped';
+-    }
+-  | {
+-      status: 'active';
+-    };
+-
+ export type Snapshot<TOutput> =
+   | {
+       status: 'active';

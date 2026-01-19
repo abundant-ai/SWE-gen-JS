@@ -1,0 +1,148 @@
+diff --git a/index.js b/index.js
+index 0b4ed58..6da03f9 100644
+--- a/index.js
++++ b/index.js
+@@ -17,7 +17,6 @@ const createErrorClass = require('create-error-class');
+ const isRetryAllowed = require('is-retry-allowed');
+ const Buffer = require('safe-buffer').Buffer;
+ const isPlainObj = require('is-plain-obj');
+-const PCancelable = require('p-cancelable');
+ const pkg = require('./package');
+ 
+ function requestAsEventEmitter(opts) {
+@@ -94,23 +93,10 @@ function requestAsEventEmitter(opts) {
+ }
+ 
+ function asPromise(opts) {
+-	return new PCancelable((onCancel, resolve, reject) => {
++	return new Promise((resolve, reject) => {
+ 		const ee = requestAsEventEmitter(opts);
+-		let cancelOnRequest = false;
+-
+-		onCancel(() => {
+-			cancelOnRequest = true;
+-		});
+ 
+ 		ee.on('request', req => {
+-			if (cancelOnRequest) {
+-				req.abort();
+-			}
+-
+-			onCancel(() => {
+-				req.abort();
+-			});
+-
+ 			if (isStream(opts.body)) {
+ 				opts.body.pipe(req);
+ 				opts.body = undefined;
+diff --git a/package.json b/package.json
+index 75d974e..3816687 100644
+--- a/package.json
++++ b/package.json
+@@ -55,7 +55,6 @@
+     "is-retry-allowed": "^1.0.0",
+     "is-stream": "^1.0.0",
+     "lowercase-keys": "^1.0.0",
+-    "p-cancelable": "^0.2.0",
+     "safe-buffer": "^5.0.1",
+     "timed-out": "^4.0.0",
+     "unzip-response": "^2.0.1",
+diff --git a/readme.md b/readme.md
+index 57161b9..ab5aed0 100644
+--- a/readme.md
++++ b/readme.md
+@@ -12,7 +12,7 @@
+ 
+ A nicer interface to the built-in [`http`](http://nodejs.org/api/http.html) module.
+ 
+-It supports following redirects, promises, streams, retries, automagically handling gzip/deflate, canceling of requests, and some convenience options.
++It supports following redirects, promises, streams, retries, automagically handling gzip/deflate and some convenience options.
+ 
+ Created because [`request`](https://github.com/request/request) is bloated *(several megabytes!)*.
+ 
+@@ -218,11 +218,6 @@ When server redirects you more than 10 times.
+ When given an unsupported protocol.
+ 
+ 
+-## Aborting the request
+-
+-The promise returned by Got has a `.cancel()` function which, when called, aborts the request.
+-
+-
+ ## Proxies
+ 
+ You can use the [`tunnel`](https://github.com/koichik/node-tunnel) module with the `agent` option to work with proxies:
+diff --git a/test/cancel.js b/test/cancel.js
+deleted file mode 100644
+index 293d0f6..0000000
+--- a/test/cancel.js
++++ /dev/null
+@@ -1,68 +0,0 @@
+-import stream from 'stream';
+-import test from 'ava';
+-import getStream from 'get-stream';
+-import PCancelable from 'p-cancelable';
+-import got from '../';
+-import {createServer} from './helpers/server';
+-
+-const Readable = stream.Readable;
+-
+-async function createAbortServer() {
+-	const s = await createServer();
+-	const aborted = new Promise((resolve, reject) => {
+-		s.on('/abort', (req, res) => {
+-			req.on('aborted', resolve);
+-			res.on('finish', reject.bind(null, new Error('Request finished instead of aborting.')));
+-
+-			getStream(req).then(() => {
+-				res.end();
+-			});
+-		});
+-	});
+-
+-	await s.listen(s.port);
+-
+-	return {
+-		aborted,
+-		url: `${s.url}/abort`
+-	};
+-}
+-
+-test('cancel in-progress request', async t => {
+-	const helper = await createAbortServer();
+-	const body = new Readable({
+-		read() {}
+-	});
+-	body.push('1');
+-
+-	const p = got(helper.url, {body});
+-
+-	// Wait for the stream to be established before canceling
+-	setTimeout(() => {
+-		p.cancel();
+-		body.push(null);
+-	}, 100);
+-
+-	await t.throws(p, PCancelable.CancelError);
+-	await t.notThrows(helper.aborted, 'Request finished instead of aborting.');
+-});
+-
+-test('cancel immediately', async t => {
+-	const s = await createServer();
+-	const aborted = new Promise((resolve, reject) => {
+-    // We won't get an abort or even a connection
+-    // We assume no request within 1000ms equals a (client side) aborted request
+-		s.on('/abort', (req, res) => {
+-			res.on('finish', reject.bind(this, new Error('Request finished instead of aborting.')));
+-			res.end();
+-		});
+-		setTimeout(resolve, 1000);
+-	});
+-
+-	await s.listen(s.port);
+-
+-	const p = got(`${s.url}/abort`);
+-	p.cancel();
+-	await t.throws(p);
+-	await t.notThrows(aborted, 'Request finished instead of aborting.');
+-});

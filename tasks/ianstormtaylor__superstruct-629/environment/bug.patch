@@ -1,0 +1,190 @@
+diff --git a/docs/reference/coercions.md b/docs/reference/coercions.md
+index 5284ad1..5b882b5 100644
+--- a/docs/reference/coercions.md
++++ b/docs/reference/coercions.md
+@@ -28,7 +28,7 @@ masked(
+ )
+ ```
+ 
+-`masked` augments an object struct to strip any unknown properties from the input when coercing it. It affects the direct properties of the struct only and not the nested structs.
++`masked` augments an object struct to strip any unknown properties from the input when coercing it.
+ 
+ ### `trimmed`
+ 
+diff --git a/docs/reference/types.md b/docs/reference/types.md
+index cacde22..af03efe 100644
+--- a/docs/reference/types.md
++++ b/docs/reference/types.md
+@@ -214,7 +214,7 @@ struct({
+ 
+ `object` structs validate that a value is an object and that each of its properties match a specific type as well.
+ 
+-> 🤖 Note that `object` structs throw errors if they encounter extra properties on an object, unless `mask` is used! If you want to be less strict and ignore any extra properties, use [`type`](#type) instead. For other more complex object use cases, check out the [coercions](./coercions.md) and [utilities](./utilities.md) too.
++> 🤖 Note that `object` structs throw errors if they encounter extra properites on an object! If you want to be less strict and ignore any extra properties, use [`type`](#type) instead. For other more complex object use cases, check out the [coercions](./coercions.md) and [utilities](./utilities.md) too.
+ 
+ ### `optional`
+ 
+@@ -317,8 +317,6 @@ type({
+ 
+ `type` structs validate that a value has a set of properties on it, but it does not assert anything about unspecified properties. This allows you to assert that a particular set of functionality exists without a strict equality check for properties.
+ 
+-When `mask()` is used with a value of `type`, its unknown properties are not removed. I.e. consider `type` as a signal to the core that the object may have arbitrary properties in addition to the known ones, in both masked and non-masked validation.
+-
+ > 🤖 If you want to throw errors when encountering unknown properties, use [`object`](#object) instead.
+ 
+ ### `union`
+diff --git a/src/struct.ts b/src/struct.ts
+index c3ad533..ce4ee6d 100644
+--- a/src/struct.ts
++++ b/src/struct.ts
+@@ -1,5 +1,6 @@
+ import { toFailures, shiftIterator, StructSchema, run } from './utils'
+ import { StructError, Failure } from './error'
++import { masked } from './structs/coercions'
+ 
+ /**
+  * `Struct` objects encapsulate the validation logic for a specific type of
+@@ -146,13 +147,9 @@ export function create<T, S>(value: unknown, struct: Struct<T, S>): T {
+  */
+ 
+ export function mask<T, S>(value: unknown, struct: Struct<T, S>): T {
+-  const result = validate(value, struct, { coerce: true, mask: true })
+-
+-  if (result[0]) {
+-    throw result[0]
+-  } else {
+-    return result[1]
+-  }
++  const M = masked(struct)
++  const ret = create(value, M)
++  return ret
+ }
+ 
+ /**
+@@ -174,7 +171,6 @@ export function validate<T, S>(
+   struct: Struct<T, S>,
+   options: {
+     coerce?: boolean
+-    mask?: boolean
+   } = {}
+ ): [StructError, undefined] | [undefined, T] {
+   const tuples = run(value, struct, options)
+diff --git a/src/utils.ts b/src/utils.ts
+index 91f1c9b..2a98e40 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -122,28 +122,13 @@ export function* run<T, S>(
+     path?: any[]
+     branch?: any[]
+     coerce?: boolean
+-    mask?: boolean
+   } = {}
+ ): IterableIterator<[Failure, undefined] | [undefined, T]> {
+-  const { path = [], branch = [value], coerce = false, mask = false } = options
++  const { path = [], branch = [value], coerce = false } = options
+   const ctx: Context = { path, branch }
+ 
+   if (coerce) {
+     value = struct.coercer(value, ctx)
+-
+-    if (
+-      mask &&
+-      struct.type !== 'type' &&
+-      isObject(struct.schema) &&
+-      isObject(value) &&
+-      !Array.isArray(value)
+-    ) {
+-      for (const key in value) {
+-        if (struct.schema[key] === undefined) {
+-          delete value[key]
+-        }
+-      }
+-    }
+   }
+ 
+   let valid = true
+@@ -158,7 +143,6 @@ export function* run<T, S>(
+       path: k === undefined ? path : [...path, k],
+       branch: k === undefined ? branch : [...branch, v],
+       coerce,
+-      mask,
+     })
+ 
+     for (const t of ts) {
+diff --git a/test/api/mask.ts b/test/api/mask.ts
+index b5e5aa9..c99c73e 100644
+--- a/test/api/mask.ts
++++ b/test/api/mask.ts
+@@ -1,13 +1,5 @@
+ import { deepStrictEqual, throws } from 'assert'
+-import {
+-  mask,
+-  object,
+-  string,
+-  defaulted,
+-  StructError,
+-  array,
+-  type,
+-} from '../..'
++import { mask, object, string, defaulted, StructError } from '../..'
+ 
+ describe('mask', () => {
+   it('object as helper', () => {
+@@ -29,57 +21,4 @@ describe('mask', () => {
+     const value = { unknown: true }
+     deepStrictEqual(mask(value, S), { id: '0' })
+   })
+-
+-  it('deep masking of objects', () => {
+-    const S = object({
+-      id: string(),
+-      sub: array(object({ prop: string() })),
+-    })
+-    const value = {
+-      id: '1',
+-      unknown: true,
+-      sub: [{ prop: '2', unknown: true }],
+-    }
+-    deepStrictEqual(mask(value, S), { id: '1', sub: [{ prop: '2' }] })
+-  })
+-
+-  it('masking of a nested type', () => {
+-    const S = object({
+-      id: string(),
+-      sub: array(type({ prop: string() })),
+-    })
+-    const value = {
+-      id: '1',
+-      unknown: true,
+-      sub: [{ prop: '2', unknown: true }],
+-    }
+-    deepStrictEqual(mask(value, S), {
+-      id: '1',
+-      sub: [{ prop: '2', unknown: true }],
+-    })
+-  })
+-
+-  it('masking of a top level type and nested object', () => {
+-    const S = type({
+-      id: string(),
+-      sub: array(object({ prop: string() })),
+-    })
+-    const value = {
+-      id: '1',
+-      unknown: true,
+-      sub: [{ prop: '2', unknown: true }],
+-    }
+-    deepStrictEqual(mask(value, S), {
+-      id: '1',
+-      unknown: true,
+-      sub: [{ prop: '2' }],
+-    })
+-  })
+-
+-  it('masking does not change the original value', () => {
+-    const S = object({ id: string() })
+-    const value = { id: '1', unknown: true }
+-    deepStrictEqual(mask(value, S), { id: '1' })
+-    deepStrictEqual(value, { id: '1', unknown: true })
+-  })
+ })

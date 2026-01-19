@@ -1,0 +1,326 @@
+diff --git a/docs/gitbook/patterns/process-step-jobs.md b/docs/gitbook/patterns/process-step-jobs.md
+index db09a7827c..59eb749b3d 100644
+--- a/docs/gitbook/patterns/process-step-jobs.md
++++ b/docs/gitbook/patterns/process-step-jobs.md
+@@ -55,7 +55,6 @@ enum Step {
+   Second,
+   Finish,
+ }
+-
+ const worker = new Worker(
+   queueName,
+   async job => {
+@@ -76,7 +75,8 @@ const worker = new Worker(
+           await job.update({
+             step: Step.Finish,
+           });
+-          throw new DelayedError();
++          step = Step.Finish;
++          return Step.Finish;
+         }
+         default: {
+           throw new Error('invalid step');
+@@ -153,7 +153,7 @@ const worker = new Worker(
+             step = Step.Finish;
+             return Step.Finish;
+           } else {
+-            throw new WaitingChildrenError();
++            return;
+           }
+         }
+         default: {
+@@ -240,7 +240,7 @@ const worker = new Worker(
+             step = Step.Finish;
+             return Step.Finish;
+           } else {
+-            throw new WaitingChildrenError();
++            return;
+           }
+         }
+         default: {
+diff --git a/src/classes/delayed-error.ts b/src/classes/delayed-error.ts
+deleted file mode 100644
+index 7e04fad7c2..0000000000
+--- a/src/classes/delayed-error.ts
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/**
+- * DelayedError
+- *
+- * Error to be thrown when job is moved to delayed state
+- * from job in active state.
+- *
+- */
+-export class DelayedError extends Error {
+-  constructor(message?: string) {
+-    super(message);
+-    this.name = this.constructor.name;
+-    Object.setPrototypeOf(this, new.target.prototype);
+-  }
+-}
+diff --git a/src/classes/index.ts b/src/classes/index.ts
+index cb4026826c..3197489b59 100644
+--- a/src/classes/index.ts
++++ b/src/classes/index.ts
+@@ -1,7 +1,6 @@
+ export * from './backoffs';
+ export * from './child-pool';
+ export * from './child-processor';
+-export * from './delayed-error';
+ export * from './flow-producer';
+ export * from './job';
+ // export * from './master'; this file must not be exported
+@@ -16,5 +15,4 @@ export * from './repeat';
+ export * from './sandbox';
+ export * from './scripts';
+ export * from './unrecoverable-error';
+-export * from './waiting-children-error';
+ export * from './worker';
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index b69673b613..75c340da8f 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -1009,7 +1009,7 @@ export class Job<
+    * otherwise the operation was not a success and throw the corresponding error. If the promise
+    * rejects, it indicates that the script failed to execute
+    */
+-  retry(state: FinishedStatus = 'failed'): Promise<void> {
++  async retry(state: FinishedStatus = 'failed'): Promise<void> {
+     this.failedReason = null;
+     this.finishedOn = null;
+     this.processedOn = null;
+diff --git a/src/classes/waiting-children-error.ts b/src/classes/waiting-children-error.ts
+deleted file mode 100644
+index a9859fbd59..0000000000
+--- a/src/classes/waiting-children-error.ts
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/**
+- * WaitingChildrenError
+- *
+- * Error to be thrown when job is moved to waiting-children state
+- * from job in active state.
+- *
+- */
+-export class WaitingChildrenError extends Error {
+-  constructor(message?: string) {
+-    super(message);
+-    this.name = this.constructor.name;
+-    Object.setPrototypeOf(this, new.target.prototype);
+-  }
+-}
+diff --git a/src/classes/worker.ts b/src/classes/worker.ts
+index df58fb9fbe..bef459d1b5 100644
+--- a/src/classes/worker.ts
++++ b/src/classes/worker.ts
+@@ -26,8 +26,6 @@ import { Job } from './job';
+ import { RedisConnection } from './redis-connection';
+ import sandbox from './sandbox';
+ import { AsyncFifoQueue } from './async-fifo-queue';
+-import { DelayedError } from './delayed-error';
+-import { WaitingChildrenError } from './waiting-children-error';
+ 
+ // 10 seconds is the maximum time a BRPOPLPUSH can block.
+ const maximumBlockTimeout = 10;
+@@ -637,16 +635,6 @@ export class Worker<
+             return;
+           }
+ 
+-          if (
+-            (err instanceof DelayedError || err.name == 'DelayedError') ||
+-            (
+-              err instanceof WaitingChildrenError ||
+-              err.name == 'WaitingChildrenError'
+-            )
+-          ) {
+-            return;
+-          }
+-
+           await job.moveToFailed(err, token);
+           this.emit('failed', job, err, 'active');
+         } catch (err) {
+diff --git a/tests/test_clean.ts b/tests/test_clean.ts
+index 4248ec9b27..aefe8c4904 100644
+--- a/tests/test_clean.ts
++++ b/tests/test_clean.ts
+@@ -3,13 +3,7 @@ import { default as IORedis } from 'ioredis';
+ import { after } from 'lodash';
+ import { beforeEach, describe, it } from 'mocha';
+ import { v4 } from 'uuid';
+-import {
+-  FlowProducer,
+-  Queue,
+-  QueueEvents,
+-  WaitingChildrenError,
+-  Worker,
+-} from '../src/classes';
++import { FlowProducer, Queue, QueueEvents, Worker } from '../src/classes';
+ import { delay, removeAllQueueData } from '../src/utils';
+ 
+ describe('Cleaner', () => {
+@@ -483,9 +477,8 @@ describe('Cleaner', () => {
+                       });
+                       step = Step.Finish;
+                       return Step.Finish;
+-                    } else {
+-                      throw new WaitingChildrenError();
+                     }
++                    break;
+                   }
+                   default: {
+                     throw new Error('invalid step');
+diff --git a/tests/test_flow.ts b/tests/test_flow.ts
+index 4b0497f10e..c919658955 100644
+--- a/tests/test_flow.ts
++++ b/tests/test_flow.ts
+@@ -9,7 +9,6 @@ import {
+   Worker,
+   FlowProducer,
+   JobNode,
+-  WaitingChildrenError,
+ } from '../src/classes';
+ import { removeAllQueueData, delay } from '../src/utils';
+ 
+@@ -311,7 +310,7 @@ describe('flows', () => {
+                   step = Step.Finish;
+                   return Step.Finish;
+                 } else {
+-                  throw new WaitingChildrenError();
++                  return;
+                 }
+               }
+               default: {
+diff --git a/tests/test_rate_limiter.ts b/tests/test_rate_limiter.ts
+index d194a6a4ed..1f4b9328ff 100644
+--- a/tests/test_rate_limiter.ts
++++ b/tests/test_rate_limiter.ts
+@@ -322,6 +322,51 @@ describe('Rate Limiter', function () {
+     await worker.close();
+   });
+ 
++  it('should obey the rate limit with workerDelay enabled', async function () {
++    this.timeout(20000);
++
++    const numJobs = 4;
++    const startTime = new Date().getTime();
++
++    const worker = new Worker(queueName, async () => {}, {
++      connection,
++      limiter: {
++        max: 1,
++        duration: 1000,
++      },
++    });
++
++    const result = new Promise<void>((resolve, reject) => {
++      queueEvents.on(
++        'completed',
++        // after every job has been completed
++        after(numJobs, async () => {
++          await worker.close();
++
++          try {
++            const timeDiff = new Date().getTime() - startTime;
++            expect(timeDiff).to.be.gte((numJobs - 1) * 1000);
++            resolve();
++          } catch (err) {
++            reject(err);
++          }
++        }),
++      );
++
++      queueEvents.on('failed', async err => {
++        await worker.close();
++        reject(err);
++      });
++    });
++
++    for (let i = 0; i < numJobs; i++) {
++      await queue.add('rate test', {});
++    }
++
++    await result;
++    await worker.close();
++  });
++
+   describe('when there are more added jobs than max limiter', () => {
+     it('processes jobs as max limiter from the beginning', async function () {
+       this.timeout(5000);
+diff --git a/tests/test_worker.ts b/tests/test_worker.ts
+index 7e69458409..737d4bc98c 100644
+--- a/tests/test_worker.ts
++++ b/tests/test_worker.ts
+@@ -10,8 +10,6 @@ import {
+   Job,
+   UnrecoverableError,
+   Worker,
+-  WaitingChildrenError,
+-  DelayedError,
+ } from '../src/classes';
+ import { KeepJobs, MinimalJob } from '../src/interfaces';
+ import { JobsOptions } from '../src/types';
+@@ -2278,7 +2276,8 @@ describe('workers', function () {
+                     await job.update({
+                       step: Step.Second,
+                     });
+-                    throw new DelayedError();
++                    step = Step.Second;
++                    return;
+                   }
+                   case Step.Second: {
+                     await job.update({
+@@ -2301,7 +2300,7 @@ describe('workers', function () {
+           const start = Date.now();
+           await queue.add('test', { step: Step.Initial });
+ 
+-          await new Promise<void>((resolve, reject) => {
++          await new Promise<void>(resolve => {
+             worker.on('completed', job => {
+               const elapse = Date.now() - start;
+               expect(elapse).to.be.greaterThan(200);
+@@ -2309,10 +2308,6 @@ describe('workers', function () {
+               expect(job.attemptsMade).to.be.eql(2);
+               resolve();
+             });
+-
+-            worker.on('error', () => {
+-              reject();
+-            });
+           });
+ 
+           await worker.close();
+@@ -2384,7 +2379,7 @@ describe('workers', function () {
+                       step = Step.Finish;
+                       return Step.Finish;
+                     } else {
+-                      throw new WaitingChildrenError();
++                      return;
+                     }
+                   }
+                   default: {
+@@ -2398,7 +2393,7 @@ describe('workers', function () {
+           const childrenWorker = new Worker(
+             queueName,
+             async () => {
+-              await delay(200);
++              await delay(100);
+             },
+             {
+               connection,
+@@ -2416,15 +2411,11 @@ describe('workers', function () {
+             },
+           );
+ 
+-          await new Promise<void>((resolve, reject) => {
++          await new Promise<void>(resolve => {
+             worker.on('completed', job => {
+               expect(job.returnvalue).to.equal(Step.Finish);
+               resolve();
+             });
+-
+-            worker.on('error', () => {
+-              reject();
+-            });
+           });
+ 
+           expect(waitingChildrenStepExecutions).to.be.equal(2);

@@ -1,0 +1,153 @@
+diff --git a/.changeset/rude-keys-grab.md b/.changeset/rude-keys-grab.md
+new file mode 100644
+index 0000000000..2af7865f06
+--- /dev/null
++++ b/.changeset/rude-keys-grab.md
+@@ -0,0 +1,5 @@
++---
++'xstate': patch
++---
++
++[core]: bugfix restoring historyValue | feature reviveHistoryValue
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index e75b394cc4..ba002fcc08 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -19,7 +19,8 @@ import type {
+   MetaObject,
+   StateSchema,
+   StateId,
+-  SnapshotStatus
++  SnapshotStatus,
++  PersistedHistoryValue
+ } from './types.ts';
+ import { matchesState } from './utils.ts';
+ 
+@@ -397,6 +398,25 @@ export function cloneMachineSnapshot<TState extends AnyMachineSnapshot>(
+   ) as TState;
+ }
+ 
++function serializeHistoryValue<
++  TContext extends MachineContext,
++  TEvent extends EventObject
++>(historyValue: HistoryValue<TContext, TEvent>): PersistedHistoryValue {
++  if (typeof historyValue !== 'object' || historyValue === null) {
++    return {};
++  }
++  const result: PersistedHistoryValue = {};
++
++  for (const key in historyValue) {
++    const value = historyValue[key];
++    if (Array.isArray(value)) {
++      result[key] = value.map((item) => ({ id: item.id }));
++    }
++  }
++
++  return result;
++}
++
+ export function getPersistedSnapshot<
+   TContext extends MachineContext,
+   TEvent extends EventObject,
+@@ -454,7 +474,10 @@ export function getPersistedSnapshot<
+   const persisted = {
+     ...jsonValues,
+     context: persistContext(context) as any,
+-    children: childrenJson
++    children: childrenJson,
++    historyValue: serializeHistoryValue<TContext, TEvent>(
++      jsonValues.historyValue
++    )
+   };
+ 
+   return persisted;
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 171872c4fb..1eec841468 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -584,13 +584,71 @@ export class StateMachine<
+       children[actorId] = actorRef;
+     });
+ 
++    function resolveStateNodeFromIdOrPath(
++      idOrPath: string,
++      root: StateNode<TContext, TEvent>
++    ) {
++      try {
++        return root.machine.getStateNodeById(idOrPath);
++      } catch {
++        try {
++          return getStateNodeByPath(root, idOrPath.split('.'));
++        } catch {
++          if (isDevelopment) {
++            console.warn(
++              `Could not resolve StateNode for id/path: ${idOrPath}`
++            );
++          }
++          return idOrPath;
++        }
++      }
++    }
++
++    function reviveHistoryValue(
++      historyValue: HistoryValue<TContext, TEvent>,
++      root: StateNode<TContext, TEvent>
++    ): HistoryValue<TContext, TEvent> {
++      if (!historyValue || typeof historyValue !== 'object') return {};
++      const revived: HistoryValue<TContext, TEvent> = {};
++      for (const key in historyValue) {
++        const arr = historyValue[key];
++        revived[key] = arr
++          .map((item) => {
++            if (item instanceof StateNode) return item;
++            if (
++              typeof item === 'object' &&
++              'id' in item &&
++              typeof (item as any).id === 'string'
++            ) {
++              const resolved = resolveStateNodeFromIdOrPath(
++                (item as any).id,
++                root
++              );
++              if (resolved instanceof StateNode) return resolved;
++            }
++            return undefined;
++          })
++          .filter((item) => item !== undefined);
++        if (revived[key].length === 0) {
++          delete revived[key];
++        }
++      }
++      return revived;
++    }
++
++    const revivedHistoryValue = reviveHistoryValue(
++      (snapshot as any).historyValue,
++      this.root
++    );
++
+     const restoredSnapshot = createMachineSnapshot(
+       {
+         ...(snapshot as any),
+         children,
+         _nodes: Array.from(
+           getAllStateNodes(getStateNodes(this.root, (snapshot as any).value))
+-        )
++        ),
++        historyValue: revivedHistoryValue
+       },
+       this
+     ) as MachineSnapshot<
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 540a34b748..d89d0b425d 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -1447,6 +1447,8 @@ export type HistoryValue<
+   TEvent extends EventObject
+ > = Record<string, Array<StateNode<TContext, TEvent>>>;
+ 
++export type PersistedHistoryValue = Record<string, Array<{ id: string }>>;
++
+ export type AnyHistoryValue = HistoryValue<any, any>;
+ 
+ export type StateFrom<

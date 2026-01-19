@@ -1,0 +1,134 @@
+diff --git a/index.js b/index.js
+index c4083a0..160b0ff 100644
+--- a/index.js
++++ b/index.js
+@@ -11,6 +11,7 @@ const getStream = require('get-stream');
+ const timedOut = require('timed-out');
+ const urlParseLax = require('url-parse-lax');
+ const lowercaseKeys = require('lowercase-keys');
++const isRedirect = require('is-redirect');
+ const decompressResponse = require('decompress-response');
+ const createErrorClass = require('create-error-class');
+ const isRetryAllowed = require('is-retry-allowed');
+@@ -20,9 +21,6 @@ const isPlainObj = require('is-plain-obj');
+ const PCancelable = require('p-cancelable');
+ const pkg = require('./package');
+ 
+-const getMethodRedirectCodes = new Set([300, 301, 302, 303, 304, 305, 307, 308]);
+-const allMethodRedirectCodes = new Set([300, 303, 307, 308]);
+-
+ function requestAsEventEmitter(opts) {
+ 	opts = opts || {};
+ 
+@@ -46,19 +44,9 @@ function requestAsEventEmitter(opts) {
+ 			res.url = redirectUrl || requestUrl;
+ 			res.requestUrl = requestUrl;
+ 
+-			const followRedirect = opts.followRedirect && 'location' in res.headers;
+-			const redirectGet = followRedirect && getMethodRedirectCodes.has(statusCode);
+-			const redirectAll = followRedirect && allMethodRedirectCodes.has(statusCode);
+-
+-			if (redirectAll || (redirectGet && (opts.method === 'GET' || opts.method === 'HEAD'))) {
++			if (isRedirect(statusCode) && opts.followRedirect && 'location' in res.headers && (opts.method === 'GET' || opts.method === 'HEAD')) {
+ 				res.resume();
+ 
+-				if (statusCode === 303) {
+-					// Server responded with "see other", indicating that the resource exists at another location,
+-					// and the client should request it from that location via GET or HEAD.
+-					opts.method = 'GET';
+-				}
+-
+ 				if (redirects.length >= 10) {
+ 					ee.emit('error', new got.MaxRedirectsError(statusCode, redirects, opts), null, res);
+ 					return;
+diff --git a/package.json b/package.json
+index 9e8e252..48beeb6 100644
+--- a/package.json
++++ b/package.json
+@@ -52,6 +52,7 @@
+     "duplexer3": "^0.1.4",
+     "get-stream": "^3.0.0",
+     "is-plain-obj": "^1.1.0",
++    "is-redirect": "^1.0.0",
+     "is-retry-allowed": "^1.0.0",
+     "is-stream": "^1.0.0",
+     "isurl": "^1.0.0-alpha5",
+diff --git a/readme.md b/readme.md
+index 1ca6fc1..6f25119 100644
+--- a/readme.md
++++ b/readme.md
+@@ -147,8 +147,6 @@ Default: `true`
+ 
+ Defines if redirect responses should be followed automatically.
+ 
+-Note that if a `303` is sent by the server in response to any request type (`POST`, `DELETE`, etc.), got will automatically
+-request the resource pointed to in the location header via `GET`. This is in accordance with [the spec](https://tools.ietf.org/html/rfc7231#section-6.4.4).
+ 
+ #### Streams
+ 
+diff --git a/test/redirects.js b/test/redirects.js
+index 991e75d..2b1a93f 100644
+--- a/test/redirects.js
++++ b/test/redirects.js
+@@ -78,27 +78,6 @@ test.before('setup', async () => {
+ 		res.end();
+ 	});
+ 
+-	http.on('/seeOther', (req, res) => {
+-		res.writeHead(303, {
+-			location: '/'
+-		});
+-		res.end();
+-	});
+-
+-	http.on('/temporary', (req, res) => {
+-		res.writeHead(307, {
+-			location: '/'
+-		});
+-		res.end();
+-	});
+-
+-	http.on('/permanent', (req, res) => {
+-		res.writeHead(308, {
+-			location: '/'
+-		});
+-		res.end();
+-	});
+-
+ 	http.on('/relativeQuery?bang', (req, res) => {
+ 		res.writeHead(302, {
+ 			location: '/'
+@@ -118,17 +97,9 @@ test.before('setup', async () => {
+ });
+ 
+ test('follows redirect', async t => {
+-	const {body, redirectUrls} = await got(`${http.url}/finite`);
+-	t.is(body, 'reached');
+-	t.deepEqual(redirectUrls, [`${http.url}/`]);
+-});
+-
+-test('follows 307, 308 redirect', async t => {
+-	const tempBody = (await got(`${http.url}/temporary`)).body;
+-	t.is(tempBody, 'reached');
+-
+-	const permBody = (await got(`${http.url}/permanent`)).body;
+-	t.is(permBody, 'reached');
++	const response = await got(`${http.url}/finite`);
++	t.is(response.body, 'reached');
++	t.deepEqual(response.redirectUrls, [`${http.url}/`]);
+ });
+ 
+ test('does not follow redirect when disabled', async t => {
+@@ -171,12 +142,6 @@ test('redirect only GET and HEAD requests', async t => {
+ 	}
+ });
+ 
+-test('redirect on 303 response even with post, put, delete', async t => {
+-	const {url, body} = await got(`${http.url}/seeOther`, {body: 'wow'});
+-	t.is(url, `${http.url}/`);
+-	t.is(body, 'reached');
+-});
+-
+ test('redirects from http to https works', async t => {
+ 	t.truthy((await got(`${http.url}/httpToHttps`, {rejectUnauthorized: false})).body);
+ });

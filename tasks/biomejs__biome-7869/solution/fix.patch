@@ -1,0 +1,170 @@
+diff --git a/.changeset/fix-html-component-tag-casing.md b/.changeset/fix-html-component-tag-casing.md
+new file mode 100644
+index 0000000000..7445f23f19
+--- /dev/null
++++ b/.changeset/fix-html-component-tag-casing.md
+@@ -0,0 +1,5 @@
++---
++"@biomejs/biome": patch
++---
++
++Fixed [#7864](https://github.com/biomejs/biome/issues/7864): Biome now preserves component tag name casing in Svelte, Astro, and Vue files.
+diff --git a/crates/biome_html_formatter/src/context.rs b/crates/biome_html_formatter/src/context.rs
+index e1dbd0780e..9955d7897f 100644
+--- a/crates/biome_html_formatter/src/context.rs
++++ b/crates/biome_html_formatter/src/context.rs
+@@ -9,8 +9,11 @@ use biome_html_syntax::{HtmlFileSource, HtmlLanguage};
+ 
+ use crate::comments::{FormatHtmlComment, HtmlCommentStyle, HtmlComments};
+ 
+-#[derive(Debug, Clone, Default)]
++#[derive(Debug, Clone)]
+ pub struct HtmlFormatOptions {
++    /// The file source.
++    file_source: HtmlFileSource,
++
+     /// The indent style.
+     indent_style: IndentStyle,
+ 
+@@ -46,13 +49,35 @@ pub struct HtmlFormatOptions {
+     self_close_void_elements: SelfCloseVoidElements,
+ }
+ 
++impl Default for HtmlFormatOptions {
++    fn default() -> Self {
++        Self {
++            file_source: HtmlFileSource::html(),
++            indent_style: IndentStyle::default(),
++            indent_width: IndentWidth::default(),
++            line_ending: LineEnding::default(),
++            line_width: LineWidth::default(),
++            attribute_position: AttributePosition::default(),
++            bracket_same_line: BracketSameLine::default(),
++            whitespace_sensitivity: WhitespaceSensitivity::default(),
++            indent_script_and_style: IndentScriptAndStyle::default(),
++            self_close_void_elements: SelfCloseVoidElements::default(),
++        }
++    }
++}
++
+ impl HtmlFormatOptions {
+-    pub fn new(_file_source: HtmlFileSource) -> Self {
++    pub fn new(file_source: HtmlFileSource) -> Self {
+         Self {
++            file_source,
+             ..Default::default()
+         }
+     }
+ 
++    pub fn file_source(&self) -> &HtmlFileSource {
++        &self.file_source
++    }
++
+     pub fn with_indent_style(mut self, indent_style: IndentStyle) -> Self {
+         self.indent_style = indent_style;
+         self
+diff --git a/crates/biome_html_formatter/src/html/auxiliary/opening_element.rs b/crates/biome_html_formatter/src/html/auxiliary/opening_element.rs
+index aca7a34600..7c755da0a7 100644
+--- a/crates/biome_html_formatter/src/html/auxiliary/opening_element.rs
++++ b/crates/biome_html_formatter/src/html/auxiliary/opening_element.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     html::lists::attribute_list::FormatHtmlAttributeListOptions,
+     prelude::*,
+-    utils::metadata::{is_canonical_html_tag, is_element_whitespace_sensitive},
++    utils::metadata::{is_element_whitespace_sensitive, should_lowercase_html_tag},
+ };
+ use biome_formatter::{FormatRuleWithOptions, GroupId, write};
+ use biome_html_syntax::{HtmlOpeningElement, HtmlOpeningElementFields};
+@@ -48,7 +48,7 @@ impl FormatNodeRule<HtmlOpeningElement> for FormatHtmlOpeningElement {
+         let l_angle_token = l_angle_token?;
+         let name = name?;
+         let is_whitespace_sensitive = is_element_whitespace_sensitive(f, &name);
+-        let is_canonical_html_tag = is_canonical_html_tag(&name);
++        let is_canonical_html_element = should_lowercase_html_tag(f, &name);
+ 
+         let bracket_same_line = f.options().bracket_same_line().value();
+ 
+@@ -66,7 +66,7 @@ impl FormatNodeRule<HtmlOpeningElement> for FormatHtmlOpeningElement {
+                 attributes
+                     .format()
+                     .with_options(FormatHtmlAttributeListOptions {
+-                        is_canonical_html_element: is_canonical_html_tag,
++                        is_canonical_html_element,
+                         tag_name: Some(name.clone()),
+                     })
+                     .fmt(f)?;
+diff --git a/crates/biome_html_formatter/src/html/auxiliary/self_closing_element.rs b/crates/biome_html_formatter/src/html/auxiliary/self_closing_element.rs
+index 07248b8b9b..67c864e228 100644
+--- a/crates/biome_html_formatter/src/html/auxiliary/self_closing_element.rs
++++ b/crates/biome_html_formatter/src/html/auxiliary/self_closing_element.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+     html::lists::attribute_list::FormatHtmlAttributeListOptions, prelude::*,
+-    utils::metadata::is_canonical_html_tag,
++    utils::metadata::should_lowercase_html_tag,
+ };
+ use biome_formatter::write;
+ use biome_html_syntax::{HtmlSelfClosingElement, HtmlSelfClosingElementFields};
+@@ -18,7 +18,7 @@ impl FormatNodeRule<HtmlSelfClosingElement> for FormatHtmlSelfClosingElement {
+         let bracket_same_line = f.options().bracket_same_line().value();
+         let self_close_void_elements = f.options().self_close_void_elements();
+         let name = name?;
+-        let is_canonical_html_tag = is_canonical_html_tag(&name);
++        let is_canonical_html_element = should_lowercase_html_tag(f, &name);
+ 
+         write!(f, [l_angle_token.format(), name.format()])?;
+ 
+@@ -29,7 +29,7 @@ impl FormatNodeRule<HtmlSelfClosingElement> for FormatHtmlSelfClosingElement {
+                 attributes
+                     .format()
+                     .with_options(FormatHtmlAttributeListOptions {
+-                        is_canonical_html_element: is_canonical_html_tag,
++                        is_canonical_html_element,
+                         tag_name: Some(name.clone()),
+                     })
+                     .fmt(f)?;
+diff --git a/crates/biome_html_formatter/src/html/auxiliary/tag_name.rs b/crates/biome_html_formatter/src/html/auxiliary/tag_name.rs
+index aa2e46a5cf..f7eec8ba0c 100644
+--- a/crates/biome_html_formatter/src/html/auxiliary/tag_name.rs
++++ b/crates/biome_html_formatter/src/html/auxiliary/tag_name.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+     prelude::*,
+-    utils::{formatters::FormatTokenAsLowercase, metadata::is_canonical_html_tag},
++    utils::{formatters::FormatTokenAsLowercase, metadata::should_lowercase_html_tag},
+ };
+ use biome_formatter::write;
+ use biome_html_syntax::{HtmlTagName, HtmlTagNameFields};
+@@ -8,11 +8,9 @@ use biome_html_syntax::{HtmlTagName, HtmlTagNameFields};
+ pub(crate) struct FormatHtmlTagName;
+ impl FormatNodeRule<HtmlTagName> for FormatHtmlTagName {
+     fn fmt_fields(&self, node: &HtmlTagName, f: &mut HtmlFormatter) -> FormatResult<()> {
+-        // TODO: maybe move this check to a parent node so we aren't checking this twice per tag?
+-        let is_canonical_html_tag = is_canonical_html_tag(node);
+         let HtmlTagNameFields { value_token } = node.as_fields();
+ 
+-        if is_canonical_html_tag {
++        if should_lowercase_html_tag(f, node) {
+             write!(f, [FormatTokenAsLowercase::from(value_token?)])
+         } else {
+             write![f, [value_token.format()]]
+diff --git a/crates/biome_html_formatter/src/utils/metadata.rs b/crates/biome_html_formatter/src/utils/metadata.rs
+index 1d18d30a7a..7774fff5cd 100644
+--- a/crates/biome_html_formatter/src/utils/metadata.rs
++++ b/crates/biome_html_formatter/src/utils/metadata.rs
+@@ -724,6 +724,14 @@ pub(crate) fn is_canonical_html_tag(tag_name: &HtmlTagName) -> bool {
+     is_canonical_html_tag_name(tag_name.text_trimmed())
+ }
+ 
++/// Whether a tag should be lowercased in the current formatting context.
++///
++/// Returns `true` only for canonical HTML tags in pure HTML files (.html).
++/// Component frameworks preserve tag name casing.
++pub(crate) fn should_lowercase_html_tag(f: &HtmlFormatter, tag_name: &HtmlTagName) -> bool {
++    f.options().file_source().is_html() && is_canonical_html_tag(tag_name)
++}
++
+ /// Whether the given attribute name is a known HTML attribute for the given tag name.
+ ///
+ /// See [`HTML_ATTRIBUTES_BY_TAG`], [`HTML_GLOBAL_ATTRIBUTES`].

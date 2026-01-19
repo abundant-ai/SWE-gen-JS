@@ -1,0 +1,171 @@
+diff --git a/src/core/immerClass.ts b/src/core/immerClass.ts
+index 6c673e0..763ed62 100644
+--- a/src/core/immerClass.ts
++++ b/src/core/immerClass.ts
+@@ -31,11 +31,16 @@ interface ProducersFns {
+ 	produceWithPatches: IProduceWithPatches
+ }
+ 
++export type StrictMode = boolean | "class_only";
++
+ export class Immer implements ProducersFns {
+ 	autoFreeze_: boolean = true
+-	useStrictShallowCopy_: boolean = false
++	useStrictShallowCopy_: StrictMode = false
+ 
+-	constructor(config?: {autoFreeze?: boolean; useStrictShallowCopy?: boolean}) {
++	constructor(config?: {
++		autoFreeze?: boolean
++		useStrictShallowCopy?: StrictMode
++	}) {
+ 		if (typeof config?.autoFreeze === "boolean")
+ 			this.setAutoFreeze(config!.autoFreeze)
+ 		if (typeof config?.useStrictShallowCopy === "boolean")
+@@ -163,7 +168,7 @@ export class Immer implements ProducersFns {
+ 	 *
+ 	 * By default, immer does not copy the object descriptors such as getter, setter and non-enumrable properties.
+ 	 */
+-	setUseStrictShallowCopy(value: boolean) {
++	setUseStrictShallowCopy(value: StrictMode) {
+ 		this.useStrictShallowCopy_ = value
+ 	}
+ 
+diff --git a/src/immer.ts b/src/immer.ts
+index 687cc2a..e940e46 100644
+--- a/src/immer.ts
++++ b/src/immer.ts
+@@ -18,7 +18,8 @@ export {
+ 	NOTHING as nothing,
+ 	DRAFTABLE as immerable,
+ 	freeze,
+-	Objectish
++	Objectish,
++	StrictMode
+ } from "./internal"
+ 
+ const immer = new Immer()
+diff --git a/src/utils/common.ts b/src/utils/common.ts
+index fb4a768..72a035b 100644
+--- a/src/utils/common.ts
++++ b/src/utils/common.ts
+@@ -8,7 +8,8 @@ import {
+ 	AnySet,
+ 	ImmerState,
+ 	ArchType,
+-	die
++	die,
++	StrictMode
+ } from "../internal"
+ 
+ export const getPrototypeOf = Object.getPrototypeOf
+@@ -140,7 +141,7 @@ export function latest(state: ImmerState): any {
+ }
+ 
+ /*#__PURE__*/
+-export function shallowCopy(base: any, strict: boolean) {
++export function shallowCopy(base: any, strict: StrictMode) {
+ 	if (isMap(base)) {
+ 		return new Map(base)
+ 	}
+@@ -149,36 +150,41 @@ export function shallowCopy(base: any, strict: boolean) {
+ 	}
+ 	if (Array.isArray(base)) return Array.prototype.slice.call(base)
+ 
+-	if (!strict && isPlainObject(base)) {
+-		if (!getPrototypeOf(base)) {
+-			const obj = Object.create(null)
+-			return Object.assign(obj, base)
++	const isPlain = isPlainObject(base)
++
++	if (strict === true || (strict === "class_only" && !isPlain)) {
++		// Perform a strict copy
++		const descriptors = Object.getOwnPropertyDescriptors(base)
++		delete descriptors[DRAFT_STATE as any]
++		let keys = Reflect.ownKeys(descriptors)
++		for (let i = 0; i < keys.length; i++) {
++			const key: any = keys[i]
++			const desc = descriptors[key]
++			if (desc.writable === false) {
++				desc.writable = true
++				desc.configurable = true
++			}
++			// like object.assign, we will read any _own_, get/set accessors. This helps in dealing
++			// with libraries that trap values, like mobx or vue
++			// unlike object.assign, non-enumerables will be copied as well
++			if (desc.get || desc.set)
++				descriptors[key] = {
++					configurable: true,
++					writable: true, // could live with !!desc.set as well here...
++					enumerable: desc.enumerable,
++					value: base[key]
++				}
+ 		}
+-		return {...base}
+-	}
+-
+-	const descriptors = Object.getOwnPropertyDescriptors(base)
+-	delete descriptors[DRAFT_STATE as any]
+-	let keys = Reflect.ownKeys(descriptors)
+-	for (let i = 0; i < keys.length; i++) {
+-		const key: any = keys[i]
+-		const desc = descriptors[key]
+-		if (desc.writable === false) {
+-			desc.writable = true
+-			desc.configurable = true
++		return Object.create(getPrototypeOf(base), descriptors)
++	} else {
++		// perform a sloppy copy
++		const proto = getPrototypeOf(base)
++		if (proto !== null && isPlain) {
++			return {...base} // assumption: better inner class optimization than the assign below
+ 		}
+-		// like object.assign, we will read any _own_, get/set accessors. This helps in dealing
+-		// with libraries that trap values, like mobx or vue
+-		// unlike object.assign, non-enumerables will be copied as well
+-		if (desc.get || desc.set)
+-			descriptors[key] = {
+-				configurable: true,
+-				writable: true, // could live with !!desc.set as well here...
+-				enumerable: desc.enumerable,
+-				value: base[key]
+-			}
++		const obj = Object.create(proto)
++		return Object.assign(obj, base)
+ 	}
+-	return Object.create(getPrototypeOf(base), descriptors)
+ }
+ 
+ /**
+diff --git a/website/docs/complex-objects.md b/website/docs/complex-objects.md
+index 985482c..b98b430 100644
+--- a/website/docs/complex-objects.md
++++ b/website/docs/complex-objects.md
+@@ -7,8 +7,6 @@ title: Classes
+ <div data-ea-publisher="immerjs" data-ea-type="image" className="horizontal bordered"></div>
+ </center>
+ 
+-By default, Immer does not strictly handle Plain object's non-eumerable properties such as getters/setters for performance reason. If you want this behavior to be strict, you can opt-in with `useStrictShallowCopy(true)`.
+-
+ Plain objects (objects without a prototype), arrays, `Map`s and `Set`s are always drafted by Immer. Every other object must use the `immerable` symbol to mark itself as compatible with Immer. When one of these objects is mutated within a producer, its prototype is preserved between copies.
+ 
+ ```js
+@@ -61,15 +59,17 @@ console.log(clock2 instanceof Clock) // true
+ The semantics on how classes are drafted are as follows:
+ 
+ 1. A draft of a class is a fresh object but with the same prototype as the original object.
+-1. When creating a draft, Immer will copy all _own_ properties from the base to the draft.This includes non-enumerable and symbolic properties.
++1. When creating a draft, Immer will copy all _own_ properties from the base to the draft.This includes (in strict mode) non-enumerable and symbolic properties.
+ 1. _Own_ getters will be invoked during the copy process, just like `Object.assign` would.
+-1. Inherited getters and methods will remain as is and be inherited by the draft.
++1. Inherited getters and methods will remain as is and be inherited by the draft, as they are stored on the prototype which is untouched.
+ 1. Immer will not invoke constructor functions.
+ 1. The final instance will be constructed with the same mechanism as the draft was created.
+ 1. Only getters that have a setter as well will be writable in the draft, as otherwise the value can't be copied back.
+ 
+ Because Immer will dereference own getters of objects into normal properties, it is possible to use objects that use getter/setter traps on their fields, like MobX and Vue do.
+ 
++Note that, by default, Immer does not strictly handle object's non-enumerable properties such as getters/setters for performance reason. If you want this behavior to be strict, you can opt-in with `useStrictShallowCopy(config)`. Use `true` to always copy strict, or `"class_only"` to only copy class instances strictly but use the faster loose copying for plain objects. The default is `false`. (Remember, regardless of strict mode, own getters / setters are always copied _by value_. There is currently no config to copy descriptors as-is. Feature request / PR welcome).
++
+ Immer does not support exotic / engine native objects such as DOM Nodes or Buffers, nor is subclassing Map, Set or arrays supported and the `immerable` symbol can't be used on them.
+ 
+ So when working for example with `Date` objects, you should always create a new `Date` instance instead of mutating an existing `Date` object.

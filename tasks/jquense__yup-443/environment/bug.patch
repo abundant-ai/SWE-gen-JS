@@ -1,0 +1,279 @@
+diff --git a/src/Condition.js b/src/Condition.js
+index 9d03437..d1ef6ee 100644
+--- a/src/Condition.js
++++ b/src/Condition.js
+@@ -40,9 +40,13 @@ class Conditional {
+     }
+   }
+ 
+-  resolve(ctx, options) {
+-    let values = this.refs.map(ref => ref.getValue(options));
++  getValue(parent, context) {
++    let values = this.refs.map(r => r.getValue(parent, context));
+ 
++    return values;
++  }
++
++  resolve(ctx, values) {
+     let schema = this.fn.apply(ctx, values.concat(ctx));
+ 
+     if (schema !== undefined && !isSchema(schema))
+diff --git a/src/Reference.js b/src/Reference.js
+index f82cead..bcb03b0 100644
+--- a/src/Reference.js
++++ b/src/Reference.js
+@@ -1,69 +1,48 @@
+ import { getter } from 'property-expr';
+ 
+-const prefixes = {
+-  context: '$',
+-  value: '.',
++let validateName = d => {
++  if (typeof d !== 'string')
++    throw new TypeError("ref's must be strings, got: " + d);
+ };
+ 
+ export default class Reference {
+-  constructor(key, options = {}) {
+-    if (typeof key !== 'string')
+-      throw new TypeError('ref must be a string, got: ' + key);
+-
+-    this.key = key.trim();
+-
+-    if (key === '') throw new TypeError('ref must be a non-empty string');
+-
+-    this.isContext = this.key[0] === prefixes.context;
+-    this.isValue = this.key[0] === prefixes.value;
+-    this.isSibling = !this.isContext && !this.isValue;
+-
+-    let prefix = this.isContext
+-      ? prefixes.context
+-      : this.isValue
+-        ? prefixes.value
+-        : '';
+-
+-    this.path = this.key.slice(prefix.length);
+-    this.getter = this.path && getter(this.path, true);
+-    this.map = options.map;
++  static isRef(value) {
++    return !!(value && (value.__isYupRef || value instanceof Reference));
+   }
+ 
+-  getValue(options) {
+-    let result = this.isContext
+-      ? options.context
+-      : this.isValue
+-        ? options.value
+-        : options.parent;
++  toString() {
++    return `Ref(${this.key})`;
++  }
+ 
+-    if (this.getter) result = this.getter(result || {});
++  constructor(key, mapFn, options = {}) {
++    validateName(key);
++    let prefix = options.contextPrefix || '$';
+ 
+-    if (this.map) result = this.map(result);
++    if (typeof key === 'function') {
++      key = '.';
++    }
+ 
+-    return result;
+-  }
++    this.key = key.trim();
++    this.prefix = prefix;
++    this.isContext = this.key.indexOf(prefix) === 0;
++    this.isSelf = this.key === '.';
+ 
+-  cast(value, options) {
+-    return this.getValue({ ...options, value });
++    this.path = this.isContext ? this.key.slice(this.prefix.length) : this.key;
++    this._get = getter(this.path, true);
++    this.map = mapFn || (value => value);
+   }
+-
+   resolve() {
+     return this;
+   }
+ 
+-  describe() {
+-    return {
+-      type: 'ref',
+-      key: this.key,
+-    };
++  cast(value, { parent, context }) {
++    return this.getValue(parent, context);
+   }
+ 
+-  toString() {
+-    return `Ref(${this.key})`;
+-  }
+-
+-  static isRef(value) {
+-    return value && value.__isYupRef;
++  getValue(parent, context) {
++    let isContext = this.isContext;
++    let value = this._get(isContext ? context : parent || context || {});
++    return this.map(value);
+   }
+ }
+ 
+diff --git a/src/mixed.js b/src/mixed.js
+index 27f781c..540057e 100644
+--- a/src/mixed.js
++++ b/src/mixed.js
+@@ -134,10 +134,11 @@ const proto = (SchemaType.prototype = {
+     return !this._typeCheck || this._typeCheck(v);
+   },
+ 
+-  resolve(options) {
++  resolve({ context, parent }) {
+     if (this._conditions.length) {
+       return this._conditions.reduce(
+-        (schema, condition) => condition.resolve(schema, options),
++        (schema, match) =>
++          match.resolve(schema, match.getValue(parent, context)),
+         this,
+       );
+     }
+@@ -146,7 +147,7 @@ const proto = (SchemaType.prototype = {
+   },
+ 
+   cast(value, options = {}) {
+-    let resolvedSchema = this.resolve({ ...options, value });
++    let resolvedSchema = this.resolve(options);
+     let result = resolvedSchema._cast(value, options);
+ 
+     if (
+@@ -239,12 +240,12 @@ const proto = (SchemaType.prototype = {
+   },
+ 
+   validate(value, options = {}) {
+-    let schema = this.resolve({ ...options, value });
++    let schema = this.resolve(options);
+     return schema._validate(value, options);
+   },
+ 
+   validateSync(value, options = {}) {
+-    let schema = this.resolve({ ...options, value });
++    let schema = this.resolve(options);
+     let result, err;
+ 
+     schema
+@@ -267,7 +268,7 @@ const proto = (SchemaType.prototype = {
+ 
+   isValidSync(value, options) {
+     try {
+-      this.validateSync(value, options);
++      this.validateSync(value, { ...options });
+       return true;
+     } catch (err) {
+       if (err.name === 'ValidationError') return false;
+@@ -379,16 +380,11 @@ const proto = (SchemaType.prototype = {
+   },
+ 
+   when(keys, options) {
+-    if (arguments.length === 1) {
+-      options = keys;
+-      keys = '.';
+-    }
+-
+     var next = this.clone(),
+       deps = [].concat(keys).map(key => new Ref(key));
+ 
+     deps.forEach(dep => {
+-      if (dep.isSibling) next._deps.push(dep.key);
++      if (!dep.isContext) next._deps.push(dep.key);
+     });
+ 
+     next._conditions.push(new Condition(deps, options));
+diff --git a/src/util/createValidation.js b/src/util/createValidation.js
+index b46f592..3cb4c2c 100644
+--- a/src/util/createValidation.js
++++ b/src/util/createValidation.js
+@@ -68,10 +68,8 @@ export default function createValidation(options) {
+     ...rest
+   }) {
+     let parent = options.parent;
+-    let resolve = item =>
+-      Ref.isRef(item)
+-        ? item.getValue({ value, parent, context: options.context })
+-        : item;
++    let resolve = value =>
++      Ref.isRef(value) ? value.getValue(parent, options.context) : value;
+ 
+     let createError = createErrorFactory({
+       message,
+diff --git a/src/util/sortFields.js b/src/util/sortFields.js
+index 6876262..b544d94 100644
+--- a/src/util/sortFields.js
++++ b/src/util/sortFields.js
+@@ -23,7 +23,7 @@ export default function sortFields(fields, excludes = []) {
+ 
+       if (!~nodes.indexOf(key)) nodes.push(key);
+ 
+-      if (Ref.isRef(value) && value.isSibling) addNode(value.path, key);
++      if (Ref.isRef(value) && !value.isContext) addNode(value.path, key);
+       else if (isSchema(value) && value._deps)
+         value._deps.forEach(path => addNode(path, key));
+     }
+diff --git a/test/mixed.js b/test/mixed.js
+index c012857..a71efe8 100644
+--- a/test/mixed.js
++++ b/test/mixed.js
+@@ -656,7 +656,7 @@ describe('Mixed Types ', () => {
+ 
+   it('should handle multiple conditionals', function() {
+     let called = false;
+-    let inst = mixed().when(['$prop', '$other'], function(prop, other) {
++    let inst = mixed().when(['prop', 'other'], function(prop, other) {
+       other.should.equal(true);
+       prop.should.equal(1);
+       called = true;
+@@ -665,7 +665,7 @@ describe('Mixed Types ', () => {
+     inst.cast({}, { context: { prop: 1, other: true } });
+     called.should.equal(true);
+ 
+-    inst = mixed().when(['$prop', '$other'], {
++    inst = mixed().when(['prop', 'other'], {
+       is: 5,
+       then: mixed().required(),
+     });
+@@ -720,36 +720,6 @@ describe('Mixed Types ', () => {
+     inst.default().should.eql({ prop: undefined });
+   });
+ 
+-  it('should support self references in conditions', async function() {
+-    let inst = number().when('.', {
+-      is: value => value > 0,
+-      then: number().min(5),
+-    });
+-
+-    await inst
+-      .validate(4)
+-      .should.be.rejectedWith(ValidationError, /must be greater/);
+-
+-    await inst.validate(5).should.be.fulfilled();
+-
+-    await inst.validate(-1).should.be.fulfilled();
+-  });
+-
+-  it('should support conditional single argument as options shortcut', async function() {
+-    let inst = number().when({
+-      is: value => value > 0,
+-      then: number().min(5),
+-    });
+-
+-    await inst
+-      .validate(4)
+-      .should.be.rejectedWith(ValidationError, /must be greater/);
+-
+-    await inst.validate(5).should.be.fulfilled();
+-
+-    await inst.validate(-1).should.be.fulfilled();
+-  });
+-
+   it('should use label in error message', async function() {
+     let label = 'Label';
+     let inst = object({

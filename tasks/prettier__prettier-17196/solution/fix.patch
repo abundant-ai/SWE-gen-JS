@@ -1,0 +1,233 @@
+diff --git a/changelog_unreleased/flow/17196.md b/changelog_unreleased/flow/17196.md
+new file mode 100644
+index 000000000..ec6ea8f61
+--- /dev/null
++++ b/changelog_unreleased/flow/17196.md
+@@ -0,0 +1,16 @@
++#### Fix missing parentheses in `ConditionalTypeAnnotation` (#17196 by @fisker)
++
++<!-- prettier-ignore -->
++```jsx
++// Input
++type T<U> = 'a' | ('b' extends U ? 'c' : empty);
++type T<U> = 'a' & ('b' extends U ? 'c' : empty);
++
++// Prettier stable
++type T<U> = "a" | "b" extends U ? "c" : empty;
++type T<U> = "a" & "b" extends U ? "c" : empty;
++
++// Prettier main
++type T<U> = "a" | ("b" extends U ? "c" : empty);
++type T<U> = "a" & ("b" extends U ? "c" : empty);
++```
+diff --git a/src/language-js/comments/handle-comments.js b/src/language-js/comments/handle-comments.js
+index e8579a1db..a890e1b01 100644
+--- a/src/language-js/comments/handle-comments.js
++++ b/src/language-js/comments/handle-comments.js
+@@ -15,6 +15,7 @@ import {
+   getFunctionParameters,
+   isCallExpression,
+   isCallLikeExpression,
++  isConditionalType,
+   isIntersectionType,
+   isMemberExpression,
+   isObjectProperty,
+@@ -365,8 +366,7 @@ function handleNestedConditionalExpressionComments({
+ 
+   const enclosingIsCond =
+     enclosingNode?.type === "ConditionalExpression" ||
+-    enclosingNode?.type === "ConditionalTypeAnnotation" ||
+-    enclosingNode?.type === "TSConditionalType";
++    isConditionalType(enclosingNode);
+ 
+   if (!enclosingIsCond) {
+     return false;
+@@ -374,8 +374,7 @@ function handleNestedConditionalExpressionComments({
+ 
+   const followingIsCond =
+     followingNode?.type === "ConditionalExpression" ||
+-    followingNode?.type === "ConditionalTypeAnnotation" ||
+-    followingNode?.type === "TSConditionalType";
++    isConditionalType(followingNode);
+ 
+   if (followingIsCond) {
+     addDanglingComment(enclosingNode, comment);
+@@ -399,8 +398,7 @@ function handleConditionalExpressionComments({
+   if (
+     (!precedingNode || !isSameLineAsPrecedingNode) &&
+     (enclosingNode?.type === "ConditionalExpression" ||
+-      enclosingNode?.type === "ConditionalTypeAnnotation" ||
+-      enclosingNode?.type === "TSConditionalType") &&
++      isConditionalType(enclosingNode)) &&
+     followingNode
+   ) {
+     if (
+diff --git a/src/language-js/needs-parens.js b/src/language-js/needs-parens.js
+index 7251c0a6b..25ee3f384 100644
+--- a/src/language-js/needs-parens.js
++++ b/src/language-js/needs-parens.js
+@@ -10,10 +10,13 @@ import {
+   isBinaryCastExpression,
+   isBitwiseOperator,
+   isCallExpression,
++  isConditionalType,
++  isIntersectionType,
+   isMemberExpression,
+   isNullishCoalescing,
+   isObjectOrRecordExpression,
+   isObjectProperty,
++  isUnionType,
+   shouldFlatten,
+   startsWithNoLookaheadToken,
+ } from "./utils/index.js";
+@@ -525,11 +528,20 @@ function needsParens(path, options) {
+     // fallthrough
+     case "TSConditionalType":
+     case "TSConstructorType":
+-      if (key === "extendsType" && parent.type === "TSConditionalType") {
+-        if (node.type === "TSConditionalType") {
+-          return true;
+-        }
++    case "ConditionalTypeAnnotation":
++      if (
++        key === "extendsType" &&
++        isConditionalType(node) &&
++        parent.type === node.type
++      ) {
++        return true;
++      }
++
++      if (key === "checkType" && isConditionalType(parent)) {
++        return true;
++      }
+ 
++      if (key === "extendsType" && parent.type === "TSConditionalType") {
+         let { typeAnnotation } = node.returnType || node.typeAnnotation;
+ 
+         if (
+@@ -547,15 +559,11 @@ function needsParens(path, options) {
+         }
+       }
+ 
+-      if (key === "checkType" && parent.type === "TSConditionalType") {
+-        return true;
+-      }
+     // fallthrough
+     case "TSUnionType":
+     case "TSIntersectionType":
+       if (
+-        (parent.type === "TSUnionType" ||
+-          parent.type === "TSIntersectionType") &&
++        (isUnionType(parent) || isIntersectionType(parent)) &&
+         parent.types.length > 1 &&
+         (!node.types || node.types.length > 1)
+       ) {
+@@ -706,19 +714,6 @@ function needsParens(path, options) {
+       );
+     }
+ 
+-    case "ConditionalTypeAnnotation":
+-      if (
+-        key === "extendsType" &&
+-        parent.type === "ConditionalTypeAnnotation" &&
+-        node.type === "ConditionalTypeAnnotation"
+-      ) {
+-        return true;
+-      }
+-
+-      if (key === "checkType" && parent.type === "ConditionalTypeAnnotation") {
+-        return true;
+-      }
+-
+     // fallthrough
+     case "OptionalIndexedAccessType":
+       return key === "objectType" && parent.type === "IndexedAccessType";
+diff --git a/src/language-js/print/ternary.js b/src/language-js/print/ternary.js
+index c9480904d..7dadade51 100644
+--- a/src/language-js/print/ternary.js
++++ b/src/language-js/print/ternary.js
+@@ -18,6 +18,7 @@ import {
+   hasComment,
+   isBinaryCastExpression,
+   isCallExpression,
++  isConditionalType,
+   isJsxElement,
+   isLoneShortArgument,
+   isMemberExpression,
+@@ -153,9 +154,7 @@ function printTernary(path, options, print, args) {
+ 
+   const { node } = path;
+   const isConditionalExpression = node.type === "ConditionalExpression";
+-  const isTSConditional =
+-    node.type === "TSConditionalType" ||
+-    node.type === "ConditionalTypeAnnotation"; // For Flow.
++  const isTSConditional = isConditionalType(node);
+   const consequentNodePropertyName = isConditionalExpression
+     ? "consequent"
+     : "trueType";
+@@ -322,8 +321,7 @@ function printTernary(path, options, print, args) {
+         " ",
+         "extends",
+         " ",
+-        node.extendsType.type === "TSConditionalType" ||
+-        node.extendsType.type === "ConditionalTypeAnnotation" ||
++        isConditionalType(node.extendsType) ||
+         node.extendsType.type === "TSMappedType"
+           ? print("extendsType")
+           : group(wrapInParens(print("extendsType"))),
+diff --git a/src/language-js/print/type-annotation.js b/src/language-js/print/type-annotation.js
+index 9e5df2b15..89d6edd53 100644
+--- a/src/language-js/print/type-annotation.js
++++ b/src/language-js/print/type-annotation.js
+@@ -15,6 +15,7 @@ import {
+   createTypeCheckFunction,
+   hasComment,
+   hasLeadingOwnLineComment,
++  isConditionalType,
+   isFlowObjectTypePropertyAFunction,
+   isObjectType,
+   isSimpleType,
+@@ -174,9 +175,7 @@ function printUnionType(path, options, print) {
+   // If there's a leading comment, the parent is doing the indentation
+   const shouldIndent =
+     parent.type !== "TypeParameterInstantiation" &&
+-    (parent.type !== "TSConditionalType" || !options.experimentalTernaries) &&
+-    (parent.type !== "ConditionalTypeAnnotation" ||
+-      !options.experimentalTernaries) &&
++    (!isConditionalType(parent) || !options.experimentalTernaries) &&
+     parent.type !== "TSTypeParameterInstantiation" &&
+     parent.type !== "GenericTypeAnnotation" &&
+     parent.type !== "TSTypeReference" &&
+diff --git a/src/language-js/utils/index.js b/src/language-js/utils/index.js
+index bb751fe9a..3eba6553e 100644
+--- a/src/language-js/utils/index.js
++++ b/src/language-js/utils/index.js
+@@ -1060,13 +1060,18 @@ const isBinaryCastExpression = createTypeCheckFunction([
+ ]);
+ 
+ const isUnionType = createTypeCheckFunction([
+-  "UnionTypeAnnotation",
+   "TSUnionType",
++  "UnionTypeAnnotation",
+ ]);
+ 
+ const isIntersectionType = createTypeCheckFunction([
+-  "IntersectionTypeAnnotation",
+   "TSIntersectionType",
++  "IntersectionTypeAnnotation",
++]);
++
++const isConditionalType = createTypeCheckFunction([
++  "TSConditionalType",
++  "ConditionalTypeAnnotation",
+ ]);
+ 
+ export {
+@@ -1092,6 +1097,7 @@ export {
+   isBitwiseOperator,
+   isCallExpression,
+   isCallLikeExpression,
++  isConditionalType,
+   isExportDeclaration,
+   isFlowObjectTypePropertyAFunction,
+   isFunctionCompositionArgs,

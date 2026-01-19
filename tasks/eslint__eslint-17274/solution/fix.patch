@@ -1,0 +1,367 @@
+diff --git a/docs/src/integrate/nodejs-api.md b/docs/src/integrate/nodejs-api.md
+index 744f98295..87fd52aae 100644
+--- a/docs/src/integrate/nodejs-api.md
++++ b/docs/src/integrate/nodejs-api.md
+@@ -159,6 +159,8 @@ The `ESLint` constructor takes an `options` object. If you omit the `options` ob
+   Default is `[]`. An array of paths to directories to load custom rules from.
+ * `options.useEslintrc` (`boolean`)<br>
+   Default is `true`. If `false` is present, ESLint doesn't load configuration files (`.eslintrc.*` files). Only the configuration of the constructor options is valid.
++* `options.ruleFilter` (`({ruleId: string, severity: number}) => boolean`)<br>
++  Default is `() => true`. A predicate function that filters rules to be run. This function is called with an object containing `ruleId` and `severity`, and returns `true` if the rule should be run.
+ 
+ ##### Autofix
+ 
+@@ -538,6 +540,7 @@ The most important method on `Linter` is `verify()`, which initiates linting of
+     * `disableFixes` - (optional) when set to `true`, the linter doesn't make either the `fix` or `suggestions` property of the lint result.
+     * `allowInlineConfig` - (optional) set to `false` to disable inline comments from changing ESLint rules.
+     * `reportUnusedDisableDirectives` - (optional) when set to `true`, adds reported errors for unused `eslint-disable` and `eslint-enable` directives when no problems would be reported in the disabled area anyway.
++    * `ruleFilter` - (optional) A function predicate that decides which rules should run. It receives an object containing `ruleId` and `severity`, and returns `true` if the rule should be run.
+ 
+ If the third argument is a string, it is interpreted as the `filename`.
+ 
+diff --git a/docs/src/use/command-line-interface.md b/docs/src/use/command-line-interface.md
+index 472619a52..97e05dc16 100644
+--- a/docs/src/use/command-line-interface.md
++++ b/docs/src/use/command-line-interface.md
+@@ -96,7 +96,7 @@ Use stdin:
+   --stdin-filename String         Specify filename to process STDIN as
+ 
+ Handle warnings:
+-  --quiet                         Report errors only - default: false
++  --quiet                         Report and check errors only - default: false
+   --max-warnings Int              Number of warnings to trigger nonzero exit code - default: -1
+ 
+ Output:
+@@ -458,7 +458,7 @@ cat myfile.js | npx eslint --stdin --stdin-filename myfile.js
+ 
+ #### `--quiet`
+ 
+-This option allows you to disable reporting on warnings. If you enable this option, only errors are reported by ESLint.
++This option allows you to disable reporting on warnings and running of rules set to warn. If you enable this option, only errors are reported by ESLint and only rules set to error will be run.
+ 
+ * **Argument Type**: No argument.
+ 
+@@ -477,6 +477,10 @@ This option allows you to specify a warning threshold, which can be used to forc
+ 
+ Normally, if ESLint runs and finds no errors (only warnings), it exits with a success exit status. However, if `--max-warnings` is specified and the total warning count is greater than the specified threshold, ESLint exits with an error status.
+ 
++::: important
++When used alongside `--quiet`, this will cause rules marked as warn to still be run, but not reported.
++:::
++
+ ##### `--max-warnings` example
+ 
+ ```shell
+diff --git a/lib/cli.js b/lib/cli.js
+index db9e1fd27..4203ac1fa 100644
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -58,6 +58,16 @@ function quietFixPredicate(message) {
+     return message.severity === 2;
+ }
+ 
++/**
++ * Predicate function for whether or not to run a rule in quiet mode.
++ * If a rule is set to warning, do not run it.
++ * @param {{ ruleId: string; severity: number; }} rule The rule id and severity.
++ * @returns {boolean} True if the lint rule should run, false otherwise.
++ */
++function quietRuleFilter(rule) {
++    return rule.severity === 2;
++}
++
+ /**
+  * Translates the CLI options into the options expected by the ESLint constructor.
+  * @param {ParsedCLIOptions} cliOptions The CLI options to translate.
+@@ -95,7 +105,8 @@ async function translateOptions({
+     rule,
+     rulesdir,
+     warnIgnored,
+-    passOnNoPatterns
++    passOnNoPatterns,
++    maxWarnings
+ }, configType) {
+ 
+     let overrideConfig, overrideConfigFile;
+@@ -195,6 +206,12 @@ async function translateOptions({
+     if (configType === "flat") {
+         options.ignorePatterns = ignorePattern;
+         options.warnIgnored = warnIgnored;
++
++        /*
++         * For performance reasons rules not marked as 'error' are filtered out in quiet mode. As maxWarnings
++         * requires rules set to 'warn' to be run, we only filter out 'warn' rules if maxWarnings is not specified.
++         */
++        options.ruleFilter = quiet && maxWarnings === -1 ? quietRuleFilter : () => true;
+     } else {
+         options.resolvePluginsRelativeTo = resolvePluginsRelativeTo;
+         options.rulePaths = rulesdir;
+diff --git a/lib/eslint/eslint-helpers.js b/lib/eslint/eslint-helpers.js
+index b367928ad..b19945277 100644
+--- a/lib/eslint/eslint-helpers.js
++++ b/lib/eslint/eslint-helpers.js
+@@ -687,6 +687,7 @@ function processOptions({
+     plugins = {},
+     warnIgnored = true,
+     passOnNoPatterns = false,
++    ruleFilter = () => true,
+     ...unknownOptions
+ }) {
+     const errors = [];
+@@ -793,6 +794,9 @@ function processOptions({
+     if (typeof warnIgnored !== "boolean") {
+         errors.push("'warnIgnored' must be a boolean.");
+     }
++    if (typeof ruleFilter !== "function") {
++        errors.push("'ruleFilter' must be a function.");
++    }
+     if (errors.length > 0) {
+         throw new ESLintInvalidOptionsError(errors);
+     }
+@@ -815,7 +819,8 @@ function processOptions({
+         ignore,
+         ignorePatterns,
+         passOnNoPatterns,
+-        warnIgnored
++        warnIgnored,
++        ruleFilter
+     };
+ }
+ 
+diff --git a/lib/eslint/flat-eslint.js b/lib/eslint/flat-eslint.js
+index eaca597c5..7629d9f67 100644
+--- a/lib/eslint/flat-eslint.js
++++ b/lib/eslint/flat-eslint.js
+@@ -460,6 +460,7 @@ async function calculateConfigArray(eslint, {
+  * @param {FlatConfigArray} config.configs The config.
+  * @param {boolean} config.fix If `true` then it does fix.
+  * @param {boolean} config.allowInlineConfig If `true` then it uses directive comments.
++ * @param {Function} config.ruleFilter A predicate function to filter which rules should be run.
+  * @param {Linter} config.linter The linter instance to verify.
+  * @returns {LintResult} The result of linting.
+  * @private
+@@ -471,6 +472,7 @@ function verifyText({
+     configs,
+     fix,
+     allowInlineConfig,
++    ruleFilter,
+     linter
+ }) {
+     const filePath = providedFilePath || "<text>";
+@@ -490,6 +492,7 @@ function verifyText({
+             allowInlineConfig,
+             filename: filePathToVerify,
+             fix,
++            ruleFilter,
+ 
+             /**
+              * Check if the linter should adopt a given code block or not.
+@@ -787,6 +790,7 @@ class FlatESLint {
+             cwd,
+             fix,
+             fixTypes,
++            ruleFilter,
+             globInputPaths,
+             errorOnUnmatchedPattern,
+             warnIgnored
+@@ -896,6 +900,7 @@ class FlatESLint {
+                             cwd,
+                             fix: fixer,
+                             allowInlineConfig,
++                            ruleFilter,
+                             linter
+                         });
+ 
+@@ -980,7 +985,8 @@ class FlatESLint {
+             allowInlineConfig,
+             cwd,
+             fix,
+-            warnIgnored: constructorWarnIgnored
++            warnIgnored: constructorWarnIgnored,
++            ruleFilter
+         } = eslintOptions;
+         const results = [];
+         const startTime = Date.now();
+@@ -1003,6 +1009,7 @@ class FlatESLint {
+                 cwd,
+                 fix,
+                 allowInlineConfig,
++                ruleFilter,
+                 linter
+             }));
+         }
+diff --git a/lib/linter/apply-disable-directives.js b/lib/linter/apply-disable-directives.js
+index c5e3c9ddc..c83d4b04c 100644
+--- a/lib/linter/apply-disable-directives.js
++++ b/lib/linter/apply-disable-directives.js
+@@ -16,6 +16,11 @@
+ //------------------------------------------------------------------------------
+ 
+ const escapeRegExp = require("escape-string-regexp");
++const {
++    Legacy: {
++        ConfigOps
++    }
++} = require("@eslint/eslintrc/universal");
+ 
+ /**
+  * Compares the locations of two objects in a source file
+@@ -345,11 +350,11 @@ function applyDirectives(options) {
+     }
+ 
+     const unusedDisableDirectivesToReport = options.directives
+-        .filter(directive => directive.type === "disable" && !usedDisableDirectives.has(directive));
++        .filter(directive => directive.type === "disable" && !usedDisableDirectives.has(directive) && !options.rulesToIgnore.has(directive.ruleId));
+ 
+ 
+     const unusedEnableDirectivesToReport = new Set(
+-        options.directives.filter(directive => directive.unprocessedDirective.type === "enable")
++        options.directives.filter(directive => directive.unprocessedDirective.type === "enable" && !options.rulesToIgnore.has(directive.ruleId))
+     );
+ 
+     /*
+@@ -410,11 +415,13 @@ function applyDirectives(options) {
+  * @param {{ruleId: (string|null), line: number, column: number}[]} options.problems
+  * A list of problems reported by rules, sorted by increasing location in the file, with one-based columns.
+  * @param {"off" | "warn" | "error"} options.reportUnusedDisableDirectives If `"warn"` or `"error"`, adds additional problems for unused directives
++ * @param {Object} options.configuredRules The rules configuration.
++ * @param {Function} options.ruleFilter A predicate function to filter which rules should be executed.
+  * @param {boolean} options.disableFixes If true, it doesn't make `fix` properties.
+  * @returns {{ruleId: (string|null), line: number, column: number, suppressions?: {kind: string, justification: string}}[]}
+  * An object with a list of reported problems, the suppressed of which contain the suppression information.
+  */
+-module.exports = ({ directives, disableFixes, problems, reportUnusedDisableDirectives = "off" }) => {
++module.exports = ({ directives, disableFixes, problems, configuredRules, ruleFilter, reportUnusedDisableDirectives = "off" }) => {
+     const blockDirectives = directives
+         .filter(directive => directive.type === "disable" || directive.type === "enable")
+         .map(directive => Object.assign({}, directive, { unprocessedDirective: directive }))
+@@ -443,17 +450,38 @@ module.exports = ({ directives, disableFixes, problems, reportUnusedDisableDirec
+         }
+     }).sort(compareLocations);
+ 
++    // This determines a list of rules that are not being run by the given ruleFilter, if present.
++    const rulesToIgnore = configuredRules && ruleFilter
++        ? new Set(Object.keys(configuredRules).filter(ruleId => {
++            const severity = ConfigOps.getRuleSeverity(configuredRules[ruleId]);
++
++            // Ignore for disabled rules.
++            if (severity === 0) {
++                return false;
++            }
++
++            return !ruleFilter({ severity, ruleId });
++        }))
++        : new Set();
++
++    // If no ruleId is supplied that means this directive is applied to all rules, so we can't determine if it's unused if any rules are filtered out.
++    if (rulesToIgnore.size > 0) {
++        rulesToIgnore.add(null);
++    }
++
+     const blockDirectivesResult = applyDirectives({
+         problems,
+         directives: blockDirectives,
+         disableFixes,
+-        reportUnusedDisableDirectives
++        reportUnusedDisableDirectives,
++        rulesToIgnore
+     });
+     const lineDirectivesResult = applyDirectives({
+         problems: blockDirectivesResult.problems,
+         directives: lineDirectives,
+         disableFixes,
+-        reportUnusedDisableDirectives
++        reportUnusedDisableDirectives,
++        rulesToIgnore
+     });
+ 
+     return reportUnusedDisableDirectives !== "off"
+diff --git a/lib/linter/linter.js b/lib/linter/linter.js
+index 998d01ad6..cfd47c6b1 100644
+--- a/lib/linter/linter.js
++++ b/lib/linter/linter.js
+@@ -105,6 +105,7 @@ const parserSymbol = Symbol.for("eslint.RuleTester.parser");
+  * @property {string} [filename] the filename of the source code.
+  * @property {boolean | "off" | "warn" | "error"} [reportUnusedDisableDirectives] Adds reported errors for
+  *      unused `eslint-disable` directives.
++ * @property {Function} [ruleFilter] A predicate function that determines whether a given rule should run.
+  */
+ 
+ /**
+@@ -661,6 +662,12 @@ function normalizeVerifyOptions(providedOptions, config) {
+         }
+     }
+ 
++    let ruleFilter = providedOptions.ruleFilter;
++
++    if (typeof ruleFilter !== "function") {
++        ruleFilter = () => true;
++    }
++
+     return {
+         filename: normalizeFilename(providedOptions.filename || "<input>"),
+         allowInlineConfig: !ignoreInlineConfig,
+@@ -668,7 +675,8 @@ function normalizeVerifyOptions(providedOptions, config) {
+             ? `your config${configNameOfNoInlineConfig}`
+             : null,
+         reportUnusedDisableDirectives,
+-        disableFixes: Boolean(providedOptions.disableFixes)
++        disableFixes: Boolean(providedOptions.disableFixes),
++        ruleFilter
+     };
+ }
+ 
+@@ -911,9 +919,10 @@ function createRuleListeners(rule, ruleContext) {
+  * @param {boolean} disableFixes If true, it doesn't make `fix` properties.
+  * @param {string | undefined} cwd cwd of the cli
+  * @param {string} physicalFilename The full path of the file on disk without any code block information
++ * @param {Function} ruleFilter A predicate function to filter which rules should be executed.
+  * @returns {LintMessage[]} An array of reported problems
+  */
+-function runRules(sourceCode, configuredRules, ruleMapper, parserName, languageOptions, settings, filename, disableFixes, cwd, physicalFilename) {
++function runRules(sourceCode, configuredRules, ruleMapper, parserName, languageOptions, settings, filename, disableFixes, cwd, physicalFilename, ruleFilter) {
+     const emitter = createEmitter();
+     const nodeQueue = [];
+     let currentNode = sourceCode.ast;
+@@ -963,6 +972,10 @@ function runRules(sourceCode, configuredRules, ruleMapper, parserName, languageO
+             return;
+         }
+ 
++        if (ruleFilter && !ruleFilter({ ruleId, severity })) {
++            return;
++        }
++
+         const rule = ruleMapper(ruleId);
+ 
+         if (!rule) {
+@@ -1317,7 +1330,8 @@ class Linter {
+                 options.filename,
+                 options.disableFixes,
+                 slots.cwd,
+-                providedOptions.physicalFilename
++                providedOptions.physicalFilename,
++                null
+             );
+         } catch (err) {
+             err.message += `\nOccurred while linting ${options.filename}`;
+@@ -1692,7 +1706,8 @@ class Linter {
+                 options.filename,
+                 options.disableFixes,
+                 slots.cwd,
+-                providedOptions.physicalFilename
++                providedOptions.physicalFilename,
++                options.ruleFilter
+             );
+         } catch (err) {
+             err.message += `\nOccurred while linting ${options.filename}`;
+@@ -1723,7 +1738,9 @@ class Linter {
+                 .concat(commentDirectives.problems)
+                 .concat(inlineConfigProblems)
+                 .sort((problemA, problemB) => problemA.line - problemB.line || problemA.column - problemB.column),
+-            reportUnusedDisableDirectives: options.reportUnusedDisableDirectives
++            reportUnusedDisableDirectives: options.reportUnusedDisableDirectives,
++            ruleFilter: options.ruleFilter,
++            configuredRules
+         });
+     }
+ 

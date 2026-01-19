@@ -1,0 +1,111 @@
+diff --git a/src/language-markdown/print-preprocess.js b/src/language-markdown/print-preprocess.js
+index 79e7fa09f..564eb2d38 100644
+--- a/src/language-markdown/print-preprocess.js
++++ b/src/language-markdown/print-preprocess.js
+@@ -143,6 +143,32 @@ function splitTextIntoSentencesLegacy(ast) {
+ }
+ 
+ function splitTextIntoSentences(ast) {
++  const canOpenAccidentalWikiLink = new Set();
++  const riskyParagraphPositions = new Set(); // we can't use nodes themselves because they will be cloned.
++
++  walkAst(ast, (node, parentStack) => {
++    if (node.type === "wikiLink") {
++      markAncestors(parentStack); // word wrapping can accidentally merge nodes like `[[foo\n[[wiki link]]`
++      return;
++    }
++
++    if (node.type !== "text") {
++      return;
++    }
++
++    if (node.raw.includes("[[")) {
++      for (const ancestor of parentStack) {
++        if (ancestor.type === "paragraph") {
++          canOpenAccidentalWikiLink.add(ancestor);
++        }
++      }
++    }
++
++    if (node.raw.includes("]]")) {
++      markAncestors(parentStack);
++    }
++  });
++
+   return mapAst(ast, (node, index, parentStack) => {
+     if (node.type !== "text") {
+       return node;
+@@ -178,12 +204,42 @@ function splitTextIntoSentences(ast) {
+       }
+     }
+ 
++    if (paragraphNode && riskyParagraphPositions.has(paragraphNode.position)) {
++      return {
++        type: "text",
++        position: node.position,
++        value: text,
++      };
++    }
++
+     return {
+       type: "sentence",
+       position: node.position,
+       children: splitText(text),
+     };
+   });
++
++  function walkAst(ast, handler) {
++    return (function preorder(node, parentStack) {
++      handler(node, parentStack);
++      if (node.children) {
++        for (const child of node.children) {
++          preorder(child, [node, ...parentStack]);
++        }
++      }
++    })(ast, []);
++  }
++
++  function markAncestors(parentStack) {
++    for (const ancestor of parentStack) {
++      if (
++        ancestor.type === "paragraph" &&
++        canOpenAccidentalWikiLink.has(ancestor)
++      ) {
++        riskyParagraphPositions.add(ancestor.position);
++      }
++    }
++  }
+ }
+ 
+ function transformIndentedCodeblock(ast, options) {
+diff --git a/src/language-markdown/printer-markdown.js b/src/language-markdown/printer-markdown.js
+index 2d2ac1f9b..4ccd6c659 100644
+--- a/src/language-markdown/printer-markdown.js
++++ b/src/language-markdown/printer-markdown.js
+@@ -368,11 +368,12 @@ function genericPrint(path, options, print) {
+       // remark-math trims content but we don't want to remove whitespaces
+       // since it's very possible that it's recognized as math accidentally
+       return options.originalText.slice(locStart(node), locEnd(node));
++    case "text":
++      return replaceEndOfLine(node.value, hardline);
+ 
+     case "frontMatter": // Handled in core
+     case "tableRow": // handled in "table"
+     case "listItem": // handled in "list"
+-    case "text": // handled in other types
+     default:
+       /* c8 ignore next */
+       throw new UnexpectedNodeError(node, "Markdown");
+diff --git a/src/language-markdown/utilities.js b/src/language-markdown/utilities.js
+index 9f400efd0..688c00a01 100644
+--- a/src/language-markdown/utilities.js
++++ b/src/language-markdown/utilities.js
+@@ -62,7 +62,7 @@ const K_REGEXP = /\p{Script_Extensions=Hangul}/u;
+  * @param {string} text
+  */
+ function splitText(text) {
+-  /** @type {Array<TextNode>} */
++  /** @type {Array<TextNode>}u*/
+   const nodes = [];
+ 
+   const tokens = text.split(/([\t\n ]+)/u);

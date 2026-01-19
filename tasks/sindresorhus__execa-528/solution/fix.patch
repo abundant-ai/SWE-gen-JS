@@ -1,0 +1,180 @@
+diff --git a/index.d.ts b/index.d.ts
+index dc97323..6cf23bc 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -541,7 +541,12 @@ console.log(stdout);
+ export function execaCommand(command: string, options?: Options): ExecaChildProcess;
+ export function execaCommand(command: string, options?: Options<null>): ExecaChildProcess<Buffer>;
+ 
+-type TemplateExpression = string | number | Array<string | number>;
++type TemplateExpression =
++	| string
++	| number
++	| ExecaReturnValue<string | Buffer>
++	| ExecaSyncReturnValue<string | Buffer>
++	| Array<string | number | ExecaReturnValue<string | Buffer> | ExecaSyncReturnValue<string | Buffer>>;
+ 
+ type Execa$<StdoutStderrType = string> = {
+ 	/**
+@@ -551,6 +556,8 @@ type Execa$<StdoutStderrType = string> = {
+ 
+ 	The `shell` option must be used if the `command` uses shell-specific features (for example, `&&` or `||`), as opposed to being a simple `file` followed by its `arguments`.
+ 
++	As a convenience, the result from previous `` $`command` `` or `` $.sync`command` `` calls can be used as template expressions in subsequent commands and `$`/`$.sync` will use the `stdout` value. See the example below `` with results from `$` or `$.sync` `` for more details.
++
+ 	@returns A [`child_process` instance](https://nodejs.org/api/child_process.html#child_process_class_childprocess), which is enhanced to also be a `Promise` for a result `Object` with `stdout` and `stderr` properties.
+ 
+ 	@example <caption>Basic</caption>
+@@ -596,6 +603,16 @@ type Execa$<StdoutStderrType = string> = {
+ 	$({stdio: 'inherit'}).sync`echo rainbows`;
+ 	//=> 'rainbows'
+ 	```
++
++	@example <caption>With results from `$` or `$.sync`</caption>
++	```
++	import {$} from 'execa';
++
++	const unicorns = await $`echo unicorns`;
++
++	$({stdio: 'inherit'}).sync`echo ${unicorns} rainbows`;
++	//=> 'unicorns rainbows'
++	```
+ 	*/
+ 	(options: Options<undefined>): Execa$<StdoutStderrType>;
+ 	(options: Options): Execa$;
+@@ -635,6 +652,8 @@ It's important to note that quotes, backslashes, and spaces are automatically es
+ 
+ The `shell` option must be used if the `command` uses shell-specific features (for example, `&&` or `||`), as opposed to being a simple `file` followed by its `arguments`.
+ 
++As a convenience, the result from previous `` $`command` `` or `` $.sync`command` `` calls can be used as template expressions in subsequent commands and `$`/`$.sync` will use the `stdout` value. See the example below `` with results from `$` or `$.sync` `` for more details.
++
+ @returns A [`child_process` instance](https://nodejs.org/api/child_process.html#child_process_class_childprocess), which is enhanced to also be a `Promise` for a result `Object` with `stdout` and `stderr` properties.
+ 
+ @example <caption>Basic</caption>
+@@ -680,6 +699,16 @@ console.log(stdout);
+ $({stdio: 'inherit'}).sync`echo rainbows`;
+ //=> 'rainbows'
+ ```
++
++@example <caption>With results from `$` or `$.sync`</caption>
++```
++import {$} from 'execa';
++
++const unicorns = await $`echo unicorns`;
++
++$({stdio: 'inherit'}).sync`echo ${unicorns} rainbows`;
++//=> 'unicorns rainbows'
++```
+ */
+ export const $: Execa$;
+ 
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 32fb555..a2a6d21 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -265,6 +265,12 @@ expectType<ExecaReturnValue>(await $`unicorns ${['foo', 'bar']}`);
+ expectType<ExecaSyncReturnValue>($.sync`unicorns ${['foo', 'bar']}`);
+ expectType<ExecaReturnValue>(await $`unicorns ${[1, 2]}`);
+ expectType<ExecaSyncReturnValue>($.sync`unicorns ${[1, 2]}`);
++expectType<ExecaReturnValue>(await $`unicorns ${await $`echo foo`}`);
++expectError<ExecaReturnValue>(await $`unicorns ${$`echo foo`}`);
++expectType<ExecaSyncReturnValue>($.sync`unicorns ${$.sync`echo foo`}`);
++expectType<ExecaReturnValue>(await $`unicorns ${[await $`echo foo`, 'bar']}`);
++expectError<ExecaReturnValue>(await $`unicorns ${[$`echo foo`, 'bar']}`);
++expectType<ExecaSyncReturnValue>($.sync`unicorns ${[$.sync`echo foo`, 'bar']}`);
+ expectType<ExecaReturnValue>(await $`unicorns ${true.toString()}`);
+ expectType<ExecaSyncReturnValue>($.sync`unicorns ${false.toString()}`);
+ expectError<ExecaReturnValue>(await $`unicorns ${true}`);
+diff --git a/lib/command.js b/lib/command.js
+index d40877f..b6d2e5e 100644
+--- a/lib/command.js
++++ b/lib/command.js
+@@ -1,3 +1,6 @@
++import {Buffer} from 'node:buffer';
++import {ChildProcess} from 'node:child_process';
++
+ const normalizeArgs = (file, args = []) => {
+ 	if (!Array.isArray(args)) {
+ 		return [file];
+@@ -40,6 +43,39 @@ export const parseCommand = command => {
+ 	return tokens;
+ };
+ 
++const parseExpression = expression => {
++	const typeOfExpression = typeof expression;
++
++	if (typeOfExpression === 'string') {
++		return expression;
++	}
++
++	if (typeOfExpression === 'number') {
++		return String(expression);
++	}
++
++	if (
++		typeOfExpression === 'object'
++		&& expression !== null
++		&& !(expression instanceof ChildProcess)
++		&& 'stdout' in expression
++	) {
++		const typeOfStdout = typeof expression.stdout;
++
++		if (typeOfStdout === 'string') {
++			return expression.stdout;
++		}
++
++		if (Buffer.isBuffer(expression.stdout)) {
++			return expression.stdout.toString();
++		}
++
++		throw new TypeError(`Unexpected "${typeOfStdout}" stdout in template expression`);
++	}
++
++	throw new TypeError(`Unexpected "${typeOfExpression}" in template expression`);
++};
++
+ const parseTemplate = (template, index, templates, expressions) => {
+ 	const templateString = template ?? templates.raw[index];
+ 	const templateTokens = templateString.split(SPACES_REGEXP).filter(Boolean);
+@@ -51,8 +87,8 @@ const parseTemplate = (template, index, templates, expressions) => {
+ 	const expression = expressions[index];
+ 
+ 	return Array.isArray(expression)
+-		? [...templateTokens, ...expression.map(String)]
+-		: [...templateTokens, String(expression)];
++		? [...templateTokens, ...expression.map(expression => parseExpression(expression))]
++		: [...templateTokens, parseExpression(expression)];
+ };
+ 
+ export const parseTemplates = (templates, expressions) => templates.flatMap(
+diff --git a/readme.md b/readme.md
+index 0b9a5a2..2964319 100644
+--- a/readme.md
++++ b/readme.md
+@@ -90,6 +90,17 @@ $({stdio: 'inherit'}).sync`echo rainbows`;
+ //=> 'rainbows'
+ ```
+ 
++#### With results from `$` or `$.sync`
++
++```js
++import {$} from 'execa';
++
++const unicorns = await $`echo unicorns`;
++
++$({stdio: 'inherit'}).sync`echo ${unicorns} rainbows`;
++//=> 'unicorns rainbows'
++```
++
+ ### Pipe the child process stdout to the parent
+ 
+ ```js
+@@ -250,6 +261,8 @@ It's important to note that quotes, backslashes, and spaces are automatically es
+ 
+ The [`shell` option](#shell) must be used if the `command` uses shell-specific features (for example, `&&` or `||`), as opposed to being a simple `file` followed by its `arguments`.
+ 
++As a convenience, the result from previous [`` $`command` ``](#command) or [`` $.sync`command` ``](#synccommand) calls can be used as template expressions in subsequent commands and `$`/`$.sync` will use the `stdout` value. See the example above [with results from `$` or `$.sync`](#with-results-from--or-sync) for more details.
++
+ Returns a `Promise` that resolves or rejects with a [`childProcessResult`](#childProcessResult).
+ 
+ ### $.sync\`command\`

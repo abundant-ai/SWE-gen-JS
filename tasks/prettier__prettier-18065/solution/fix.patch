@@ -1,0 +1,285 @@
+diff --git a/changelog_unreleased/handlebars/17856.md b/changelog_unreleased/handlebars/17856.md
+index 44815340d..865d49086 100644
+--- a/changelog_unreleased/handlebars/17856.md
++++ b/changelog_unreleased/handlebars/17856.md
+@@ -2,21 +2,21 @@
+ 
+ <!-- prettier-ignore -->
+ ```hbs
+-{{!-- Input --}}
++{{! Input }}
+ {{#animated-if this.foo}}
+ foo content
+ {{else if (this.bar)}}
+ bar content
+ {{/animated-if}}
+ 
+-{{!-- Prettier stable --}}
++{{! Prettier stable }}
+ {{#animated-if this.foo}}
+   foo content
+ {{else}}{{#if (this.bar)}}
+     bar content
+   {{/if}}{{/animated-if}}
+ 
+-{{!-- Prettier main --}}
++{{! Prettier main }}
+ {{#animated-if this.foo}}
+   foo content
+ {{else if (this.bar)}}
+diff --git a/changelog_unreleased/handlebars/18065.md b/changelog_unreleased/handlebars/18065.md
+new file mode 100644
+index 000000000..4260f29b0
+--- /dev/null
++++ b/changelog_unreleased/handlebars/18065.md
+@@ -0,0 +1,27 @@
++#### Remove extra blank lines in `<style>` tags (#18065 by @kovsu, @fisker)
++
++<!-- prettier-ignore -->
++```hbs
++{{! Input }}
++<style>
++  #foo {
++    color: red;
++  }
++</style>
++
++{{! Prettier stable (--html-whitespace-sensitivity=ignore) }}
++<style>
++
++  #foo {
++    color: red;
++  }
++
++</style>
++
++{{! Prettier main (--html-whitespace-sensitivity=ignore)  }}
++<style>
++  #foo {
++    color: red;
++  }
++</style>
++```
+diff --git a/src/language-handlebars/embed.js b/src/language-handlebars/embed.js
+index b0b10b6ea..3bdc10b81 100644
+--- a/src/language-handlebars/embed.js
++++ b/src/language-handlebars/embed.js
+@@ -1,5 +1,3 @@
+-import { dedent, hardline, softline } from "../document/builders.js";
+-
+ function embed(path /* , options*/) {
+   const { node } = path;
+ 
+@@ -35,11 +33,12 @@ function embed(path /* , options*/) {
+   }
+ 
+   return async (textToDoc) => {
+-    const doc = await textToDoc(node.chars, { parser: "css" });
+-    if (!doc) {
+-      return [];
++    const context = node.chars;
++    if (!context.trim()) {
++      return "";
+     }
+-    return [hardline, doc, dedent(softline)];
++    const doc = await textToDoc(context, { parser: "css" });
++    return doc;
+   };
+ }
+ 
+diff --git a/src/language-handlebars/printer-glimmer.js b/src/language-handlebars/printer-glimmer.js
+index 073c54c01..5836fc067 100644
+--- a/src/language-handlebars/printer-glimmer.js
++++ b/src/language-handlebars/printer-glimmer.js
+@@ -55,17 +55,19 @@ function print(path, options, print) {
+       }
+ 
+       const endingTag = ["</", node.tag, ">"];
++      const isStyle = node.tag === "style";
+ 
+       if (
+         node.children.length === 0 ||
+-        (!isWhitespaceSensitive &&
++        ((!isWhitespaceSensitive || isStyle) &&
+           node.children.every((node) => isWhitespaceNode(node)))
+       ) {
+         return [startingTag, endingTag];
+       }
++
+       const parts = path.map(print, "children");
+ 
+-      if (!isWhitespaceSensitive) {
++      if (isStyle || !isWhitespaceSensitive) {
+         return [startingTag, indent([softline, ...parts]), softline, endingTag];
+       }
+ 
+@@ -158,14 +160,27 @@ function print(path, options, print) {
+       // 1. in `<pre>`,
+       // 2. in `<style>`
+ 
+-      if (path.parent.tag === "pre" || path.parent.tag === "style") {
+-        return node.chars;
++      let text = node.chars;
++
++      const { parent } = path;
++      if (parent.type === "ElementNode") {
++        if (parent.tag === "pre") {
++          return replaceEndOfLine(text);
++        }
++
++        if (parent.tag === "style") {
++          text = text.replaceAll(/^\n+/gu, "");
++          text = htmlWhitespaceUtils.trimEnd(text);
++          text = htmlWhitespaceUtils.dedentString(text);
++
++          return replaceEndOfLine(text, hardline);
++        }
+       }
+ 
+       /* if `{{my-component}}` (or any text containing "{{")
+        * makes it to the TextNode, it means it was escaped,
+        * so let's print it escaped, ie.; `\{{my-component}}` */
+-      let text = node.chars.replaceAll("{{", String.raw`\{{`);
++      text = text.replaceAll("{{", String.raw`\{{`);
+ 
+       const attrName = getCurrentAttributeName(path);
+ 
+diff --git a/src/language-html/embed.js b/src/language-html/embed.js
+index a319a1aab..da924c259 100644
+--- a/src/language-html/embed.js
++++ b/src/language-html/embed.js
+@@ -9,6 +9,7 @@ import {
+   isEmbedFrontMatter,
+   printEmbedFrontMatter,
+ } from "../utils/front-matter/index.js";
++import htmlWhitespaceUtils from "../utils/html-whitespace-utils.js";
+ import printAngularControlFlowBlockParameters from "./embed/angular-control-flow-block-parameters.js";
+ import printAttribute from "./embed/attribute.js";
+ import { formatAttributeValue } from "./embed/utils.js";
+@@ -21,7 +22,6 @@ import {
+   printOpeningTagPrefix,
+ } from "./print/tag.js";
+ import {
+-  dedentString,
+   htmlTrimPreserveIndentation,
+   inferElementParser,
+   isScriptLikeTag,
+@@ -89,7 +89,9 @@ function embed(path, options) {
+           return async (textToDoc) => {
+             const value =
+               parser === "markdown"
+-                ? dedentString(node.value.replace(/^[^\S\n]*\n/u, ""))
++                ? htmlWhitespaceUtils.dedentString(
++                    node.value.replace(/^[^\S\n]*\n/u, ""),
++                  )
+                 : node.value;
+             const textToDocOptions = { parser, __embeddedInHtml: true };
+             if (options.parser === "html" && parser === "babel") {
+diff --git a/src/language-html/utils/index.js b/src/language-html/utils/index.js
+index 184d4e25d..e55aa60ce 100644
+--- a/src/language-html/utils/index.js
++++ b/src/language-html/utils/index.js
+@@ -523,40 +523,6 @@ function getNodeCssStyleWhiteSpace(node) {
+   return CSS_WHITE_SPACE_DEFAULT;
+ }
+ 
+-function getMinIndentation(text) {
+-  let minIndentation = Number.POSITIVE_INFINITY;
+-
+-  for (const lineText of text.split("\n")) {
+-    if (lineText.length === 0) {
+-      continue;
+-    }
+-
+-    const indentation = htmlWhitespaceUtils.getLeadingWhitespaceCount(lineText);
+-    if (indentation === 0) {
+-      return 0;
+-    }
+-
+-    if (lineText.length === indentation) {
+-      continue;
+-    }
+-
+-    if (indentation < minIndentation) {
+-      minIndentation = indentation;
+-    }
+-  }
+-
+-  return minIndentation === Number.POSITIVE_INFINITY ? 0 : minIndentation;
+-}
+-
+-function dedentString(text, minIndent = getMinIndentation(text)) {
+-  return minIndent === 0
+-    ? text
+-    : text
+-        .split("\n")
+-        .map((lineText) => lineText.slice(minIndent))
+-        .join("\n");
+-}
+-
+ function unescapeQuoteEntities(text) {
+   return text.replaceAll("&apos;", "'").replaceAll("&quot;", '"');
+ }
+@@ -620,7 +586,7 @@ function getTextValueParts(node, value = node.value) {
+     ? node.parent.isIndentationSensitive
+       ? replaceEndOfLine(value)
+       : replaceEndOfLine(
+-          dedentString(htmlTrimPreserveIndentation(value)),
++          htmlWhitespaceUtils.dedentString(htmlTrimPreserveIndentation(value)),
+           hardline,
+         )
+     : join(line, htmlWhitespaceUtils.split(value));
+@@ -632,7 +598,6 @@ function isVueScriptTag(node, options) {
+ 
+ export {
+   canHaveInterpolation,
+-  dedentString,
+   forceBreakChildren,
+   forceBreakContent,
+   forceNextEmptyLine,
+diff --git a/src/utils/whitespace-utils.js b/src/utils/whitespace-utils.js
+index 757889744..9e9ee9c9b 100644
+--- a/src/utils/whitespace-utils.js
++++ b/src/utils/whitespace-utils.js
+@@ -114,6 +114,41 @@ class WhitespaceUtils {
+       whitespaceCharacters.has(character),
+     );
+   }
++
++  #getMinIndentation(text) {
++    let minIndentation = Number.POSITIVE_INFINITY;
++
++    for (const line of text.split("\n")) {
++      if (line.length === 0) {
++        continue;
++      }
++
++      const indentation = this.getLeadingWhitespaceCount(line);
++      if (indentation === 0) {
++        return 0;
++      }
++
++      if (line.length === indentation) {
++        continue;
++      }
++
++      if (indentation < minIndentation) {
++        minIndentation = indentation;
++      }
++    }
++
++    return minIndentation === Number.POSITIVE_INFINITY ? 0 : minIndentation;
++  }
++
++  dedentString(text) {
++    const minIndent = this.#getMinIndentation(text);
++    return minIndent === 0
++      ? text
++      : text
++          .split("\n")
++          .map((lineText) => lineText.slice(minIndent))
++          .join("\n");
++  }
+ }
+ 
+ export default WhitespaceUtils;

@@ -1,0 +1,182 @@
+diff --git a/docs/eslint/eslint-plugin-query.md b/docs/eslint/eslint-plugin-query.md
+index 359fb1274..bc092f3b7 100644
+--- a/docs/eslint/eslint-plugin-query.md
++++ b/docs/eslint/eslint-plugin-query.md
+@@ -98,3 +98,4 @@ Alternatively, add `@tanstack/query` to the plugins section, and configure the r
+ - [@tanstack/query/stable-query-client](./stable-query-client.md)
+ - [@tanstack/query/no-unstable-deps](./no-unstable-deps.md)
+ - [@tanstack/query/infinite-query-property-order](./infinite-query-property-order.md)
++- [@tanstack/query/no-void-query-fn](./no-void-query-fn.md)
+diff --git a/docs/eslint/no-void-query-fn.md b/docs/eslint/no-void-query-fn.md
+new file mode 100644
+index 000000000..445c43775
+--- /dev/null
++++ b/docs/eslint/no-void-query-fn.md
+@@ -0,0 +1,39 @@
++---
++id: no-void-query-fn
++title: Disallow returning void from query functions
++---
++
++Query functions must return a value that will be cached by TanStack Query. Functions that don't return a value (void functions) can lead to unexpected behavior and might indicate a mistake in the implementation.
++
++## Rule Details
++
++Example of **incorrect** code for this rule:
++
++```tsx
++/* eslint "@tanstack/query/no-void-query-fn": "error" */
++
++useQuery({
++  queryKey: ['todos'],
++  queryFn: async () => {
++    await api.todos.fetch() // Function doesn't return the fetched data
++  },
++})
++```
++
++Example of **correct** code for this rule:
++
++```tsx
++/* eslint "@tanstack/query/no-void-query-fn": "error" */
++useQuery({
++  queryKey: ['todos'],
++  queryFn: async () => {
++    const todos = await api.todos.fetch()
++    return todos
++  },
++})
++```
++
++## Attributes
++
++- [x] ✅ Recommended
++- [ ] 🔧 Fixable
+diff --git a/packages/eslint-plugin-query/src/index.ts b/packages/eslint-plugin-query/src/index.ts
+index 19c04064d..f16cb985b 100644
+--- a/packages/eslint-plugin-query/src/index.ts
++++ b/packages/eslint-plugin-query/src/index.ts
+@@ -30,6 +30,7 @@ Object.assign(plugin.configs, {
+       '@tanstack/query/stable-query-client': 'error',
+       '@tanstack/query/no-unstable-deps': 'error',
+       '@tanstack/query/infinite-query-property-order': 'error',
++      '@tanstack/query/no-void-query-fn': 'error',
+     },
+   },
+   'flat/recommended': [
+@@ -44,6 +45,7 @@ Object.assign(plugin.configs, {
+         '@tanstack/query/stable-query-client': 'error',
+         '@tanstack/query/no-unstable-deps': 'error',
+         '@tanstack/query/infinite-query-property-order': 'error',
++        '@tanstack/query/no-void-query-fn': 'error',
+       },
+     },
+   ],
+diff --git a/packages/eslint-plugin-query/src/rules.ts b/packages/eslint-plugin-query/src/rules.ts
+index 73a6efdd5..5163deb3d 100644
+--- a/packages/eslint-plugin-query/src/rules.ts
++++ b/packages/eslint-plugin-query/src/rules.ts
+@@ -3,6 +3,7 @@ import * as stableQueryClient from './rules/stable-query-client/stable-query-cli
+ import * as noRestDestructuring from './rules/no-rest-destructuring/no-rest-destructuring.rule'
+ import * as noUnstableDeps from './rules/no-unstable-deps/no-unstable-deps.rule'
+ import * as infiniteQueryPropertyOrder from './rules/infinite-query-property-order/infinite-query-property-order.rule'
++import * as noVoidQueryFn from './rules/no-void-query-fn/no-void-query-fn.rule'
+ import type { ESLintUtils } from '@typescript-eslint/utils'
+ import type { ExtraRuleDocs } from './types'
+ 
+@@ -20,4 +21,5 @@ export const rules: Record<
+   [noRestDestructuring.name]: noRestDestructuring.rule,
+   [noUnstableDeps.name]: noUnstableDeps.rule,
+   [infiniteQueryPropertyOrder.name]: infiniteQueryPropertyOrder.rule,
++  [noVoidQueryFn.name]: noVoidQueryFn.rule,
+ }
+diff --git a/packages/eslint-plugin-query/src/rules/no-void-query-fn/no-void-query-fn.rule.ts b/packages/eslint-plugin-query/src/rules/no-void-query-fn/no-void-query-fn.rule.ts
+new file mode 100644
+index 000000000..9c202e621
+--- /dev/null
++++ b/packages/eslint-plugin-query/src/rules/no-void-query-fn/no-void-query-fn.rule.ts
+@@ -0,0 +1,84 @@
++import { ESLintUtils } from '@typescript-eslint/utils'
++import ts from 'typescript'
++import { ASTUtils } from '../../utils/ast-utils'
++import { detectTanstackQueryImports } from '../../utils/detect-react-query-imports'
++import { getDocsUrl } from '../../utils/get-docs-url'
++import type { ExtraRuleDocs } from '../../types'
++
++export const name = 'no-void-query-fn'
++
++const createRule = ESLintUtils.RuleCreator<ExtraRuleDocs>(getDocsUrl)
++
++export const rule = createRule({
++  name,
++  meta: {
++    type: 'problem',
++    docs: {
++      description: 'Ensures queryFn returns a non-undefined value',
++      recommended: 'error',
++    },
++    messages: {
++      noVoidReturn: 'queryFn must return a non-undefined value',
++    },
++    schema: [],
++  },
++  defaultOptions: [],
++
++  create: detectTanstackQueryImports((context) => {
++    return {
++      Property(node) {
++        if (
++          !ASTUtils.isObjectExpression(node.parent) ||
++          !ASTUtils.isIdentifierWithName(node.key, 'queryFn')
++        ) {
++          return
++        }
++
++        const parserServices = context.sourceCode.parserServices
++
++        if (
++          !parserServices ||
++          !parserServices.esTreeNodeToTSNodeMap ||
++          !parserServices.program
++        ) {
++          return
++        }
++
++        const checker = parserServices.program.getTypeChecker()
++        const tsNode = parserServices.esTreeNodeToTSNodeMap.get(node.value)
++        const type = checker.getTypeAtLocation(tsNode)
++
++        // Get the return type of the function
++        if (type.getCallSignatures().length > 0) {
++          const returnType = type.getCallSignatures()[0]?.getReturnType()
++
++          if (!returnType) {
++            return
++          }
++
++          // Check if return type is void or undefined
++          if (isIllegalReturn(checker, returnType)) {
++            context.report({
++              node: node.value,
++              messageId: 'noVoidReturn',
++            })
++          }
++        }
++      },
++    }
++  }),
++})
++
++function isIllegalReturn(checker: ts.TypeChecker, type: ts.Type): boolean {
++  const awaited = checker.getAwaitedType(type)
++
++  if (!awaited) return false
++
++  if (awaited.isUnion()) {
++    return awaited.types.some((t) => isIllegalReturn(checker, t))
++  }
++
++  return awaited.flags & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)
++    ? true
++    : false
++}

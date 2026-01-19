@@ -1,0 +1,97 @@
+diff --git a/index.js b/index.js
+index 07d55dc..1778be2 100644
+--- a/index.js
++++ b/index.js
+@@ -18,6 +18,7 @@ const Buffer = require('safe-buffer').Buffer;
+ const isURL = require('isurl');
+ const isPlainObj = require('is-plain-obj');
+ const PCancelable = require('p-cancelable');
++const pTimeout = require('p-timeout');
+ const pkg = require('./package');
+ 
+ function requestAsEventEmitter(opts) {
+@@ -101,7 +102,11 @@ function requestAsEventEmitter(opts) {
+ }
+ 
+ function asPromise(opts) {
+-	return new PCancelable((onCancel, resolve, reject) => {
++	const timeoutFn = requestPromise => opts.gotTimeout && opts.gotTimeout.request ?
++		pTimeout(requestPromise, opts.gotTimeout.request, new got.RequestError({message: 'Request timed out', code: 'ETIMEDOUT'}, opts)) :
++		requestPromise;
++
++	return timeoutFn(new PCancelable((onCancel, resolve, reject) => {
+ 		const ee = requestAsEventEmitter(opts);
+ 		let cancelOnRequest = false;
+ 
+@@ -161,13 +166,20 @@ function asPromise(opts) {
+ 		});
+ 
+ 		ee.on('error', reject);
+-	});
++	}));
+ }
+ 
+ function asStream(opts) {
+ 	const input = new PassThrough();
+ 	const output = new PassThrough();
+ 	const proxy = duplexer3(input, output);
++	let timeout;
++
++	if (opts.gotTimeout && opts.gotTimeout.request) {
++		timeout = setTimeout(() => {
++			proxy.emit('error', new got.RequestError({message: 'Request timed out', code: 'ETIMEDOUT'}, opts));
++		}, opts.gotTimeout.request);
++	}
+ 
+ 	if (opts.json) {
+ 		throw new Error('got can not be used as stream when options.json is used');
+@@ -203,6 +215,8 @@ function asStream(opts) {
+ 	});
+ 
+ 	ee.on('response', res => {
++		clearTimeout(timeout);
++
+ 		const statusCode = res.statusCode;
+ 
+ 		res.pipe(output);
+@@ -336,7 +350,11 @@ function normalizeArguments(url, opts) {
+ 	}
+ 
+ 	if (opts.timeout) {
+-		opts.gotTimeout = opts.timeout;
++		if (typeof opts.timeout === 'number') {
++			opts.gotTimeout = {request: opts.timeout};
++		} else {
++			opts.gotTimeout = opts.timeout;
++		}
+ 		delete opts.timeout;
+ 	}
+ 
+diff --git a/package.json b/package.json
+index 34f0b99..4c449f0 100644
+--- a/package.json
++++ b/package.json
+@@ -57,6 +57,7 @@
+     "isurl": "^1.0.0-alpha5",
+     "lowercase-keys": "^1.0.0",
+     "p-cancelable": "^0.2.0",
++    "p-timeout": "^1.1.1",
+     "safe-buffer": "^5.0.1",
+     "timed-out": "^4.0.0",
+     "url-parse-lax": "^1.0.0"
+diff --git a/readme.md b/readme.md
+index 6f25119..ff2bfa9 100644
+--- a/readme.md
++++ b/readme.md
+@@ -125,9 +125,9 @@ Query string object that will be added to the request URL. This will override th
+ 
+ Type: `number`, `object`
+ 
+-Milliseconds to wait for a server to send response headers before aborting request with `ETIMEDOUT` error.
++Milliseconds to wait for the server to end the response before aborting request with `ETIMEDOUT` error.
+ 
+-Option accepts `object` with separate `connect` and `socket` fields for connection and socket inactivity timeouts.
++This also accepts an object with separate `connect`, `socket`, and `request` fields for connection, socket, and entire request timeouts.
+ 
+ ###### retries
+ 

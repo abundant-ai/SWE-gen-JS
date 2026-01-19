@@ -1,0 +1,215 @@
+diff --git a/packages/core/router/router-execution-context.ts b/packages/core/router/router-execution-context.ts
+index 9f783f06e..d1e983834 100644
+--- a/packages/core/router/router-execution-context.ts
++++ b/packages/core/router/router-execution-context.ts
+@@ -434,7 +434,7 @@ export class RouterExecutionContext {
+     }
+     const isSseHandler = !!this.reflectSse(callback);
+     if (isSseHandler) {
+-      return async <
++      return <
+         TResult extends Observable<unknown> = any,
+         TResponse extends HeaderStream = any,
+         TRequest extends IncomingMessage = any,
+@@ -443,7 +443,7 @@ export class RouterExecutionContext {
+         res: TResponse,
+         req: TRequest,
+       ) => {
+-        await this.responseController.sse(
++        this.responseController.sse(
+           result,
+           (res as any).raw || res,
+           (req as any).raw || req,
+diff --git a/packages/core/router/router-response-controller.ts b/packages/core/router/router-response-controller.ts
+index 5c5e48ac6..e66544a1d 100644
+--- a/packages/core/router/router-response-controller.ts
++++ b/packages/core/router/router-response-controller.ts
+@@ -99,12 +99,12 @@ export class RouterResponseController {
+     this.applicationRef.status(response, statusCode);
+   }
+ 
+-  public async sse<
++  public sse<
+     TInput extends Observable<unknown> = any,
+     TResponse extends WritableHeaderStream = any,
+     TRequest extends IncomingMessage = any,
+   >(
+-    result: TInput | Promise<TInput>,
++    result: TInput,
+     response: TResponse,
+     request: TRequest,
+     options?: { additionalHeaders: AdditionalHeaders },
+@@ -114,22 +114,12 @@ export class RouterResponseController {
+       return;
+     }
+ 
+-    const observableResult = await Promise.resolve(result);
+-
+-    this.assertObservable(observableResult);
++    this.assertObservable(result);
+ 
+     const stream = new SseStream(request);
++    stream.pipe(response, options);
+ 
+-    // Extract custom status code from response if it was set
+-    const customStatusCode = (response as any).statusCode;
+-    const pipeOptions =
+-      typeof customStatusCode !== 'undefined'
+-        ? { ...options, statusCode: customStatusCode }
+-        : options;
+-
+-    stream.pipe(response, pipeOptions);
+-
+-    const subscription = observableResult
++    const subscription = result
+       .pipe(
+         map((message): MessageEvent => {
+           if (isObject(message)) {
+diff --git a/packages/core/router/sse-stream.ts b/packages/core/router/sse-stream.ts
+index 26b5a2522..a354c8a89 100644
+--- a/packages/core/router/sse-stream.ts
++++ b/packages/core/router/sse-stream.ts
+@@ -66,13 +66,11 @@ export class SseStream extends Transform {
+     destination: T,
+     options?: {
+       additionalHeaders?: AdditionalHeaders;
+-      statusCode?: number;
+       end?: boolean;
+     },
+   ): T {
+     if (destination.writeHead) {
+-      const statusCode = options?.statusCode ?? 200;
+-      destination.writeHead(statusCode, {
++      destination.writeHead(200, {
+         ...options?.additionalHeaders,
+         // See https://github.com/dunglas/mercure/blob/master/hub/subscribe.go#L124-L130
+         'Content-Type': 'text/event-stream',
+diff --git a/packages/core/test/router/router-response-controller.spec.ts b/packages/core/test/router/router-response-controller.spec.ts
+index 997e335aa..20c4ed8ba 100644
+--- a/packages/core/test/router/router-response-controller.spec.ts
++++ b/packages/core/test/router/router-response-controller.spec.ts
+@@ -263,7 +263,7 @@ describe('RouterResponseController', () => {
+     it('should accept only observables', async () => {
+       const result = Promise.resolve('test');
+       try {
+-        await routerResponseController.sse(
++        routerResponseController.sse(
+           result as unknown as any,
+           {} as unknown as ServerResponse,
+           {} as unknown as IncomingMessage,
+@@ -275,76 +275,6 @@ describe('RouterResponseController', () => {
+       }
+     });
+ 
+-    it('should accept Promise<Observable>', async () => {
+-      class Sink extends Writable {
+-        private readonly chunks: string[] = [];
+-
+-        _write(
+-          chunk: any,
+-          encoding: string,
+-          callback: (error?: Error | null) => void,
+-        ): void {
+-          this.chunks.push(chunk);
+-          callback();
+-        }
+-
+-        get content() {
+-          return this.chunks.join('');
+-        }
+-      }
+-
+-      const written = (stream: Writable) =>
+-        new Promise((resolve, reject) =>
+-          stream.on('error', reject).on('finish', resolve),
+-        );
+-
+-      const result = Promise.resolve(of('test'));
+-      const response = new Sink();
+-      const request = new PassThrough();
+-      await routerResponseController.sse(
+-        result,
+-        response as unknown as ServerResponse,
+-        request as unknown as IncomingMessage,
+-      );
+-      request.destroy();
+-      await written(response);
+-      expect(response.content).to.eql(
+-        `
+-id: 1
+-data: test
+-
+-`,
+-      );
+-    });
+-
+-    it('should use custom status code from response', async () => {
+-      class SinkWithStatusCode extends Writable {
+-        statusCode = 404;
+-        writeHead = sinon.spy();
+-        flushHeaders = sinon.spy();
+-
+-        _write(
+-          chunk: any,
+-          encoding: string,
+-          callback: (error?: Error | null) => void,
+-        ): void {
+-          callback();
+-        }
+-      }
+-
+-      const result = of('test');
+-      const response = new SinkWithStatusCode();
+-      const request = new PassThrough();
+-      await routerResponseController.sse(
+-        result,
+-        response as unknown as ServerResponse,
+-        request as unknown as IncomingMessage,
+-      );
+-
+-      expect(response.writeHead.firstCall.args[0]).to.equal(404);
+-      request.destroy();
+-    });
+-
+     it('should write string', async () => {
+       class Sink extends Writable {
+         private readonly chunks: string[] = [];
+diff --git a/packages/core/test/router/sse-stream.spec.ts b/packages/core/test/router/sse-stream.spec.ts
+index 52666806e..4a41e4ecc 100644
+--- a/packages/core/test/router/sse-stream.spec.ts
++++ b/packages/core/test/router/sse-stream.spec.ts
+@@ -160,34 +160,6 @@ data: hello
+     });
+   });
+ 
+-  it('sets custom status code when provided', callback => {
+-    const sse = new SseStream();
+-    const sink = new Sink(
+-      (status: number, headers: string | OutgoingHttpHeaders) => {
+-        expect(status).to.equal(404);
+-        callback();
+-        return sink;
+-      },
+-    );
+-
+-    sse.pipe(sink, {
+-      statusCode: 404,
+-    });
+-  });
+-
+-  it('defaults to 200 status code when not provided', callback => {
+-    const sse = new SseStream();
+-    const sink = new Sink(
+-      (status: number, headers: string | OutgoingHttpHeaders) => {
+-        expect(status).to.equal(200);
+-        callback();
+-        return sink;
+-      },
+-    );
+-
+-    sse.pipe(sink);
+-  });
+-
+   it('allows an eventsource to connect', callback => {
+     let sse: SseStream;
+     const server = createServer((req, res) => {

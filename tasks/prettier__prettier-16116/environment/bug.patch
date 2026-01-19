@@ -1,0 +1,291 @@
+diff --git a/changelog_unreleased/javascript/16116.md b/changelog_unreleased/javascript/16116.md
+deleted file mode 100644
+index 31673dfa1..000000000
+--- a/changelog_unreleased/javascript/16116.md
++++ /dev/null
+@@ -1,19 +0,0 @@
+-#### Allow linebreaks in member expressions in template interpolations (#16116 by @bakkot)
+-
+-When there is already a linebreak in a template interpolation, allow it to stay there even if it is a member expression. Note that (as of [#15209](https://github.com/prettier/prettier/pull/15209)) Prettier will not insert a linebreak inside an interpolation when one is not already present.
+-
+-<!-- prettier-ignore -->
+-```jsx
+-// Input
+-`template with ${
+-    very.very.very.very.very.very.very.very.very.very.very.long.chain
+-}`;
+-
+-// Prettier stable
+-`template with ${very.very.very.very.very.very.very.very.very.very.very.long.chain}`;
+-
+-// Prettier main
+-`template with ${
+-  very.very.very.very.very.very.very.very.very.very.very.long.chain
+-}`;
+-```
+diff --git a/src/language-js/print/template-literal.js b/src/language-js/print/template-literal.js
+index effab7f88..d4b1db9cc 100644
+--- a/src/language-js/print/template-literal.js
++++ b/src/language-js/print/template-literal.js
+@@ -20,6 +20,7 @@ import {
+   isBinaryCastExpression,
+   isBinaryish,
+   isMemberExpression,
++  isSimpleTemplateLiteral,
+ } from "../utils/index.js";
+ 
+ function printTemplateLiteral(path, print, options) {
+@@ -38,7 +39,18 @@ function printTemplateLiteral(path, print, options) {
+   }
+   const parts = [];
+ 
+-  const expressionDocs = path.map(print, expressionsKey);
++  let expressionDocs = path.map(print, expressionsKey);
++  const isSimple = isSimpleTemplateLiteral(node);
++
++  if (isSimple) {
++    expressionDocs = expressionDocs.map(
++      (doc) =>
++        printDocToString(doc, {
++          ...options,
++          printWidth: Number.POSITIVE_INFINITY,
++        }).formatted,
++    );
++  }
+ 
+   parts.push(lineSuffixBoundary, "`");
+ 
+@@ -70,43 +82,44 @@ function printTemplateLiteral(path, print, options) {
+ 
+     let expressionDoc = expressionDocs[index];
+ 
+-    const expression = node[expressionsKey][index];
++    if (!isSimple) {
++      const expression = node[expressionsKey][index];
+ 
+-    let interpolationHasNewline = hasNewlineInRange(
+-      options.originalText,
+-      locEnd(quasi),
+-      locStart(node.quasis[index + 1]),
+-    );
++      let interpolationHasNewline = hasNewlineInRange(
++        options.originalText,
++        locEnd(quasi),
++        locStart(node.quasis[index + 1]),
++      );
+ 
+-    if (!interpolationHasNewline) {
+-      // Never add a newline to an interpolation which didn't already have one...
+-      const renderedExpression = printDocToString(expressionDoc, {
+-        ...options,
+-        printWidth: Number.POSITIVE_INFINITY,
+-      }).formatted;
+-
+-      // ... unless one will be introduced anyway, e.g. by a nested function.
+-      // This case is rare, so we can pay the cost of re-rendering.
+-      if (renderedExpression.includes("\n")) {
+-        interpolationHasNewline = true;
+-      } else {
+-        expressionDoc = renderedExpression;
++      if (!interpolationHasNewline) {
++        // Never add a newline to an interpolation which didn't already have one...
++        const renderedExpression = printDocToString(expressionDoc, {
++          ...options,
++          printWidth: Number.POSITIVE_INFINITY,
++        }).formatted;
++
++        // ... unless one will be introduced anyway, e.g. by a nested function.
++        // This case is rare, so we can pay the cost of re-rendering.
++        if (renderedExpression.includes("\n")) {
++          interpolationHasNewline = true;
++        } else {
++          expressionDoc = renderedExpression;
++        }
+       }
+-    }
+ 
+-    // Breaks at the template element boundaries (${ and }) are preferred to breaking
+-    // in the middle of a MemberExpression
+-    if (
+-      interpolationHasNewline &&
+-      (hasComment(expression) ||
+-        expression.type === "Identifier" ||
+-        isMemberExpression(expression) ||
+-        expression.type === "ConditionalExpression" ||
+-        expression.type === "SequenceExpression" ||
+-        isBinaryCastExpression(expression) ||
+-        isBinaryish(expression))
+-    ) {
+-      expressionDoc = [indent([softline, expressionDoc]), softline];
++      // Breaks at the template element boundaries (${ and }) are preferred to breaking
++      // in the middle of a MemberExpression
++      if (
++        interpolationHasNewline &&
++        (hasComment(expression) ||
++          isMemberExpression(expression) ||
++          expression.type === "ConditionalExpression" ||
++          expression.type === "SequenceExpression" ||
++          isBinaryCastExpression(expression) ||
++          isBinaryish(expression))
++      ) {
++        expressionDoc = [indent([softline, expressionDoc]), softline];
++      }
+     }
+ 
+     const aligned =
+diff --git a/src/language-js/utils/index.js b/src/language-js/utils/index.js
+index f0c385da5..369e0c381 100644
+--- a/src/language-js/utils/index.js
++++ b/src/language-js/utils/index.js
+@@ -418,6 +418,68 @@ const isMemberExpression = skipChainExpression(
+   createTypeCheckFunction(["MemberExpression", "OptionalMemberExpression"]),
+ );
+ 
++/**
++ *
++ * @param {any} node
++ * @returns {boolean}
++ */
++function isSimpleTemplateLiteral(node) {
++  let expressionsKey = "expressions";
++  if (node.type === "TSTemplateLiteralType") {
++    expressionsKey = "types";
++  }
++  const expressions = node[expressionsKey];
++
++  if (expressions.length === 0) {
++    return false;
++  }
++
++  return expressions.every((expr) => {
++    if (isSimpleAtomicExpression(expr) || isSimpleMemberExpression(expr)) {
++      return true;
++    }
++  });
++}
++
++function isSimpleMemberExpression(
++  node,
++  { maxDepth = Number.POSITIVE_INFINITY } = {},
++) {
++  if (hasComment(node)) {
++    return false;
++  }
++  if (node.type === "ChainExpression") {
++    return isSimpleMemberExpression(node.expression, { maxDepth });
++  }
++  if (!isMemberExpression(node)) {
++    return false;
++  }
++
++  let head = node;
++  let depth = 0;
++  while (isMemberExpression(head) && depth++ <= maxDepth) {
++    if (!isSimpleAtomicExpression(head.property)) {
++      return false;
++    }
++    head = head.object;
++    if (hasComment(head)) {
++      return false;
++    }
++  }
++  return isSimpleAtomicExpression(head);
++}
++
++/**
++ * This is intended to return true for small expressions
++ * which cannot be broken.
++ */
++function isSimpleAtomicExpression(node) {
++  if (hasComment(node)) {
++    return false;
++  }
++  return isLiteral(node) || isSingleWordType(node);
++}
++
+ /**
+  * Attempts to gauge the rough complexity of a node, for example
+  * to detect deeply-nested booleans, call expressions with lots of arguments, etc.
+@@ -1145,8 +1207,11 @@ export {
+   isPrettierIgnoreComment,
+   isRegExpLiteral,
+   isSignedNumericLiteral,
++  isSimpleAtomicExpression,
+   isSimpleCallArgument,
+   isSimpleExpressionByNodeCount,
++  isSimpleMemberExpression,
++  isSimpleTemplateLiteral,
+   isSimpleType,
+   isStringLiteral,
+   isTemplateOnItsOwnLine,
+diff --git a/tests/format/js/strings/__snapshots__/jsfmt.spec.js.snap b/tests/format/js/strings/__snapshots__/jsfmt.spec.js.snap
+index b21ee067e..c5982dad0 100644
+--- a/tests/format/js/strings/__snapshots__/jsfmt.spec.js.snap
++++ b/tests/format/js/strings/__snapshots__/jsfmt.spec.js.snap
+@@ -415,12 +415,6 @@ and this other one: \${
+ which already had a linebreak so can be broken up
+ \`;
+ 
+-// https://github.com/prettier/prettier/issues/16114
+-message = \`this is a long messsage a simple interpolation without a linebreak \${foo} <- like this\`;
+-
+-message = \`whereas this messsage has a linebreak in the interpolation \${
+-  foo} <- like this\`;
+-
+ =====================================output=====================================
+ foo(
+   \`a long string \${1 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3} with expr\`,
+@@ -543,13 +537,6 @@ and this other one: \${this(
+ which already had a linebreak so can be broken up
+ \`;
+ 
+-// https://github.com/prettier/prettier/issues/16114
+-message = \`this is a long messsage a simple interpolation without a linebreak \${foo} <- like this\`;
+-
+-message = \`whereas this messsage has a linebreak in the interpolation \${
+-  foo
+-} <- like this\`;
+-
+ ================================================================================
+ `;
+ 
+@@ -628,12 +615,6 @@ and this other one: \${
+ which already had a linebreak so can be broken up
+ \`;
+ 
+-// https://github.com/prettier/prettier/issues/16114
+-message = \`this is a long messsage a simple interpolation without a linebreak \${foo} <- like this\`;
+-
+-message = \`whereas this messsage has a linebreak in the interpolation \${
+-  foo} <- like this\`;
+-
+ =====================================output=====================================
+ foo(
+   \`a long string \${1 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3 + 2 + 3} with expr\`
+@@ -756,12 +737,5 @@ and this other one: \${this(
+ which already had a linebreak so can be broken up
+ \`;
+ 
+-// https://github.com/prettier/prettier/issues/16114
+-message = \`this is a long messsage a simple interpolation without a linebreak \${foo} <- like this\`;
+-
+-message = \`whereas this messsage has a linebreak in the interpolation \${
+-  foo
+-} <- like this\`;
+-
+ ================================================================================
+ `;
+diff --git a/tests/format/js/strings/template-literals.js b/tests/format/js/strings/template-literals.js
+index d7c9e71eb..fc6bca5d9 100644
+--- a/tests/format/js/strings/template-literals.js
++++ b/tests/format/js/strings/template-literals.js
+@@ -65,9 +65,3 @@ and this other one: ${
+ }
+ which already had a linebreak so can be broken up
+ `;
+-
+-// https://github.com/prettier/prettier/issues/16114
+-message = `this is a long messsage a simple interpolation without a linebreak ${foo} <- like this`;
+-
+-message = `whereas this messsage has a linebreak in the interpolation ${
+-  foo} <- like this`;

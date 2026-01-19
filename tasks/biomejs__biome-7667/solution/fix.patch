@@ -1,0 +1,178 @@
+diff --git a/.changeset/social-hornets-wait.md b/.changeset/social-hornets-wait.md
+new file mode 100644
+index 0000000000..c485403a2d
+--- /dev/null
++++ b/.changeset/social-hornets-wait.md
+@@ -0,0 +1,12 @@
++---
++"@biomejs/biome": minor
++---
++
++Added the ability to show severity `Information` diagnostics in reporter outputs.
++
++If one or more rules are triggered, and they are configured to emit an `Information` diagnostic, now they're counted in the final output:
++
++```bash
++Checked 1 file in <TIME>. No fixes applied.
++Found 1 info.
++```
+diff --git a/.changeset/warm-insects-dress.md b/.changeset/warm-insects-dress.md
+index 46aeb7f9b4..3b15c05143 100644
+--- a/.changeset/warm-insects-dress.md
++++ b/.changeset/warm-insects-dress.md
+@@ -6,7 +6,7 @@
+ 
+ The option `lineEnding` now has a variant called `auto` to match the operating system's expected
+ line-ending style: on Windows, this will be CRLF (`\r\n`), and on macOS / Linux, this will
+-be LF (`\n`). 
++be LF (`\n`).
+ 
+ This allows for cross-platform projects that use Biome not to have to
+ force one option or the other, which aligns better with Git's default behavior
+diff --git a/crates/biome_cli/src/execute/traverse.rs b/crates/biome_cli/src/execute/traverse.rs
+index 28f7512a4f..19ea18ae04 100644
+--- a/crates/biome_cli/src/execute/traverse.rs
++++ b/crates/biome_cli/src/execute/traverse.rs
+@@ -101,6 +101,7 @@ pub(crate) fn traverse(
+ 
+     let errors = printer.errors();
+     let warnings = printer.warnings();
++    let infos = printer.infos();
+     let changed = changed.load(Ordering::Relaxed);
+     let unchanged = unchanged.load(Ordering::Relaxed);
+     let matches = matches.load(Ordering::Relaxed);
+@@ -116,6 +117,7 @@ pub(crate) fn traverse(
+             errors,
+             matches,
+             warnings,
++            infos,
+             skipped,
+             suggested_fixes_skipped,
+             diagnostics_not_printed,
+@@ -165,6 +167,9 @@ struct DiagnosticsPrinter<'ctx> {
+     /// Mutable reference to a boolean flag tracking whether the console thread
+     /// printed any warnings-level message
+     warnings: AtomicU32,
++    /// Mutable reference to a boolean flag tracking whether the console thread
++    /// printed any info-level message
++    infos: AtomicU32,
+     /// Whether the console thread should print diagnostics in verbose mode
+     verbose: bool,
+     /// The diagnostic level the console thread should print
+@@ -183,6 +188,7 @@ impl<'ctx> DiagnosticsPrinter<'ctx> {
+         Self {
+             errors: AtomicU32::new(0),
+             warnings: AtomicU32::new(0),
++            infos: AtomicU32::new(0),
+             remaining_diagnostics: AtomicU32::new(0),
+             execution,
+             diagnostic_level: Severity::Hint,
+@@ -218,6 +224,10 @@ impl<'ctx> DiagnosticsPrinter<'ctx> {
+         self.warnings.load(Ordering::Relaxed)
+     }
+ 
++    fn infos(&self) -> u32 {
++        self.infos.load(Ordering::Relaxed)
++    }
++
+     fn not_printed_diagnostics(&self) -> u32 {
+         self.not_printed_diagnostics.load(Ordering::Relaxed)
+     }
+@@ -284,6 +294,9 @@ impl<'ctx> DiagnosticsPrinter<'ctx> {
+                     if err.severity() == Severity::Warning {
+                         self.warnings.fetch_add(1, Ordering::Relaxed);
+                     }
++                    // if err.severity() == Severity::Information {
++                    //     self.infos.fetch_add(1, Ordering::Relaxed);
++                    // }
+                     if let Some(Resource::File(file_path)) = location.resource.as_ref() {
+                         // Retrieves the file name from the file ID cache, if it's a miss
+                         // flush entries from the interner channel until it's found
+@@ -340,6 +353,9 @@ impl<'ctx> DiagnosticsPrinter<'ctx> {
+                         if severity == Severity::Warning {
+                             self.warnings.fetch_add(1, Ordering::Relaxed);
+                         }
++                        if severity == Severity::Information {
++                            self.infos.fetch_add(1, Ordering::Relaxed);
++                        }
+ 
+                         let should_print = self.should_print();
+ 
+diff --git a/crates/biome_cli/src/reporter/mod.rs b/crates/biome_cli/src/reporter/mod.rs
+index 194f1f2cbb..599be5e2a2 100644
+--- a/crates/biome_cli/src/reporter/mod.rs
++++ b/crates/biome_cli/src/reporter/mod.rs
+@@ -37,6 +37,7 @@ pub struct TraversalSummary {
+     pub scanner_duration: Option<Duration>,
+     pub errors: u32,
+     pub warnings: u32,
++    pub infos: u32,
+     pub skipped: usize,
+     pub suggested_fixes_skipped: u32,
+     pub diagnostics_not_printed: u32,
+diff --git a/crates/biome_cli/src/reporter/terminal.rs b/crates/biome_cli/src/reporter/terminal.rs
+index 75877cf738..dce07f2047 100644
+--- a/crates/biome_cli/src/reporter/terminal.rs
++++ b/crates/biome_cli/src/reporter/terminal.rs
+@@ -259,28 +259,45 @@ impl fmt::Display for ConsoleTraversalSummary<'_> {
+         let detail = SummaryDetail(mode, summary.changed);
+         fmt.write_markup(markup!(<Info>{total}{detail}</Info>))?;
+ 
+-        if summary.errors > 0 {
+-            if summary.errors == 1 {
+-                fmt.write_markup(markup!("\n"<Error>"Found "{summary.errors}" error."</Error>))?;
+-            } else {
+-                fmt.write_markup(markup!("\n"<Error>"Found "{summary.errors}" errors."</Error>))?;
+-            }
+-        }
+-        if summary.warnings > 0 {
+-            if summary.warnings == 1 {
+-                fmt.write_markup(markup!("\n"<Warn>"Found "{summary.warnings}" warning."</Warn>))?;
+-            } else {
+-                fmt.write_markup(markup!("\n"<Warn>"Found "{summary.warnings}" warnings."</Warn>))?;
+-            }
+-        }
+-
++        // The search emits info diagnostics, so we use if control-flow to print a different message
+         if let TraversalMode::Search { .. } = mode {
+             if summary.matches == 1 {
+                 fmt.write_markup(markup!(" "<Info>"Found "{summary.matches}" match."</Info>))?
+             } else {
+                 fmt.write_markup(markup!(" "<Info>"Found "{summary.matches}" matches."</Info>))?
+             };
+-        };
++        } else {
++            if summary.errors > 0 {
++                if summary.errors == 1 {
++                    fmt.write_markup(
++                        markup!("\n"<Error>"Found "{summary.errors}" error."</Error>),
++                    )?;
++                } else {
++                    fmt.write_markup(
++                        markup!("\n"<Error>"Found "{summary.errors}" errors."</Error>),
++                    )?;
++                }
++            }
++            if summary.warnings > 0 {
++                if summary.warnings == 1 {
++                    fmt.write_markup(
++                        markup!("\n"<Warn>"Found "{summary.warnings}" warning."</Warn>),
++                    )?;
++                } else {
++                    fmt.write_markup(
++                        markup!("\n"<Warn>"Found "{summary.warnings}" warnings."</Warn>),
++                    )?;
++                }
++            }
++
++            if summary.infos > 0 {
++                if summary.infos == 1 {
++                    fmt.write_markup(markup!("\n"<Info>"Found "{summary.infos}" info."</Info>))?;
++                } else {
++                    fmt.write_markup(markup!("\n"<Info>"Found "{summary.infos}" infos."</Info>))?;
++                }
++            }
++        }
+         Ok(())
+     }
+ }

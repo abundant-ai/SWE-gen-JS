@@ -1,0 +1,300 @@
+diff --git a/changelog_unreleased/angular/16922-2.md b/changelog_unreleased/angular/16922-2.md
+new file mode 100644
+index 000000000..446699da2
+--- /dev/null
++++ b/changelog_unreleased/angular/16922-2.md
+@@ -0,0 +1,27 @@
++#### Improve line breaks inside ICU blocks (#16922 by @fisker)
++
++<!-- prettier-ignore -->
++```html
++<!-- Input -->
++<span>The author is {gender, select, male {male} female {female} other {other}}</span>
++<span>The author is <span>male consectetur adipiscing elit, sed do eiusmod</span></span>
++
++<!-- Prettier stable -->
++<span
++  >The author is {gender, select, male {male} female {female} other {other}
++}</span>
++<span
++  >The author is
++  <span>male consectetur adipiscing elit, sed do eiusmod</span></span
++>
++
++<!-- Prettier main -->
++<span
++  >The author is
++  {gender, select, male {male} female {female} other {other}}</span
++>
++<span
++  >The author is
++  <span>male consectetur adipiscing elit, sed do eiusmod</span></span
++>
++```
+diff --git a/changelog_unreleased/angular/16922.md b/changelog_unreleased/angular/16922.md
+new file mode 100644
+index 000000000..4c70bcff5
+--- /dev/null
++++ b/changelog_unreleased/angular/16922.md
+@@ -0,0 +1,36 @@
++#### Fix extra new line inside ICU blocks (#16922 by @fisker)
++
++<!-- prettier-ignore -->
++```html
++<!-- Input -->
++{active, select,
++  true {
++    Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod temp
++  }
++  false {
++    Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod temp
++  }
++}
++
++<!-- Prettier stable -->
++{active, select,
++  true {
++    Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod temp
++
++  }
++  false {
++    Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod temp
++
++  }
++}
++
++<!-- Prettier main -->
++{active, select,
++  true {
++    Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod temp
++  }
++  false {
++    Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod temp
++  }
++}
++```
+diff --git a/src/language-html/ast.js b/src/language-html/ast.js
+index bdcaf18b3..144471e01 100644
+--- a/src/language-html/ast.js
++++ b/src/language-html/ast.js
+@@ -11,6 +11,9 @@ const NON_ENUMERABLE_PROPERTIES = new Set(["parent"]);
+ // https://github.com/microsoft/TypeScript/issues/26811
+ 
+ class Node {
++  type;
++  parent;
++
+   constructor(nodeOrProperties = {}) {
+     for (const property of new Set([
+       ...NON_ENUMERABLE_PROPERTIES,
+@@ -51,7 +54,6 @@ class Node {
+         const mappedNodes = mapNodesIfChanged(nodes, (node) => node.map(fn));
+         if (newNode !== nodes) {
+           if (!newNode) {
+-            // @ts-expect-error
+             newNode = new Node({ parent: this.parent });
+           }
+           newNode.setProperty(NODES_KEY, mappedNodes);
+@@ -96,21 +98,16 @@ class Node {
+    * @param {Object} [node]
+    */
+   insertChildBefore(target, node) {
+-    // @ts-expect-error
+-    this.children.splice(
+-      // @ts-expect-error
+-      this.children.indexOf(target),
+-      0,
+-      this.createChild(node),
+-    );
++    const children = this.$children;
++    children.splice(children.indexOf(target), 0, this.createChild(node));
+   }
+ 
+   /**
+    * @param {Node} [child]
+    */
+   removeChild(child) {
+-    // @ts-expect-error
+-    this.children.splice(this.children.indexOf(child), 1);
++    const children = this.$children;
++    children.splice(children.indexOf(child), 1);
+   }
+ 
+   /**
+@@ -118,32 +115,57 @@ class Node {
+    * @param {Object} [node]
+    */
+   replaceChild(target, node) {
+-    // @ts-expect-error
+-    this.children[this.children.indexOf(target)] = this.createChild(node);
++    const children = this.$children;
++    children[children.indexOf(target)] = this.createChild(node);
+   }
+ 
+   clone() {
+     return new Node(this);
+   }
+ 
++  get #childrenProperty() {
++    if (this.type === "angularIcuCase") {
++      return "expression";
++    }
++
++    if (this.type === "angularIcuExpression") {
++      return "cases";
++    }
++
++    return "children";
++  }
++
++  // Use `$` prefix since `children` already exits in the original AST,
++  // Can't use `#children` either, since it need be public
++  // There are other children in different Node, see `#childrenProperty`
++  get $children() {
++    return this[this.#childrenProperty];
++  }
++
++  set $children(value) {
++    this[this.#childrenProperty] = value;
++  }
++
+   get firstChild() {
+-    // @ts-expect-error
+-    return this.children?.[0];
++    return this.$children?.[0];
+   }
+ 
+   get lastChild() {
+-    // @ts-expect-error
+-    return this.children?.[this.children.length - 1];
++    return this.$children?.at(-1);
++  }
++
++  get #siblings() {
++    return this.parent?.$children ?? [];
+   }
+ 
+   get prev() {
+-    // @ts-expect-error
+-    return this.parent?.children?.[this.parent.children.indexOf(this) - 1];
++    const siblings = this.#siblings;
++    return siblings[siblings.indexOf(this) - 1];
+   }
+ 
+   get next() {
+-    // @ts-expect-error
+-    return this.parent?.children?.[this.parent.children.indexOf(this) + 1];
++    const siblings = this.#siblings;
++    return siblings[siblings.indexOf(this) + 1];
+   }
+ 
+   // for element and attribute
+diff --git a/src/language-html/print-preprocess.js b/src/language-html/print-preprocess.js
+index 9e6dc9300..f0284e583 100644
+--- a/src/language-html/print-preprocess.js
++++ b/src/language-html/print-preprocess.js
+@@ -28,6 +28,7 @@ function preprocess(ast, options) {
+   for (const fn of PREPROCESS_PIPELINE) {
+     fn(ast, options);
+   }
++
+   return ast;
+ }
+ 
+@@ -253,18 +254,20 @@ function extractInterpolation(ast, options) {
+  */
+ function extractWhitespaces(ast /*, options*/) {
+   ast.walk((node) => {
+-    if (!node.children) {
++    const children = node.$children;
++
++    if (!children) {
+       return;
+     }
+ 
+     if (
+-      node.children.length === 0 ||
+-      (node.children.length === 1 &&
+-        node.children[0].type === "text" &&
+-        htmlWhitespaceUtils.trim(node.children[0].value).length === 0)
++      children.length === 0 ||
++      (children.length === 1 &&
++        children[0].type === "text" &&
++        htmlWhitespaceUtils.trim(children[0].value).length === 0)
+     ) {
+-      node.hasDanglingSpaces = node.children.length > 0;
+-      node.children = [];
++      node.hasDanglingSpaces = children.length > 0;
++      node.$children = [];
+       return;
+     }
+ 
+@@ -272,8 +275,8 @@ function extractWhitespaces(ast /*, options*/) {
+     const isIndentationSensitive = isIndentationSensitiveNode(node);
+ 
+     if (!isWhitespaceSensitive) {
+-      for (let i = 0; i < node.children.length; i++) {
+-        const child = node.children[i];
++      for (let i = 0; i < children.length; i++) {
++        const child = children[i];
+         if (child.type !== "text") {
+           continue;
+         }
+diff --git a/src/language-html/print/angular-icu-expression.js b/src/language-html/print/angular-icu-expression.js
+index f66553217..7789d49da 100644
+--- a/src/language-html/print/angular-icu-expression.js
++++ b/src/language-html/print/angular-icu-expression.js
+@@ -5,7 +5,6 @@ import {
+   line,
+   softline,
+ } from "../../document/builders.js";
+-import htmlWhitespaceUtils from "../../utils/html-whitespace-utils.js";
+ import { printClosingTagEnd, printOpeningTagStart } from "./tag.js";
+ 
+ /*
+@@ -37,20 +36,27 @@ function printAngularIcuExpression(path, options, print) {
+ 
+ function printAngularIcuCase(path, options, print) {
+   const { node } = path;
++
+   return [
+     node.value,
+     " {",
+     group([
+       indent([
+         softline,
+-        path.map(({ node }) => {
+-          // FIXME: We need a fundamental solution.
+-          // Like this: https://github.com/prettier/prettier/blob/c1ebae2e8303841e59bc02e9e719a93e964ab0e9/src/language-html/print-preprocess.js#L254
+-          if (node.type === "text" && !htmlWhitespaceUtils.trim(node.value)) {
+-            return "";
++        path.map(({ node, isLast }) => {
++          const parts = [print()];
++
++          if (node.type === "text") {
++            if (node.hasLeadingSpaces) {
++              parts.unshift(line);
++            }
++
++            if (node.hasTrailingSpaces && !isLast) {
++              parts.push(line);
++            }
+           }
+ 
+-          return print();
++          return parts;
+         }, "expression"),
+       ]),
+       softline,
+diff --git a/src/language-html/printer-html.js b/src/language-html/printer-html.js
+index 0fe924ad0..713e15e6d 100644
+--- a/src/language-html/printer-html.js
++++ b/src/language-html/printer-html.js
+@@ -92,6 +92,7 @@ function genericPrint(path, options, print) {
+ 
+       const prefix = printOpeningTagPrefix(node, options);
+       const printed = getTextValueParts(node);
++
+       const suffix = printClosingTagSuffix(node, options);
+       // We cant use `fill([prefix, printed, suffix])` because it violates rule of fill: elements with odd indices must be line break
+       printed[0] = [prefix, printed[0]];

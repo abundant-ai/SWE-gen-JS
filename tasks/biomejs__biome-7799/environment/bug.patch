@@ -1,0 +1,1293 @@
+diff --git a/.changeset/group-by-nesting-feature.md b/.changeset/group-by-nesting-feature.md
+deleted file mode 100644
+index 328be09b52..0000000000
+--- a/.changeset/group-by-nesting-feature.md
++++ /dev/null
+@@ -1,51 +0,0 @@
+----
+-"@biomejs/biome": minor
+----
+-
+-Added `groupByNesting` option to the `useSortedKeys` assist. When enabled, object keys are grouped by their value's nesting depth before sorting alphabetically.
+-
+-Simple values (primitives, single-line arrays, and single-line objects) are sorted first, followed by nested values (multi-line arrays and multi-line objects).
+-
+-#### Example
+-
+-To enable this option, configure it in your `biome.json`:
+-
+-```json
+-{
+-  "linter": {
+-    "rules": {
+-      "source": {
+-        "useSortedKeys": {
+-          "options": {
+-            "groupByNesting": true
+-          }
+-        }
+-      }
+-    }
+-  }
+-}
+-```
+-
+-With this option, the following unsorted object:
+-
+-```js
+-const object = {
+-  "name": "Sample",
+-  "details": {
+-    "description": "nested"
+-  },
+-  "id": 123
+-}
+-```
+-
+-Will be sorted as:
+-
+-```js
+-const object ={
+-  "id": 123,
+-  "name": "Sample",
+-  "details": {
+-    "description": "nested"
+-  }
+-}
+-```
+diff --git a/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs b/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs
+index 972bfd86a4..eea816874f 100644
+--- a/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs
++++ b/crates/biome_js_analyze/src/assist/source/use_sorted_keys.rs
+@@ -1,4 +1,4 @@
+-use std::{borrow::Cow, cmp::Ordering, ops::Not};
++use std::{borrow::Cow, ops::Not};
+ 
+ use biome_analyze::{
+     Ast, FixKind, Rule, RuleAction, RuleDiagnostic, RuleSource,
+@@ -10,10 +10,8 @@ use biome_console::markup;
+ use biome_deserialize::TextRange;
+ use biome_diagnostics::{Applicability, category};
+ use biome_js_factory::make;
+-use biome_js_syntax::{
+-    AnyJsExpression, AnyJsObjectMember, JsLanguage, JsObjectExpression, JsObjectMemberList, T,
+-};
+-use biome_rowan::{AstNode, BatchMutationExt, SyntaxResult, SyntaxToken, TriviaPieceKind};
++use biome_js_syntax::{JsObjectExpression, JsObjectMemberList, T};
++use biome_rowan::{AstNode, BatchMutationExt, TriviaPieceKind};
+ use biome_rule_options::use_sorted_keys::{SortOrder, UseSortedKeysOptions};
+ use biome_string_case::comparable_token::ComparableToken;
+ 
+@@ -131,31 +129,6 @@ declare_source_rule! {
+     /// };
+     /// ```
+     ///
+-    /// ### `groupByNesting`
+-    /// When enabled, groups object keys by their value's nesting depth before sorting alphabetically.
+-    /// Simple values (primitives, single-line arrays, and single-line objects) are sorted first,
+-    /// followed by nested values (multi-line arrays and multi-line objects).
+-    ///
+-    /// > Default: `false`
+-    ///
+-    ///
+-    /// ```json,options
+-    /// {
+-    ///     "options": {
+-    ///         "groupByNesting": true
+-    ///     }
+-    /// }
+-    /// ```
+-    /// ```js,use_options,expect_diagnostic
+-    /// const obj = {
+-    ///     name: "Sample",
+-    ///     details: {
+-    ///         description: "nested"
+-    ///     },
+-    ///     id: 123
+-    /// };
+-    /// ```
+-    ///
+     pub UseSortedKeys {
+         version: "2.0.0",
+         name: "useSortedKeys",
+@@ -166,67 +139,6 @@ declare_source_rule! {
+     }
+ }
+ 
+-/// Checks if an object/array spans multiple lines by examining CST trivia.
+-/// For non-empty containers, checks the first token of the members/elements.
+-/// For empty containers, checks the closing brace/bracket token.
+-fn has_multiline_content(
+-    members_first_token: Option<SyntaxToken<JsLanguage>>,
+-    closing_token: SyntaxResult<SyntaxToken<JsLanguage>>,
+-) -> bool {
+-    members_first_token.map_or_else(
+-        || {
+-            closing_token
+-                .map(|token| token.has_leading_newline())
+-                .unwrap_or(false)
+-        },
+-        |token| token.has_leading_newline(),
+-    )
+-}
+-
+-/// Determines the nesting depth of a JavaScript expression for grouping purposes.
+-fn get_nesting_depth(value: &AnyJsExpression) -> Ordering {
+-    match value {
+-        AnyJsExpression::JsObjectExpression(obj) => {
+-            let members = obj.members();
+-            if has_multiline_content(members.syntax().first_token(), obj.r_curly_token()) {
+-                Ordering::Greater
+-            } else {
+-                Ordering::Equal
+-            }
+-        }
+-        AnyJsExpression::JsArrayExpression(array) => {
+-            let elements = array.elements();
+-            if has_multiline_content(elements.syntax().first_token(), array.r_brack_token()) {
+-                Ordering::Greater
+-            } else {
+-                Ordering::Equal
+-            }
+-        }
+-        // Function and class expressions are treated as nested
+-        AnyJsExpression::JsArrowFunctionExpression(_)
+-        | AnyJsExpression::JsFunctionExpression(_)
+-        | AnyJsExpression::JsClassExpression(_) => Ordering::Greater,
+-        _ => Ordering::Equal,
+-    }
+-}
+-
+-/// Determines the nesting depth for an object member:
+-/// - properties: based on value expression;
+-/// - methods/getters/setters: treat as nested (1);
+-/// - spreads/computed or unnamed: non-sortable (None).
+-fn get_member_depth(node: &AnyJsObjectMember) -> Option<Ordering> {
+-    match node {
+-        AnyJsObjectMember::JsPropertyObjectMember(prop) => {
+-            let value = prop.value().ok()?;
+-            Some(get_nesting_depth(&value))
+-        }
+-        AnyJsObjectMember::JsMethodObjectMember(_)
+-        | AnyJsObjectMember::JsGetterObjectMember(_)
+-        | AnyJsObjectMember::JsSetterObjectMember(_) => Some(Ordering::Greater),
+-        _ => None,
+-    }
+-}
+-
+ impl Rule for UseSortedKeys {
+     type Query = Ast<JsObjectMemberList>;
+     type State = ();
+@@ -241,46 +153,23 @@ impl Rule for UseSortedKeys {
+             SortOrder::Lexicographic => ComparableToken::lexicographic_cmp,
+         };
+ 
+-        if options.group_by_nesting.unwrap_or(false) {
+-            is_separated_list_sorted_by(
+-                ctx.query(),
+-                |node| {
+-                    let depth = get_member_depth(node)?;
+-                    let name = node.name().map(ComparableToken::new)?;
+-                    Some((depth, name))
+-                },
+-                |(d1, n1), (d2, n2)| d1.cmp(d2).then_with(|| comparator(n1, n2)),
+-            )
+-            .ok()?
+-            .not()
+-            .then_some(())
+-        } else {
+-            is_separated_list_sorted_by(
+-                ctx.query(),
+-                |node| node.name().map(ComparableToken::new),
+-                comparator,
+-            )
+-            .ok()?
+-            .not()
+-            .then_some(())
+-        }
++        is_separated_list_sorted_by(
++            ctx.query(),
++            |node| node.name().map(ComparableToken::new),
++            comparator,
++        )
++        .ok()?
++        .not()
++        .then_some(())
+     }
+ 
+     fn diagnostic(ctx: &RuleContext<Self>, _state: &Self::State) -> Option<RuleDiagnostic> {
+-        let options = ctx.options();
+-        let message = if options.group_by_nesting.unwrap_or(false) {
+-            markup! {
+-                "The object properties are not sorted by nesting level and key."
+-            }
+-        } else {
+-            markup! {
+-                "The object properties are not sorted by key."
+-            }
+-        };
+         Some(RuleDiagnostic::new(
+             category!("assist/source/useSortedKeys"),
+             ctx.query().range(),
+-            message,
++            markup! {
++                "The object properties are not sorted by key."
++            },
+         ))
+     }
+ 
+@@ -301,27 +190,13 @@ impl Rule for UseSortedKeys {
+             SortOrder::Lexicographic => ComparableToken::lexicographic_cmp,
+         };
+ 
+-        let new_list = if options.group_by_nesting.unwrap_or(false) {
+-            sorted_separated_list_by(
+-                list,
+-                |node| {
+-                    let depth = get_member_depth(node)?;
+-                    let name = node.name().map(ComparableToken::new)?;
+-                    Some((depth, name))
+-                },
+-                || make::token(T![,]).with_trailing_trivia([(TriviaPieceKind::Whitespace, " ")]),
+-                |(d1, n1), (d2, n2)| d1.cmp(d2).then_with(|| comparator(n1, n2)),
+-            )
+-            .ok()?
+-        } else {
+-            sorted_separated_list_by(
+-                list,
+-                |node| node.name().map(ComparableToken::new),
+-                || make::token(T![,]).with_trailing_trivia([(TriviaPieceKind::Whitespace, " ")]),
+-                comparator,
+-            )
+-            .ok()?
+-        };
++        let new_list = sorted_separated_list_by(
++            list,
++            |node| node.name().map(ComparableToken::new),
++            || make::token(T![,]).with_trailing_trivia([(TriviaPieceKind::Whitespace, " ")]),
++            comparator,
++        )
++        .ok()?;
+ 
+         let mut mutation = ctx.root().begin();
+         mutation.replace_node_discard_trivia(list.clone(), new_list);
+diff --git a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.js b/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.js
+deleted file mode 100644
+index 5ce0fc54ce..0000000000
+--- a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.js
++++ /dev/null
+@@ -1,19 +0,0 @@
+-const obj = {
+-  name: "Sample Item",
+-  details: {
+-    description: "This is a nested object",
+-    status: "active"
+-  },
+-  id: "12345",
+-  tags: ["short", "array"],
+-  metadata: {
+-    created: "2024-01-01",
+-    updated: "2024-01-02"
+-  },
+-  count: 42,
+-  multiLineArray: [
+-    "item1",
+-    "item2",
+-    "item3"
+-  ]
+-};
+diff --git a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.js.snap b/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.js.snap
+deleted file mode 100644
+index 96d2c59e0f..0000000000
+--- a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.js.snap
++++ /dev/null
+@@ -1,73 +0,0 @@
+----
+-source: crates/biome_js_analyze/tests/spec_tests.rs
+-expression: group-by-nesting-lexicographic.js
+----
+-# Input
+-```js
+-const obj = {
+-  name: "Sample Item",
+-  details: {
+-    description: "This is a nested object",
+-    status: "active"
+-  },
+-  id: "12345",
+-  tags: ["short", "array"],
+-  metadata: {
+-    created: "2024-01-01",
+-    updated: "2024-01-02"
+-  },
+-  count: 42,
+-  multiLineArray: [
+-    "item1",
+-    "item2",
+-    "item3"
+-  ]
+-};
+-
+-```
+-
+-# Diagnostics
+-```
+-group-by-nesting-lexicographic.js:2:3 assist/source/useSortedKeys  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  i The object properties are not sorted by nesting level and key.
+-  
+-     1 │ const obj = {
+-   > 2 │   name: "Sample Item",
+-       │   ^^^^^^^^^^^^^^^^^^^^
+-   > 3 │   details: {
+-   > 4 │     description: "This is a nested object",
+-        ...
+-  > 17 │     "item3"
+-  > 18 │   ]
+-       │   ^
+-    19 │ };
+-    20 │ 
+-  
+-  i Safe fix: Sort the object properties by key.
+-  
+-     1  1 │   const obj = {
+-     2    │ - ··name:·"Sample·Item",
+-     3    │ - ··details:·{
+-        2 │ + ··count:·42,
+-        3 │ + ··id:·"12345",
+-        4 │ + ··name:·"Sample·Item",
+-        5 │ + ··tags:·["short",·"array"],
+-        6 │ + ··details:·{
+-     4  7 │       description: "This is a nested object",
+-     5  8 │       status: "active"
+-     6  9 │     },
+-     7    │ - ··id:·"12345",
+-     8    │ - ··tags:·["short",·"array"],
+-     9    │ - ··metadata:·{
+-       10 │ + ··metadata:·{
+-    10 11 │       created: "2024-01-01",
+-    11 12 │       updated: "2024-01-02"
+-    12    │ - ··},
+-    13    │ - ··count:·42,
+-       13 │ + ··},
+-    14 14 │     multiLineArray: [
+-    15 15 │       "item1",
+-  
+-
+-```
+diff --git a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.options.json b/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.options.json
+deleted file mode 100644
+index d1b261bc00..0000000000
+--- a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.options.json
++++ /dev/null
+@@ -1,16 +0,0 @@
+-{
+-  "$schema": "../../../../../../packages/@biomejs/biome/configuration_schema.json",
+-  "assist": {
+-    "actions": {
+-      "source": {
+-        "useSortedKeys": {
+-          "level": "on",
+-          "options": {
+-            "sortOrder": "lexicographic",
+-            "groupByNesting": true
+-          }
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.js b/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.js
+deleted file mode 100644
+index a5637118b9..0000000000
+--- a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.js
++++ /dev/null
+@@ -1,42 +0,0 @@
+-const obj = {
+-  name: "Sample Item",
+-  details: {
+-    description: "This is a nested object",
+-    status: "active"
+-  },
+-  id: "12345",
+-  tags: ["short", "array"],
+-  metadata: {
+-    created: "2024-01-01",
+-    updated: "2024-01-02"
+-  },
+-  count: 42,
+-  multiLineArray: [
+-    "item1",
+-    "item2",
+-    "item3"
+-  ]
+-};
+-
+-// Edge case: object with content on same line as closing brace (non-formatted)
+-const edgeCase1 = {
+-  obj: {
+-    b: "" },
+-  obj2: {
+-
+-  },
+-  a: 1
+-};
+-
+-// Edge case: empty multi-line object
+-const edgeCase2 = {
+-  empty: {
+-  },
+-  a: 1
+-};
+-
+-// Edge case: single-line nested object (should NOT be treated as nested)
+-const edgeCase3 = {
+-  nested: { a: 1, b: 2 },
+-  z: 1
+-};
+diff --git a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.js.snap b/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.js.snap
+deleted file mode 100644
+index f0132ae0f7..0000000000
+--- a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.js.snap
++++ /dev/null
+@@ -1,164 +0,0 @@
+----
+-source: crates/biome_js_analyze/tests/spec_tests.rs
+-expression: group-by-nesting-natural.js
+----
+-# Input
+-```js
+-const obj = {
+-  name: "Sample Item",
+-  details: {
+-    description: "This is a nested object",
+-    status: "active"
+-  },
+-  id: "12345",
+-  tags: ["short", "array"],
+-  metadata: {
+-    created: "2024-01-01",
+-    updated: "2024-01-02"
+-  },
+-  count: 42,
+-  multiLineArray: [
+-    "item1",
+-    "item2",
+-    "item3"
+-  ]
+-};
+-
+-// Edge case: object with content on same line as closing brace (non-formatted)
+-const edgeCase1 = {
+-  obj: {
+-    b: "" },
+-  obj2: {
+-
+-  },
+-  a: 1
+-};
+-
+-// Edge case: empty multi-line object
+-const edgeCase2 = {
+-  empty: {
+-  },
+-  a: 1
+-};
+-
+-// Edge case: single-line nested object (should NOT be treated as nested)
+-const edgeCase3 = {
+-  nested: { a: 1, b: 2 },
+-  z: 1
+-};
+-
+-```
+-
+-# Diagnostics
+-```
+-group-by-nesting-natural.js:2:3 assist/source/useSortedKeys  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  i The object properties are not sorted by nesting level and key.
+-  
+-     1 │ const obj = {
+-   > 2 │   name: "Sample Item",
+-       │   ^^^^^^^^^^^^^^^^^^^^
+-   > 3 │   details: {
+-   > 4 │     description: "This is a nested object",
+-        ...
+-  > 17 │     "item3"
+-  > 18 │   ]
+-       │   ^
+-    19 │ };
+-    20 │ 
+-  
+-  i Safe fix: Sort the object properties by key.
+-  
+-     1  1 │   const obj = {
+-     2    │ - ··name:·"Sample·Item",
+-     3    │ - ··details:·{
+-        2 │ + ··count:·42,
+-        3 │ + ··id:·"12345",
+-        4 │ + ··name:·"Sample·Item",
+-        5 │ + ··tags:·["short",·"array"],
+-        6 │ + ··details:·{
+-     4  7 │       description: "This is a nested object",
+-     5  8 │       status: "active"
+-     6  9 │     },
+-     7    │ - ··id:·"12345",
+-     8    │ - ··tags:·["short",·"array"],
+-     9    │ - ··metadata:·{
+-       10 │ + ··metadata:·{
+-    10 11 │       created: "2024-01-01",
+-    11 12 │       updated: "2024-01-02"
+-    12    │ - ··},
+-    13    │ - ··count:·42,
+-       13 │ + ··},
+-    14 14 │     multiLineArray: [
+-    15 15 │       "item1",
+-  
+-
+-```
+-
+-```
+-group-by-nesting-natural.js:23:3 assist/source/useSortedKeys  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  i The object properties are not sorted by nesting level and key.
+-  
+-    21 │ // Edge case: object with content on same line as closing brace (non-formatted)
+-    22 │ const edgeCase1 = {
+-  > 23 │   obj: {
+-       │   ^^^^^^
+-  > 24 │     b: "" },
+-  > 25 │   obj2: {
+-  > 26 │ 
+-  > 27 │   },
+-  > 28 │   a: 1
+-       │   ^^^^
+-    29 │ };
+-    30 │ 
+-  
+-  i Safe fix: Sort the object properties by key.
+-  
+-    21 21 │   // Edge case: object with content on same line as closing brace (non-formatted)
+-    22 22 │   const edgeCase1 = {
+-    23    │ - ··obj:·{
+-       23 │ + ··a:·1,·
+-       24 │ + ··obj:·{
+-    24 25 │       b: "" },
+-    25 26 │     obj2: {
+-    26 27 │   
+-    27    │ - ··},
+-    28    │ - ··a:·1
+-       28 │ + ··}
+-    29 29 │   };
+-    30 30 │   
+-  
+-
+-```
+-
+-```
+-group-by-nesting-natural.js:33:3 assist/source/useSortedKeys  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  i The object properties are not sorted by nesting level and key.
+-  
+-    31 │ // Edge case: empty multi-line object
+-    32 │ const edgeCase2 = {
+-  > 33 │   empty: {
+-       │   ^^^^^^^^
+-  > 34 │   },
+-  > 35 │   a: 1
+-       │   ^^^^
+-    36 │ };
+-    37 │ 
+-  
+-  i Safe fix: Sort the object properties by key.
+-  
+-    31 31 │   // Edge case: empty multi-line object
+-    32 32 │   const edgeCase2 = {
+-    33    │ - ··empty:·{
+-    34    │ - ··},
+-    35    │ - ··a:·1
+-       33 │ + ··a:·1,·
+-       34 │ + ··empty:·{
+-       35 │ + ··}
+-    36 36 │   };
+-    37 37 │   
+-  
+-
+-```
+diff --git a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.options.json b/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.options.json
+deleted file mode 100644
+index 7ec166cd87..0000000000
+--- a/crates/biome_js_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.options.json
++++ /dev/null
+@@ -1,16 +0,0 @@
+-{
+-  "$schema": "../../../../../../packages/@biomejs/biome/configuration_schema.json",
+-  "assist": {
+-    "actions": {
+-      "source": {
+-        "useSortedKeys": {
+-          "level": "on",
+-          "options": {
+-            "sortOrder": "natural",
+-            "groupByNesting": true
+-          }
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs b/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs
+index c2a944bc17..ce9d21bf36 100644
+--- a/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs
++++ b/crates/biome_json_analyze/src/assist/source/use_sorted_keys.rs
+@@ -6,13 +6,11 @@ use biome_analyze::{
+ use biome_console::markup;
+ use biome_diagnostics::category;
+ use biome_json_factory::make;
+-use biome_json_syntax::{
+-    AnyJsonValue, JsonLanguage, JsonMemberList, JsonObjectValue, T, TextRange,
+-};
+-use biome_rowan::{AstNode, BatchMutationExt, SyntaxResult, SyntaxToken};
++use biome_json_syntax::{JsonMemberList, JsonObjectValue, T, TextRange};
++use biome_rowan::{AstNode, BatchMutationExt};
+ use biome_rule_options::use_sorted_keys::{SortOrder, UseSortedKeysOptions};
+ use biome_string_case::comparable_token::ComparableToken;
+-use std::{cmp::Ordering, ops::Not};
++use std::ops::Not;
+ 
+ declare_source_rule! {
+     /// Sort the keys of a JSON object in natural order.
+@@ -77,30 +75,6 @@ declare_source_rule! {
+     /// }
+     /// ```
+     ///
+-    /// ### `groupByNesting`
+-    /// When enabled, groups object keys by their value's nesting depth before sorting alphabetically.
+-    /// Simple values (primitives, single-line arrays, and single-line objects) are sorted first,
+-    /// followed by nested values (multi-line arrays and multi-line objects).
+-    ///
+-    /// > Default: `false`
+-    ///
+-    /// ```json,options
+-    /// {
+-    ///     "options": {
+-    ///         "groupByNesting": true
+-    ///     }
+-    /// }
+-    /// ```
+-    /// ```json,use_options,expect_diagnostic
+-    /// {
+-    ///     "name": "Sample",
+-    ///     "details": {
+-    ///         "description": "nested"
+-    ///     },
+-    ///     "id": 123
+-    /// }
+-    /// ```
+-    ///
+     pub UseSortedKeys {
+         version: "1.9.0",
+         name: "useSortedKeys",
+@@ -109,48 +83,6 @@ declare_source_rule! {
+     }
+ }
+ 
+-/// Checks if an object/array spans multiple lines by examining CST trivia.
+-/// For non-empty containers, checks the first token of the members/elements.
+-/// For empty containers, checks the closing brace/bracket token.
+-fn has_multiline_content(
+-    members_first_token: Option<SyntaxToken<JsonLanguage>>,
+-    closing_token: SyntaxResult<SyntaxToken<JsonLanguage>>,
+-) -> bool {
+-    members_first_token.map_or_else(
+-        || {
+-            closing_token
+-                .map(|token| token.has_leading_newline())
+-                .unwrap_or(false)
+-        },
+-        |token| token.has_leading_newline(),
+-    )
+-}
+-
+-/// Determines the nesting depth of a JSON value for grouping purposes.
+-/// Multi-line objects and multi-line arrays are considered nested (depth 1).
+-/// Primitives, single-line arrays, and single-line objects are considered simple (depth 0).
+-fn get_nesting_depth(value: &AnyJsonValue) -> Ordering {
+-    match value {
+-        AnyJsonValue::JsonObjectValue(obj) => {
+-            let members = obj.json_member_list();
+-            if has_multiline_content(members.syntax().first_token(), obj.r_curly_token()) {
+-                Ordering::Greater
+-            } else {
+-                Ordering::Equal
+-            }
+-        }
+-        AnyJsonValue::JsonArrayValue(array) => {
+-            let elements = array.elements();
+-            if has_multiline_content(elements.syntax().first_token(), array.r_brack_token()) {
+-                Ordering::Greater
+-            } else {
+-                Ordering::Equal
+-            }
+-        }
+-        _ => Ordering::Equal, // primitives: string, number, boolean, null
+-    }
+-}
+-
+ impl Rule for UseSortedKeys {
+     type Query = Ast<JsonMemberList>;
+     type State = ();
+@@ -165,58 +97,29 @@ impl Rule for UseSortedKeys {
+             SortOrder::Lexicographic => ComparableToken::lexicographic_cmp,
+         };
+ 
+-        if options.group_by_nesting.unwrap_or(false) {
+-            is_separated_list_sorted_by(
+-                ctx.query(),
+-                |node| {
+-                    let value = node.value().ok()?;
+-                    let depth = get_nesting_depth(&value);
+-                    let name = node
+-                        .name()
+-                        .ok()?
+-                        .inner_string_text()
+-                        .ok()
+-                        .map(ComparableToken::new)?;
+-                    Some((depth, name))
+-                },
+-                |(d1, n1), (d2, n2)| d1.cmp(d2).then_with(|| comparator(n1, n2)),
+-            )
+-            .ok()?
+-            .not()
+-            .then_some(())
+-        } else {
+-            is_separated_list_sorted_by(
+-                ctx.query(),
+-                |node| {
+-                    node.name()
+-                        .ok()?
+-                        .inner_string_text()
+-                        .ok()
+-                        .map(ComparableToken::new)
+-                },
+-                comparator,
+-            )
+-            .ok()?
+-            .not()
+-            .then_some(())
+-        }
++        is_separated_list_sorted_by(
++            ctx.query(),
++            |node| {
++                node.name()
++                    .ok()?
++                    .inner_string_text()
++                    .ok()
++                    .map(ComparableToken::new)
++            },
++            comparator,
++        )
++        .ok()?
++        .not()
++        .then_some(())
+     }
+ 
+     fn diagnostic(ctx: &RuleContext<Self>, state: &Self::State) -> Option<RuleDiagnostic> {
+-        let options = ctx.options();
+-        let message = if options.group_by_nesting.unwrap_or(false) {
+-            markup! {
+-                "The members are not sorted by nesting level and key."
+-            }
+-        } else {
+-            markup! {
+-                "The members are not sorted by key."
+-            }
+-        };
+         Some(RuleDiagnostic::new(
+             category!("assist/source/useSortedKeys"),
+             Self::text_range(ctx, state),
+-            message,
++            markup! {
++                "The members are not sorted by key."
++            },
+         ))
+     }
+ 
+@@ -237,39 +140,19 @@ impl Rule for UseSortedKeys {
+             SortOrder::Lexicographic => ComparableToken::lexicographic_cmp,
+         };
+ 
+-        let new_list = if options.group_by_nesting.unwrap_or(false) {
+-            sorted_separated_list_by(
+-                list,
+-                |node| {
+-                    let value = node.value().ok()?;
+-                    let depth = get_nesting_depth(&value);
+-                    let name = node
+-                        .name()
+-                        .ok()?
+-                        .inner_string_text()
+-                        .ok()
+-                        .map(ComparableToken::new)?;
+-                    Some((depth, name))
+-                },
+-                || make::token(T![,]),
+-                |(d1, n1), (d2, n2)| d1.cmp(d2).then_with(|| comparator(n1, n2)),
+-            )
+-            .ok()?
+-        } else {
+-            sorted_separated_list_by(
+-                list,
+-                |node| {
+-                    node.name()
+-                        .ok()?
+-                        .inner_string_text()
+-                        .ok()
+-                        .map(ComparableToken::new)
+-                },
+-                || make::token(T![,]),
+-                comparator,
+-            )
+-            .ok()?
+-        };
++        let new_list = sorted_separated_list_by(
++            list,
++            |node| {
++                node.name()
++                    .ok()?
++                    .inner_string_text()
++                    .ok()
++                    .map(ComparableToken::new)
++            },
++            || make::token(T![,]),
++            comparator,
++        )
++        .ok()?;
+ 
+         let mut mutation = ctx.root().begin();
+         mutation.replace_node_discard_trivia(list.clone(), new_list);
+diff --git a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.json b/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.json
+deleted file mode 100644
+index b1900ca56f..0000000000
+--- a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.json
++++ /dev/null
+@@ -1,19 +0,0 @@
+-{
+-  "name": "Sample Item",
+-  "details": {
+-    "description": "This is a nested object",
+-    "status": "active"
+-  },
+-  "id": "12345",
+-  "tags": ["short", "array"],
+-  "metadata": {
+-    "created": "2024-01-01",
+-    "updated": "2024-01-02"
+-  },
+-  "count": 42,
+-  "multiLineArray": [
+-    "item1",
+-    "item2",
+-    "item3"
+-  ]
+-}
+diff --git a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.json.snap b/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.json.snap
+deleted file mode 100644
+index 4003e48656..0000000000
+--- a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.json.snap
++++ /dev/null
+@@ -1,73 +0,0 @@
+----
+-source: crates/biome_json_analyze/tests/spec_tests.rs
+-expression: group-by-nesting-lexicographic.json
+----
+-# Input
+-```json
+-{
+-  "name": "Sample Item",
+-  "details": {
+-    "description": "This is a nested object",
+-    "status": "active"
+-  },
+-  "id": "12345",
+-  "tags": ["short", "array"],
+-  "metadata": {
+-    "created": "2024-01-01",
+-    "updated": "2024-01-02"
+-  },
+-  "count": 42,
+-  "multiLineArray": [
+-    "item1",
+-    "item2",
+-    "item3"
+-  ]
+-}
+-
+-```
+-
+-# Diagnostics
+-```
+-group-by-nesting-lexicographic.json:1:1 assist/source/useSortedKeys  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━
+-
+-  i The members are not sorted by nesting level and key.
+-  
+-   > 1 │ {
+-       │ ^
+-   > 2 │   "name": "Sample Item",
+-   > 3 │   "details": {
+-   > 4 │     "description": "This is a nested object",
+-        ...
+-  > 17 │     "item3"
+-  > 18 │   ]
+-  > 19 │ }
+-       │ ^
+-    20 │ 
+-  
+-  i Safe fix: Sort the members by key.
+-  
+-     1  1 │   {
+-     2    │ - ··"name":·"Sample·Item",
+-     3    │ - ··"details":·{
+-        2 │ + ··"count":·42,
+-        3 │ + ··"id":·"12345",
+-        4 │ + ··"name":·"Sample·Item",
+-        5 │ + ··"tags":·["short",·"array"],
+-        6 │ + ··"details":·{
+-     4  7 │       "description": "This is a nested object",
+-     5  8 │       "status": "active"
+-     6  9 │     },
+-     7    │ - ··"id":·"12345",
+-     8    │ - ··"tags":·["short",·"array"],
+-     9    │ - ··"metadata":·{
+-       10 │ + ··"metadata":·{
+-    10 11 │       "created": "2024-01-01",
+-    11 12 │       "updated": "2024-01-02"
+-    12    │ - ··},
+-    13    │ - ··"count":·42,
+-       13 │ + ··},
+-    14 14 │     "multiLineArray": [
+-    15 15 │       "item1",
+-  
+-
+-```
+diff --git a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.options.json b/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.options.json
+deleted file mode 100644
+index cb3518747c..0000000000
+--- a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-lexicographic.options.json
++++ /dev/null
+@@ -1,16 +0,0 @@
+-{
+-	"$schema": "../../../../../../packages/@biomejs/biome/configuration_schema.json",
+-	"assist": {
+-		"actions": {
+-			"source": {
+-				"useSortedKeys": {
+-					"level": "on",
+-					"options": {
+-						"sortOrder": "lexicographic",
+-						"groupByNesting": true
+-					}
+-				}
+-			}
+-		}
+-	}
+-}
+diff --git a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.json b/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.json
+deleted file mode 100644
+index abe11d5bae..0000000000
+--- a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.json
++++ /dev/null
+@@ -1,36 +0,0 @@
+-{
+-  "name": "Sample Item",
+-  "details": {
+-    "description": "This is a nested object",
+-    "status": "active"
+-  },
+-  "id": "12345",
+-  "tags": ["short", "array"],
+-  "metadata": {
+-    "created": "2024-01-01",
+-    "updated": "2024-01-02"
+-  },
+-  "count": 42,
+-  "multiLineArray": [
+-    "item1",
+-    "item2",
+-    "item3"
+-  ],
+-  "edgeCase1": {
+-    "obj": {
+-      "b": "" },
+-    "obj2": {
+-
+-    },
+-    "a": 1
+-  },
+-  "edgeCase2": {
+-    "empty": {
+-    },
+-    "a": 1
+-  },
+-  "edgeCase3": {
+-    "nested": { "a": 1, "b": 2 },
+-    "z": 1
+-  }
+-}
+diff --git a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.json.snap b/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.json.snap
+deleted file mode 100644
+index f1acd618ed..0000000000
+--- a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.json.snap
++++ /dev/null
+@@ -1,182 +0,0 @@
+----
+-source: crates/biome_json_analyze/tests/spec_tests.rs
+-expression: group-by-nesting-natural.json
+----
+-# Input
+-```json
+-{
+-  "name": "Sample Item",
+-  "details": {
+-    "description": "This is a nested object",
+-    "status": "active"
+-  },
+-  "id": "12345",
+-  "tags": ["short", "array"],
+-  "metadata": {
+-    "created": "2024-01-01",
+-    "updated": "2024-01-02"
+-  },
+-  "count": 42,
+-  "multiLineArray": [
+-    "item1",
+-    "item2",
+-    "item3"
+-  ],
+-  "edgeCase1": {
+-    "obj": {
+-      "b": "" },
+-    "obj2": {
+-
+-    },
+-    "a": 1
+-  },
+-  "edgeCase2": {
+-    "empty": {
+-    },
+-    "a": 1
+-  },
+-  "edgeCase3": {
+-    "nested": { "a": 1, "b": 2 },
+-    "z": 1
+-  }
+-}
+-
+-```
+-
+-# Diagnostics
+-```
+-group-by-nesting-natural.json:1:1 assist/source/useSortedKeys  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  i The members are not sorted by nesting level and key.
+-  
+-   > 1 │ {
+-       │ ^
+-   > 2 │   "name": "Sample Item",
+-   > 3 │   "details": {
+-   > 4 │     "description": "This is a nested object",
+-        ...
+-  > 34 │     "z": 1
+-  > 35 │   }
+-  > 36 │ }
+-       │ ^
+-    37 │ 
+-  
+-  i Safe fix: Sort the members by key.
+-  
+-     1  1 │   {
+-     2    │ - ··"name":·"Sample·Item",
+-     3    │ - ··"details":·{
+-     4    │ - ····"description":·"This·is·a·nested·object",
+-     5    │ - ····"status":·"active"
+-     6    │ - ··},
+-     7    │ - ··"id":·"12345",
+-        2 │ + ··"count":·42,
+-        3 │ + ··"id":·"12345",
+-        4 │ + ··"name":·"Sample·Item",
+-     8  5 │     "tags": ["short", "array"],
+-     9    │ - ··"metadata":·{
+-    10    │ - ····"created":·"2024-01-01",
+-    11    │ - ····"updated":·"2024-01-02"
+-    12    │ - ··},
+-    13    │ - ··"count":·42,
+-    14    │ - ··"multiLineArray":·[
+-    15    │ - ····"item1",
+-    16    │ - ····"item2",
+-    17    │ - ····"item3"
+-    18    │ - ··],
+-    19    │ - ··"edgeCase1":·{
+-        6 │ + ··"details":·{
+-        7 │ + ····"description":·"This·is·a·nested·object",
+-        8 │ + ····"status":·"active"
+-        9 │ + ··},
+-       10 │ + ··"edgeCase1":·{
+-    20 11 │       "obj": {
+-    21 12 │         "b": "" },
+-    ····· │ 
+-    33 24 │       "nested": { "a": 1, "b": 2 },
+-    34 25 │       "z": 1
+-    35    │ - ··}
+-       26 │ + ··},
+-       27 │ + ··"metadata":·{
+-       28 │ + ····"created":·"2024-01-01",
+-       29 │ + ····"updated":·"2024-01-02"
+-       30 │ + ··},
+-       31 │ + ··"multiLineArray":·[
+-       32 │ + ····"item1",
+-       33 │ + ····"item2",
+-       34 │ + ····"item3"
+-       35 │ + ··]
+-    36 36 │   }
+-    37 37 │   
+-  
+-
+-```
+-
+-```
+-group-by-nesting-natural.json:19:16 assist/source/useSortedKeys  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  i The members are not sorted by nesting level and key.
+-  
+-    17 │     "item3"
+-    18 │   ],
+-  > 19 │   "edgeCase1": {
+-       │                ^
+-  > 20 │     "obj": {
+-        ...
+-  > 25 │     "a": 1
+-  > 26 │   },
+-       │   ^
+-    27 │   "edgeCase2": {
+-    28 │     "empty": {
+-  
+-  i Safe fix: Sort the members by key.
+-  
+-    18 18 │     ],
+-    19 19 │     "edgeCase1": {
+-    20    │ - ····"obj":·{
+-       20 │ + ····"a":·1,
+-       21 │ + ····"obj":·{
+-    21 22 │         "b": "" },
+-    22 23 │       "obj2": {
+-    23 24 │   
+-    24    │ - ····},
+-    25    │ - ····"a":·1
+-       25 │ + ····}
+-    26 26 │     },
+-    27 27 │     "edgeCase2": {
+-  
+-
+-```
+-
+-```
+-group-by-nesting-natural.json:27:16 assist/source/useSortedKeys  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  i The members are not sorted by nesting level and key.
+-  
+-    25 │     "a": 1
+-    26 │   },
+-  > 27 │   "edgeCase2": {
+-       │                ^
+-  > 28 │     "empty": {
+-  > 29 │     },
+-  > 30 │     "a": 1
+-  > 31 │   },
+-       │   ^
+-    32 │   "edgeCase3": {
+-    33 │     "nested": { "a": 1, "b": 2 },
+-  
+-  i Safe fix: Sort the members by key.
+-  
+-    26 26 │     },
+-    27 27 │     "edgeCase2": {
+-    28    │ - ····"empty":·{
+-    29    │ - ····},
+-    30    │ - ····"a":·1
+-       28 │ + ····"a":·1,
+-       29 │ + ····"empty":·{
+-       30 │ + ····}
+-    31 31 │     },
+-    32 32 │     "edgeCase3": {
+-  
+-
+-```
+diff --git a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.options.json b/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.options.json
+deleted file mode 100644
+index f9a6087f0c..0000000000
+--- a/crates/biome_json_analyze/tests/specs/source/useSortedKeys/group-by-nesting-natural.options.json
++++ /dev/null
+@@ -1,16 +0,0 @@
+-{
+-	"$schema": "../../../../../../packages/@biomejs/biome/configuration_schema.json",
+-	"assist": {
+-		"actions": {
+-			"source": {
+-				"useSortedKeys": {
+-					"level": "on",
+-					"options": {
+-						"sortOrder": "natural",
+-						"groupByNesting": true
+-					}
+-				}
+-			}
+-		}
+-	}
+-}
+diff --git a/crates/biome_rule_options/src/use_sorted_keys.rs b/crates/biome_rule_options/src/use_sorted_keys.rs
+index 47ad351b38..9a80f7caec 100644
+--- a/crates/biome_rule_options/src/use_sorted_keys.rs
++++ b/crates/biome_rule_options/src/use_sorted_keys.rs
+@@ -8,9 +8,4 @@ use serde::{Deserialize, Serialize};
+ pub struct UseSortedKeysOptions {
+     #[serde(skip_serializing_if = "Option::<_>::is_none")]
+     pub sort_order: Option<SortOrder>,
+-    /// When enabled, groups object keys by their value's nesting depth before sorting.
+-    /// Simple values (primitives, single-line arrays, single-line objects) are sorted first,
+-    /// followed by nested values (multi-line objects, multi-line arrays).
+-    #[serde(skip_serializing_if = "Option::<_>::is_none")]
+-    pub group_by_nesting: Option<bool>,
+ }
+diff --git a/packages/@biomejs/backend-jsonrpc/src/workspace.ts b/packages/@biomejs/backend-jsonrpc/src/workspace.ts
+index facd692756..ef941a2fc0 100644
+--- a/packages/@biomejs/backend-jsonrpc/src/workspace.ts
++++ b/packages/@biomejs/backend-jsonrpc/src/workspace.ts
+@@ -4323,12 +4323,6 @@ export interface UseSortedAttributesOptions {
+ }
+ export type UseSortedInterfaceMembersOptions = {};
+ export interface UseSortedKeysOptions {
+-	/**
+-	* When enabled, groups object keys by their value's nesting depth before sorting.
+-Simple values (primitives, single-line arrays, single-line objects) are sorted first,
+-followed by nested values (multi-line objects, multi-line arrays). 
+-	 */
+-	groupByNesting?: boolean;
+ 	sortOrder?: SortOrder;
+ }
+ export type UseSortedPropertiesOptions = {};
+diff --git a/packages/@biomejs/biome/configuration_schema.json b/packages/@biomejs/biome/configuration_schema.json
+index 5188464cc5..453e92eb32 100644
+--- a/packages/@biomejs/biome/configuration_schema.json
++++ b/packages/@biomejs/biome/configuration_schema.json
+@@ -12470,10 +12470,6 @@
+ 		"UseSortedKeysOptions": {
+ 			"type": "object",
+ 			"properties": {
+-				"groupByNesting": {
+-					"description": "When enabled, groups object keys by their value's nesting depth before sorting.\nSimple values (primitives, single-line arrays, single-line objects) are sorted first,\nfollowed by nested values (multi-line objects, multi-line arrays).",
+-					"type": ["boolean", "null"]
+-				},
+ 				"sortOrder": {
+ 					"anyOf": [{ "$ref": "#/$defs/SortOrder" }, { "type": "null" }]
+ 				}

@@ -1,0 +1,426 @@
+diff --git a/index.d.ts b/index.d.ts
+index 1c2d4de..e6e1eb5 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -468,6 +468,26 @@ type CommonOptions<IsSync extends boolean = boolean> = {
+ 	*/
+ 	readonly killSignal?: string | number;
+ 
++	/**
++	If the child process is terminated but does not exit, forcefully exit it by sending [`SIGKILL`](https://en.wikipedia.org/wiki/Signal_(IPC)#SIGKILL).
++
++	The grace period is 5 seconds by default. This feature can be disabled with `false`.
++
++	This works when the child process is terminated by either:
++	- the `signal`, `timeout`, `maxBuffer` or `cleanup` option
++	- calling [`subprocess.kill()`](https://nodejs.org/api/child_process.html#subprocesskillsignal) with no arguments
++
++	This does not work when the child process is terminated by either:
++	- calling [`subprocess.kill()`](https://nodejs.org/api/child_process.html#subprocesskillsignal) with an argument
++	- calling [`process.kill(subprocess.pid)`](https://nodejs.org/api/process.html#processkillpid-signal)
++	- sending a termination signal from another process
++
++	Also, this does not work on Windows, because Windows [doesn't support signals](https://nodejs.org/api/process.html#process_signal_events): `SIGKILL` and `SIGTERM` both terminate the process immediately. Other packages (such as [`taskkill`](https://github.com/sindresorhus/taskkill)) can be used to achieve fail-safe termination on Windows.
++
++	@default 5000
++	*/
++	forceKillAfterTimeout?: number | false;
++
+ 	/**
+ 	If `true`, no quoting or escaping of arguments is done on Windows. Ignored on other platforms. This is set to `true` automatically when the `shell` option is `true`.
+ 
+@@ -721,17 +741,6 @@ type ExecaCommonError = {
+ export type ExecaError<OptionsType extends Options = Options> = ExecaCommonReturnValue<false, OptionsType> & ExecaCommonError;
+ export type ExecaSyncError<OptionsType extends SyncOptions = SyncOptions> = ExecaCommonReturnValue<true, OptionsType> & ExecaCommonError;
+ 
+-export type KillOptions = {
+-	/**
+-	Milliseconds to wait for the child process to terminate before sending `SIGKILL`.
+-
+-	Can be disabled with `false`.
+-
+-	@default 5000
+-	*/
+-	forceKillAfterTimeout?: number | false;
+-};
+-
+ type StreamUnlessIgnored<
+ 	StreamIndex extends string,
+ 	OptionsType extends Options = Options,
+@@ -779,11 +788,6 @@ export type ExecaChildPromise<OptionsType extends Options = Options> = {
+ 		onRejected?: (reason: ExecaError<OptionsType>) => ResultType | PromiseLike<ResultType>
+ 	): Promise<ExecaReturnValue<OptionsType> | ResultType>;
+ 
+-	/**
+-	Same as the original [`child_process#kill()`](https://nodejs.org/api/child_process.html#child_process_subprocess_kill_signal), except if `signal` is `SIGTERM` (the default value) and the child process is not terminated after 5 seconds, force it by sending `SIGKILL`. Note that this graceful termination does not work on Windows, because Windows [doesn't support signals](https://nodejs.org/api/process.html#process_signal_events) (`SIGKILL` and `SIGTERM` has the same effect of force-killing the process immediately.) If you want to achieve graceful termination on Windows, you have to use other means, such as [`taskkill`](https://github.com/sindresorhus/taskkill).
+-	*/
+-	kill(signal?: string, options?: KillOptions): void;
+-
+ 	/**
+ 	[Pipe](https://nodejs.org/api/stream.html#readablepipedestination-options) the child process's `stdout` to `target`, which can be:
+ 	- Another `execa()` return value
+@@ -917,17 +921,6 @@ try {
+ 	\*\/
+ }
+ ```
+-
+-@example <caption>Graceful termination</caption>
+-```
+-const subprocess = execa('node');
+-
+-setTimeout(() => {
+-	subprocess.kill('SIGTERM', {
+-		forceKillAfterTimeout: 2000
+-	});
+-}, 1000);
+-```
+ */
+ export function execa<OptionsType extends Options = {}>(
+ 	file: string | URL,
+diff --git a/index.js b/index.js
+index c78346e..728c0ad 100644
+--- a/index.js
++++ b/index.js
+@@ -10,7 +10,7 @@ import {makeError} from './lib/error.js';
+ import {handleInputAsync, pipeOutputAsync} from './lib/stdio/async.js';
+ import {handleInputSync, pipeOutputSync} from './lib/stdio/sync.js';
+ import {normalizeStdioNode} from './lib/stdio/normalize.js';
+-import {spawnedKill, validateTimeout} from './lib/kill.js';
++import {spawnedKill, validateTimeout, normalizeForceKillAfterTimeout} from './lib/kill.js';
+ import {addPipeMethods} from './lib/pipe.js';
+ import {getSpawnedResult, makeAllStream} from './lib/stream.js';
+ import {mergePromise} from './lib/promise.js';
+@@ -53,6 +53,7 @@ const handleArguments = (rawFile, rawArgs, rawOptions = {}) => {
+ 	validateTimeout(options);
+ 	options.shell = normalizeFileUrl(options.shell);
+ 	options.env = getEnv(options);
++	options.forceKillAfterTimeout = normalizeForceKillAfterTimeout(options.forceKillAfterTimeout);
+ 
+ 	if (process.platform === 'win32' && path.basename(file, '.exe') === 'cmd') {
+ 		// #116
+@@ -80,6 +81,7 @@ const addDefaultOptions = ({
+ 	windowsHide = true,
+ 	verbose = verboseDefault,
+ 	killSignal = 'SIGTERM',
++	forceKillAfterTimeout = true,
+ 	...options
+ }) => ({
+ 	...options,
+@@ -98,6 +100,7 @@ const addDefaultOptions = ({
+ 	windowsHide,
+ 	verbose,
+ 	killSignal,
++	forceKillAfterTimeout,
+ });
+ 
+ const handleOutput = (options, value) => {
+@@ -140,26 +143,28 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 		return dummySpawned;
+ 	}
+ 
++	const controller = new AbortController();
++
+ 	pipeOutputAsync(spawned, stdioStreamsGroups);
+ 
+-	spawned.kill = spawnedKill.bind(null, spawned.kill.bind(spawned));
++	spawned.kill = spawnedKill.bind(null, spawned.kill.bind(spawned), options, controller);
+ 	spawned.all = makeAllStream(spawned, options);
+ 
+ 	addPipeMethods(spawned);
+ 
+-	const promise = handlePromise({spawned, options, stdioStreamsGroups, command, escapedCommand});
++	const promise = handlePromise({spawned, options, stdioStreamsGroups, command, escapedCommand, controller});
+ 	mergePromise(spawned, promise);
+ 	return spawned;
+ }
+ 
+-const handlePromise = async ({spawned, options, stdioStreamsGroups, command, escapedCommand}) => {
++const handlePromise = async ({spawned, options, stdioStreamsGroups, command, escapedCommand, controller}) => {
+ 	const context = {timedOut: false};
+ 
+ 	const [
+ 		[exitCode, signal, error],
+ 		stdioResults,
+ 		allResult,
+-	] = await getSpawnedResult(spawned, options, context, stdioStreamsGroups);
++	] = await getSpawnedResult({spawned, options, context, stdioStreamsGroups, controller});
+ 	const stdio = stdioResults.map(stdioResult => handleOutput(options, stdioResult));
+ 	const all = handleOutput(options, allResult);
+ 
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 4ee948c..73c48bb 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -1187,6 +1187,14 @@ execa('unicorns', {killSignal: 'SIGTERM'});
+ execaSync('unicorns', {killSignal: 'SIGTERM'});
+ execa('unicorns', {killSignal: 9});
+ execaSync('unicorns', {killSignal: 9});
++execa('unicorns', {forceKillAfterTimeout: false});
++execaSync('unicorns', {forceKillAfterTimeout: false});
++execa('unicorns', {forceKillAfterTimeout: 42});
++execaSync('unicorns', {forceKillAfterTimeout: 42});
++execa('unicorns', {forceKillAfterTimeout: undefined});
++execaSync('unicorns', {forceKillAfterTimeout: undefined});
++expectError(execa('unicorns', {forceKillAfterTimeout: 'true'}));
++expectError(execaSync('unicorns', {forceKillAfterTimeout: 'true'}));
+ execa('unicorns', {signal: new AbortController().signal});
+ expectError(execaSync('unicorns', {signal: new AbortController().signal}));
+ execa('unicorns', {windowsVerbatimArguments: true});
+@@ -1199,10 +1207,7 @@ execaSync('unicorns', {verbose: false});
+ execa('unicorns').kill();
+ execa('unicorns').kill('SIGKILL');
+ execa('unicorns').kill(undefined);
+-execa('unicorns').kill('SIGKILL', {});
+-execa('unicorns').kill('SIGKILL', {forceKillAfterTimeout: false});
+-execa('unicorns').kill('SIGKILL', {forceKillAfterTimeout: 42});
+-execa('unicorns').kill('SIGKILL', {forceKillAfterTimeout: undefined});
++expectError(execa('unicorns').kill('SIGKILL', {}));
+ 
+ expectError(execa(['unicorns', 'arg']));
+ expectType<ExecaChildProcess>(execa('unicorns'));
+diff --git a/lib/kill.js b/lib/kill.js
+index 7cc6836..ae10671 100644
+--- a/lib/kill.js
++++ b/lib/kill.js
+@@ -1,34 +1,36 @@
+ import os from 'node:os';
+-import {setTimeout as pSetTimeout} from 'node:timers/promises';
++import {setTimeout} from 'node:timers/promises';
+ import {onExit} from 'signal-exit';
+ 
+ const DEFAULT_FORCE_KILL_TIMEOUT = 1000 * 5;
+ 
+ // Monkey-patches `childProcess.kill()` to add `forceKillAfterTimeout` behavior
+-export const spawnedKill = (kill, signal = 'SIGTERM', {forceKillAfterTimeout = true} = {}) => {
++export const spawnedKill = (kill, {forceKillAfterTimeout}, controller, signal) => {
+ 	const killResult = kill(signal);
+-	const timeout = getForceKillAfterTimeout(signal, forceKillAfterTimeout, killResult);
+-	setKillTimeout(kill, timeout);
++	setKillTimeout({kill, signal, forceKillAfterTimeout, killResult, controller});
+ 	return killResult;
+ };
+ 
+-const setKillTimeout = async (kill, timeout) => {
+-	if (timeout === undefined) {
++const setKillTimeout = async ({kill, signal, forceKillAfterTimeout, killResult, controller}) => {
++	if (!shouldForceKill(signal, forceKillAfterTimeout, killResult)) {
+ 		return;
+ 	}
+ 
+-	await pSetTimeout(timeout, undefined, {ref: false});
+-	kill('SIGKILL');
++	try {
++		await setTimeout(forceKillAfterTimeout, undefined, {signal: controller.signal});
++		kill('SIGKILL');
++	} catch {}
+ };
+ 
+ const shouldForceKill = (signal, forceKillAfterTimeout, killResult) => isSigterm(signal) && forceKillAfterTimeout !== false && killResult;
+ 
+-const isSigterm = signal => signal === os.constants.signals.SIGTERM
++const isSigterm = signal => signal === undefined
++	|| signal === os.constants.signals.SIGTERM
+ 	|| (typeof signal === 'string' && signal.toUpperCase() === 'SIGTERM');
+ 
+-const getForceKillAfterTimeout = (signal, forceKillAfterTimeout, killResult) => {
+-	if (!shouldForceKill(signal, forceKillAfterTimeout, killResult)) {
+-		return;
++export const normalizeForceKillAfterTimeout = forceKillAfterTimeout => {
++	if (forceKillAfterTimeout === false) {
++		return forceKillAfterTimeout;
+ 	}
+ 
+ 	if (forceKillAfterTimeout === true) {
+@@ -43,20 +45,18 @@ const getForceKillAfterTimeout = (signal, forceKillAfterTimeout, killResult) =>
+ };
+ 
+ const killAfterTimeout = async ({spawned, timeout, killSignal, context, controller}) => {
+-	await pSetTimeout(timeout, undefined, {ref: false, signal: controller.signal});
++	await setTimeout(timeout, undefined, {signal: controller.signal});
+ 	spawned.kill(killSignal);
+ 	Object.assign(context, {timedOut: true, signal: killSignal});
+ 	throw new Error('Timed out');
+ };
+ 
+ // `timeout` option handling
+-export const throwOnTimeout = ({spawned, timeout, killSignal, context, finalizers}) => {
++export const throwOnTimeout = ({spawned, timeout, killSignal, context, controller}) => {
+ 	if (timeout === 0 || timeout === undefined) {
+ 		return [];
+ 	}
+ 
+-	const controller = new AbortController();
+-	finalizers.push(controller.abort.bind(controller));
+ 	return [killAfterTimeout({spawned, timeout, killSignal, context, controller})];
+ };
+ 
+@@ -67,13 +67,12 @@ export const validateTimeout = ({timeout}) => {
+ };
+ 
+ // `cleanup` option handling
+-export const cleanupOnExit = (spawned, cleanup, detached, finalizers) => {
++export const cleanupOnExit = (spawned, cleanup, detached) => {
+ 	if (!cleanup || detached) {
+ 		return;
+ 	}
+ 
+-	const removeExitHandler = onExit(() => {
++	return onExit(() => {
+ 		spawned.kill();
+ 	});
+-	finalizers.push(removeExitHandler);
+ };
+diff --git a/lib/stream.js b/lib/stream.js
+index 23f1f46..153acff 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -106,14 +106,14 @@ const cleanupStdioStreams = (customStreams, error) => {
+ };
+ 
+ // Retrieve result of child process: exit code, signal, error, streams (stdout/stderr/all)
+-export const getSpawnedResult = async (
++export const getSpawnedResult = async ({
+ 	spawned,
+-	{encoding, buffer, maxBuffer, timeout, killSignal, cleanup, detached},
++	options: {encoding, buffer, maxBuffer, timeout, killSignal, cleanup, detached},
+ 	context,
+ 	stdioStreamsGroups,
+-) => {
+-	const finalizers = [];
+-	cleanupOnExit(spawned, cleanup, detached, finalizers);
++	controller,
++}) => {
++	const removeExitHandler = cleanupOnExit(spawned, cleanup, detached);
+ 	const customStreams = getCustomStreams(stdioStreamsGroups);
+ 
+ 	const stdioPromises = spawned.stdio.map((stream, index) => getStdioPromise({stream, stdioStreams: stdioStreamsGroups[index], encoding, buffer, maxBuffer}));
+@@ -129,7 +129,7 @@ export const getSpawnedResult = async (
+ 			]),
+ 			...throwOnCustomStreamsError(customStreams),
+ 			...throwIfStreamError(spawned.stdin),
+-			...throwOnTimeout({spawned, timeout, killSignal, context, finalizers}),
++			...throwOnTimeout({spawned, timeout, killSignal, context, controller}),
+ 		]);
+ 	} catch (error) {
+ 		spawned.kill();
+@@ -141,8 +141,7 @@ export const getSpawnedResult = async (
+ 		cleanupStdioStreams(customStreams, error);
+ 		return results;
+ 	} finally {
+-		for (const finalizer of finalizers) {
+-			finalizer();
+-		}
++		controller.abort();
++		removeExitHandler?.();
+ 	}
+ };
+diff --git a/readme.md b/readme.md
+index c590b88..89cb363 100644
+--- a/readme.md
++++ b/readme.md
+@@ -50,7 +50,7 @@ This package improves [`child_process`](https://nodejs.org/api/child_process.htm
+ - Redirect [`stdin`](#stdin)/[`stdout`](#stdout-1)/[`stderr`](#stderr-1) from/to files, streams, iterables, strings, `Uint8Array` or [objects](docs/transform.md#object-mode).
+ - [Transform](docs/transform.md) `stdin`/`stdout`/`stderr` with simple functions.
+ - Iterate over [each text line](docs/transform.md#binary-data) output by the process.
+-- [Graceful termination](#optionsforcekillaftertimeout).
++- [Fail-safe process termination](#forcekillaftertimeout).
+ - Get [interleaved output](#all) from `stdout` and `stderr` similar to what is printed on the terminal.
+ - [Strips the final newline](#stripfinalnewline) from the output so you don't have to do `stdout.trim()`.
+ - Convenience methods to pipe processes' [input](#input) and [output](#redirect-output-to-a-file).
+@@ -221,20 +221,6 @@ try {
+ }
+ ```
+ 
+-### Graceful termination
+-
+-Using SIGTERM, and after 2 seconds, kill it with SIGKILL.
+-
+-```js
+-const subprocess = execa('node');
+-
+-setTimeout(() => {
+-	subprocess.kill('SIGTERM', {
+-		forceKillAfterTimeout: 2000
+-	});
+-}, 1000);
+-```
+-
+ ## API
+ 
+ ### Methods
+@@ -323,21 +309,6 @@ The return value of all [asynchronous methods](#methods) is both:
+ - a `Promise` resolving or rejecting with a [`childProcessResult`](#childProcessResult).
+ - a [`child_process` instance](https://nodejs.org/api/child_process.html#child_process_class_childprocess) with the following additional methods and properties.
+ 
+-#### kill(signal?, options?)
+-
+-Same as the original [`child_process#kill()`](https://nodejs.org/api/child_process.html#child_process_subprocess_kill_signal) except: if `signal` is `SIGTERM` (the default value) and the child process is not terminated after 5 seconds, force it by sending `SIGKILL`.
+-
+-Note that this graceful termination does not work on Windows, because Windows [doesn't support signals](https://nodejs.org/api/process.html#process_signal_events) (`SIGKILL` and `SIGTERM` has the same effect of force-killing the process immediately.) If you want to achieve graceful termination on Windows, you have to use other means, such as [`taskkill`](https://github.com/sindresorhus/taskkill).
+-
+-##### options.forceKillAfterTimeout
+-
+-Type: `number | false`\
+-Default: `5000`
+-
+-Milliseconds to wait for the child process to terminate before sending `SIGKILL`.
+-
+-Can be disabled with `false`.
+-
+ #### all
+ 
+ Type: `ReadableStream | undefined`
+@@ -468,7 +439,7 @@ Whether the process was canceled using the [`signal`](#signal-1) option.
+ Type: `boolean`
+ 
+ Whether the process was terminated using either:
+-- [`childProcess.kill()`](#killsignal-options).
++- `childProcess.kill()`.
+ - A signal sent by another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
+ 
+ #### signal
+@@ -476,7 +447,7 @@ Whether the process was terminated using either:
+ Type: `string | undefined`
+ 
+ The name of the signal (like `SIGFPE`) that terminated the process using either:
+-- [`childProcess.kill()`](#killsignal-options).
++- `childProcess.kill()`.
+ - A signal sent by another process. This case is [not supported on Windows](https://nodejs.org/api/process.html#signal-events).
+ 
+ If a signal terminated the process, this property is defined and included in the error message. Otherwise it is `undefined`.
+@@ -783,6 +754,26 @@ Default: `SIGTERM`
+ 
+ Signal value to be used when the spawned process will be killed.
+ 
++#### forceKillAfterTimeout
++
++Type: `number | false`\
++Default: `5000`
++
++If the child process is terminated but does not exit, forcefully exit it by sending [`SIGKILL`](https://en.wikipedia.org/wiki/Signal_(IPC)#SIGKILL).
++
++The grace period is 5 seconds by default. This feature can be disabled with `false`.
++
++This works when the child process is terminated by either:
++- the [`signal`](#signal-1), [`timeout`](#timeout), [`maxBuffer`](#maxbuffer) or [`cleanup`](#cleanup) option
++- calling [`subprocess.kill()`](https://nodejs.org/api/child_process.html#subprocesskillsignal) with no arguments
++
++This does not work when the child process is terminated by either:
++- calling [`subprocess.kill()`](https://nodejs.org/api/child_process.html#subprocesskillsignal) with an argument
++- calling [`process.kill(subprocess.pid)`](https://nodejs.org/api/process.html#processkillpid-signal)
++- sending a termination signal from another process
++
++Also, this does not work on Windows, because Windows [doesn't support signals](https://nodejs.org/api/process.html#process_signal_events): `SIGKILL` and `SIGTERM` both terminate the process immediately. Other packages (such as [`taskkill`](https://github.com/sindresorhus/taskkill)) can be used to achieve fail-safe termination on Windows.
++
+ #### signal
+ 
+ Type: [`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal)
+@@ -861,7 +852,7 @@ This limitation can be worked around by passing either:
+ 
+ ### Retry on error
+ 
+-Gracefully handle failures by using automatic retries and exponential backoff with the [`p-retry`](https://github.com/sindresorhus/p-retry) package:
++Safely handle failures by using automatic retries and exponential backoff with the [`p-retry`](https://github.com/sindresorhus/p-retry) package:
+ 
+ ```js
+ import pRetry from 'p-retry';

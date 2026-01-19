@@ -1,0 +1,270 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 6bf8dcf8a..c0e2e7240 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -116,7 +116,7 @@ jobs:
+       fail-fast: true
+       matrix:
+         os: [ubuntu-latest]
+-        node_version: [14]
++        node_version: [12, 14]
+     name: ${{ matrix.os }} / Node ${{ matrix.node_version }}
+     runs-on: ${{ matrix.os }}
+     steps:
+diff --git a/packages/hooks/jest.config.js b/packages/hooks/jest.config.js
+index 1fdd30d29..7da7d2da8 100644
+--- a/packages/hooks/jest.config.js
++++ b/packages/hooks/jest.config.js
+@@ -1,5 +1,3 @@
+ const config = require('../../jest/config');
+ 
+-module.exports = Object.assign({}, config, {
+-  testEnvironment: 'node',
+-});
++module.exports = Object.assign({}, config, {});
+diff --git a/packages/hooks/package.json b/packages/hooks/package.json
+index 7410e61b7..7a87d4c7b 100644
+--- a/packages/hooks/package.json
++++ b/packages/hooks/package.json
+@@ -26,7 +26,7 @@
+     "verdaccio"
+   ],
+   "engines": {
+-    "node": ">=12",
++    "node": ">=10",
+     "npm": ">=6"
+   },
+   "dependencies": {
+@@ -34,14 +34,15 @@
+     "@verdaccio/logger": "workspace:6.0.0-6-next.4",
+     "debug": "^4.2.0",
+     "handlebars": "4.5.3",
+-    "undici": "^4.0.0-rc.1",
+-    "undici-fetch": "^1.0.0-rc.1"
++    "node-fetch": "^2.6.1",
++    "request": "2.87.0"
+   },
+   "devDependencies": {
+     "@verdaccio/auth": "workspace:6.0.0-6-next.9",
+     "@verdaccio/commons-api": "workspace:11.0.0-alpha.3",
+     "@verdaccio/config": "workspace:6.0.0-6-next.7",
+-    "@verdaccio/types": "workspace:11.0.0-6-next.7"
++    "@verdaccio/types": "workspace:11.0.0-6-next.7",
++    "nock": "^13.0.4"
+   },
+   "scripts": {
+     "clean": "rimraf ./build",
+diff --git a/packages/hooks/src/notify-request.ts b/packages/hooks/src/notify-request.ts
+index 50367da08..bddcd2a1d 100644
+--- a/packages/hooks/src/notify-request.ts
++++ b/packages/hooks/src/notify-request.ts
+@@ -1,18 +1,13 @@
++import fetch, { RequestInit } from 'node-fetch';
+ import buildDebug from 'debug';
+ 
+ import { logger } from '@verdaccio/logger';
+ import { HTTP_STATUS } from '@verdaccio/commons-api';
+ 
+ const debug = buildDebug('verdaccio:hooks:request');
+-const fetch = require('undici-fetch');
++export type NotifyRequestOptions = RequestInit;
+ 
+-export type FetchOptions = {
+-  body: string;
+-  headers?: {};
+-  method?: string;
+-};
+-
+-export async function notifyRequest(url: string, options: FetchOptions): Promise<boolean> {
++export async function notifyRequest(url: string, options: NotifyRequestOptions): Promise<boolean> {
+   let response;
+   try {
+     debug('uri %o', url);
+diff --git a/packages/hooks/src/notify.ts b/packages/hooks/src/notify.ts
+index 1c2c5bbcb..3c861f3e0 100644
+--- a/packages/hooks/src/notify.ts
++++ b/packages/hooks/src/notify.ts
+@@ -5,7 +5,7 @@ import Handlebars from 'handlebars';
+ import buildDebug from 'debug';
+ import { Config, Package, RemoteUser, Notification } from '@verdaccio/types';
+ import { logger } from '@verdaccio/logger';
+-import { notifyRequest, FetchOptions } from './notify-request';
++import { notifyRequest, NotifyRequestOptions } from './notify-request';
+ 
+ const debug = buildDebug('verdaccio:hooks');
+ 
+@@ -50,7 +50,7 @@ export async function handleNotify(
+     content = await compileTemplate(notifyEntry.content, metadata);
+   }
+ 
+-  const options: FetchOptions = {
++  const options: NotifyRequestOptions = {
+     body: JSON.stringify(content),
+   };
+ 
+diff --git a/packages/hooks/test/notify-request.spec.ts b/packages/hooks/test/notify-request.spec.ts
+index 300b6255c..d530f106d 100644
+--- a/packages/hooks/test/notify-request.spec.ts
++++ b/packages/hooks/test/notify-request.spec.ts
+@@ -1,4 +1,4 @@
+-import { setup } from '@verdaccio/logger';
++import nock from 'nock';
+ import { Config } from '@verdaccio/types';
+ import { parseConfigFile, createRemoteUser } from '@verdaccio/config';
+ import { notify } from '../src/notify';
+@@ -12,33 +12,36 @@ const singleHeaderNotificationConfig = parseConfigFile(
+ );
+ const multiNotificationConfig = parseConfigFile(parseConfigurationNotifyFile('multiple.notify'));
+ 
+-setup([]);
++const mockInfo = jest.fn();
++jest.mock('@verdaccio/logger', () => ({
++  setup: jest.fn(),
++  logger: {
++    child: jest.fn(),
++    debug: jest.fn(),
++    trace: jest.fn(),
++    warn: jest.fn(),
++    info: () => mockInfo(),
++    error: jest.fn(),
++    fatal: jest.fn(),
++  },
++}));
+ 
+ const domain = 'http://slack-service';
+-const { MockAgent } = require('undici');
+-const { setGlobalDispatcher } = require('undici-fetch');
+-
+-const options = {
+-  path: '/foo?auth_token=mySecretToken',
+-  method: 'POST',
+-};
+ 
+ describe('Notifications:: notifyRequest', () => {
++  beforeEach(() => {
++    nock.cleanAll();
++  });
++
+   test('when sending a empty notification', async () => {
+-    const mockAgent = new MockAgent({ connections: 1 });
+-    setGlobalDispatcher(mockAgent);
+-    const mockClient = mockAgent.get(domain);
+-    mockClient.intercept(options).reply(200, { body: 'test' });
++    nock(domain).post('/foo?auth_token=mySecretToken').reply(200, { body: 'test' });
+ 
+     const notificationResponse = await notify({}, {}, createRemoteUser('foo', []), 'bar');
+     expect(notificationResponse).toEqual([false]);
+   });
+ 
+   test('when sending a single notification', async () => {
+-    const mockAgent = new MockAgent({ connections: 1 });
+-    setGlobalDispatcher(mockAgent);
+-    const mockClient = mockAgent.get(domain);
+-    mockClient.intercept(options).reply(200, { body: 'test' });
++    nock(domain).post('/foo?auth_token=mySecretToken').reply(200, { body: 'test' });
+ 
+     const notificationResponse = await notify(
+       {},
+@@ -47,14 +50,10 @@ describe('Notifications:: notifyRequest', () => {
+       'bar'
+     );
+     expect(notificationResponse).toEqual([true]);
+-    await mockClient.close();
+   });
+ 
+   test('when notification endpoint is missing', async () => {
+-    const mockAgent = new MockAgent({ connections: 1 });
+-    setGlobalDispatcher(mockAgent);
+-    const mockClient = mockAgent.get(domain);
+-    mockClient.intercept(options).reply(200, { body: 'test' });
++    nock(domain).post('/foo?auth_token=mySecretToken').reply(200, { body: 'test' });
+     const name = 'package';
+     const config: Partial<Config> = {
+       // @ts-ignore
+@@ -69,16 +68,14 @@ describe('Notifications:: notifyRequest', () => {
+   });
+ 
+   test('when multiple notifications', async () => {
+-    const mockAgent = new MockAgent({ connections: 1 });
+-    setGlobalDispatcher(mockAgent);
+-    const mockClient = mockAgent.get(domain);
+-    mockClient.intercept(options).reply(200, { body: 'test' });
+-    mockClient.intercept(options).reply(400, {});
+-    mockClient.intercept(options).reply(500, { message: 'Something bad happened' });
++    nock(domain).post('/foo?auth_token=mySecretToken').reply(200, { body: 'test' });
++    nock(domain).post('/foo?auth_token=mySecretToken').reply(400, {});
++    nock(domain)
++      .post('/foo?auth_token=mySecretToken')
++      .reply(500, { message: 'Something bad happened' });
+ 
+     const name = 'package';
+     const responses = await notify({ name }, multiNotificationConfig, { name: 'foo' }, 'bar');
+     expect(responses).toEqual([true, false, false]);
+-    await mockClient.close();
+   });
+ });
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 37602b6b7..8c9e2bcab 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -504,19 +504,21 @@ importers:
+       '@verdaccio/types': workspace:11.0.0-6-next.7
+       debug: ^4.2.0
+       handlebars: 4.5.3
+-      undici: ^4.0.0-rc.1
+-      undici-fetch: ^1.0.0-rc.1
++      nock: ^13.0.4
++      node-fetch: ^2.6.1
++      request: 2.87.0
+     dependencies:
+       '@verdaccio/commons-api': link:../core/commons-api
+       '@verdaccio/logger': link:../logger
+       debug: 4.2.0
+       handlebars: 4.5.3
+-      undici: 4.0.0-rc.7
+-      undici-fetch: 1.0.0-rc.1
++      node-fetch: 2.6.1
++      request: 2.87.0
+     devDependencies:
+       '@verdaccio/auth': link:../auth
+       '@verdaccio/config': link:../config
+       '@verdaccio/types': link:../core/types
++      nock: 13.0.4
+ 
+   packages/loaders:
+     specifiers:
+@@ -13498,6 +13500,16 @@ packages:
+       - supports-color
+     dev: true
+ 
++  /nock/13.0.4:
++    resolution: {integrity: sha512-alqTV8Qt7TUbc74x1pKRLSENzfjp4nywovcJgi/1aXDiUxXdt7TkruSTF5MDWPP7UoPVgea4F9ghVdmX0xxnSA==}
++    engines: {node: '>= 10.13'}
++    dependencies:
++      debug: 4.1.1
++      json-stringify-safe: 5.0.1
++      lodash.set: 4.3.2
++      propagate: 2.0.1
++    dev: true
++
+   /node-abi/2.19.1:
+     resolution: {integrity: sha512-HbtmIuByq44yhAzK7b9j/FelKlHYISKQn0mtvcBrU5QBkhoCMp5bu8Hv5AI34DcKfOAcJBcOEMwLlwO62FFu9A==}
+     dependencies:
+@@ -18083,17 +18095,6 @@ packages:
+       debug: 2.6.9
+     dev: true
+ 
+-  /undici-fetch/1.0.0-rc.1:
+-    resolution: {integrity: sha512-VPMBog6ke/hSABltjVrcq+xc0RSnqfgmufn+5hfKBoIEJJq5nkKWQcWzW/uGlesSC2eKFQ6sPCQesFc7LfqGAg==}
+-    dependencies:
+-      undici: 4.0.0-rc.7
+-    dev: false
+-
+-  /undici/4.0.0-rc.7:
+-    resolution: {integrity: sha512-8vhF9REAH/O+eGh1K942bTznr47JOZHlHMTh9/5XiJvcBk3GqV2qzeRPxwDfAeHNWjm1BZ4EsSgAotHV2EOxeA==}
+-    engines: {node: '>=12.18'}
+-    dev: false
+-
+   /unicode-canonical-property-names-ecmascript/1.0.4:
+     resolution: {integrity: sha512-jDrNnXWHd4oHiTZnx/ZG7gtUTVp+gCcTTKr8L0HjlwphROEW3+Him+IpvC+xcJEFegapiMZyZe02CyuOnRmbnQ==}
+     engines: {node: '>=4'}

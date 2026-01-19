@@ -1,0 +1,178 @@
+diff --git a/integration/scopes/src/durable/durable-context-id.strategy.ts b/integration/scopes/src/durable/durable-context-id.strategy.ts
+index feea43a02..b0bb6bee1 100644
+--- a/integration/scopes/src/durable/durable-context-id.strategy.ts
++++ b/integration/scopes/src/durable/durable-context-id.strategy.ts
+@@ -1,6 +1,11 @@
+ import { ContextId, ContextIdStrategy, HostComponentInfo } from '@nestjs/core';
+ import { Request } from 'express';
+ 
++export type TenantContext = {
++  tenantId: string;
++  forceError?: boolean;
++};
++
+ const tenants = new Map<string, ContextId>();
+ 
+ export class DurableContextIdStrategy implements ContextIdStrategy {
+@@ -17,10 +22,7 @@ export class DurableContextIdStrategy implements ContextIdStrategy {
+       tenants.set(tenantId, tenantSubTreeId);
+     }
+ 
+-    const payload: {
+-      tenantId: string;
+-      forceError?: boolean;
+-    } = { tenantId };
++    const payload: TenantContext = { tenantId };
+     if (forceError) {
+       payload.forceError = true;
+     }
+diff --git a/integration/scopes/src/durable/durable.controller.ts b/integration/scopes/src/durable/durable.controller.ts
+index be51ad2df..fbc33c12c 100644
+--- a/integration/scopes/src/durable/durable.controller.ts
++++ b/integration/scopes/src/durable/durable.controller.ts
+@@ -1,9 +1,13 @@
+ import { Controller, Get } from '@nestjs/common';
+ import { DurableService } from './durable.service';
++import { NonDurableService } from './non-durable.service';
+ 
+ @Controller('durable')
+ export class DurableController {
+-  constructor(private readonly durableService: DurableService) {}
++  constructor(
++    private readonly durableService: DurableService,
++    private readonly nonDurableService: NonDurableService,
++  ) {}
+ 
+   @Get()
+   greeting(): string {
+@@ -12,6 +16,16 @@ export class DurableController {
+ 
+   @Get('echo')
+   echo() {
+-    return this.durableService.requestPayload;
++    return {
++      tenantId: this.durableService.getTenantId(),
++    };
++  }
++
++  @Get('request-context')
++  getRequestContext() {
++    return {
++      durableService: this.durableService.getTenantId(),
++      nonDurableService: this.nonDurableService.getTenantId(),
++    };
+   }
+ }
+diff --git a/integration/scopes/src/durable/durable.module.ts b/integration/scopes/src/durable/durable.module.ts
+index d749135bd..dc91cded6 100644
+--- a/integration/scopes/src/durable/durable.module.ts
++++ b/integration/scopes/src/durable/durable.module.ts
+@@ -3,11 +3,13 @@ import { APP_GUARD } from '@nestjs/core';
+ import { DurableController } from './durable.controller';
+ import { DurableGuard } from './durable.guard';
+ import { DurableService } from './durable.service';
++import { NonDurableService } from './non-durable.service';
+ 
+ @Module({
+   controllers: [DurableController],
+   providers: [
+     DurableService,
++    NonDurableService,
+     {
+       provide: APP_GUARD,
+       useClass: DurableGuard,
+diff --git a/integration/scopes/src/durable/durable.service.ts b/integration/scopes/src/durable/durable.service.ts
+index 8f33692d8..247501143 100644
+--- a/integration/scopes/src/durable/durable.service.ts
++++ b/integration/scopes/src/durable/durable.service.ts
+@@ -5,14 +5,14 @@ import {
+   Scope,
+ } from '@nestjs/common';
+ import { REQUEST } from '@nestjs/core';
++import { TenantContext } from './durable-context-id.strategy';
+ 
+ @Injectable({ scope: Scope.REQUEST, durable: true })
+ export class DurableService {
+   public instanceCounter = 0;
+ 
+   constructor(
+-    @Inject(REQUEST)
+-    public readonly requestPayload: { tenantId: string; forceError: boolean },
++    @Inject(REQUEST) private readonly requestPayload: TenantContext,
+   ) {
+     if (requestPayload.forceError) {
+       throw new PreconditionFailedException('Forced error');
+@@ -23,4 +23,8 @@ export class DurableService {
+     ++this.instanceCounter;
+     return `Hello world! Counter: ${this.instanceCounter}`;
+   }
++
++  getTenantId() {
++    return this.requestPayload.tenantId;
++  }
+ }
+diff --git a/integration/scopes/src/durable/non-durable.service.ts b/integration/scopes/src/durable/non-durable.service.ts
+new file mode 100644
+index 000000000..add062941
+--- /dev/null
++++ b/integration/scopes/src/durable/non-durable.service.ts
+@@ -0,0 +1,14 @@
++import { Inject, Injectable, Scope } from '@nestjs/common';
++import { REQUEST } from '@nestjs/core';
++import { TenantContext } from './durable-context-id.strategy';
++
++@Injectable()
++export class NonDurableService {
++  constructor(
++    @Inject(REQUEST) private readonly requestPayload: TenantContext,
++  ) {}
++
++  getTenantId() {
++    return this.requestPayload.tenantId;
++  }
++}
+diff --git a/packages/core/middleware/middleware-module.ts b/packages/core/middleware/middleware-module.ts
+index b956a2385..68e4d197e 100644
+--- a/packages/core/middleware/middleware-module.ts
++++ b/packages/core/middleware/middleware-module.ts
+@@ -346,7 +346,9 @@ export class MiddlewareModule<
+         configurable: false,
+       });
+ 
+-      const requestProviderValue = isTreeDurable ? contextId.payload : request;
++      const requestProviderValue = isTreeDurable
++        ? contextId.payload
++        : Object.assign(request, contextId.payload);
+       this.container.registerRequestProvider(requestProviderValue, contextId);
+     }
+     return contextId;
+diff --git a/packages/core/router/router-explorer.ts b/packages/core/router/router-explorer.ts
+index 411d86efb..7c537ab12 100644
+--- a/packages/core/router/router-explorer.ts
++++ b/packages/core/router/router-explorer.ts
+@@ -418,7 +418,9 @@ export class RouterExplorer {
+         configurable: false,
+       });
+ 
+-      const requestProviderValue = isTreeDurable ? contextId.payload : request;
++      const requestProviderValue = isTreeDurable
++        ? contextId.payload
++        : Object.assign(request, contextId.payload);
+       this.container.registerRequestProvider(requestProviderValue, contextId);
+     }
+     return contextId;
+diff --git a/packages/microservices/listeners-controller.ts b/packages/microservices/listeners-controller.ts
+index cba398269..4a1c43935 100644
+--- a/packages/microservices/listeners-controller.ts
++++ b/packages/microservices/listeners-controller.ts
+@@ -308,7 +308,9 @@ export class ListenersController {
+         configurable: false,
+       });
+ 
+-      const requestProviderValue = isTreeDurable ? contextId.payload : request;
++      const requestProviderValue = isTreeDurable
++        ? contextId.payload
++        : Object.assign(request, contextId.payload);
+       this.container.registerRequestProvider(requestProviderValue, contextId);
+     }
+     return contextId;

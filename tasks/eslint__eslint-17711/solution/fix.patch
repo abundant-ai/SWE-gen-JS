@@ -1,0 +1,454 @@
+diff --git a/docs/src/_data/rules.json b/docs/src/_data/rules.json
+index 33915152a..8d8ca09bc 100644
+--- a/docs/src/_data/rules.json
++++ b/docs/src/_data/rules.json
+@@ -659,7 +659,7 @@
+                 "description": "Disallow `Array` constructors",
+                 "recommended": false,
+                 "fixable": false,
+-                "hasSuggestions": false
++                "hasSuggestions": true
+             },
+             {
+                 "name": "no-bitwise",
+diff --git a/docs/src/_data/rules_meta.json b/docs/src/_data/rules_meta.json
+index a00b86c70..59818ecf9 100644
+--- a/docs/src/_data/rules_meta.json
++++ b/docs/src/_data/rules_meta.json
+@@ -758,7 +758,8 @@
+             "description": "Disallow `Array` constructors",
+             "recommended": false,
+             "url": "https://eslint.org/docs/latest/rules/no-array-constructor"
+-        }
++        },
++        "hasSuggestions": true
+     },
+     "no-async-promise-executor": {
+         "type": "problem",
+diff --git a/docs/src/rules/no-array-constructor.md b/docs/src/rules/no-array-constructor.md
+index aa7c079ba..eff97dee7 100644
+--- a/docs/src/rules/no-array-constructor.md
++++ b/docs/src/rules/no-array-constructor.md
+@@ -24,9 +24,13 @@ Examples of **incorrect** code for this rule:
+ ```js
+ /*eslint no-array-constructor: "error"*/
+ 
+-Array(0, 1, 2)
++Array();
+ 
+-new Array(0, 1, 2)
++Array(0, 1, 2);
++
++new Array(0, 1, 2);
++
++Array(...args);
+ ```
+ 
+ :::
+@@ -38,11 +42,13 @@ Examples of **correct** code for this rule:
+ ```js
+ /*eslint no-array-constructor: "error"*/
+ 
+-Array(500)
++Array(500);
++
++new Array(someOtherArray.length);
+ 
+-new Array(someOtherArray.length)
++[0, 1, 2];
+ 
+-[0, 1, 2]
++const createArray = Array => new Array();
+ ```
+ 
+ :::
+diff --git a/lib/rules/no-array-constructor.js b/lib/rules/no-array-constructor.js
+index b53992641..f56b68766 100644
+--- a/lib/rules/no-array-constructor.js
++++ b/lib/rules/no-array-constructor.js
+@@ -5,6 +5,18 @@
+ 
+ "use strict";
+ 
++//------------------------------------------------------------------------------
++// Requirements
++//------------------------------------------------------------------------------
++
++const {
++    getVariableByName,
++    isClosingParenToken,
++    isOpeningParenToken,
++    isStartOfExpressionStatement,
++    needsPrecedingSemicolon
++} = require("./utils/ast-utils");
++
+ //------------------------------------------------------------------------------
+ // Rule Definition
+ //------------------------------------------------------------------------------
+@@ -20,15 +32,45 @@ module.exports = {
+             url: "https://eslint.org/docs/latest/rules/no-array-constructor"
+         },
+ 
++        hasSuggestions: true,
++
+         schema: [],
+ 
+         messages: {
+-            preferLiteral: "The array literal notation [] is preferable."
++            preferLiteral: "The array literal notation [] is preferable.",
++            useLiteral: "Replace with an array literal.",
++            useLiteralAfterSemicolon: "Replace with an array literal, add preceding semicolon."
+         }
+     },
+ 
+     create(context) {
+ 
++        const sourceCode = context.sourceCode;
++
++        /**
++         * Gets the text between the calling parentheses of a CallExpression or NewExpression.
++         * @param {ASTNode} node A CallExpression or NewExpression node.
++         * @returns {string} The text between the calling parentheses, or an empty string if there are none.
++         */
++        function getArgumentsText(node) {
++            const lastToken = sourceCode.getLastToken(node);
++
++            if (!isClosingParenToken(lastToken)) {
++                return "";
++            }
++
++            let firstToken = node.callee;
++
++            do {
++                firstToken = sourceCode.getTokenAfter(firstToken);
++                if (!firstToken || firstToken === lastToken) {
++                    return "";
++                }
++            } while (!isOpeningParenToken(firstToken));
++
++            return sourceCode.text.slice(firstToken.range[1], lastToken.range[0]);
++        }
++
+         /**
+          * Disallow construction of dense arrays using the Array constructor
+          * @param {ASTNode} node node to evaluate
+@@ -37,11 +79,48 @@ module.exports = {
+          */
+         function check(node) {
+             if (
+-                node.arguments.length !== 1 &&
+-                node.callee.type === "Identifier" &&
+-                node.callee.name === "Array"
+-            ) {
+-                context.report({ node, messageId: "preferLiteral" });
++                node.callee.type !== "Identifier" ||
++                node.callee.name !== "Array" ||
++                node.arguments.length === 1 &&
++                node.arguments[0].type !== "SpreadElement") {
++                return;
++            }
++
++            const variable = getVariableByName(sourceCode.getScope(node), "Array");
++
++            /*
++             * Check if `Array` is a predefined global variable: predefined globals have no declarations,
++             * meaning that the `identifiers` list of the variable object is empty.
++             */
++            if (variable && variable.identifiers.length === 0) {
++                const argsText = getArgumentsText(node);
++                let fixText;
++                let messageId;
++
++                /*
++                 * Check if the suggested change should include a preceding semicolon or not.
++                 * Due to JavaScript's ASI rules, a missing semicolon may be inserted automatically
++                 * before an expression like `Array()` or `new Array()`, but not when the expression
++                 * is changed into an array literal like `[]`.
++                 */
++                if (isStartOfExpressionStatement(node) && needsPrecedingSemicolon(sourceCode, node)) {
++                    fixText = `;[${argsText}]`;
++                    messageId = "useLiteralAfterSemicolon";
++                } else {
++                    fixText = `[${argsText}]`;
++                    messageId = "useLiteral";
++                }
++
++                context.report({
++                    node,
++                    messageId: "preferLiteral",
++                    suggest: [
++                        {
++                            messageId,
++                            fix: fixer => fixer.replaceText(node, fixText)
++                        }
++                    ]
++                });
+             }
+         }
+ 
+diff --git a/lib/rules/no-object-constructor.js b/lib/rules/no-object-constructor.js
+index e3ac20957..8875ec212 100644
+--- a/lib/rules/no-object-constructor.js
++++ b/lib/rules/no-object-constructor.js
+@@ -9,67 +9,12 @@
+ // Requirements
+ //------------------------------------------------------------------------------
+ 
+-const { getVariableByName, isArrowToken, isClosingBraceToken, isClosingParenToken } = require("./utils/ast-utils");
+-
+-//------------------------------------------------------------------------------
+-// Helpers
+-//------------------------------------------------------------------------------
+-
+-const BREAK_OR_CONTINUE = new Set(["BreakStatement", "ContinueStatement"]);
+-
+-// Declaration types that must contain a string Literal node at the end.
+-const DECLARATIONS = new Set(["ExportAllDeclaration", "ExportNamedDeclaration", "ImportDeclaration"]);
+-
+-const IDENTIFIER_OR_KEYWORD = new Set(["Identifier", "Keyword"]);
+-
+-// Keywords that can immediately precede an ExpressionStatement node, mapped to the their node types.
+-const NODE_TYPES_BY_KEYWORD = {
+-    __proto__: null,
+-    break: "BreakStatement",
+-    continue: "ContinueStatement",
+-    debugger: "DebuggerStatement",
+-    do: "DoWhileStatement",
+-    else: "IfStatement",
+-    return: "ReturnStatement",
+-    yield: "YieldExpression"
+-};
+-
+-/*
+- * Before an opening parenthesis, postfix `++` and `--` always trigger ASI;
+- * the tokens `:`, `;`, `{` and `=>` don't expect a semicolon, as that would count as an empty statement.
+- */
+-const PUNCTUATORS = new Set([":", ";", "{", "=>", "++", "--"]);
+-
+-/*
+- * Statements that can contain an `ExpressionStatement` after a closing parenthesis.
+- * DoWhileStatement is an exception in that it always triggers ASI after the closing parenthesis.
+- */
+-const STATEMENTS = new Set([
+-    "DoWhileStatement",
+-    "ForInStatement",
+-    "ForOfStatement",
+-    "ForStatement",
+-    "IfStatement",
+-    "WhileStatement",
+-    "WithStatement"
+-]);
+-
+-/**
+- * Tests if a node appears at the beginning of an ancestor ExpressionStatement node.
+- * @param {ASTNode} node The node to check.
+- * @returns {boolean} Whether the node appears at the beginning of an ancestor ExpressionStatement node.
+- */
+-function isStartOfExpressionStatement(node) {
+-    const start = node.range[0];
+-    let ancestor = node;
+-
+-    while ((ancestor = ancestor.parent) && ancestor.range[0] === start) {
+-        if (ancestor.type === "ExpressionStatement") {
+-            return true;
+-        }
+-    }
+-    return false;
+-}
++const {
++    getVariableByName,
++    isArrowToken,
++    isStartOfExpressionStatement,
++    needsPrecedingSemicolon
++} = require("./utils/ast-utils");
+ 
+ //------------------------------------------------------------------------------
+ // Rule Definition
+@@ -120,50 +65,6 @@ module.exports = {
+             return false;
+         }
+ 
+-        /**
+-         * Determines whether a parenthesized object literal that replaces a specified node needs to be preceded by a semicolon.
+-         * @param {ASTNode} node The node to be replaced. This node should be at the start of an `ExpressionStatement` or at the start of the body of an `ArrowFunctionExpression`.
+-         * @returns {boolean} Whether a semicolon is required before the parenthesized object literal.
+-         */
+-        function needsSemicolon(node) {
+-            const prevToken = sourceCode.getTokenBefore(node);
+-
+-            if (!prevToken || prevToken.type === "Punctuator" && PUNCTUATORS.has(prevToken.value)) {
+-                return false;
+-            }
+-
+-            const prevNode = sourceCode.getNodeByRangeIndex(prevToken.range[0]);
+-
+-            if (isClosingParenToken(prevToken)) {
+-                return !STATEMENTS.has(prevNode.type);
+-            }
+-
+-            if (isClosingBraceToken(prevToken)) {
+-                return (
+-                    prevNode.type === "BlockStatement" && prevNode.parent.type === "FunctionExpression" ||
+-                    prevNode.type === "ClassBody" && prevNode.parent.type === "ClassExpression" ||
+-                    prevNode.type === "ObjectExpression"
+-                );
+-            }
+-
+-            if (IDENTIFIER_OR_KEYWORD.has(prevToken.type)) {
+-                if (BREAK_OR_CONTINUE.has(prevNode.parent.type)) {
+-                    return false;
+-                }
+-
+-                const keyword = prevToken.value;
+-                const nodeType = NODE_TYPES_BY_KEYWORD[keyword];
+-
+-                return prevNode.type !== nodeType;
+-            }
+-
+-            if (prevToken.type === "String") {
+-                return !DECLARATIONS.has(prevNode.parent.type);
+-            }
+-
+-            return true;
+-        }
+-
+         /**
+          * Reports on nodes where the `Object` constructor is called without arguments.
+          * @param {ASTNode} node The node to evaluate.
+@@ -183,7 +84,7 @@ module.exports = {
+ 
+                 if (needsParentheses(node)) {
+                     replacement = "({})";
+-                    if (needsSemicolon(node)) {
++                    if (needsPrecedingSemicolon(sourceCode, node)) {
+                         fixText = ";({})";
+                         messageId = "useLiteralAfterSemicolon";
+                     } else {
+diff --git a/lib/rules/utils/ast-utils.js b/lib/rules/utils/ast-utils.js
+index bebb4d516..962bdde0a 100644
+--- a/lib/rules/utils/ast-utils.js
++++ b/lib/rules/utils/ast-utils.js
+@@ -1015,6 +1015,114 @@ function isDirective(node) {
+     return node.type === "ExpressionStatement" && typeof node.directive === "string";
+ }
+ 
++/**
++ * Tests if a node appears at the beginning of an ancestor ExpressionStatement node.
++ * @param {ASTNode} node The node to check.
++ * @returns {boolean} Whether the node appears at the beginning of an ancestor ExpressionStatement node.
++ */
++function isStartOfExpressionStatement(node) {
++    const start = node.range[0];
++    let ancestor = node;
++
++    while ((ancestor = ancestor.parent) && ancestor.range[0] === start) {
++        if (ancestor.type === "ExpressionStatement") {
++            return true;
++        }
++    }
++    return false;
++}
++
++/**
++ * Determines whether an opening parenthesis `(`, bracket `[` or backtick ``` ` ``` needs to be preceded by a semicolon.
++ * This opening parenthesis or bracket should be at the start of an `ExpressionStatement` or at the start of the body of an `ArrowFunctionExpression`.
++ * @type {(sourceCode: SourceCode, node: ASTNode) => boolean}
++ * @param {SourceCode} sourceCode The source code object.
++ * @param {ASTNode} node A node at the position where an opening parenthesis or bracket will be inserted.
++ * @returns {boolean} Whether a semicolon is required before the opening parenthesis or braket.
++ */
++let needsPrecedingSemicolon;
++
++{
++    const BREAK_OR_CONTINUE = new Set(["BreakStatement", "ContinueStatement"]);
++
++    // Declaration types that must contain a string Literal node at the end.
++    const DECLARATIONS = new Set(["ExportAllDeclaration", "ExportNamedDeclaration", "ImportDeclaration"]);
++
++    const IDENTIFIER_OR_KEYWORD = new Set(["Identifier", "Keyword"]);
++
++    // Keywords that can immediately precede an ExpressionStatement node, mapped to the their node types.
++    const NODE_TYPES_BY_KEYWORD = {
++        __proto__: null,
++        break: "BreakStatement",
++        continue: "ContinueStatement",
++        debugger: "DebuggerStatement",
++        do: "DoWhileStatement",
++        else: "IfStatement",
++        return: "ReturnStatement",
++        yield: "YieldExpression"
++    };
++
++    /*
++     * Before an opening parenthesis, postfix `++` and `--` always trigger ASI;
++     * the tokens `:`, `;`, `{` and `=>` don't expect a semicolon, as that would count as an empty statement.
++     */
++    const PUNCTUATORS = new Set([":", ";", "{", "=>", "++", "--"]);
++
++    /*
++     * Statements that can contain an `ExpressionStatement` after a closing parenthesis.
++     * DoWhileStatement is an exception in that it always triggers ASI after the closing parenthesis.
++     */
++    const STATEMENTS = new Set([
++        "DoWhileStatement",
++        "ForInStatement",
++        "ForOfStatement",
++        "ForStatement",
++        "IfStatement",
++        "WhileStatement",
++        "WithStatement"
++    ]);
++
++    needsPrecedingSemicolon =
++    function(sourceCode, node) {
++        const prevToken = sourceCode.getTokenBefore(node);
++
++        if (!prevToken || prevToken.type === "Punctuator" && PUNCTUATORS.has(prevToken.value)) {
++            return false;
++        }
++
++        const prevNode = sourceCode.getNodeByRangeIndex(prevToken.range[0]);
++
++        if (isClosingParenToken(prevToken)) {
++            return !STATEMENTS.has(prevNode.type);
++        }
++
++        if (isClosingBraceToken(prevToken)) {
++            return (
++                prevNode.type === "BlockStatement" && prevNode.parent.type === "FunctionExpression" ||
++                prevNode.type === "ClassBody" && prevNode.parent.type === "ClassExpression" ||
++                prevNode.type === "ObjectExpression"
++            );
++        }
++
++        if (IDENTIFIER_OR_KEYWORD.has(prevToken.type)) {
++            if (BREAK_OR_CONTINUE.has(prevNode.parent.type)) {
++                return false;
++            }
++
++            const keyword = prevToken.value;
++            const nodeType = NODE_TYPES_BY_KEYWORD[keyword];
++
++            return prevNode.type !== nodeType;
++        }
++
++        if (prevToken.type === "String") {
++            return !DECLARATIONS.has(prevNode.parent.type);
++        }
++
++        return true;
++    };
++}
++
+ //------------------------------------------------------------------------------
+ // Public Interface
+ //------------------------------------------------------------------------------
+@@ -2168,5 +2276,7 @@ module.exports = {
+     getModuleExportName,
+     isConstant,
+     isTopLevelExpressionStatement,
+-    isDirective
++    isDirective,
++    isStartOfExpressionStatement,
++    needsPrecedingSemicolon
+ };

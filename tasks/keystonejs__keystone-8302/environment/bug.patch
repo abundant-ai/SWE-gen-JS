@@ -1,0 +1,373 @@
+diff --git a/.changeset/plenty-books-share.md b/.changeset/plenty-books-share.md
+deleted file mode 100644
+index c25789679..000000000
+--- a/.changeset/plenty-books-share.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'@keystone-6/core': major
+----
+-
+-Removes `--reset-db` from `keystone dev`, use `keystone prisma db push --force-reset` to reset your database
+diff --git a/docs/pages/docs/guides/cli.md b/docs/pages/docs/guides/cli.md
+index 50de079b0..ac1e092a8 100644
+--- a/docs/pages/docs/guides/cli.md
++++ b/docs/pages/docs/guides/cli.md
+@@ -129,18 +129,17 @@ We strongly recommend enabling migrations if you are going to run your app in pr
+ 
+ ### Resetting the database
+ 
+-From time to time, in development you may want to reset the database and recreate it from scratch.
+-You can do this by using Prisma:
++From time to time, in development you may want to reset the database and recreate it from scratch. You can do this by passing the `--reset-db` flag:
+ 
+ ```bash
+-$ keystone prisma db push --force-reset
++$ keystone dev --reset-db
+ ```
+ 
+ {% hint kind="error" %}
+ Doing this will destroy your database, including all data
+ {% /hint %}
+ 
+-This is typically useful early in a project's development lifecycle, when you want to test database initialisation scripts or create a fresh set of test data.
++This is mainly useful early in a project's development lifecycle, when you want to test database initialisation scripts or create a fresh set of test data.
+ 
+ ## postinstall
+ 
+diff --git a/packages/core/src/lib/migrations.ts b/packages/core/src/lib/migrations.ts
+index 5e8402d7f..6bea14ee1 100644
+--- a/packages/core/src/lib/migrations.ts
++++ b/packages/core/src/lib/migrations.ts
+@@ -66,7 +66,7 @@ export async function pushPrismaSchemaToDatabase(
+   shadowDbUrl: string | undefined,
+   schema: string,
+   schemaPath: string,
+-  resetDb: boolean
++  resetDb = false
+ ) {
+   const before = Date.now();
+   await ensureDatabaseExists(dbUrl, path.dirname(schemaPath));
+@@ -181,6 +181,7 @@ export async function deployMigrations(dbUrl: string) {
+   });
+ }
+ 
++// TODO: don't have process.exit calls here
+ export async function devMigrations(
+   dbUrl: string,
+   shadowDbUrl: string | undefined,
+diff --git a/packages/core/src/scripts/cli.ts b/packages/core/src/scripts/cli.ts
+index 43f352cfe..9dbf4b672 100644
+--- a/packages/core/src/scripts/cli.ts
++++ b/packages/core/src/scripts/cli.ts
+@@ -11,6 +11,7 @@ export type Flags = {
+   fix: boolean; // TODO: remove, deprecated
+   frozen: boolean;
+   prisma: boolean;
++  resetDb: boolean;
+   server: boolean;
+   ui: boolean;
+   withMigrations: boolean;
+@@ -79,7 +80,10 @@ export async function cli(cwd: string, argv: string[]) {
+ 
+   const command = input[0] || 'dev';
+   if (command === 'dev') {
+-    return dev(cwd, defaultFlags(flags, { dbPush: true, prisma: true, server: true, ui: true }));
++    return dev(
++      cwd,
++      defaultFlags(flags, { dbPush: true, prisma: true, resetDb: false, server: true, ui: true })
++    );
+   }
+ 
+   if (command === 'build') {
+@@ -91,7 +95,7 @@ export async function cli(cwd: string, argv: string[]) {
+   }
+ 
+   if (command === 'prisma') {
+-    return prisma(cwd, argv.slice(1), Boolean(flags.frozen));
++    return prisma(cwd, argv.slice(1), defaultFlags(flags, { frozen: false }).frozen);
+   }
+ 
+   if (command === 'telemetry') return telemetry(cwd, argv[1]);
+diff --git a/packages/core/src/scripts/run/dev.ts b/packages/core/src/scripts/run/dev.ts
+index c69d1a287..36419e22e 100644
+--- a/packages/core/src/scripts/run/dev.ts
++++ b/packages/core/src/scripts/run/dev.ts
+@@ -77,7 +77,13 @@ type WatchBuildResult = { error: BuildFailure | null; result: BuildResult | null
+ 
+ export async function dev(
+   cwd: string,
+-  { dbPush, prisma, server, ui }: Pick<Flags, 'dbPush' | 'prisma' | 'server' | 'ui'>
++  {
++    dbPush,
++    prisma,
++    resetDb,
++    server,
++    ui,
++  }: Pick<Flags, 'dbPush' | 'prisma' | 'resetDb' | 'server' | 'ui'>
+ ) {
+   console.log('✨ Starting Keystone');
+   const app = server ? express() : null;
+@@ -129,6 +135,7 @@ export async function dev(
+       server,
+       prisma,
+       dbPush,
++      resetDb,
+     });
+ 
+     if (configWithHTTP?.server?.extendHttpServer && httpServer && context) {
+@@ -368,11 +375,12 @@ async function setupInitialKeystone(
+   cwd: string,
+   options: {
+     dbPush: boolean;
++    resetDb: boolean;
+     prisma: boolean;
+     server: boolean;
+   }
+ ) {
+-  const { dbPush, prisma, server } = options;
++  const { dbPush, resetDb, prisma, server } = options;
+   const { graphQLSchema, adminMeta, getKeystone } = createSystem(config);
+ 
+   // Make local storage folders if used
+@@ -395,7 +403,7 @@ async function setupInitialKeystone(
+         config.db.shadowDatabaseUrl,
+         prismaSchema,
+         getSchemaPaths(cwd).prisma,
+-        false
++        resetDb
+       );
+     } else if (dbPush) {
+       await pushPrismaSchemaToDatabase(
+@@ -403,7 +411,7 @@ async function setupInitialKeystone(
+         config.db.shadowDatabaseUrl,
+         prismaSchema,
+         getSchemaPaths(cwd).prisma,
+-        false
++        resetDb
+       );
+     } else {
+       console.log('⚠️ Skipping database schema push');
+diff --git a/packages/core/src/scripts/tests/migrations.test.ts b/packages/core/src/scripts/tests/migrations.test.ts
+index 7a389cdf9..5759ce861 100644
+--- a/packages/core/src/scripts/tests/migrations.test.ts
++++ b/packages/core/src/scripts/tests/migrations.test.ts
+@@ -17,10 +17,19 @@ setSkipWatching();
+ 
+ const dbUrl = 'file:./app.db';
+ 
++async function setupAndStopDevServerForMigrations(cwd: string, resetDb: boolean = false) {
++  const stopServer = (await runCommand(
++    cwd,
++    `dev${resetDb ? ' --reset-db' : ''}`
++  )) as () => Promise<void>;
++  await stopServer();
++}
++
+ function getPrismaClient(cwd: string) {
+-  return new (requirePrismaClient(cwd).PrismaClient)({
++  const prismaClient = new (requirePrismaClient(cwd).PrismaClient)({
+     datasources: { sqlite: { url: dbUrl } },
+   });
++  return prismaClient;
+ }
+ 
+ async function getGeneratedMigration(
+@@ -64,8 +73,8 @@ async function setupInitialProjectWithoutMigrations() {
+     'keystone.js': basicKeystoneConfig,
+   });
+   const recording = recordConsole();
++  await setupAndStopDevServerForMigrations(tmp);
+ 
+-  await runCommand(tmp, 'dev');
+   expect(await introspectDb(tmp, dbUrl)).toEqual(`datasource db {
+   provider = "sqlite"
+   url      = "file:./app.db"
+@@ -97,7 +106,7 @@ describe('useMigrations: false', () => {
+   test('logs correctly when things are already up to date', async () => {
+     const tmp = await setupInitialProjectWithoutMigrations();
+     const recording = recordConsole();
+-    await runCommand(tmp, 'dev');
++    await setupAndStopDevServerForMigrations(tmp);
+ 
+     expect(recording()).toMatchInlineSnapshot(`
+       "✨ Starting Keystone
+@@ -123,7 +132,7 @@ describe('useMigrations: false', () => {
+     const recording = recordConsole({
+       'Do you want to continue? Some data will be lost.': true,
+     });
+-    await runCommand(tmp, 'dev');
++    await setupAndStopDevServerForMigrations(tmp);
+ 
+     expect(await introspectDb(tmp, dbUrl)).toMatchInlineSnapshot(`
+       "datasource db {
+@@ -165,7 +174,7 @@ describe('useMigrations: false', () => {
+     const recording = recordConsole({
+       'Do you want to continue? Some data will be lost.': false,
+     });
+-    await expect(runCommand(tmp, 'dev')).rejects.toEqual(new ExitError(0));
++    await expect(setupAndStopDevServerForMigrations(tmp)).rejects.toEqual(new ExitError(0));
+ 
+     expect(await introspectDb(tmp, dbUrl)).toMatchInlineSnapshot(`
+       "datasource db {
+@@ -192,19 +201,17 @@ describe('useMigrations: false', () => {
+       Push cancelled."
+     `);
+   });
+-  test('prisma db push --force-reset works', async () => {
++  test('--reset-db flag', async () => {
+     const tmp = await setupInitialProjectWithoutMigrations();
+     {
+-      const prismaClient = getPrismaClient(tmp);
++      const prismaClient = await getPrismaClient(tmp);
+       await prismaClient.todo.create({ data: { title: 'something' } });
+       await prismaClient.$disconnect();
+     }
+     const recording = recordConsole();
+-
+-    await runCommand(tmp, 'prisma db push --force-reset');
+-    await runCommand(tmp, 'dev');
++    await setupAndStopDevServerForMigrations(tmp, true);
+     {
+-      const prismaClient = getPrismaClient(tmp);
++      const prismaClient = await getPrismaClient(tmp);
+       expect(await prismaClient.todo.findMany()).toHaveLength(0);
+       await prismaClient.$disconnect();
+     }
+@@ -214,7 +221,8 @@ describe('useMigrations: false', () => {
+       ⭐️ Server listening on :3000 (http://localhost:3000/)
+       ⭐️ GraphQL API available at /api/graphql
+       ✨ Generating GraphQL and Prisma schemas
+-      ✨ The database is already in sync with the Prisma schema.
++      ✨ Your database has been reset
++      ✨ Your database is now in sync with your schema. Done in 0ms
+       ✨ Connecting to the database
+       ✨ Creating server
+       ✅ GraphQL API ready"
+@@ -236,7 +244,7 @@ async function setupInitialProjectWithMigrations() {
+     'Name of migration': 'init',
+     'Would you like to apply this migration?': true,
+   });
+-  await runCommand(tmp, 'dev');
++  await setupAndStopDevServerForMigrations(tmp);
+ 
+   expect(await introspectDb(tmp, dbUrl)).toEqual(`datasource db {
+   provider = "sqlite"
+@@ -296,7 +304,7 @@ describe('useMigrations: true', () => {
+       'Name of migration': 'add-is-complete',
+       'Would you like to apply this migration?': true,
+     });
+-    await runCommand(tmp, 'dev');
++    await setupAndStopDevServerForMigrations(tmp);
+ 
+     expect(await introspectDb(tmp, dbUrl)).toMatchInlineSnapshot(`
+       "datasource db {
+@@ -363,7 +371,7 @@ describe('useMigrations: true', () => {
+       'Name of migration': 'remove all fields except id',
+       'Would you like to apply this migration?': true,
+     });
+-    await runCommand(tmp, 'dev');
++    await setupAndStopDevServerForMigrations(tmp);
+ 
+     expect(await introspectDb(tmp, dbUrl)).toMatchInlineSnapshot(`
+       "datasource db {
+@@ -436,7 +444,7 @@ describe('useMigrations: true', () => {
+       'Name of migration': 'init',
+       'Would you like to apply this migration?': true,
+     });
+-    await runCommand(tmp, 'dev');
++    await setupAndStopDevServerForMigrations(tmp);
+ 
+     expect(await introspectDb(tmp, dbUrl)).toMatchInlineSnapshot(`
+       "datasource db {
+@@ -511,7 +519,7 @@ describe('useMigrations: true', () => {
+       'Do you want to continue? All data will be lost.': false,
+     });
+ 
+-    await expect(runCommand(tmp, 'dev')).rejects.toEqual(new ExitError(0));
++    await expect(setupAndStopDevServerForMigrations(tmp)).rejects.toEqual(new ExitError(0));
+ 
+     expect(await fs.readFile(`${prevCwd}/app.db`)).toEqual(dbBuffer);
+ 
+@@ -550,7 +558,7 @@ describe('useMigrations: true', () => {
+       'Name of migration': 'add-is-complete',
+       'Would you like to apply this migration?': false,
+     });
+-    await expect(runCommand(tmp, 'dev')).rejects.toEqual(new ExitError(0));
++    await expect(setupAndStopDevServerForMigrations(tmp)).rejects.toEqual(new ExitError(0));
+ 
+     expect(await introspectDb(tmp, dbUrl)).toMatchInlineSnapshot(`
+       "datasource db {
+@@ -609,7 +617,7 @@ describe('useMigrations: true', () => {
+       'keystone.js': basicWithMigrations,
+     });
+     const recording = recordConsole();
+-    await runCommand(tmp, 'dev');
++    await setupAndStopDevServerForMigrations(tmp);
+ 
+     expect(await introspectDb(tmp, dbUrl)).toMatchInlineSnapshot(`
+       "datasource db {
+@@ -645,10 +653,46 @@ describe('useMigrations: true', () => {
+       ✅ GraphQL API ready"
+     `);
+   });
++  test('--reset-db flag', async () => {
++    const tmp = await setupInitialProjectWithMigrations();
++    {
++      const prismaClient = await getPrismaClient(tmp);
++      await prismaClient.todo.create({ data: { title: 'something' } });
++      await prismaClient.$disconnect();
++    }
++    const recording = recordConsole();
++    await setupAndStopDevServerForMigrations(tmp, true);
++    {
++      const prismaClient = await getPrismaClient(tmp);
++      expect(await prismaClient.todo.findMany()).toHaveLength(0);
++      await prismaClient.$disconnect();
++    }
++
++    const { migrationName } = await getGeneratedMigration(tmp, 1, 'init');
++
++    expect(recording().replace(new RegExp(migrationName, 'g'), 'migration_name'))
++      .toMatchInlineSnapshot(`
++      "✨ Starting Keystone
++      ⭐️ Server listening on :3000 (http://localhost:3000/)
++      ⭐️ GraphQL API available at /api/graphql
++      ✨ Generating GraphQL and Prisma schemas
++      ✨ Your database has been reset
++      Applying migration \`migration_name\`
++      ✨ The following migration(s) have been applied:
++
++      migrations/
++        └─ migration_name/
++          └─ migration.sql
++      ✨ Your migrations are up to date, no new migrations need to be created
++      ✨ Connecting to the database
++      ✨ Creating server
++      ✅ GraphQL API ready"
++    `);
++  });
+   test('logs correctly when no migrations need to be created or applied', async () => {
+     const tmp = await setupInitialProjectWithMigrations();
+     const recording = recordConsole();
+-    await runCommand(tmp, 'dev');
++    await setupAndStopDevServerForMigrations(tmp);
+ 
+     expect(recording()).toMatchInlineSnapshot(`
+       "✨ Starting Keystone
+diff --git a/packages/core/src/scripts/tests/utils.tsx b/packages/core/src/scripts/tests/utils.tsx
+index b026d2da2..a6008b4ac 100644
+--- a/packages/core/src/scripts/tests/utils.tsx
++++ b/packages/core/src/scripts/tests/utils.tsx
+@@ -137,10 +137,7 @@ async function getSymlinkType(targetPath: string): Promise<'dir' | 'file'> {
+ 
+ export async function runCommand(cwd: string, args: string) {
+   const argv = parseArgsStringToArgv(args);
+-  const proc = await cli(cwd, argv);
+-  if (typeof proc === 'function') {
+-    await proc();
+-  }
++  return cli(cwd, argv);
+ }
+ 
+ let dirsToRemove: string[] = [];

@@ -1,0 +1,283 @@
+diff --git a/docs/src/rules/no-unused-labels.md b/docs/src/rules/no-unused-labels.md
+index 971c56722..fcbe2e179 100644
+--- a/docs/src/rules/no-unused-labels.md
++++ b/docs/src/rules/no-unused-labels.md
+@@ -30,6 +30,8 @@ Such labels take up space in the code and can lead to confusion by readers.
+ 
+ This rule is aimed at eliminating unused labels.
+ 
++Problems reported by this rule can be fixed automatically, except when there are any comments between the label and the following statement, or when removing a label would cause the following statement to become a directive such as `"use strict"`.
++
+ Examples of **incorrect** code for this rule:
+ 
+ ::: incorrect
+diff --git a/lib/rules/dot-notation.js b/lib/rules/dot-notation.js
+index 78f136867..21cba54e2 100644
+--- a/lib/rules/dot-notation.js
++++ b/lib/rules/dot-notation.js
+@@ -133,8 +133,7 @@ module.exports = {
+                 }
+                 if (
+                     node.computed &&
+-                    node.property.type === "TemplateLiteral" &&
+-                    node.property.expressions.length === 0
++                    astUtils.isStaticTemplateLiteral(node.property)
+                 ) {
+                     checkComputedProperty(node, node.property.quasis[0].value.cooked);
+                 }
+diff --git a/lib/rules/no-restricted-modules.js b/lib/rules/no-restricted-modules.js
+index d79bdbe57..4a9b0a4c0 100644
+--- a/lib/rules/no-restricted-modules.js
++++ b/lib/rules/no-restricted-modules.js
+@@ -5,6 +5,12 @@
+  */
+ "use strict";
+ 
++//------------------------------------------------------------------------------
++// Requirements
++//------------------------------------------------------------------------------
++
++const astUtils = require("./utils/ast-utils");
++
+ //------------------------------------------------------------------------------
+ // Rule Definition
+ //------------------------------------------------------------------------------
+@@ -116,15 +122,6 @@ module.exports = {
+             return node && node.type === "Literal" && typeof node.value === "string";
+         }
+ 
+-        /**
+-         * Function to check if a node is a static string template literal.
+-         * @param {ASTNode} node The node to check.
+-         * @returns {boolean} If the node is a string template literal.
+-         */
+-        function isStaticTemplateLiteral(node) {
+-            return node && node.type === "TemplateLiteral" && node.expressions.length === 0;
+-        }
+-
+         /**
+          * Function to check if a node is a require call.
+          * @param {ASTNode} node The node to check.
+@@ -144,7 +141,7 @@ module.exports = {
+                 return node.value.trim();
+             }
+ 
+-            if (isStaticTemplateLiteral(node)) {
++            if (astUtils.isStaticTemplateLiteral(node)) {
+                 return node.quasis[0].value.cooked.trim();
+             }
+ 
+diff --git a/lib/rules/no-unused-labels.js b/lib/rules/no-unused-labels.js
+index 9aa1067c6..be06b324c 100644
+--- a/lib/rules/no-unused-labels.js
++++ b/lib/rules/no-unused-labels.js
+@@ -5,6 +5,12 @@
+ 
+ "use strict";
+ 
++//------------------------------------------------------------------------------
++// Requirements
++//------------------------------------------------------------------------------
++
++const astUtils = require("./utils/ast-utils");
++
+ //------------------------------------------------------------------------------
+ // Rule Definition
+ //------------------------------------------------------------------------------
+@@ -46,6 +52,45 @@ module.exports = {
+             };
+         }
+ 
++        /**
++         * Checks if a `LabeledStatement` node is fixable.
++         * For a node to be fixable, there must be no comments between the label and the body.
++         * Furthermore, is must be possible to remove the label without turning the body statement into a
++         * directive after other fixes are applied.
++         * @param {ASTNode} node The node to evaluate.
++         * @returns {boolean} Whether or not the node is fixable.
++         */
++        function isFixable(node) {
++
++            /*
++             * Only perform a fix if there are no comments between the label and the body. This will be the case
++             * when there is exactly one token/comment (the ":") between the label and the body.
++             */
++            if (sourceCode.getTokenAfter(node.label, { includeComments: true }) !==
++                sourceCode.getTokenBefore(node.body, { includeComments: true })) {
++                return false;
++            }
++
++            // Looking for the node's deepest ancestor which is not a `LabeledStatement`.
++            let ancestor = node.parent;
++
++            while (ancestor.type === "LabeledStatement") {
++                ancestor = ancestor.parent;
++            }
++
++            if (ancestor.type === "Program" ||
++                (ancestor.type === "BlockStatement" && astUtils.isFunction(ancestor.parent))) {
++                const { body } = node;
++
++                if (body.type === "ExpressionStatement" &&
++                    ((body.expression.type === "Literal" && typeof body.expression.value === "string") ||
++                    astUtils.isStaticTemplateLiteral(body.expression))) {
++                    return false; // potential directive
++                }
++            }
++            return true;
++        }
++
+         /**
+          * Removes the top of the stack.
+          * At the same time, this reports the label if it's never used.
+@@ -58,19 +103,7 @@ module.exports = {
+                     node: node.label,
+                     messageId: "unused",
+                     data: node.label,
+-                    fix(fixer) {
+-
+-                        /*
+-                         * Only perform a fix if there are no comments between the label and the body. This will be the case
+-                         * when there is exactly one token/comment (the ":") between the label and the body.
+-                         */
+-                        if (sourceCode.getTokenAfter(node.label, { includeComments: true }) ===
+-                                sourceCode.getTokenBefore(node.body, { includeComments: true })) {
+-                            return fixer.removeRange([node.range[0], node.body.range[0]]);
+-                        }
+-
+-                        return null;
+-                    }
++                    fix: isFixable(node) ? fixer => fixer.removeRange([node.range[0], node.body.range[0]]) : null
+                 });
+             }
+ 
+diff --git a/lib/rules/prefer-regex-literals.js b/lib/rules/prefer-regex-literals.js
+index 39e295064..eca805483 100644
+--- a/lib/rules/prefer-regex-literals.js
++++ b/lib/rules/prefer-regex-literals.js
+@@ -37,15 +37,6 @@ function isRegexLiteral(node) {
+     return node.type === "Literal" && Object.prototype.hasOwnProperty.call(node, "regex");
+ }
+ 
+-/**
+- * Determines whether the given node is a template literal without expressions.
+- * @param {ASTNode} node Node to check.
+- * @returns {boolean} True if the node is a template literal without expressions.
+- */
+-function isStaticTemplateLiteral(node) {
+-    return node.type === "TemplateLiteral" && node.expressions.length === 0;
+-}
+-
+ const validPrecedingTokens = new Set([
+     "(",
+     ";",
+@@ -178,7 +169,7 @@ module.exports = {
+             return node.type === "TaggedTemplateExpression" &&
+                 astUtils.isSpecificMemberAccess(node.tag, "String", "raw") &&
+                 isGlobalReference(astUtils.skipChainExpression(node.tag).object) &&
+-                isStaticTemplateLiteral(node.quasi);
++                astUtils.isStaticTemplateLiteral(node.quasi);
+         }
+ 
+         /**
+@@ -191,7 +182,7 @@ module.exports = {
+                 return node.value;
+             }
+ 
+-            if (isStaticTemplateLiteral(node)) {
++            if (astUtils.isStaticTemplateLiteral(node)) {
+                 return node.quasis[0].value.cooked;
+             }
+ 
+@@ -209,7 +200,7 @@ module.exports = {
+          */
+         function isStaticString(node) {
+             return isStringLiteral(node) ||
+-                isStaticTemplateLiteral(node) ||
++                astUtils.isStaticTemplateLiteral(node) ||
+                 isStringRawTaggedStaticTemplateLiteral(node);
+         }
+ 
+diff --git a/lib/rules/utils/ast-utils.js b/lib/rules/utils/ast-utils.js
+index aed2c42f9..b6479cfa2 100644
+--- a/lib/rules/utils/ast-utils.js
++++ b/lib/rules/utils/ast-utils.js
+@@ -2123,6 +2123,15 @@ module.exports = {
+         return OCTAL_OR_NON_OCTAL_DECIMAL_ESCAPE_PATTERN.test(rawString);
+     },
+ 
++    /**
++     * Determines whether the given node is a template literal without expressions.
++     * @param {ASTNode} node Node to check.
++     * @returns {boolean} True if the node is a template literal without expressions.
++     */
++    isStaticTemplateLiteral(node) {
++        return node.type === "TemplateLiteral" && node.expressions.length === 0;
++    },
++
+     isReferenceToGlobalVariable,
+     isLogicalExpression,
+     isCoalesceExpression,
+diff --git a/lib/rules/valid-typeof.js b/lib/rules/valid-typeof.js
+index 82af130f9..3818dafea 100644
+--- a/lib/rules/valid-typeof.js
++++ b/lib/rules/valid-typeof.js
+@@ -4,6 +4,12 @@
+  */
+ "use strict";
+ 
++//------------------------------------------------------------------------------
++// Requirements
++//------------------------------------------------------------------------------
++
++const astUtils = require("./utils/ast-utils");
++
+ //------------------------------------------------------------------------------
+ // Rule Definition
+ //------------------------------------------------------------------------------
+@@ -88,7 +94,7 @@ module.exports = {
+                     if (parent.type === "BinaryExpression" && OPERATORS.has(parent.operator)) {
+                         const sibling = parent.left === node ? parent.right : parent.left;
+ 
+-                        if (sibling.type === "Literal" || sibling.type === "TemplateLiteral" && !sibling.expressions.length) {
++                        if (sibling.type === "Literal" || astUtils.isStaticTemplateLiteral(sibling)) {
+                             const value = sibling.type === "Literal" ? sibling.value : sibling.quasis[0].value.cooked;
+ 
+                             if (!VALID_TYPES.has(value)) {
+diff --git a/lib/rules/yoda.js b/lib/rules/yoda.js
+index 60a6ad2f2..af8f52518 100644
+--- a/lib/rules/yoda.js
++++ b/lib/rules/yoda.js
+@@ -58,22 +58,13 @@ function isNegativeNumericLiteral(node) {
+     );
+ }
+ 
+-/**
+- * Determines whether a node is a Template Literal which can be determined statically.
+- * @param {ASTNode} node Node to test
+- * @returns {boolean} True if the node is a Template Literal without expression.
+- */
+-function isStaticTemplateLiteral(node) {
+-    return node.type === "TemplateLiteral" && node.expressions.length === 0;
+-}
+-
+ /**
+  * Determines whether a non-Literal node should be treated as a single Literal node.
+  * @param {ASTNode} node Node to test
+  * @returns {boolean} True if the node should be treated as a single Literal node.
+  */
+ function looksLikeLiteral(node) {
+-    return isNegativeNumericLiteral(node) || isStaticTemplateLiteral(node);
++    return isNegativeNumericLiteral(node) || astUtils.isStaticTemplateLiteral(node);
+ }
+ 
+ /**
+@@ -100,7 +91,7 @@ function getNormalizedLiteral(node) {
+         };
+     }
+ 
+-    if (isStaticTemplateLiteral(node)) {
++    if (astUtils.isStaticTemplateLiteral(node)) {
+         return {
+             type: "Literal",
+             value: node.quasis[0].value.cooked,

@@ -1,0 +1,326 @@
+diff --git a/src/Condition.js b/src/Condition.js
+index a5d9024..9d03437 100644
+--- a/src/Condition.js
++++ b/src/Condition.js
+@@ -1,64 +1,55 @@
+ import has from 'lodash/has';
+ import isSchema from './util/isSchema';
+ 
+-function wrapCusomFn(fn) {
+-  return function(...args) {
+-    args.pop();
+-    return fn.apply(this, args);
+-  };
++function callOrConcat(schema) {
++  if (typeof schema === 'function') return schema;
++
++  return base => base.concat(schema);
+ }
+ 
+-function makeFn(options) {
+-  if (typeof options === 'function') return wrapCusomFn(options);
++class Conditional {
++  constructor(refs, options) {
++    let { is, then, otherwise } = options;
+ 
+-  if (!has(options, 'is'))
+-    throw new TypeError('`is:` is required for `when()` conditions');
++    this.refs = [].concat(refs);
+ 
+-  if (!options.then && !options.otherwise)
+-    throw new TypeError(
+-      'either `then:` or `otherwise:` is required for `when()` conditions',
+-    );
++    then = callOrConcat(then);
++    otherwise = callOrConcat(otherwise);
+ 
+-  let { is, then, otherwise } = options;
++    if (typeof options === 'function') this.fn = options;
++    else {
++      if (!has(options, 'is'))
++        throw new TypeError('`is:` is required for `when()` conditions');
+ 
+-  let check;
+-  if (typeof is === 'function') {
+-    check = is;
+-  } else {
+-    check = (...values) => values.every(value => value === is);
+-  }
++      if (!options.then && !options.otherwise)
++        throw new TypeError(
++          'either `then:` or `otherwise:` is required for `when()` conditions',
++        );
+ 
+-  let fn = function(...args) {
+-    let options = args.pop();
+-    let schema = args.pop();
+-    let branch = check(...args) ? then : otherwise;
++      let isFn =
++        typeof is === 'function'
++          ? is
++          : (...values) => values.every(value => value === is);
+ 
+-    if (!branch) return undefined;
+-    if (typeof branch === 'function') return branch(schema);
+-    return schema.concat(branch.resolve(options));
+-  };
++      this.fn = function(...values) {
++        let currentSchema = values.pop();
++        let option = isFn(...values) ? then : otherwise;
+ 
+-  return fn;
+-}
+-
+-class Condition {
+-  constructor(refs, options) {
+-    this.refs = refs;
+-    this.fn = makeFn(options);
++        return option(currentSchema);
++      };
++    }
+   }
+ 
+-  resolve(base, options) {
++  resolve(ctx, options) {
+     let values = this.refs.map(ref => ref.getValue(options));
+ 
+-    let schema = this.fn.apply(base, values.concat(base, options));
+-
+-    if (schema === undefined || schema === base) return base;
++    let schema = this.fn.apply(ctx, values.concat(ctx));
+ 
+-    if (!isSchema(schema))
++    if (schema !== undefined && !isSchema(schema))
+       throw new TypeError('conditions must return a schema object');
+ 
+-    return schema.resolve(options);
++    return schema || ctx;
+   }
+ }
+ 
+-export default Condition;
++export default Conditional;
+diff --git a/src/Lazy.js b/src/Lazy.js
+index 0de633a..d092667 100644
+--- a/src/Lazy.js
++++ b/src/Lazy.js
+@@ -2,17 +2,16 @@ import isSchema from './util/isSchema';
+ 
+ class Lazy {
+   constructor(mapFn) {
+-    this._resolve = (value, options) => {
+-      let schema = mapFn(value, options);
+-
++    this._resolve = (...args) => {
++      let schema = mapFn(...args);
+       if (!isSchema(schema))
+         throw new TypeError('lazy() functions must return a valid schema');
+ 
+-      return schema.resolve(options);
++      return schema;
+     };
+   }
+-  resolve(options) {
+-    return this._resolve(options.value, options);
++  resolve({ value, ...rest }) {
++    return this._resolve(value, rest);
+   }
+   cast(value, options) {
+     return this._resolve(value, options).cast(value, options);
+diff --git a/src/mixed.js b/src/mixed.js
+index b59e7ab..27f781c 100644
+--- a/src/mixed.js
++++ b/src/mixed.js
+@@ -135,22 +135,14 @@ const proto = (SchemaType.prototype = {
+   },
+ 
+   resolve(options) {
+-    let schema = this;
+-
+-    if (schema._conditions.length) {
+-      let conditions = schema._conditions;
+-
+-      schema = schema.clone();
+-      schema._conditions = [];
+-      schema = conditions.reduce(
++    if (this._conditions.length) {
++      return this._conditions.reduce(
+         (schema, condition) => condition.resolve(schema, options),
+-        schema,
++        this,
+       );
+-
+-      schema = schema.resolve(options);
+     }
+ 
+-    return schema;
++    return this;
+   },
+ 
+   cast(value, options = {}) {
+diff --git a/src/util/reach.js b/src/util/reach.js
+index 1f8fae7..d033d19 100644
+--- a/src/util/reach.js
++++ b/src/util/reach.js
+@@ -13,7 +13,7 @@ export function getIn(schema, path, value, context) {
+     return {
+       parent,
+       parentPath: path,
+-      schema,
++      schema: schema.resolve({ context, parent, value }),
+     };
+ 
+   forEach(path, (_part, isBracket, isArray) => {
+@@ -55,6 +55,10 @@ export function getIn(schema, path, value, context) {
+     }
+   });
+ 
++  if (schema) {
++    schema = schema.resolve({ context, parent, value });
++  }
++
+   return { schema, parent, parentPath: lastPart };
+ }
+ 
+diff --git a/test/mixed.js b/test/mixed.js
+index 0272718..c012857 100644
+--- a/test/mixed.js
++++ b/test/mixed.js
+@@ -7,7 +7,6 @@ import {
+   ref,
+   reach,
+   bool,
+-  lazy,
+   ValidationError,
+ } from '../src';
+ 
+@@ -751,28 +750,6 @@ describe('Mixed Types ', () => {
+     await inst.validate(-1).should.be.fulfilled();
+   });
+ 
+-  it('should allow nested conditions and lazies', async function() {
+-    let inst = string().when('$check', {
+-      is: value => typeof value === 'string',
+-      then: string().when('$check', {
+-        is: value => /hello/.test(value),
+-        then: lazy(() => string().min(6)),
+-      }),
+-    });
+-
+-    await inst
+-      .validate('pass', { context: { check: false } })
+-      .should.be.fulfilled();
+-
+-    await inst
+-      .validate('pass', { context: { check: 'hello' } })
+-      .should.be.rejectedWith(ValidationError, /must be at least/);
+-
+-    await inst
+-      .validate('passes', { context: { check: 'hello' } })
+-      .should.be.fulfilled();
+-  });
+-
+   it('should use label in error message', async function() {
+     let label = 'Label';
+     let inst = object({
+diff --git a/test/object.js b/test/object.js
+index 705067f..2069d51 100644
+--- a/test/object.js
++++ b/test/object.js
+@@ -448,12 +448,8 @@ describe('Object types', () => {
+         }),
+       });
+ 
+-      reach(inst, 'nested')
+-        .resolve({})
+-        .should.equal(inst);
+-      reach(inst, 'x.y')
+-        .resolve({})
+-        .should.equal(inst);
++      reach(inst, 'nested').should.equal(inst);
++      reach(inst, 'x.y').should.equal(inst);
+     });
+ 
+     it('should be passed the value', done => {
+diff --git a/test/yup.js b/test/yup.js
+index e877345..9ec8d51 100644
+--- a/test/yup.js
++++ b/test/yup.js
+@@ -2,7 +2,7 @@ import reach, { getIn } from '../src/util/reach';
+ import prependDeep from '../src/util/prependDeep';
+ import { settled } from '../src/util/runValidations';
+ 
+-import { object, array, string, lazy, number, ValidationError } from '../src';
++import { object, array, string, lazy, number } from '../src';
+ 
+ describe('Yup', function() {
+   it('cast should not assert on undefined', () => {
+@@ -108,8 +108,8 @@ describe('Yup', function() {
+     valid.should.equal(true);
+   });
+ 
+-  it('should REACH conditionally correctly', async function() {
+-    var num = number().oneOf([4]),
++  it('should REACH conditionally correctly', function() {
++    var num = number(),
+       inst = object().shape({
+         num: number().max(4),
+         nested: object().shape({
+@@ -136,42 +136,21 @@ describe('Yup', function() {
+       },
+     };
+ 
+-    let options = {};
+-    options.parent = value.nested.arr[0];
+-    options.value = options.parent.num;
+-    reach(inst, 'nested.arr.num', value)
+-      .resolve(options)
+-      .should.equal(num);
+-    reach(inst, 'nested.arr[].num', value)
+-      .resolve(options)
+-      .should.equal(num);
+-
+-    options.context = context;
+-    reach(inst, 'nested.arr.num', value, context)
+-      .resolve(options)
+-      .should.equal(num);
+-    reach(inst, 'nested.arr[].num', value, context)
+-      .resolve(options)
+-      .should.equal(num);
+-    reach(inst, 'nested.arr[0].num', value, context)
+-      .resolve(options)
+-      .should.equal(num);
+-
+-    // // should fail b/c item[1] is used to resolve the schema
+-    options.parent = value.nested.arr[1];
+-    options.value = options.parent.num;
+-    reach(inst, 'nested["arr"][1].num', value, context)
+-      .resolve(options)
+-      .should.not.equal(num);
+-
+-    let reached = reach(inst, 'nested.arr[].num', value, context);
+-
+-    await reached.validate(5, { context, parent: { foo: 4 } }).should.be
+-      .fulfilled;
+-
+-    await reached
+-      .validate(5, { context, parent: { foo: 5 } })
+-      .should.be.rejectedWith(ValidationError, /one of the following/);
++    reach(inst, 'nested.arr.num', value).should.equal(num);
++    reach(inst, 'nested.arr[].num', value).should.equal(num);
++
++    reach(inst, 'nested.arr.num', value, context).should.equal(num);
++    reach(inst, 'nested.arr[].num', value, context).should.equal(num);
++    reach(inst, 'nested.arr[0].num', value, context).should.equal(num);
++
++    // should fail b/c item[1] is used to resolve the schema
++    reach(inst, 'nested["arr"][1].num', value, context).should.not.equal(num);
++
++    return reach(inst, 'nested.arr[].num', value, context)
++      .isValid(5)
++      .then(valid => {
++        valid.should.equal(true);
++      });
+   });
+ 
+   it('should reach through lazy', async () => {

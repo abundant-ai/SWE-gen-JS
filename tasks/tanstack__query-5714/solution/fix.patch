@@ -1,0 +1,236 @@
+diff --git a/docs/react/guides/migrating-to-v5.md b/docs/react/guides/migrating-to-v5.md
+index a1c4e8ada..b19440e22 100644
+--- a/docs/react/guides/migrating-to-v5.md
++++ b/docs/react/guides/migrating-to-v5.md
+@@ -276,6 +276,14 @@ There are some caveats to this change however, which you must be aware of:
+ 
+ The `visibilitychange` event is used exclusively now. This is possible because we only support browsers that support the `visibilitychange` event. This fixes a bunch of issues [as listed here](https://github.com/TanStack/query/pull/4805).
+ 
++### Network status no longer relies on the `navigator.onLine` property
++
++`navigator.onLine` doesn't work well in Chromium based browsers. There are [a lot of issues](https://bugs.chromium.org/p/chromium/issues/list?q=navigator.online) around false negatives, which lead to Queries being wrongfully marked as `offline`.
++
++To circumvent this, we now always start with `online: true` and only listen to `online` and `offline` events to update the status.
++
++This should reduce the likelihood of false negatives, however, it might mean false positives for offline apps that load via serviceWorkers, which can work even without an internet connection.
++
+ ### Removed custom `context` prop in favor of custom `queryClient` instance
+ 
+ In v4, we introduced the possibility to pass a custom `context` to all react-query hooks. This allowed for proper isolation when using MicroFrontends.
+diff --git a/docs/react/reference/focusManager.md b/docs/react/reference/focusManager.md
+index edf2c94e7..1d8abe614 100644
+--- a/docs/react/reference/focusManager.md
++++ b/docs/react/reference/focusManager.md
+@@ -10,6 +10,7 @@ It can be used to change the default event listeners or to manually change the f
+ Its available methods are:
+ 
+ - [`setEventListener`](#focusmanagerseteventlistener)
++- [`subscribe`](#focusmanagersubscribe)
+ - [`setFocused`](#focusmanagersetfocused)
+ - [`isFocused`](#focusmanagerisfocused)
+ 
+@@ -33,9 +34,21 @@ focusManager.setEventListener((handleFocus) => {
+ })
+ ```
+ 
++## `focusManager.subscribe`
++
++`subscribe` can be used to subscribe to changes in the visibility state. It returns an unsubscribe function:
++
++```tsx
++import { focusManager } from '@tanstack/react-query'
++
++const unsubscribe = focusManager.subscribe(isVisible => {
++  console.log('isVisible', isVisible)
++})
++```
++
+ ## `focusManager.setFocused`
+ 
+-`setFocused` can be used to manually set the focus state. Set `undefined` to fallback to the default focus check.
++`setFocused` can be used to manually set the focus state. Set `undefined` to fall back to the default focus check.
+ 
+ ```tsx
+ import { focusManager } from '@tanstack/react-query'
+diff --git a/docs/react/reference/onlineManager.md b/docs/react/reference/onlineManager.md
+index 4b6536e9e..b563010ae 100644
+--- a/docs/react/reference/onlineManager.md
++++ b/docs/react/reference/onlineManager.md
+@@ -3,13 +3,20 @@ id: OnlineManager
+ title: OnlineManager
+ ---
+ 
+-The `OnlineManager` manages the online state within TanStack Query.
++The `OnlineManager` manages the online state within TanStack Query. It can be used to change the default event listeners or to manually change the online state.
+ 
+-It can be used to change the default event listeners or to manually change the online state.
++> Per default, the `onlineManager` assumes an active network connection, and listens to the `online` and `offline` events on the `window` object to detect changes.
++
++> In previous versions, `navigator.onLine` was used to determine the network status. However, it doesn't work well in Chromium based browsers. There are [a lot of issues](https://bugs.chromium.org/p/chromium/issues/list?q=navigator.online) around false negatives, which lead to Queries being wrongfully marked as `offline`.
++
++> To circumvent this, we now always start with `online: true` and only listen to `online` and `offline` events to update the status.
++
++> This should reduce the likelihood of false negatives, however, it might mean false positives for offline apps that load via serviceWorkers, which can work even without an internet connection.
+ 
+ Its available methods are:
+ 
+ - [`setEventListener`](#onlinemanagerseteventlistener)
++- [`subscribe`](#onlinemanagersubscribe)
+ - [`setOnline`](#onlinemanagersetonline)
+ - [`isOnline`](#onlinemanagerisonline)
+ 
+@@ -28,9 +35,21 @@ onlineManager.setEventListener(setOnline => {
+ })
+ ```
+ 
++## `onlineManager.subscribe`
++
++`subscribe` can be used to subscribe to changes in the online state. It returns an unsubscribe function:
++
++```tsx
++import { onlineManager } from '@tanstack/react-query'
++
++const unsubscribe = onlineManager.subscribe(isOnline => {
++  console.log('isOnline', isOnline)
++})
++```
++
+ ## `onlineManager.setOnline`
+ 
+-`setOnline` can be used to manually set the online state. Set `undefined` to fallback to the default online check.
++`setOnline` can be used to manually set the online state.
+ 
+ ```tsx
+ import { onlineManager } from '@tanstack/react-query'
+@@ -40,14 +59,11 @@ onlineManager.setOnline(true)
+ 
+ // Set to offline
+ onlineManager.setOnline(false)
+-
+-// Fallback to the default online check
+-onlineManager.setOnline(undefined)
+ ```
+ 
+ **Options**
+ 
+-- `online: boolean | undefined`
++- `online: boolean`
+ 
+ ## `onlineManager.isOnline`
+ 
+diff --git a/packages/query-core/src/onlineManager.ts b/packages/query-core/src/onlineManager.ts
+index 22c4c1375..daf77d5a4 100644
+--- a/packages/query-core/src/onlineManager.ts
++++ b/packages/query-core/src/onlineManager.ts
+@@ -1,14 +1,11 @@
+ import { Subscribable } from './subscribable'
+ import { isServer } from './utils'
+ 
+-type SetupFn = (
+-  setOnline: (online?: boolean) => void,
+-) => (() => void) | undefined
++type Listener = (online: boolean) => void
++type SetupFn = (setOnline: Listener) => (() => void) | undefined
+ 
+-const onlineEvents = ['online', 'offline'] as const
+-
+-export class OnlineManager extends Subscribable {
+-  #online?: boolean
++export class OnlineManager extends Subscribable<Listener> {
++  #online = true
+   #cleanup?: () => void
+ 
+   #setup: SetupFn
+@@ -19,17 +16,16 @@ export class OnlineManager extends Subscribable {
+       // addEventListener does not exist in React Native, but window does
+       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+       if (!isServer && window.addEventListener) {
+-        const listener = () => onOnline()
++        const onlineListener = () => onOnline(true)
++        const offlineListener = () => onOnline(false)
+         // Listen to online
+-        onlineEvents.forEach((event) => {
+-          window.addEventListener(event, listener, false)
+-        })
++        window.addEventListener('online', onlineListener, false)
++        window.addEventListener('offline', offlineListener, false)
+ 
+         return () => {
+           // Be sure to unsubscribe if a new handler is set
+-          onlineEvents.forEach((event) => {
+-            window.removeEventListener(event, listener)
+-          })
++          window.removeEventListener('online', onlineListener)
++          window.removeEventListener('offline', offlineListener)
+         }
+       }
+ 
+@@ -53,43 +49,22 @@ export class OnlineManager extends Subscribable {
+   setEventListener(setup: SetupFn): void {
+     this.#setup = setup
+     this.#cleanup?.()
+-    this.#cleanup = setup((online?: boolean) => {
+-      if (typeof online === 'boolean') {
+-        this.setOnline(online)
+-      } else {
+-        this.onOnline()
+-      }
+-    })
++    this.#cleanup = setup(this.setOnline.bind(this))
+   }
+ 
+-  setOnline(online?: boolean): void {
++  setOnline(online: boolean): void {
+     const changed = this.#online !== online
+ 
+     if (changed) {
+       this.#online = online
+-      this.onOnline()
++      this.listeners.forEach((listener) => {
++        listener(online)
++      })
+     }
+   }
+ 
+-  onOnline(): void {
+-    this.listeners.forEach((listener) => {
+-      listener()
+-    })
+-  }
+-
+   isOnline(): boolean {
+-    if (typeof this.#online === 'boolean') {
+-      return this.#online
+-    }
+-
+-    if (
+-      typeof navigator === 'undefined' ||
+-      typeof navigator.onLine === 'undefined'
+-    ) {
+-      return true
+-    }
+-
+-    return navigator.onLine
++    return this.#online
+   }
+ }
+ 
+diff --git a/packages/query-devtools/src/Devtools.tsx b/packages/query-devtools/src/Devtools.tsx
+index 6f27b3d69..f27f3ddbd 100644
+--- a/packages/query-devtools/src/Devtools.tsx
++++ b/packages/query-devtools/src/Devtools.tsx
+@@ -485,13 +485,11 @@ export const DevtoolsPanel: Component<DevtoolsPanelProps> = (props) => {
+             <button
+               onClick={() => {
+                 if (offline()) {
+-                  onlineManager().setOnline(undefined)
++                  onlineManager().setOnline(true)
+                   setOffline(false)
+-                  window.dispatchEvent(new Event('online'))
+                 } else {
+                   onlineManager().setOnline(false)
+                   setOffline(true)
+-                  window.dispatchEvent(new Event('offline'))
+                 }
+               }}
+               class={styles.actionsBtn}

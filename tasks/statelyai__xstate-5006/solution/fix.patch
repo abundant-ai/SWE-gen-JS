@@ -1,0 +1,225 @@
+diff --git a/.changeset/two-hounds-march.md b/.changeset/two-hounds-march.md
+new file mode 100644
+index 0000000000..324d18d3f0
+--- /dev/null
++++ b/.changeset/two-hounds-march.md
+@@ -0,0 +1,63 @@
++---
++'xstate': minor
++---
++
++The state value typings for setup state machine actors (`setup({}).createMachine({ ... })`) have been improved to represent the actual expected state values.
++
++```ts
++const machine = setup({}).createMachine({
++  initial: 'green',
++  states: {
++    green: {},
++    yellow: {},
++    red: {
++      initial: 'walk',
++      states: {
++        walk: {},
++        wait: {},
++        stop: {}
++      }
++    },
++    emergency: {
++      type: 'parallel',
++      states: {
++        main: {
++          initial: 'blinking',
++          states: {
++            blinking: {}
++          }
++        },
++        cross: {
++          initial: 'blinking',
++          states: {
++            blinking: {}
++          }
++        }
++      }
++    }
++  }
++});
++
++const actor = createActor(machine).start();
++
++const stateValue = actor.getSnapshot().value;
++
++if (stateValue === 'green') {
++  // ...
++} else if (stateValue === 'yellow') {
++  // ...
++} else if ('red' in stateValue) {
++  stateValue;
++  // {
++  //   red: "walk" | "wait" | "stop";
++  // }
++} else {
++  stateValue;
++  // {
++  //   emergency: {
++  //     main: "blinking";
++  //     cross: "blinking";
++  //   };
++  // }
++}
++```
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index 32ea67a23a..4fbfb557a2 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -24,7 +24,7 @@ import type {
+ } from './types.ts';
+ import { matchesState } from './utils.ts';
+ 
+-type ToTestStateValue<TStateValue extends StateValue> =
++export type ToTestStateValue<TStateValue extends StateValue> =
+   TStateValue extends string
+     ? TStateValue
+     : IsNever<keyof TStateValue> extends true
+@@ -57,7 +57,7 @@ interface MachineSnapshotBase<
+   TTag extends string,
+   TOutput,
+   TMeta,
+-  TConfig extends StateSchema
++  TStateSchema extends StateSchema = StateSchema
+ > {
+   /** The state machine that produced this state snapshot. */
+   machine: StateMachine<
+@@ -74,7 +74,7 @@ interface MachineSnapshotBase<
+     TOutput,
+     EventObject, // TEmitted
+     any, // TMeta
+-    TConfig
++    TStateSchema
+   >;
+   /** The tags of the active state nodes that represent the current state value. */
+   tags: Set<string>;
+@@ -137,7 +137,7 @@ interface MachineSnapshotBase<
+   can: (event: TEvent) => boolean;
+ 
+   getMeta: () => Record<
+-    StateId<TConfig> & string,
++    StateId<TStateSchema> & string,
+     TMeta | undefined // States might not have meta defined
+   >;
+ 
+diff --git a/packages/core/src/setup.ts b/packages/core/src/setup.ts
+index 7070b19236..8f18d398a6 100644
+--- a/packages/core/src/setup.ts
++++ b/packages/core/src/setup.ts
+@@ -7,7 +7,6 @@ import {
+   AnyActorRef,
+   AnyEventObject,
+   Cast,
+-  ConditionalRequired,
+   DelayConfig,
+   EventObject,
+   Invert,
+@@ -18,8 +17,8 @@ import {
+   NonReducibleUnknown,
+   ParameterizedObject,
+   SetupTypes,
+-  StateSchema,
+   ToChildren,
++  ToStateValue,
+   UnknownActorLogic,
+   Values
+ } from './types';
+@@ -67,43 +66,6 @@ type ToProvidedActor<
+         };
+       }>;
+ 
+-type _GroupStateKeys<
+-  T extends StateSchema,
+-  S extends keyof T['states']
+-> = S extends any
+-  ? T['states'][S] extends { type: 'history' }
+-    ? [never, never]
+-    : T extends { type: 'parallel' }
+-      ? [S, never]
+-      : 'states' extends keyof T['states'][S]
+-        ? [S, never]
+-        : [never, S]
+-  : never;
+-
+-type GroupStateKeys<T extends StateSchema, S extends keyof T['states']> = {
+-  nonLeaf: _GroupStateKeys<T, S & string>[0];
+-  leaf: _GroupStateKeys<T, S & string>[1];
+-};
+-
+-type ToStateValue<T extends StateSchema> = T extends {
+-  states: Record<infer S, any>;
+-}
+-  ? IsNever<S> extends true
+-    ? {}
+-    :
+-        | GroupStateKeys<T, S>['leaf']
+-        | (IsNever<GroupStateKeys<T, S>['nonLeaf']> extends false
+-            ? ConditionalRequired<
+-                {
+-                  [K in GroupStateKeys<T, S>['nonLeaf']]?: ToStateValue<
+-                    T['states'][K]
+-                  >;
+-                },
+-                T extends { type: 'parallel' } ? true : false
+-              >
+-            : never)
+-  : {};
+-
+ type RequiredSetupKeys<TChildrenMap> = IsNever<keyof TChildrenMap> extends true
+   ? never
+   : 'actors';
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 13fbbcf924..c84c91281d 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -2551,3 +2551,45 @@ export type GetConcreteByKey<
+   TKey extends keyof T,
+   TValue extends T[TKey]
+ > = T & Record<TKey, TValue>;
++
++type _GroupStateKeys<
++  T extends StateSchema,
++  S extends keyof T['states']
++> = S extends any
++  ? T['states'][S] extends { type: 'history' }
++    ? [never, never]
++    : T extends { type: 'parallel' }
++      ? [S, never]
++      : 'states' extends keyof T['states'][S]
++        ? [S, never]
++        : [never, S]
++  : never;
++
++type GroupStateKeys<T extends StateSchema, S extends keyof T['states']> = {
++  nonLeaf: _GroupStateKeys<T, S & string>[0];
++  leaf: _GroupStateKeys<T, S & string>[1];
++};
++
++export type ToStateValue<T extends StateSchema> = T extends {
++  states: Record<infer S, any>;
++}
++  ? IsNever<S> extends true
++    ? {}
++    :
++        | GroupStateKeys<T, S>['leaf']
++        | (IsNever<GroupStateKeys<T, S>['nonLeaf']> extends false
++            ? T extends { type: 'parallel' }
++              ? {
++                  [K in GroupStateKeys<T, S>['nonLeaf']]: ToStateValue<
++                    T['states'][K]
++                  >;
++                }
++              : Compute<
++                  Values<{
++                    [K in GroupStateKeys<T, S>['nonLeaf']]: {
++                      [StateKey in K]: ToStateValue<T['states'][K]>;
++                    };
++                  }>
++                >
++            : never)
++  : {};

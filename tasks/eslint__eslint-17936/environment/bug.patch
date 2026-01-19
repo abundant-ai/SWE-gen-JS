@@ -1,0 +1,226 @@
+diff --git a/docs/src/extend/code-path-analysis.md b/docs/src/extend/code-path-analysis.md
+index 36d827bee..879119574 100644
+--- a/docs/src/extend/code-path-analysis.md
++++ b/docs/src/extend/code-path-analysis.md
+@@ -37,6 +37,7 @@ This has references of both the initial segment and the final segments of a code
+ * `finalSegments` (`CodePathSegment[]`) - The final segments which includes both returned and thrown.
+ * `returnedSegments` (`CodePathSegment[]`) - The final segments which includes only returned.
+ * `thrownSegments` (`CodePathSegment[]`) - The final segments which includes only thrown.
++* `currentSegments` (`CodePathSegment[]`) - **Deprecated.** Segments of the current traversal position.
+ * `upper` (`CodePath|null`) - The code path of the upper function/global scope.
+ * `childCodePaths` (`CodePath[]`) - Code paths of functions this code path contains.
+ 
+@@ -634,7 +635,7 @@ last();
+ ```
+ 
+ If there is not `catch` block, `finally` block has two current segments.
+-At this time when running the previous example to find unreachable nodes, `currentSegments.length` is `2`.
++At this time, `CodePath.currentSegments.length` is `2`.
+ One is the normal path, and another is the leaving path (`throw` or `return`).
+ 
+ :::img-container
+diff --git a/docs/src/use/migrate-to-9.0.0.md b/docs/src/use/migrate-to-9.0.0.md
+index f806a52df..3dfd6e7e4 100644
+--- a/docs/src/use/migrate-to-9.0.0.md
++++ b/docs/src/use/migrate-to-9.0.0.md
+@@ -34,7 +34,6 @@ The lists below are ordered roughly by the number of users each change is expect
+ * [Node.js < v18.18, v19 are no longer supported](#drop-old-node)
+ * [Removed multiple `context` methods](#removed-context-methods)
+ * [Removed `sourceCode.getComments()`](#removed-sourcecode-getcomments)
+-* [Removed `CodePath#currentSegments`](#removed-codepath-currentsegments)
+ * [Function-style rules are no longer supported](#drop-function-style-rules)
+ * [`meta.schema` is required for rules with options](#meta-schema-required)
+ * [`FlatRuleTester` is now `RuleTester`](#flat-rule-tester)
+@@ -277,14 +276,6 @@ ESLint v9.0.0 removes the deprecated `sourceCode.getComments()` method.
+ 
+ **Related Issues(s):** [#14744](https://github.com/eslint/eslint/issues/14744)
+ 
+-## <a name="removed-codepath-currentsegments"></a> Removed `CodePath#currentSegments`
+-
+-ESLint v9.0.0 removes the deprecated `CodePath#currentSegments` property.
+-
+-**To address:** Update your code following the recommendations in the [blog post](https://eslint.org/blog/2023/09/preparing-custom-rules-eslint-v9/#codepath%23currentsegments).
+-
+-**Related Issues(s):** [#17457](https://github.com/eslint/eslint/issues/17457)
+-
+ ## <a name="drop-function-style-rules"></a> Function-style rules are no longer supported
+ 
+ ESLint v9.0.0 drops support for function-style rules. Function-style rules are rules created by exporting a function rather than an object with a `create()` method. This rule format was deprecated in 2016.
+diff --git a/lib/linter/code-path-analysis/code-path.js b/lib/linter/code-path-analysis/code-path.js
+index 90cafef68..3bf570d75 100644
+--- a/lib/linter/code-path-analysis/code-path.js
++++ b/lib/linter/code-path-analysis/code-path.js
+@@ -125,6 +125,20 @@ class CodePath {
+         return this.internal.thrownForkContext;
+     }
+ 
++    /**
++     * Tracks the traversal of the code path through each segment. This array
++     * starts empty and segments are added or removed as the code path is
++     * traversed. This array always ends up empty at the end of a code path
++     * traversal. The `CodePathState` uses this to track its progress through
++     * the code path.
++     * This is a passthrough to the underlying `CodePathState`.
++     * @type {CodePathSegment[]}
++     * @deprecated
++     */
++    get currentSegments() {
++        return this.internal.currentSegments;
++    }
++
+     /**
+      * Traverses all segments in this code path.
+      *
+diff --git a/lib/rule-tester/rule-tester.js b/lib/rule-tester/rule-tester.js
+index bff284ea8..092378f4d 100644
+--- a/lib/rule-tester/rule-tester.js
++++ b/lib/rule-tester/rule-tester.js
+@@ -16,7 +16,8 @@ const
+     equal = require("fast-deep-equal"),
+     Traverser = require("../shared/traverser"),
+     { getRuleOptionsSchema } = require("../config/flat-config-helpers"),
+-    { Linter, SourceCodeFixer, interpolate } = require("../linter");
++    { Linter, SourceCodeFixer, interpolate } = require("../linter"),
++    CodePath = require("../linter/code-path-analysis/code-path");
+ 
+ const { FlatConfigArray } = require("../config/flat-config-array");
+ const { defaultConfig } = require("../config/default-config");
+@@ -273,6 +274,21 @@ function wrapParser(parser) {
+     };
+ }
+ 
++/**
++ * Emit a deprecation warning if rule uses CodePath#currentSegments.
++ * @param {string} ruleName Name of the rule.
++ * @returns {void}
++ */
++function emitCodePathCurrentSegmentsWarning(ruleName) {
++    if (!emitCodePathCurrentSegmentsWarning[`warned-${ruleName}`]) {
++        emitCodePathCurrentSegmentsWarning[`warned-${ruleName}`] = true;
++        process.emitWarning(
++            `"${ruleName}" rule uses CodePath#currentSegments and will stop working in ESLint v9. Please read the documentation for how to update your code: https://eslint.org/docs/latest/extend/code-path-analysis#usage-examples`,
++            "DeprecationWarning"
++        );
++    }
++}
++
+ /**
+  * Function to replace forbidden `SourceCode` methods. Allows just one call per method.
+  * @param {string} methodName The name of the method to forbid.
+@@ -737,15 +753,24 @@ class RuleTester {
+ 
+             // Verify the code.
+             const { applyLanguageOptions, applyInlineConfig, finalize } = SourceCode.prototype;
++            const originalCurrentSegments = Object.getOwnPropertyDescriptor(CodePath.prototype, "currentSegments");
+             let messages;
+ 
+             try {
++                Object.defineProperty(CodePath.prototype, "currentSegments", {
++                    get() {
++                        emitCodePathCurrentSegmentsWarning(ruleName);
++                        return originalCurrentSegments.get.call(this);
++                    }
++                });
++
+                 forbiddenMethods.forEach(methodName => {
+                     SourceCode.prototype[methodName] = throwForbiddenMethodError(methodName, SourceCode.prototype);
+                 });
+ 
+                 messages = linter.verify(code, configs, filename);
+             } finally {
++                Object.defineProperty(CodePath.prototype, "currentSegments", originalCurrentSegments);
+                 SourceCode.prototype.applyInlineConfig = applyInlineConfig;
+                 SourceCode.prototype.applyLanguageOptions = applyLanguageOptions;
+                 SourceCode.prototype.finalize = finalize;
+diff --git a/tests/lib/linter/code-path-analysis/code-path-analyzer.js b/tests/lib/linter/code-path-analysis/code-path-analyzer.js
+index c85ef3563..d6a559fdb 100644
+--- a/tests/lib/linter/code-path-analysis/code-path-analyzer.js
++++ b/tests/lib/linter/code-path-analysis/code-path-analyzer.js
+@@ -137,6 +137,37 @@ describe("CodePathAnalyzer", () => {
+             assert(actual[1].thrownSegments[0] instanceof CodePathSegment);
+         });
+ 
++        it("should have `currentSegments` as CodePathSegment[]", () => {
++            assert(Array.isArray(actual[0].currentSegments));
++            assert(Array.isArray(actual[1].currentSegments));
++            assert(actual[0].currentSegments.length === 0);
++            assert(actual[1].currentSegments.length === 0);
++
++            // there is the current segment in progress.
++            linter.defineRule("test", {
++                create() {
++                    let codePath = null;
++
++                    return {
++                        onCodePathStart(cp) {
++                            codePath = cp;
++                        },
++                        ReturnStatement() {
++                            assert(codePath.currentSegments.length === 1);
++                            assert(codePath.currentSegments[0] instanceof CodePathSegment);
++                        },
++                        ThrowStatement() {
++                            assert(codePath.currentSegments.length === 1);
++                            assert(codePath.currentSegments[0] instanceof CodePathSegment);
++                        }
++                    };
++                }
++            });
++            linter.verify(
++                "function foo(a) { if (a) return 0; else throw new Error(); }",
++                { rules: { test: 2 } }
++            );
++        });
+     });
+ 
+     describe("interface of code path segments", () => {
+diff --git a/tests/lib/rule-tester/rule-tester.js b/tests/lib/rule-tester/rule-tester.js
+index 4d892c9fa..e0f00b47f 100644
+--- a/tests/lib/rule-tester/rule-tester.js
++++ b/tests/lib/rule-tester/rule-tester.js
+@@ -2530,6 +2530,45 @@ describe("RuleTester", () => {
+         });
+     });
+ 
++    describe("deprecations", () => {
++        let processStub;
++
++        beforeEach(() => {
++            processStub = sinon.stub(process, "emitWarning");
++        });
++
++        afterEach(() => {
++            processStub.restore();
++        });
++
++        it("should emit a deprecation warning when CodePath#currentSegments is accessed", () => {
++
++            const useCurrentSegmentsRule = {
++                create: () => ({
++                    onCodePathStart(codePath) {
++                        codePath.currentSegments.forEach(() => { });
++                    }
++                })
++            };
++
++            ruleTester.run("use-current-segments", useCurrentSegmentsRule, {
++                valid: ["foo"],
++                invalid: []
++            });
++
++            assert.strictEqual(processStub.callCount, 1, "calls `process.emitWarning()` once");
++            assert.deepStrictEqual(
++                processStub.getCall(0).args,
++                [
++                    "\"use-current-segments\" rule uses CodePath#currentSegments and will stop working in ESLint v9. Please read the documentation for how to update your code: https://eslint.org/docs/latest/extend/code-path-analysis#usage-examples",
++                    "DeprecationWarning"
++                ]
++            );
++
++        });
++
++    });
++
+     /**
+      * Asserts that a particular value will be emitted from an EventEmitter.
+      * @param {EventEmitter} emitter The emitter that should emit a value

@@ -1,0 +1,294 @@
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 762dc818b..a95a75c29 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -48,7 +48,7 @@ function runFormatTest(
+ Parameters:
+ 
+ - **`fixtures`**: Must be set to `import.meta` or to an object of the shape `{ importMeta: import.meta, ... }`. The object may have the `snippets` property to specify an array of extra input entries in addition to the files in the current directory. For each input entry (a file or a snippet), `runFormatTest` configures and runs a number of tests. The main check is that for a given input the output should match the snapshot (for snippets, the expected output can also be specified directly). [Additional checks](#deeper-testing) are controlled by options and environment variables.
+-- **`parsers`**: A list of parser names. The tests verify that the parsers in this list produce the same output. If the list includes `typescript`, then `babel-ts` is included implicitly. If the list includes `flow`, then `babel-flow` is included implicitly. If the list includes `babel`, and the current directory is inside `tests/format/js` or `tests/format/jsx`, then `acorn`, `espree`, `meriyah`, and `oxc` are included implicitly.
++- **`parsers`**: A list of parser names. The tests verify that the parsers in this list produce the same output. If the list includes `typescript`, then `babel-ts`, and `oxc-ts` is included implicitly. If the list includes `flow`, then `babel-flow` is included implicitly. If the list includes `babel`, and the current directory is inside `tests/format/js` or `tests/format/jsx`, then `acorn`, `espree`, `meriyah`, and `oxc` are included implicitly.
+ - **`options`**: In addition to Prettier's formatting options, can contain the `errors` property to specify that it's expected that the formatting shouldn't be successful and an error should be thrown for all (`errors: true`) or some combinations of input entries and parsers.
+ 
+ The implementation of `runFormatTest` can be found in [`tests/config/run-format-test.js`](tests/config/run-format-test.js).
+diff --git a/package.json b/package.json
+index 00c021859..80558179c 100644
+--- a/package.json
++++ b/package.json
+@@ -189,9 +189,9 @@
+     "build": "node ./scripts/build/build.js",
+     "build:website": "node ./scripts/build-website.js",
+     "gen:changelog": "node ./scripts/generate-changelog.js",
+-    "debug": "node bin/prettier.js --ignore-path=.prettierignore",
+-    "debug:watch": "node --watch bin/prettier.js --ignore-path=.prettierignore",
+-    "debug:inspect": "node --inspect-brk bin/prettier.js --ignore-path=.prettierignore"
++    "debug": "node bin/prettier.js --ignore-path=.prettierignore --plugin=./packages/plugin-oxc/index.js",
++    "debug:watch": "node --watch bin/prettier.js --ignore-path=.prettierignore --plugin=./packages/plugin-oxc/index.js",
++    "debug:inspect": "node --inspect-brk bin/prettier.js --ignore-path=.prettierignore --plugin=./packages/plugin-oxc/index.js"
+   },
+   "c8": {
+     "reporter": [
+diff --git a/packages/plugin-oxc/README.md b/packages/plugin-oxc/README.md
+index f7cec954d..cdcf9c1b2 100644
+--- a/packages/plugin-oxc/README.md
++++ b/packages/plugin-oxc/README.md
+@@ -16,11 +16,18 @@ Create or modify your [prettier configuration file](https://prettier.io/docs/en/
+ {
+   "overrides": [
+     {
+-      "files": ["**/*.{js,mjs,cjs}"],
++      "files": ["**/*.{js,mjs,cjs,jsx}"],
+       "options": {
+         "plugins": ["@prettier/plugin-oxc"],
+         "parser": "oxc"
+       }
++    },
++    {
++      "files": ["**/*.{ts,mts,cts,tsx}"],
++      "options": {
++        "plugins": ["@prettier/plugin-oxc"],
++        "parser": "oxc-ts"
++      }
+     }
+   ]
+ }
+diff --git a/packages/plugin-oxc/index.js b/packages/plugin-oxc/index.js
+index d81d6defb..f830f22b6 100644
+--- a/packages/plugin-oxc/index.js
++++ b/packages/plugin-oxc/index.js
+@@ -1,3 +1 @@
+-import { oxc } from "../../src/language-js/parse/oxc.js";
+-
+-export const parsers = { oxc };
++export * as parsers from "../../src/language-js/parse/oxc.js";
+diff --git a/src/language-js/comments/printer-methods.js b/src/language-js/comments/printer-methods.js
+index ed8d74880..9884f4b78 100644
+--- a/src/language-js/comments/printer-methods.js
++++ b/src/language-js/comments/printer-methods.js
+@@ -46,6 +46,7 @@ function getCommentChildNodes(node, options) {
+       options.parser === "flow" ||
+       options.parser === "acorn" ||
+       options.parser === "oxc" ||
++      options.parser === "oxc-ts" ||
+       options.parser === "espree" ||
+       options.parser === "meriyah" ||
+       options.parser === "__babel_estree") &&
+diff --git a/src/language-js/parse/oxc.js b/src/language-js/parse/oxc.js
+index 87c397675..44b9fdc96 100644
+--- a/src/language-js/parse/oxc.js
++++ b/src/language-js/parse/oxc.js
+@@ -31,13 +31,11 @@ const isRawTransferSupported = () => {
+   return cachedIsRawTransferSupported;
+ };
+ 
+-async function parseWithOptions(filename, text, sourceType) {
++async function parseWithOptions(filename, text, options) {
+   const result = await oxcParse(filename, text, {
+-    sourceType,
+-    lang: "jsx",
+     preserveParens: true,
+-    // @ts-expect-error -- missing
+     experimentalRawTransfer: isRawTransferSupported(),
++    ...options,
+   });
+ 
+   const { errors } = result;
+@@ -56,7 +54,7 @@ async function parseWithOptions(filename, text, sourceType) {
+   return result;
+ }
+ 
+-async function parse(text, options = {}) {
++async function parseJs(text, options = {}) {
+   const sourceType = getSourceType(options);
+   let { filepath } = options;
+   if (typeof filepath !== "string") {
+@@ -64,7 +62,8 @@ async function parse(text, options = {}) {
+   }
+ 
+   const combinations = (sourceType ? [sourceType] : ["module", "script"]).map(
+-    (sourceType) => () => parseWithOptions(filepath, text, sourceType),
++    (sourceType) => () =>
++      parseWithOptions(filepath, text, { sourceType, lang: "jsx" }),
+   );
+ 
+   let result;
+@@ -81,4 +80,75 @@ async function parse(text, options = {}) {
+   return postprocess(ast, { text, parser: "oxc" });
+ }
+ 
+-export const oxc = createParser(parse);
++function getTsParseOptionsCombinations(text, options) {
++  const sourceType = getSourceType(options);
++  /** @type {("module" | "script") []} */
++  const sourceTypes = sourceType ? [sourceType] : ["module", "script"];
++  const combinations = sourceTypes.map((sourceType) => ({ sourceType }));
++
++  const extension = options.filepath?.toLowerCase().split(".").at(-1);
++  const isKnownJsx = extension === "jsx" || extension === "tsx";
++
++  if (isKnownJsx) {
++    return combinations.map((parseOptions) => ({
++      ...parseOptions,
++      lang: "tsx",
++    }));
++  }
++
++  const shouldEnableJsx = isProbablyJsx(text);
++  return combinations.flatMap((parseOptions) =>
++    [shouldEnableJsx, !shouldEnableJsx].map((jsx) =>
++      jsx ? { ...parseOptions, lang: "tsx" } : { ...parseOptions, lang: "ts" },
++    ),
++  );
++}
++
++async function parseTs(text, options = {}) {
++  const parseOptionsCombinations = getTsParseOptionsCombinations(text, options);
++  let { filepath } = options;
++  if (typeof filepath !== "string") {
++    filepath = "prettier.tsx";
++  }
++
++  let result;
++  try {
++    result = await tryCombinationsAsync(
++      parseOptionsCombinations.map(
++        (parseOptions) => () =>
++          parseWithOptions(filepath, text, { ...parseOptions, astType: "ts" }),
++      ),
++    );
++  } catch ({
++    // @ts-expect-error -- expected
++    errors: [error],
++  }) {
++    throw error;
++  }
++
++  const { program: ast, comments } = result;
++  // @ts-expect-error -- expected
++  ast.comments = comments;
++  return postprocess(ast, { text, parser: "oxc", oxcAstType: "ts" });
++}
++
++/**
++ * Use a naive regular expression to detect JSX
++ * copied from typescript.js
++ */
++function isProbablyJsx(text) {
++  return new RegExp(
++    // eslint-disable-next-line regexp/no-useless-non-capturing-group -- possible bug
++    [
++      "(?:^[^\"'`]*</)", // Contains "</" when probably not in a string
++      "|",
++      "(?:^[^/]{2}.*/>)", // Contains "/>" on line not starting with "//"
++    ].join(""),
++    "mu",
++  ).test(text);
++}
++
++const oxc = createParser(parseJs);
++const oxcTs = createParser(parseTs);
++
++export { oxc, oxcTs as "oxc-ts" };
+diff --git a/src/language-js/parse/postprocess/index.js b/src/language-js/parse/postprocess/index.js
+index 7db0b0545..69dfe1069 100644
+--- a/src/language-js/parse/postprocess/index.js
++++ b/src/language-js/parse/postprocess/index.js
+@@ -34,6 +34,7 @@ const isNodeWithRaw = createTypeCheckFunction([
+  * @param {{
+  *   text: string,
+  *   parser?: string,
++ *   oxcAstType?: string,
+  * }} options
+  */
+ function postprocess(ast, options) {
+@@ -49,6 +50,12 @@ function postprocess(ast, options) {
+     delete program.interpreter;
+   }
+ 
++  if (parser === "oxc" && options.oxcAstType === "ts" && ast.hashbang) {
++    const { comments, hashbang } = ast;
++    comments.unshift(hashbang);
++    delete program.hashbang;
++  }
++
+   if (ast.comments.length > 0) {
+     let followingComment;
+     for (let i = ast.comments.length - 1; i >= 0; i--) {
+@@ -117,13 +124,23 @@ function postprocess(ast, options) {
+         }
+         break;
+ 
++      // This happens when use `oxc-parser` to parse `` `${foo satisfies bar}`; ``
++      // https://github.com/oxc-project/oxc/issues/11313
++      case "TemplateLiteral":
++        /* c8 ignore next 3 */
++        if (node.expressions.length !== node.quasis.length - 1) {
++          throw new Error("Malformed template literal.");
++        }
++        break;
++
+       case "TemplateElement":
+-        // `flow` and `typescript` follows the `espree` style positions
++        // `flow`, `typescript`, and `oxc`(with `{astType: 'ts'}`) follows the `espree` style positions
+         // https://github.com/eslint/js/blob/5826877f7b33548e5ba984878dd4a8eac8448f87/packages/espree/lib/espree.js#L213
+         if (
+           parser === "flow" ||
+           parser === "espree" ||
+-          parser === "typescript"
++          parser === "typescript" ||
++          (parser === "oxc" && options.oxcAstType === "ts")
+         ) {
+           const start = locStart(node) + 1;
+           const end = locEnd(node) - (node.tail ? 1 : 2);
+diff --git a/src/language-js/print/property.js b/src/language-js/print/property.js
+index 7d972946e..c6aabcaf3 100644
+--- a/src/language-js/print/property.js
++++ b/src/language-js/print/property.js
+@@ -56,7 +56,8 @@ function isStringKeySafeToUnquote(node, options) {
+     // See https://github.com/microsoft/TypeScript/pull/20075
+     !(
+       (options.parser === "babel-ts" && node.type === "ClassProperty") ||
+-      (options.parser === "typescript" && node.type === "PropertyDefinition")
++      ((options.parser === "typescript" || options.parser === "oxc-ts") &&
++        node.type === "PropertyDefinition")
+     )
+   ) {
+     return true;
+@@ -90,7 +91,11 @@ function shouldQuotePropertyKey(path, options) {
+         String(key.value) === printNumber(getRaw(key)) &&
+         // Quoting number keys is safe in JS and Flow, but not in TypeScript (as
+         // mentioned in `isStringKeySafeToUnquote`).
+-        !(options.parser === "typescript" || options.parser === "babel-ts"))) &&
++        !(
++          options.parser === "typescript" ||
++          options.parser === "babel-ts" ||
++          options.parser === "oxc-ts"
++        ))) &&
+     (options.parser === "json" ||
+       options.parser === "jsonc" ||
+       (options.quoteProps === "consistent" && needsQuoteProps.get(path.parent)))
+diff --git a/src/language-js/utils/is-line-comment.js b/src/language-js/utils/is-line-comment.js
+index 9c99b038a..79aedac05 100644
+--- a/src/language-js/utils/is-line-comment.js
++++ b/src/language-js/utils/is-line-comment.js
+@@ -16,7 +16,7 @@ const isLineComment = createTypeCheckFunction([
+   "HashbangComment",
+   "HTMLOpen",
+   "HTMLClose",
+-  // `espree`
++  // `espree`, and `oxc`(with `{astType: 'ts'}`)
+   "Hashbang",
+   // `babel` and `flow` hashbang
+   "InterpreterDirective",
+diff --git a/src/main/range-util.js b/src/main/range-util.js
+index b2e2906a3..b4cb9acd6 100644
+--- a/src/main/range-util.js
++++ b/src/main/range-util.js
+@@ -178,6 +178,7 @@ function isSourceElement(opts, node, parentNode) {
+     case "espree":
+     case "meriyah":
+     case "oxc":
++    case "oxc-ts":
+     case "__babel_estree":
+       return isJsSourceElement(node.type, parentNode?.type);
+     case "json":

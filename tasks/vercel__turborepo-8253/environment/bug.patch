@@ -1,0 +1,2834 @@
+diff --git a/crates/turborepo-lib/src/hash/mod.rs b/crates/turborepo-lib/src/hash/mod.rs
+index 6558c36c86..74fd46ccbd 100644
+--- a/crates/turborepo-lib/src/hash/mod.rs
++++ b/crates/turborepo-lib/src/hash/mod.rs
+@@ -67,6 +67,7 @@ pub struct GlobalHashable<'a> {
+     // These are None in single package mode
+     pub root_external_dependencies_hash: Option<&'a str>,
+     pub root_internal_dependencies_hash: Option<&'a str>,
++    pub engines: HashMap<&'a str, &'a str>,
+     pub env: &'a [String],
+     pub resolved_env_vars: EnvironmentVariablePairs,
+     pub pass_through_env: &'a [String],
+@@ -303,6 +304,24 @@ impl From<GlobalHashable<'_>> for Builder<HeapAllocator> {
+             }
+         }
+ 
++        {
++            let mut entries = builder
++                .reborrow()
++                .init_engines(hashable.engines.len() as u32);
++
++            // get a sorted iterator over keys and values of the hashmap
++            // and set the entries in the capnp message
++
++            let mut hashable: Vec<_> = hashable.engines.iter().collect();
++            hashable.sort_by(|a, b| a.0.cmp(b.0));
++
++            for (i, (key, value)) in hashable.iter().enumerate() {
++                let mut entry = entries.reborrow().get(i as u32);
++                entry.set_key(key);
++                entry.set_value(value);
++            }
++        }
++
+         if let Some(root_external_dependencies_hash) = hashable.root_external_dependencies_hash {
+             builder.set_root_external_deps_hash(root_external_dependencies_hash);
+         }
+@@ -407,6 +426,7 @@ mod test {
+             global_file_hash_map: &global_file_hash_map,
+             root_external_dependencies_hash: Some("0000000000000000"),
+             root_internal_dependencies_hash: Some("0000000000000001"),
++            engines: Default::default(),
+             env: &["env".to_string()],
+             resolved_env_vars: vec![],
+             pass_through_env: &["pass_through_env".to_string()],
+@@ -414,7 +434,7 @@ mod test {
+             framework_inference: true,
+         };
+ 
+-        assert_eq!(global_hash.hash(), "8d5ecbdc3ff2b3f2");
++        assert_eq!(global_hash.hash(), "5072bd005ec02799");
+     }
+ 
+     #[test_case(vec![], "459c029558afe716" ; "empty")]
+diff --git a/crates/turborepo-lib/src/hash/proto.capnp b/crates/turborepo-lib/src/hash/proto.capnp
+index 19cf20915e..9486bf0c04 100644
+--- a/crates/turborepo-lib/src/hash/proto.capnp
++++ b/crates/turborepo-lib/src/hash/proto.capnp
+@@ -41,6 +41,7 @@ struct GlobalHashable {
+   passThroughEnv @6 :List(Text);
+   envMode @7 :EnvMode;
+   frameworkInference @8 :Bool;
++  engines @9 :List(Entry);
+ 
+ 
+   enum EnvMode {
+diff --git a/crates/turborepo-lib/src/run/global_hash.rs b/crates/turborepo-lib/src/run/global_hash.rs
+index ece8fa8cca..d4a405c8ef 100644
+--- a/crates/turborepo-lib/src/run/global_hash.rs
++++ b/crates/turborepo-lib/src/run/global_hash.rs
+@@ -11,7 +11,10 @@ use tracing::debug;
+ use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf, RelativeUnixPathBuf};
+ use turborepo_env::{get_global_hashable_env_vars, DetailedMap, EnvironmentVariableMap};
+ use turborepo_lockfiles::Lockfile;
+-use turborepo_repository::package_manager::{self, PackageManager};
++use turborepo_repository::{
++    package_graph::PackageInfo,
++    package_manager::{self, PackageManager},
++};
+ use turborepo_scm::SCM;
+ 
+ use crate::{
+@@ -41,9 +44,10 @@ pub enum Error {
+ pub struct GlobalHashableInputs<'a> {
+     pub global_cache_key: &'static str,
+     pub global_file_hash_map: HashMap<RelativeUnixPathBuf, String>,
+-    // These are `None` in single package mode
++    // This is `None` in single package mode
+     pub root_external_dependencies_hash: Option<&'a str>,
+     pub root_internal_dependencies_hash: Option<&'a str>,
++    pub engines: Option<HashMap<&'a str, &'a str>>,
+     pub env: &'a [String],
+     // Only Option to allow #[derive(Default)]
+     pub resolved_env_vars: Option<DetailedMap>,
+@@ -57,6 +61,7 @@ pub struct GlobalHashableInputs<'a> {
+ pub fn get_global_hash_inputs<'a, L: ?Sized + Lockfile>(
+     root_external_dependencies_hash: Option<&'a str>,
+     root_internal_dependencies_hash: Option<&'a str>,
++    root_package: &'a PackageInfo,
+     root_path: &AbsoluteSystemPath,
+     package_manager: &PackageManager,
+     lockfile: Option<&L>,
+@@ -68,6 +73,8 @@ pub fn get_global_hash_inputs<'a, L: ?Sized + Lockfile>(
+     framework_inference: bool,
+     hasher: &SCM,
+ ) -> Result<GlobalHashableInputs<'a>, Error> {
++    let engines = root_package.package_json.engines();
++
+     let global_hashable_env_vars =
+         get_global_hashable_env_vars(env_at_execution_start, global_env)?;
+ 
+@@ -104,6 +111,7 @@ pub fn get_global_hash_inputs<'a, L: ?Sized + Lockfile>(
+         global_file_hash_map,
+         root_external_dependencies_hash,
+         root_internal_dependencies_hash,
++        engines,
+         env: global_env,
+         resolved_env_vars: Some(global_hashable_env_vars),
+         pass_through_env: global_pass_through_env,
+@@ -180,6 +188,7 @@ impl<'a> GlobalHashableInputs<'a> {
+             global_file_hash_map: &self.global_file_hash_map,
+             root_external_dependencies_hash: self.root_external_dependencies_hash,
+             root_internal_dependencies_hash: self.root_internal_dependencies_hash,
++            engines: self.engines.clone().unwrap_or_default(),
+             env: self.env,
+             resolved_env_vars: self
+                 .resolved_env_vars
+@@ -200,7 +209,7 @@ mod tests {
+     use turbopath::AbsoluteSystemPathBuf;
+     use turborepo_env::EnvironmentVariableMap;
+     use turborepo_lockfiles::Lockfile;
+-    use turborepo_repository::package_manager::PackageManager;
++    use turborepo_repository::{package_graph::PackageInfo, package_manager::PackageManager};
+     use turborepo_scm::SCM;
+ 
+     use super::get_global_hash_inputs;
+@@ -222,6 +231,7 @@ mod tests {
+             .unwrap();
+ 
+         let env_var_map = EnvironmentVariableMap::default();
++        let package_info = PackageInfo::default();
+         let lockfile: Option<&dyn Lockfile> = None;
+         #[cfg(windows)]
+         let file_deps = ["C:\\some\\path".to_string()];
+@@ -230,6 +240,7 @@ mod tests {
+         let result = get_global_hash_inputs(
+             None,
+             None,
++            &package_info,
+             &root,
+             &PackageManager::Pnpm,
+             lockfile,
+diff --git a/crates/turborepo-lib/src/run/mod.rs b/crates/turborepo-lib/src/run/mod.rs
+index 60be2dfba1..073dc728ea 100644
+--- a/crates/turborepo-lib/src/run/mod.rs
++++ b/crates/turborepo-lib/src/run/mod.rs
+@@ -282,6 +282,7 @@ impl Run {
+             get_global_hash_inputs(
+                 root_external_dependencies_hash.as_deref(),
+                 root_internal_dependencies_hash.as_deref(),
++                root_workspace,
+                 &self.repo_root,
+                 self.pkg_dep_graph.package_manager(),
+                 self.pkg_dep_graph.lockfile(),
+diff --git a/crates/turborepo-lib/src/run/summary/global_hash.rs b/crates/turborepo-lib/src/run/summary/global_hash.rs
+index 6eb4d68ea3..3f693308ae 100644
+--- a/crates/turborepo-lib/src/run/summary/global_hash.rs
++++ b/crates/turborepo-lib/src/run/summary/global_hash.rs
+@@ -33,6 +33,7 @@ pub struct GlobalHashSummary<'a> {
+     pub hash_of_external_dependencies: &'a str,
+     pub hash_of_internal_dependencies: &'a str,
+     pub environment_variables: GlobalEnvVarSummary<'a>,
++    pub engines: Option<BTreeMap<&'a str, &'a str>>,
+ }
+ 
+ impl<'a> TryFrom<GlobalHashableInputs<'a>> for GlobalHashSummary<'a> {
+@@ -48,6 +49,7 @@ impl<'a> TryFrom<GlobalHashableInputs<'a>> for GlobalHashSummary<'a> {
+             resolved_env_vars,
+             pass_through_env,
+             env_at_execution_start,
++            engines,
+             ..
+         } = global_hashable_inputs;
+ 
+@@ -62,6 +64,8 @@ impl<'a> TryFrom<GlobalHashableInputs<'a>> for GlobalHashSummary<'a> {
+             )
+             .transpose()?;
+ 
++        let engines = engines.map(|engines| engines.into_iter().collect());
++
+         Ok(Self {
+             root_key: global_cache_key,
+             files: global_file_hash_map.into_iter().collect(),
+@@ -81,6 +85,7 @@ impl<'a> TryFrom<GlobalHashableInputs<'a>> for GlobalHashSummary<'a> {
+                     .map(|vars| vars.by_source.matching.to_secret_hashable()),
+                 pass_through,
+             },
++            engines,
+         })
+     }
+ }
+diff --git a/crates/turborepo-lib/src/run/summary/mod.rs b/crates/turborepo-lib/src/run/summary/mod.rs
+index 36ab46baef..0c6a0bd8fe 100644
+--- a/crates/turborepo-lib/src/run/summary/mod.rs
++++ b/crates/turborepo-lib/src/run/summary/mod.rs
+@@ -538,6 +538,20 @@ impl<'a> RunSummary<'a> {
+                 .unwrap_or_default()
+                 .join(", ")
+         )?;
++        cwriteln!(
++            tab_writer,
++            ui,
++            GREY,
++            "  Engines Values\t=\t{}",
++            self.global_hash_summary
++                .engines
++                .as_ref()
++                .map(|engines| engines
++                    .iter()
++                    .map(|(key, value)| format!("{key}={value}"))
++                    .join(", "))
++                .unwrap_or_default()
++        )?;
+ 
+         tab_writer.flush()?;
+         println!();
+diff --git a/crates/turborepo-repository/src/package_json.rs b/crates/turborepo-repository/src/package_json.rs
+index aa2c4130c8..b1ba183177 100644
+--- a/crates/turborepo-repository/src/package_json.rs
++++ b/crates/turborepo-repository/src/package_json.rs
+@@ -1,4 +1,7 @@
+-use std::{collections::BTreeMap, str::FromStr};
++use std::{
++    collections::{BTreeMap, HashMap},
++    str::FromStr,
++};
+ 
+ use anyhow::Result;
+ use serde::{Deserialize, Serialize};
+@@ -79,6 +82,19 @@ impl PackageJson {
+             .filter(|command| !command.is_empty())
+             .map(|command| command.as_str())
+     }
++
++    pub fn engines(&self) -> Option<HashMap<&str, &str>> {
++        let engines = self.other.get("engines")?.as_object()?;
++        Some(
++            engines
++                .iter()
++                .filter_map(|(key, value)| {
++                    let value = value.as_str()?;
++                    Some((key.as_str(), value))
++                })
++                .collect(),
++        )
++    }
+ }
+ 
+ impl FromStr for PackageJson {
+diff --git a/packages/eslint-plugin-turbo/lib/utils/calculate-inputs.ts b/packages/eslint-plugin-turbo/lib/utils/calculate-inputs.ts
+index 656cd770e2..3965ad2498 100644
+--- a/packages/eslint-plugin-turbo/lib/utils/calculate-inputs.ts
++++ b/packages/eslint-plugin-turbo/lib/utils/calculate-inputs.ts
+@@ -4,8 +4,7 @@ import path from "node:path";
+ import type { WorkspaceConfig } from "@turbo/utils";
+ import { getWorkspaceConfigs } from "@turbo/utils";
+ import type { Pipeline } from "@turbo/types";
+-import type { RootSchema, RootSchemaV1 } from "@turbo/types/src/types/config";
+-import { forEachTaskDef } from "@turbo/utils/src/getTurboConfigs";
++import type { RootSchema } from "@turbo/types/src/types/config";
+ import { dotEnv } from "./dotenv-processing";
+ import { wildcardTests } from "./wildcard-processing";
+ 
+@@ -132,7 +131,7 @@ function processDotEnv(
+ 
+ function processGlobal(
+   workspacePath: string,
+-  rootTurboJson: RootSchema | RootSchemaV1
++  rootTurboJson: RootSchema
+ ): EnvironmentConfig {
+   return {
+     legacyConfig: processLegacyConfig(rootTurboJson.globalDependencies),
+@@ -315,8 +314,7 @@ export class Project {
+         this.projectRoot.turboConfig
+       );
+ 
+-      forEachTaskDef(
+-        this.projectRoot.turboConfig,
++      Object.entries(this.projectRoot.turboConfig.pipeline).forEach(
+         ([taskName, taskDefinition]) => {
+           const { workspaceName, scriptName } = getTaskAddress(taskName);
+           if (workspaceName) {
+@@ -343,8 +341,7 @@ export class Project {
+         return;
+       }
+ 
+-      forEachTaskDef(
+-        projectWorkspace.turboConfig,
++      Object.entries(projectWorkspace.turboConfig.pipeline).forEach(
+         ([taskName, taskDefinition]) => {
+           const { workspaceName: erroneousWorkspaceName, scriptName } =
+             getTaskAddress(taskName);
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/no-turbo-json/package.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/no-turbo-json/package.json
+deleted file mode 100644
+index cd983346b8..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/no-turbo-json/package.json
++++ /dev/null
+@@ -1,7 +0,0 @@
+-{
+-  "name": "set-default-outputs-no-turbo-json",
+-  "version": "1.0.0",
+-  "dependencies": {},
+-  "devDependencies": {},
+-  "packageManager": "npm@1.2.3"
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/important.txt b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/important.txt
+deleted file mode 100644
+index ce01362503..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/important.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-hello
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/package.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/package.json
+deleted file mode 100644
+index 0967ef424b..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/package.json
++++ /dev/null
+@@ -1 +0,0 @@
+-{}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/turbo.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/turbo.json
+deleted file mode 100644
+index caa7754bb0..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/root-only/turbo.json
++++ /dev/null
+@@ -1,9 +0,0 @@
+-{
+-  "$schema": "https://turbo.build/schema.json",
+-  "globalDependencies": ["important.txt"],
+-  "pipeline": {
+-    "build": {
+-      "outputs": ["dist"]
+-    }
+-  }
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/index.js b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/index.js
+deleted file mode 100644
+index 4de53f5ec2..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/index.js
++++ /dev/null
+@@ -1,6 +0,0 @@
+-export default function docs() {
+-  if (process.env.ENV_1 === undefined) {
+-    return "does not exist";
+-  }
+-  return "exists";
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/package.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/package.json
+deleted file mode 100644
+index 82f9a44736..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/package.json
++++ /dev/null
+@@ -1,4 +0,0 @@
+-{
+-  "name": "docs",
+-  "version": "1.0.0"
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/turbo.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/turbo.json
+deleted file mode 100644
+index a3713efab8..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/docs/turbo.json
++++ /dev/null
+@@ -1,9 +0,0 @@
+-{
+-  "$schema": "https://turbo.build/schema.json",
+-  "extends": ["//"],
+-  "pipeline": {
+-    "build": {
+-      "env": ["ENV_3"]
+-    }
+-  }
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/index.js b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/index.js
+deleted file mode 100644
+index bfd3ab817a..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/index.js
++++ /dev/null
+@@ -1,6 +0,0 @@
+-export default function web() {
+-  if (!process.env.ENV_2) {
+-    return "bar";
+-  }
+-  return "foo";
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/package.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/package.json
+deleted file mode 100644
+index d8a83edbd3..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/package.json
++++ /dev/null
+@@ -1,4 +0,0 @@
+-{
+-  "name": "web",
+-  "version": "1.0.0"
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/turbo.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/turbo.json
+deleted file mode 100644
+index 2adc44b444..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/apps/web/turbo.json
++++ /dev/null
+@@ -1,9 +0,0 @@
+-{
+-  "$schema": "https://turbo.build/schema.json",
+-  "extends": ["//"],
+-  "pipeline": {
+-    "build": {
+-      "dependsOn": []
+-    }
+-  }
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/package.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/package.json
+deleted file mode 100644
+index c6616a615d..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/package.json
++++ /dev/null
+@@ -1,14 +0,0 @@
+-{
+-  "private": true,
+-  "workspaces": [
+-    "apps/*",
+-    "packages/*"
+-  ],
+-  "scripts": {
+-    "build": "turbo run build"
+-  },
+-  "devDependencies": {
+-    "turbo": "latest"
+-  },
+-  "packageManager": "yarn@1.22.19"
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/index.js b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/index.js
+deleted file mode 100644
+index dee5e80cd6..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/index.js
++++ /dev/null
+@@ -1,6 +0,0 @@
+-export default function foo() {
+-  if (!process.env.IS_SERVER) {
+-    return "bar";
+-  }
+-  return "foo";
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/package.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/package.json
+deleted file mode 100644
+index 7cb7cf1734..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/package.json
++++ /dev/null
+@@ -1,4 +0,0 @@
+-{
+-  "name": "ui",
+-  "version": "1.0.0"
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/turbo.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/turbo.json
+deleted file mode 100644
+index f82702d135..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/packages/ui/turbo.json
++++ /dev/null
+@@ -1,9 +0,0 @@
+-{
+-  "$schema": "https://turbo.build/schema.json",
+-  "extends": ["//"],
+-  "pipeline": {
+-    "test": {
+-      "dependsOn": ["build"]
+-    }
+-  }
+-}
+diff --git a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/turbo.json b/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/turbo.json
+deleted file mode 100644
+index 6a7d63e0dc..0000000000
+--- a/packages/turbo-codemod/__tests__/__fixtures__/rename-pipeline/workspace-configs/turbo.json
++++ /dev/null
+@@ -1,18 +0,0 @@
+-{
+-  "$schema": "https://turbo.build/schema.json",
+-  "pipeline": {
+-    "build": {
+-      "outputs": [".next/**", "!.next/cache/**"],
+-      "dependsOn": ["^build"]
+-    },
+-    "lint": {
+-      "outputs": []
+-    },
+-    "test": {
+-      "outputs": []
+-    },
+-    "dev": {
+-      "cache": false
+-    }
+-  }
+-}
+diff --git a/packages/turbo-codemod/__tests__/migrate-env-var-dependencies.test.ts b/packages/turbo-codemod/__tests__/migrate-env-var-dependencies.test.ts
+index 7680d64dc3..86c7de9a9f 100644
+--- a/packages/turbo-codemod/__tests__/migrate-env-var-dependencies.test.ts
++++ b/packages/turbo-codemod/__tests__/migrate-env-var-dependencies.test.ts
+@@ -1,6 +1,5 @@
+ import merge from "deepmerge";
+ import type { Schema } from "@turbo/types";
+-import type { SchemaV1 } from "@turbo/types/src/types/config";
+ import { setupTestFixtures } from "@turbo/test-utils";
+ import {
+   hasLegacyEnvVarDependencies,
+@@ -9,9 +8,7 @@ import {
+   transformer,
+ } from "../src/transforms/migrate-env-var-dependencies";
+ 
+-const getTestTurboConfig = (
+-  override: SchemaV1 = { pipeline: {} }
+-): SchemaV1 => {
++const getTestTurboConfig = (override: Schema = { pipeline: {} }): Schema => {
+   const config = {
+     $schema: "./docs/public/schema.json",
+     globalDependencies: ["$GLOBAL_ENV_KEY"],
+diff --git a/packages/turbo-codemod/__tests__/rename-pipeline.ts b/packages/turbo-codemod/__tests__/rename-pipeline.ts
+deleted file mode 100644
+index 0631c50e6f..0000000000
+--- a/packages/turbo-codemod/__tests__/rename-pipeline.ts
++++ /dev/null
+@@ -1,142 +0,0 @@
+-import { setupTestFixtures } from "@turbo/test-utils";
+-import { transformer } from "../src/transforms/rename-pipeline";
+-
+-describe("rename-pipeline", () => {
+-  const { useFixture } = setupTestFixtures({
+-    directory: __dirname,
+-    test: "rename-pipeline",
+-  });
+-
+-  it("migrates turbo.json pipeline - root config only", () => {
+-    // load the fixture for the test
+-    const { root, read } = useFixture({
+-      fixture: "root-only",
+-    });
+-
+-    // run the transformer
+-    const result = transformer({
+-      root,
+-      options: { force: false, dry: false, print: false },
+-    });
+-
+-    expect(JSON.parse(read("turbo.json") || "{}")).toStrictEqual({
+-      $schema: "https://turbo.build/schema.json",
+-      globalDependencies: ["important.txt"],
+-      tasks: {
+-        build: {
+-          outputs: ["dist"],
+-        },
+-      },
+-    });
+-
+-    expect(result.fatalError).toBeUndefined();
+-    expect(result.changes).toMatchInlineSnapshot(`
+-      Object {
+-        "turbo.json": Object {
+-          "action": "modified",
+-          "additions": 1,
+-          "deletions": 1,
+-        },
+-      }
+-    `);
+-  });
+-
+-  it("migrates turbo.json pipeline - workspace configs", () => {
+-    // load the fixture for the test
+-    const { root, read } = useFixture({
+-      fixture: "workspace-configs",
+-    });
+-
+-    // run the transformer
+-    const result = transformer({
+-      root,
+-      options: { force: false, dry: false, print: false },
+-    });
+-
+-    expect(JSON.parse(read("turbo.json") || "{}")).toStrictEqual({
+-      $schema: "https://turbo.build/schema.json",
+-      tasks: {
+-        build: {
+-          dependsOn: ["^build"],
+-          outputs: [".next/**", "!.next/cache/**"],
+-        },
+-        dev: {
+-          cache: false,
+-        },
+-        lint: {
+-          outputs: [],
+-        },
+-        test: {
+-          outputs: [],
+-        },
+-      },
+-    });
+-
+-    expect(JSON.parse(read("apps/web/turbo.json") || "{}")).toStrictEqual({
+-      $schema: "https://turbo.build/schema.json",
+-      extends: ["//"],
+-      tasks: {
+-        build: {
+-          dependsOn: [],
+-        },
+-      },
+-    });
+-
+-    expect(JSON.parse(read("packages/ui/turbo.json") || "{}")).toStrictEqual({
+-      $schema: "https://turbo.build/schema.json",
+-      extends: ["//"],
+-      tasks: {
+-        test: {
+-          dependsOn: ["build"],
+-        },
+-      },
+-    });
+-
+-    expect(result.fatalError).toBeUndefined();
+-    expect(result.changes).toMatchInlineSnapshot(`
+-      Object {
+-        "apps/docs/turbo.json": Object {
+-          "action": "modified",
+-          "additions": 1,
+-          "deletions": 1,
+-        },
+-        "apps/web/turbo.json": Object {
+-          "action": "modified",
+-          "additions": 1,
+-          "deletions": 1,
+-        },
+-        "packages/ui/turbo.json": Object {
+-          "action": "modified",
+-          "additions": 1,
+-          "deletions": 1,
+-        },
+-        "turbo.json": Object {
+-          "action": "modified",
+-          "additions": 1,
+-          "deletions": 1,
+-        },
+-      }
+-    `);
+-  });
+-
+-  it("errors if no turbo.json can be found", () => {
+-    // load the fixture for the test
+-    const { root, read } = useFixture({
+-      fixture: "no-turbo-json",
+-    });
+-
+-    expect(read("turbo.json")).toBeUndefined();
+-
+-    // run the transformer
+-    const result = transformer({
+-      root,
+-      options: { force: false, dry: false, print: false },
+-    });
+-
+-    expect(read("turbo.json")).toBeUndefined();
+-    expect(result.fatalError).toBeDefined();
+-    expect(result.fatalError?.message).toMatch(
+-      /No turbo\.json found at .*?\. Is the path correct\?/
+-    );
+-  });
+-});
+diff --git a/packages/turbo-codemod/src/transforms/clean-globs.ts b/packages/turbo-codemod/src/transforms/clean-globs.ts
+index 2cda0f942a..b5a663be10 100644
+--- a/packages/turbo-codemod/src/transforms/clean-globs.ts
++++ b/packages/turbo-codemod/src/transforms/clean-globs.ts
+@@ -1,5 +1,5 @@
+ import path from "node:path";
+-import type { SchemaV1 } from "@turbo/types/src/types/config";
++import type { Schema as TurboJsonSchema } from "@turbo/types";
+ import { readJsonSync } from "fs-extra";
+ import { getTurboConfigs } from "@turbo/utils";
+ import type { TransformerArgs, Transformer } from "../types";
+@@ -24,7 +24,7 @@ export function transformer({
+ 
+   const turboConfigPath = path.join(root, "turbo.json");
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
++  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateConfig(turboJson),
+@@ -34,18 +34,16 @@ export function transformer({
+   const workspaceConfigs = getTurboConfigs(root);
+   workspaceConfigs.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath } = workspaceConfig;
+-    if ("pipeline" in config) {
+-      runner.modifyFile({
+-        filePath,
+-        after: migrateConfig(config),
+-      });
+-    }
++    runner.modifyFile({
++      filePath,
++      after: migrateConfig(config),
++    });
+   });
+ 
+   return runner.finish();
+ }
+ 
+-function migrateConfig(config: SchemaV1) {
++function migrateConfig(config: TurboJsonSchema) {
+   const mapGlob = (glob: string) => fixGlobPattern(glob);
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     taskDef.inputs = taskDef.inputs?.map(mapGlob);
+diff --git a/packages/turbo-codemod/src/transforms/migrate-env-var-dependencies.ts b/packages/turbo-codemod/src/transforms/migrate-env-var-dependencies.ts
+index d2a17b7a95..b6f36f646c 100644
+--- a/packages/turbo-codemod/src/transforms/migrate-env-var-dependencies.ts
++++ b/packages/turbo-codemod/src/transforms/migrate-env-var-dependencies.ts
+@@ -1,8 +1,7 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { Pipeline } from "@turbo/types";
+-import type { SchemaV1 } from "@turbo/types/src/types/config";
++import type { Schema as TurboJsonSchema, Pipeline } from "@turbo/types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+ import type { Transformer, TransformerArgs } from "../types";
+@@ -13,7 +12,7 @@ const DESCRIPTION =
+   'Migrate environment variable dependencies from "dependsOn" to "env" in `turbo.json`';
+ const INTRODUCED_IN = "1.5.0";
+ 
+-export function hasLegacyEnvVarDependencies(config: SchemaV1) {
++export function hasLegacyEnvVarDependencies(config: TurboJsonSchema) {
+   const dependsOn = [
+     "extends" in config ? [] : config.globalDependencies,
+     Object.values(config.pipeline).flatMap(
+@@ -69,7 +68,7 @@ export function migratePipeline(pipeline: Pipeline) {
+   return migratedPipeline;
+ }
+ 
+-export function migrateGlobal(config: SchemaV1) {
++export function migrateGlobal(config: TurboJsonSchema) {
+   if ("extends" in config) {
+     return config;
+   }
+@@ -92,7 +91,7 @@ export function migrateGlobal(config: SchemaV1) {
+   return migratedConfig;
+ }
+ 
+-export function migrateConfig(config: SchemaV1) {
++export function migrateConfig(config: TurboJsonSchema) {
+   const migratedConfig = migrateGlobal(config);
+   Object.keys(config.pipeline).forEach((pipelineKey) => {
+     config.pipeline;
+@@ -145,7 +144,7 @@ export function transformer({
+     });
+   }
+ 
+-  let turboJson = readJsonSync(turboConfigPath) as SchemaV1;
++  let turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
+   if (hasLegacyEnvVarDependencies(turboJson).hasKeys) {
+     turboJson = migrateConfig(turboJson);
+   }
+@@ -159,7 +158,7 @@ export function transformer({
+   const workspaceConfigs = getTurboConfigs(root);
+   workspaceConfigs.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath } = workspaceConfig;
+-    if ("pipeline" in config && hasLegacyEnvVarDependencies(config).hasKeys) {
++    if (hasLegacyEnvVarDependencies(config).hasKeys) {
+       runner.modifyFile({
+         filePath,
+         after: migrateConfig(config),
+diff --git a/packages/turbo-codemod/src/transforms/rename-output-mode.ts b/packages/turbo-codemod/src/transforms/rename-output-mode.ts
+index df372718c4..0ffeae82e7 100644
+--- a/packages/turbo-codemod/src/transforms/rename-output-mode.ts
++++ b/packages/turbo-codemod/src/transforms/rename-output-mode.ts
+@@ -1,8 +1,7 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { OutputMode } from "@turbo/types";
+-import type { SchemaV1 } from "@turbo/types/src/types/config";
++import type { Schema as TurboJsonSchema, OutputMode } from "@turbo/types";
+ import type { Transformer, TransformerArgs } from "../types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+@@ -13,7 +12,7 @@ const DESCRIPTION =
+   'Rename the "outputMode" key to "outputLogs" in `turbo.json`';
+ const INTRODUCED_IN = "2.0.0";
+ 
+-function migrateConfig(config: SchemaV1) {
++function migrateConfig(config: TurboJsonSchema) {
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     if (Object.prototype.hasOwnProperty.call(taskDef, "outputMode")) {
+       //@ts-expect-error - outputMode is no longer in the schema
+@@ -62,7 +61,7 @@ export function transformer({
+     });
+   }
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
++  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateConfig(turboJson),
+@@ -72,12 +71,10 @@ export function transformer({
+   const workspaceConfigs = getTurboConfigs(root);
+   workspaceConfigs.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath } = workspaceConfig;
+-    if ("pipeline" in config) {
+-      runner.modifyFile({
+-        filePath,
+-        after: migrateConfig(config),
+-      });
+-    }
++    runner.modifyFile({
++      filePath,
++      after: migrateConfig(config),
++    });
+   });
+ 
+   return runner.finish();
+diff --git a/packages/turbo-codemod/src/transforms/rename-pipeline.ts b/packages/turbo-codemod/src/transforms/rename-pipeline.ts
+deleted file mode 100644
+index 5217631bbb..0000000000
+--- a/packages/turbo-codemod/src/transforms/rename-pipeline.ts
++++ /dev/null
+@@ -1,67 +0,0 @@
+-import path from "node:path";
+-import { readJsonSync, existsSync } from "fs-extra";
+-import { getTurboConfigs } from "@turbo/utils";
+-import type { Schema, SchemaV1 } from "@turbo/types/src/types/config";
+-import type { Transformer, TransformerArgs } from "../types";
+-import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+-import type { TransformerResults } from "../runner";
+-
+-// transformer details
+-const TRANSFORMER = "rename-pipeline";
+-const DESCRIPTION = 'Rename the "pipeline" key to "tasks" in `turbo.json`';
+-const INTRODUCED_IN = "2.0.0";
+-
+-function migrateConfig(config: SchemaV1): Schema {
+-  const { pipeline, ...rest } = config;
+-
+-  return { tasks: pipeline, ...rest };
+-}
+-
+-export function transformer({
+-  root,
+-  options,
+-}: TransformerArgs): TransformerResults {
+-  const { log, runner } = getTransformerHelpers({
+-    transformer: TRANSFORMER,
+-    rootPath: root,
+-    options,
+-  });
+-
+-  log.info(`Renaming \`pipeline\` key in turbo.json to \`tasks\``);
+-  const turboConfigPath = path.join(root, "turbo.json");
+-  if (!existsSync(turboConfigPath)) {
+-    return runner.abortTransform({
+-      reason: `No turbo.json found at ${root}. Is the path correct?`,
+-    });
+-  }
+-
+-  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
+-  runner.modifyFile({
+-    filePath: turboConfigPath,
+-    after: migrateConfig(turboJson),
+-  });
+-
+-  // find and migrate any workspace configs
+-  const workspaceConfigs = getTurboConfigs(root);
+-  workspaceConfigs.forEach((workspaceConfig) => {
+-    const { config, turboConfigPath: filePath } = workspaceConfig;
+-    if ("pipeline" in config) {
+-      runner.modifyFile({
+-        filePath,
+-        after: migrateConfig(config),
+-      });
+-    }
+-  });
+-
+-  return runner.finish();
+-}
+-
+-const transformerMeta: Transformer = {
+-  name: TRANSFORMER,
+-  description: DESCRIPTION,
+-  introducedIn: INTRODUCED_IN,
+-  transformer,
+-};
+-
+-// eslint-disable-next-line import/no-default-export -- transforms require default export
+-export default transformerMeta;
+diff --git a/packages/turbo-codemod/src/transforms/set-default-outputs.ts b/packages/turbo-codemod/src/transforms/set-default-outputs.ts
+index 5de94265c2..5eb99ac776 100644
+--- a/packages/turbo-codemod/src/transforms/set-default-outputs.ts
++++ b/packages/turbo-codemod/src/transforms/set-default-outputs.ts
+@@ -1,7 +1,7 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { SchemaV1 } from "@turbo/types/src/types/config";
++import type { Schema as TurboJsonSchema } from "@turbo/types";
+ import type { Transformer, TransformerArgs } from "../types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+@@ -14,7 +14,7 @@ const DESCRIPTION =
+   'Add the "outputs" key with defaults where it is missing in `turbo.json`';
+ const INTRODUCED_IN = "1.7.0";
+ 
+-function migrateConfig(config: SchemaV1) {
++function migrateConfig(config: TurboJsonSchema) {
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     if (taskDef.cache !== false) {
+       if (!taskDef.outputs) {
+@@ -67,7 +67,7 @@ export function transformer({
+     });
+   }
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
++  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateConfig(turboJson),
+@@ -77,12 +77,10 @@ export function transformer({
+   const workspaceConfigs = getTurboConfigs(root);
+   workspaceConfigs.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath } = workspaceConfig;
+-    if ("pipeline" in config) {
+-      runner.modifyFile({
+-        filePath,
+-        after: migrateConfig(config),
+-      });
+-    }
++    runner.modifyFile({
++      filePath,
++      after: migrateConfig(config),
++    });
+   });
+ 
+   return runner.finish();
+diff --git a/packages/turbo-codemod/src/transforms/stabilize-env-mode.ts b/packages/turbo-codemod/src/transforms/stabilize-env-mode.ts
+index 9f88843d85..de69532b51 100644
+--- a/packages/turbo-codemod/src/transforms/stabilize-env-mode.ts
++++ b/packages/turbo-codemod/src/transforms/stabilize-env-mode.ts
+@@ -1,7 +1,8 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { SchemaV1, RootSchemaV1 } from "@turbo/types/src/types/config";
++import type { Schema as TurboJsonSchema } from "@turbo/types";
++import type { RootSchema } from "@turbo/types/src/types/config";
+ import type { Transformer, TransformerArgs } from "../types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+@@ -12,7 +13,7 @@ const DESCRIPTION =
+   "Rewrite experimentalPassThroughEnv and experimentalGlobalPassThroughEnv";
+ const INTRODUCED_IN = "1.10.0";
+ 
+-function migrateRootConfig(config: RootSchemaV1) {
++function migrateRootConfig(config: RootSchema) {
+   const oldConfig = config.experimentalGlobalPassThroughEnv;
+   const newConfig = config.globalPassThroughEnv;
+   // Set to an empty array is meaningful, so we have undefined as an option here.
+@@ -44,7 +45,7 @@ function migrateRootConfig(config: RootSchemaV1) {
+   return migrateTaskConfigs(config);
+ }
+ 
+-function migrateTaskConfigs(config: SchemaV1) {
++function migrateTaskConfigs(config: TurboJsonSchema) {
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     const oldConfig = taskDef.experimentalPassThroughEnv;
+     const newConfig = taskDef.passThroughEnv;
+@@ -118,7 +119,7 @@ export function transformer({
+     });
+   }
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
++  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateRootConfig(turboJson),
+@@ -128,7 +129,7 @@ export function transformer({
+   const allTurboJsons = getTurboConfigs(root);
+   allTurboJsons.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath, isRootConfig } = workspaceConfig;
+-    if (!isRootConfig && "pipeline" in config) {
++    if (!isRootConfig) {
+       runner.modifyFile({
+         filePath,
+         after: migrateTaskConfigs(config),
+diff --git a/packages/turbo-codemod/src/transforms/transform-env-literals-to-wildcards.ts b/packages/turbo-codemod/src/transforms/transform-env-literals-to-wildcards.ts
+index adc5f6add4..d83e61ae0d 100644
+--- a/packages/turbo-codemod/src/transforms/transform-env-literals-to-wildcards.ts
++++ b/packages/turbo-codemod/src/transforms/transform-env-literals-to-wildcards.ts
+@@ -1,8 +1,8 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { EnvWildcard } from "@turbo/types";
+-import type { RootSchemaV1, SchemaV1 } from "@turbo/types/src/types/config";
++import type { EnvWildcard, Schema as TurboJsonSchema } from "@turbo/types";
++import type { RootSchema } from "@turbo/types/src/types/config";
+ import type { Transformer, TransformerArgs } from "../types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+@@ -27,7 +27,7 @@ function transformEnvVarName(envVarName: string): EnvWildcard {
+   return output;
+ }
+ 
+-function migrateRootConfig(config: RootSchemaV1) {
++function migrateRootConfig(config: RootSchema) {
+   const { globalEnv, globalPassThroughEnv } = config;
+ 
+   if (Array.isArray(globalEnv)) {
+@@ -40,7 +40,7 @@ function migrateRootConfig(config: RootSchemaV1) {
+   return migrateTaskConfigs(config);
+ }
+ 
+-function migrateTaskConfigs(config: SchemaV1) {
++function migrateTaskConfigs(config: TurboJsonSchema) {
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     const { env, passThroughEnv } = taskDef;
+ 
+@@ -91,7 +91,7 @@ export function transformer({
+     });
+   }
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
++  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateRootConfig(turboJson),
+@@ -101,7 +101,7 @@ export function transformer({
+   const allTurboJsons = getTurboConfigs(root);
+   allTurboJsons.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath, isRootConfig } = workspaceConfig;
+-    if (!isRootConfig && "pipeline" in config) {
++    if (!isRootConfig) {
+       runner.modifyFile({
+         filePath,
+         after: migrateTaskConfigs(config),
+diff --git a/packages/turbo-types/src/types/config.ts b/packages/turbo-types/src/types/config.ts
+index 8861150963..9319ff42a1 100644
+--- a/packages/turbo-types/src/types/config.ts
++++ b/packages/turbo-types/src/types/config.ts
+@@ -1,11 +1,6 @@
+ /* This file generates the `schema.json` file. */
+ export type Schema = RootSchema | WorkspaceSchema;
+ 
+-/* Used to support codemods that target turbo 1 */
+-export type LegacySchema = LegacyRootSchema | LegacyWorkspaceSchema;
+-
+-export type SchemaV1 = RootSchemaV1 | WorkspaceSchemaV1;
+-
+ export interface BaseSchema {
+   /** @defaultValue https://turbo.build/schema.json */
+   $schema?: string;
+@@ -19,7 +14,7 @@ export interface BaseSchema {
+    * @defaultValue `{}`
+    */
+   // eslint-disable-next-line @typescript-eslint/consistent-indexed-object-style -- it's more readable to specify a name for the key
+-  tasks: {
++  pipeline: {
+     /**
+      * The name of a task that can be executed by turbo. If turbo finds a workspace
+      * package with a package.json scripts object with a matching key, it will apply the
+@@ -29,15 +24,6 @@ export interface BaseSchema {
+   };
+ }
+ 
+-export interface BaseSchemaV1 {
+-  // eslint-disable-next-line @typescript-eslint/consistent-indexed-object-style -- it's more readable to specify a name for the key
+-  pipeline: {
+-    [script: string]: Pipeline;
+-  };
+-}
+-
+-export type LegacyBaseSchema = BaseSchema | BaseSchemaV1;
+-
+ export interface WorkspaceSchema extends BaseSchema {
+   /**
+    * This key is only available in Workspace Configs
+@@ -54,10 +40,6 @@ export interface WorkspaceSchema extends BaseSchema {
+   extends: Array<string>;
+ }
+ 
+-export type LegacyWorkspaceSchema = WorkspaceSchema & LegacyBaseSchema;
+-
+-export type WorkspaceSchemaV1 = Omit<WorkspaceSchema, "tasks"> & BaseSchemaV1;
+-
+ export interface RootSchema extends BaseSchema {
+   /**
+    * A list of globs to include in the set of implicit global hash dependencies.
+@@ -140,10 +122,6 @@ export interface RootSchema extends BaseSchema {
+   experimentalUI?: boolean;
+ }
+ 
+-export type LegacyRootSchema = RootSchema & LegacyBaseSchema;
+-
+-export type RootSchemaV1 = Omit<RootSchema, "tasks"> & BaseSchemaV1;
+-
+ export interface Pipeline {
+   /**
+    * The list of tasks that this task depends on.
+diff --git a/packages/turbo-utils/src/getTurboConfigs.ts b/packages/turbo-utils/src/getTurboConfigs.ts
+index a7cdd185e2..04a7e8e8b7 100644
+--- a/packages/turbo-utils/src/getTurboConfigs.ts
++++ b/packages/turbo-utils/src/getTurboConfigs.ts
+@@ -2,7 +2,7 @@ import fs from "node:fs";
+ import path from "node:path";
+ import yaml from "js-yaml";
+ import { sync } from "fast-glob";
+-import type { LegacySchema, Pipeline } from "@turbo/types/src/types/config";
++import type { Schema } from "@turbo/types";
+ import JSON5 from "json5";
+ import * as logger from "./logger";
+ import { getTurboRoot } from "./getTurboRoot";
+@@ -15,11 +15,11 @@ export interface WorkspaceConfig {
+   workspaceName: string;
+   workspacePath: string;
+   isWorkspaceRoot: boolean;
+-  turboConfig?: LegacySchema;
++  turboConfig?: Schema;
+ }
+ 
+ export interface TurboConfig {
+-  config: LegacySchema;
++  config: Schema;
+   turboConfigPath: string;
+   workspacePath: string;
+   isRootConfig: boolean;
+@@ -92,7 +92,7 @@ export function getTurboConfigs(cwd?: string, opts?: Options): TurboConfigs {
+       try {
+         const raw = fs.readFileSync(configPath, "utf8");
+         // eslint-disable-next-line import/no-named-as-default-member -- json5 exports different objects depending on if you're using esm or cjs (https://github.com/json5/json5/issues/240)
+-        const turboJsonContent: LegacySchema = JSON5.parse(raw);
++        const turboJsonContent: Schema = JSON5.parse(raw);
+         // basic config validation
+         const isRootConfig = path.dirname(configPath) === turboRoot;
+         if (isRootConfig) {
+@@ -163,7 +163,7 @@ export function getWorkspaceConfigs(
+         // Try and get turbo.json
+         const turboJsonPath = path.join(workspacePath, "turbo.json");
+         let rawTurboJson = null;
+-        let turboConfig: LegacySchema | undefined;
++        let turboConfig: Schema | undefined;
+         try {
+           rawTurboJson = fs.readFileSync(turboJsonPath, "utf8");
+           // eslint-disable-next-line import/no-named-as-default-member -- json5 exports different objects depending on if you're using esm or cjs (https://github.com/json5/json5/issues/240)
+@@ -204,14 +204,3 @@ export function getWorkspaceConfigs(
+ 
+   return configs;
+ }
+-
+-export function forEachTaskDef(
+-  config: LegacySchema,
+-  f: (value: [string, Pipeline]) => void
+-) {
+-  if ("pipeline" in config) {
+-    Object.entries(config.pipeline).forEach(f);
+-  } else {
+-    Object.entries(config.tasks).forEach(f);
+-  }
+-}
+diff --git a/turborepo-tests/integration/tests/dry-json/monorepo.t b/turborepo-tests/integration/tests/dry-json/monorepo.t
+index 48ba60672a..75379b04e9 100644
+--- a/turborepo-tests/integration/tests/dry-json/monorepo.t
++++ b/turborepo-tests/integration/tests/dry-json/monorepo.t
+@@ -26,7 +26,8 @@ Setup
+       "configured": [],
+       "inferred": [],
+       "passthrough": null
+-    }
++    },
++    "engines": null
+   }
+ 
+   $ cat tmpjson.log | jq 'keys'
+@@ -50,7 +51,7 @@ Setup
+     "taskId": "my-app#build",
+     "task": "build",
+     "package": "my-app",
+-    "hash": "270f1ef47a80f1d1",
++    "hash": "0555ce94ca234049",
+     "inputs": {
+       ".env.local": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+       "package.json": "1746e0db2361085b5953a6a3beab08c24af5bc08"
+@@ -110,7 +111,7 @@ Setup
+     "taskId": "util#build",
+     "task": "build",
+     "package": "util",
+-    "hash": "fad2a643cb480b55",
++    "hash": "bf1798d3e46e1b48",
+     "inputs": {
+       "package.json": "e755064fd7893809d10fc067bb409c7ae516327f"
+     },
+diff --git a/turborepo-tests/integration/tests/dry-json/single-package-no-config.t b/turborepo-tests/integration/tests/dry-json/single-package-no-config.t
+index 2e0b4c5cc0..248ffc91f5 100644
+--- a/turborepo-tests/integration/tests/dry-json/single-package-no-config.t
++++ b/turborepo-tests/integration/tests/dry-json/single-package-no-config.t
+@@ -25,7 +25,8 @@ Setup
+         "configured": [],
+         "inferred": [],
+         "passthrough": null
+-      }
++      },
++      "engines": null
+     },
+     "envMode": "strict",
+     "frameworkInference": true,
+@@ -33,7 +34,7 @@ Setup
+       {
+         "taskId": "build",
+         "task": "build",
+-        "hash": "12c592ddc0e53a5c",
++        "hash": "e2b99dad85a4ff66",
+         "inputs": {
+           ".gitignore": "03b541460c1b836f96f9c0a941ceb48e91a9fd83",
+           "package-lock.json": "1c117cce37347befafe3a9cba1b8a609b3600021",
+diff --git a/turborepo-tests/integration/tests/dry-json/single-package-with-deps.t b/turborepo-tests/integration/tests/dry-json/single-package-with-deps.t
+index 85e3d0b1af..2f73cdf82e 100644
+--- a/turborepo-tests/integration/tests/dry-json/single-package-with-deps.t
++++ b/turborepo-tests/integration/tests/dry-json/single-package-with-deps.t
+@@ -24,7 +24,8 @@ Setup
+         "configured": [],
+         "inferred": [],
+         "passthrough": null
+-      }
++      },
++      "engines": null
+     },
+     "envMode": "strict",
+     "frameworkInference": true,
+@@ -32,7 +33,7 @@ Setup
+       {
+         "taskId": "build",
+         "task": "build",
+-        "hash": "81a933c332d3f388",
++        "hash": "7ece7b62aad25615",
+         "inputs": {
+           ".gitignore": "03b541460c1b836f96f9c0a941ceb48e91a9fd83",
+           "package-lock.json": "1c117cce37347befafe3a9cba1b8a609b3600021",
+@@ -87,7 +88,7 @@ Setup
+       {
+         "taskId": "test",
+         "task": "test",
+-        "hash": "785d8ef1115bde3b",
++        "hash": "cb5839f7284aa5f3",
+         "inputs": {
+           ".gitignore": "03b541460c1b836f96f9c0a941ceb48e91a9fd83",
+           "package-lock.json": "1c117cce37347befafe3a9cba1b8a609b3600021",
+diff --git a/turborepo-tests/integration/tests/dry-json/single-package.t b/turborepo-tests/integration/tests/dry-json/single-package.t
+index 4ef1962489..452725a666 100644
+--- a/turborepo-tests/integration/tests/dry-json/single-package.t
++++ b/turborepo-tests/integration/tests/dry-json/single-package.t
+@@ -24,7 +24,8 @@ Setup
+         "configured": [],
+         "inferred": [],
+         "passthrough": null
+-      }
++      },
++      "engines": null
+     },
+     "envMode": "strict",
+     "frameworkInference": true,
+@@ -32,7 +33,7 @@ Setup
+       {
+         "taskId": "build",
+         "task": "build",
+-        "hash": "81a933c332d3f388",
++        "hash": "7ece7b62aad25615",
+         "inputs": {
+           ".gitignore": "03b541460c1b836f96f9c0a941ceb48e91a9fd83",
+           "package-lock.json": "1c117cce37347befafe3a9cba1b8a609b3600021",
+diff --git a/turborepo-tests/integration/tests/dry-run.t b/turborepo-tests/integration/tests/dry-run.t
+index a3aa4939db..bb0363e41b 100644
+--- a/turborepo-tests/integration/tests/dry-run.t
++++ b/turborepo-tests/integration/tests/dry-run.t
+@@ -24,47 +24,48 @@ Setup
+     Inferred Global Env Vars Values       = 
+     Global Passed Through Env Vars        = 
+     Global Passed Through Env Vars Values = 
++    Engines Values                        = 
+ 
+ # Part 3 are Tasks to Run, and we have to validate each task separately
+   $ cat tmp-3.txt | grep "my-app#build" -A 17
+   my-app#build
+     Task                           = build\s* (re)
+     Package                        = my-app\s* (re)
+-    Hash                           = 270f1ef47a80f1d1
+-    Cached (Local)                 = false
+-    Cached (Remote)                = false
+-    Directory                      = apps(\/|\\)my-app (re)
+-    Command                        = echo building
+-    Outputs                        = apple.json, banana.txt
+-    Log File                       = apps(\/|\\)my-app(\/|\\).turbo(\/|\\)turbo-build.log (re)
+-    Dependencies                   = 
+-    Dependents                     = 
+-    Inputs Files Considered        = 2
+-    Env Vars                       = 
+-    Env Vars Values                = 
+-    Inferred Env Vars Values       = 
+-    Passed Through Env Vars        = 
+-    Passed Through Env Vars Values = 
++    Hash                           = 0555ce94ca234049
++    Cached \(Local\)                 = false\s* (re)
++    Cached \(Remote\)                = false\s* (re)
++    Directory                      = apps(\/|\\)my-app\s* (re)
++    Command                        = echo building\s* (re)
++    Outputs                        = apple.json, banana.txt\s* (re)
++    Log File                       = apps(\/|\\)my-app(\/|\\)\.turbo(\/|\\)turbo-build\.log\s* (re)
++    Dependencies                   =\s* (re)
++    Dependents                     =\s* (re)
++    Inputs Files Considered        = 2\s* (re)
++    Env Vars                       =\s* (re)
++    Env Vars Values                =\s* (re)
++    Inferred Env Vars Values       =\s* (re)
++    Passed Through Env Vars        =\s* (re)
++    Passed Through Env Vars Values =\s* (re)
+ 
+   $ cat tmp-3.txt | grep "util#build" -A 17
+   util#build
+     Task                           = build\s* (re)
+     Package                        = util\s* (re)
+-    Hash                           = fad2a643cb480b55
+-    Cached (Local)                 = false
+-    Cached (Remote)                = false
+-    Directory                      = packages(\/|\\)util (re)
+-    Command                        = echo building
+-    Outputs                        = 
+-    Log File                       = packages(\/|\\)util(\/|\\).turbo(\/|\\)turbo-build.log (re)
+-    Dependencies                   = 
+-    Dependents                     = 
+-    Inputs Files Considered        = 1
+-    Env Vars                       = NODE_ENV
+-    Env Vars Values                = 
+-    Inferred Env Vars Values       = 
+-    Passed Through Env Vars        = 
+-    Passed Through Env Vars Values = 
++    Hash                           = bf1798d3e46e1b48
++    Cached \(Local\)                 = false\s* (re)
++    Cached \(Remote\)                = false\s* (re)
++    Directory                      = packages(\/|\\)util\s* (re)
++    Command                        = echo building\s* (re)
++    Outputs                        =\s* (re)
++    Log File                       = packages(\/|\\)util(\/|\\)\.turbo(\/|\\)turbo-build\.log\s* (re)
++    Dependencies                   =\s* (re)
++    Dependents                     =\s* (re)
++    Inputs Files Considered        = 1\s* (re)
++    Env Vars                       = NODE_ENV\s* (re)
++    Env Vars Values                =\s* (re)
++    Inferred Env Vars Values       =\s* (re)
++    Passed Through Env Vars        =\s* (re)
++    Passed Through Env Vars Values =\s* (re)
+ 
+ # Run the task with NODE_ENV set and see it in summary. Use util package so it's just one package
+   $ NODE_ENV=banana ${TURBO} run build --dry --filter=util | grep "Environment Variables"
+diff --git a/turborepo-tests/integration/tests/edit-turbo-json/task.t b/turborepo-tests/integration/tests/edit-turbo-json/task.t
+index b0efcc78fc..d72b6cdf72 100644
+--- a/turborepo-tests/integration/tests/edit-turbo-json/task.t
++++ b/turborepo-tests/integration/tests/edit-turbo-json/task.t
+@@ -6,15 +6,15 @@ Baseline task hashes
+   $ ${TURBO} build --dry=json | jq -r '.tasks | sort_by(.taskId)[] | {taskId, hash}'
+   {
+     "taskId": "another#build",
+-    "hash": "ea00e25531db048f"
++    "hash": "3639431fdcdf9f9e"
+   }
+   {
+     "taskId": "my-app#build",
+-    "hash": "270f1ef47a80f1d1"
++    "hash": "0555ce94ca234049"
+   }
+   {
+     "taskId": "util#build",
+-    "hash": "fad2a643cb480b55"
++    "hash": "bf1798d3e46e1b48"
+   }
+ 
+ Change only my-app#build
+@@ -22,15 +22,15 @@ Change only my-app#build
+   $ ${TURBO} build --dry=json | jq -r '.tasks | sort_by(.taskId)[] | {taskId, hash}'
+   {
+     "taskId": "another#build",
+-    "hash": "ea00e25531db048f"
++    "hash": "3639431fdcdf9f9e"
+   }
+   {
+     "taskId": "my-app#build",
+-    "hash": "b0eb2c24b2a84be5"
++    "hash": "6eea03fab6f9a8c8"
+   }
+   {
+     "taskId": "util#build",
+-    "hash": "fad2a643cb480b55"
++    "hash": "bf1798d3e46e1b48"
+   }
+ 
+ Change my-app#build dependsOn
+@@ -38,15 +38,15 @@ Change my-app#build dependsOn
+   $ ${TURBO} build --dry=json | jq -r '.tasks | sort_by(.taskId)[] | {taskId, hash}'
+   {
+     "taskId": "another#build",
+-    "hash": "ea00e25531db048f"
++    "hash": "3639431fdcdf9f9e"
+   }
+   {
+     "taskId": "my-app#build",
+-    "hash": "9e63702de36d25c6"
++    "hash": "8637a0f5db686164"
+   }
+   {
+     "taskId": "util#build",
+-    "hash": "fad2a643cb480b55"
++    "hash": "bf1798d3e46e1b48"
+   }
+ 
+ Non-materially modifying the dep graph does nothing.
+@@ -54,15 +54,15 @@ Non-materially modifying the dep graph does nothing.
+   $ ${TURBO} build --dry=json | jq -r '.tasks | sort_by(.taskId)[] | {taskId, hash}'
+   {
+     "taskId": "another#build",
+-    "hash": "ea00e25531db048f"
++    "hash": "3639431fdcdf9f9e"
+   }
+   {
+     "taskId": "my-app#build",
+-    "hash": "9e63702de36d25c6"
++    "hash": "8637a0f5db686164"
+   }
+   {
+     "taskId": "util#build",
+-    "hash": "fad2a643cb480b55"
++    "hash": "bf1798d3e46e1b48"
+   }
+ 
+ 
+@@ -71,13 +71,13 @@ Change util#build impacts itself and my-app
+   $ ${TURBO} build --dry=json | jq -r '.tasks | sort_by(.taskId)[] | {taskId, hash}'
+   {
+     "taskId": "another#build",
+-    "hash": "ea00e25531db048f"
++    "hash": "3639431fdcdf9f9e"
+   }
+   {
+     "taskId": "my-app#build",
+-    "hash": "867bee2191fbd90c"
++    "hash": "2721f01b53b758d0"
+   }
+   {
+     "taskId": "util#build",
+-    "hash": "6f4abe279ba198a8"
++    "hash": "74c8eb9bab702b4b"
+   }
+diff --git a/turborepo-tests/integration/tests/engines.t b/turborepo-tests/integration/tests/engines.t
+new file mode 100644
+index 0000000000..bee444d45c
+--- /dev/null
++++ b/turborepo-tests/integration/tests/engines.t
+@@ -0,0 +1,21 @@
++Setup
++  $ . ${TESTDIR}/../../helpers/setup_integration_test.sh
++  $ jq '.engines = {"node": ">=12"}' package.json > package.json.new
++  $ mv package.json.new package.json
++
++Check a hash
++  $ ${TURBO} build --dry=json --filter=my-app | jq '.tasks | last | .hash'
++  "56d7eb9a31d82ee0"
++Change engines
++  $ jq '.engines = {"node": ">=16"}' package.json > package.json.new
++  $ mv package.json.new package.json
++
++Verify hash has changed
++  $ ${TURBO} build --dry=json --filter=my-app | jq ".tasks | last | .hash"
++  "1d8b8596ae37a40c"
++
++Verify engines are part of global cache inputs
++  $ ${TURBO} build --dry=json | jq '.globalCacheInputs.engines'
++  {
++    "node": ">=16"
++  }
+diff --git a/turborepo-tests/integration/tests/global-deps.t b/turborepo-tests/integration/tests/global-deps.t
+index a0adbd8b7c..05cee80e19 100644
+--- a/turborepo-tests/integration/tests/global-deps.t
++++ b/turborepo-tests/integration/tests/global-deps.t
+@@ -6,7 +6,7 @@ Run a build
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache miss, executing 3292edbc955db609
++  my-app:build: cache miss, executing 2a57e19ce0b2cfd5
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -18,7 +18,7 @@ Run a build
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache miss, executing 7a2d3560117367eb
++  my-app:build: cache miss, executing 3883869b5e1dc9cf
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -29,7 +29,7 @@ Run a build
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache hit, suppressing logs 7a2d3560117367eb
++  my-app:build: cache hit, suppressing logs 3883869b5e1dc9cf
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+diff --git a/turborepo-tests/integration/tests/global-env.t b/turborepo-tests/integration/tests/global-env.t
+index 378066107d..a22269cf5b 100644
+--- a/turborepo-tests/integration/tests/global-env.t
++++ b/turborepo-tests/integration/tests/global-env.t
+@@ -8,7 +8,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache miss, executing fad2a643cb480b55
++  util:build: cache miss, executing bf1798d3e46e1b48
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -19,7 +19,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache hit, suppressing logs fad2a643cb480b55
++  util:build: cache hit, suppressing logs bf1798d3e46e1b48
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -30,7 +30,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache miss, executing a7c44af22f60539c
++  util:build: cache miss, executing 265e40ee03ae83ec
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -41,7 +41,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache hit, suppressing logs fad2a643cb480b55
++  util:build: cache hit, suppressing logs bf1798d3e46e1b48
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -52,7 +52,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache miss, executing 18e70da6088a7985
++  util:build: cache miss, executing b8f403756f67074c
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/6-topological-unimplemented.t b/turborepo-tests/integration/tests/persistent-dependencies/6-topological-unimplemented.t
+index 495aac4528..429824d258 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/6-topological-unimplemented.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/6-topological-unimplemented.t
+@@ -17,7 +17,7 @@
+   \xe2\x80\xa2 Packages in scope: app-a, pkg-a (esc)
+   \xe2\x80\xa2 Running dev in 2 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  app-a:dev: cache miss, executing 6d74f36653305cef
++  app-a:dev: cache miss, executing 7def3a3e7f1235de
+   app-a:dev: 
+   app-a:dev: > dev
+   app-a:dev: > echo dev-app-a
+diff --git a/turborepo-tests/integration/tests/pkg-inference.t b/turborepo-tests/integration/tests/pkg-inference.t
+index 2406059a18..51eeadef87 100644
+--- a/turborepo-tests/integration/tests/pkg-inference.t
++++ b/turborepo-tests/integration/tests/pkg-inference.t
+@@ -6,7 +6,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache miss, executing fad2a643cb480b55
++  util:build: cache miss, executing bf1798d3e46e1b48
+   util:build: 
+   util:build: > build
+   util:build: > echo building
+diff --git a/turborepo-tests/integration/tests/prune/composable-config.t b/turborepo-tests/integration/tests/prune/composable-config.t
+index e51dbef0c9..e9dd448c00 100644
+--- a/turborepo-tests/integration/tests/prune/composable-config.t
++++ b/turborepo-tests/integration/tests/prune/composable-config.t
+@@ -11,7 +11,7 @@ Make sure that the internal util package is part of the prune output
+   \xe2\x80\xa2 Packages in scope: docs, shared, util (esc)
+   \xe2\x80\xa2 Running new-task in 3 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  docs:new-task: cache miss, executing 37946d5a79df43a8
++  docs:new-task: cache miss, executing 869a9c24e803c5d6
+   docs:new-task: 
+   docs:new-task: > docs@ new-task .*out(\/|\\)apps(\/|\\)docs (re)
+   docs:new-task: > echo building
+diff --git a/turborepo-tests/integration/tests/run-caching/excluded-inputs/excluded-inputs.t b/turborepo-tests/integration/tests/run-caching/excluded-inputs/excluded-inputs.t
+index c0491c7550..6ebf04aa02 100644
+--- a/turborepo-tests/integration/tests/run-caching/excluded-inputs/excluded-inputs.t
++++ b/turborepo-tests/integration/tests/run-caching/excluded-inputs/excluded-inputs.t
+@@ -9,7 +9,7 @@ Running build for my-app succeeds
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache miss, executing 92e6e0fa25bd067f
++  my-app:build: cache miss, executing e228bd94fd46352c
+   my-app:build: 
+   my-app:build: > build
+   my-app:build: > echo building
+@@ -26,7 +26,7 @@ Update exluded file and try again
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache hit, replaying logs 92e6e0fa25bd067f
++  my-app:build: cache hit, replaying logs e228bd94fd46352c
+   my-app:build: 
+   my-app:build: > build
+   my-app:build: > echo building
+diff --git a/turborepo-tests/integration/tests/run-caching/root-deps.t b/turborepo-tests/integration/tests/run-caching/root-deps.t
+index 2e3515840b..5ce05723d1 100644
+--- a/turborepo-tests/integration/tests/run-caching/root-deps.t
++++ b/turborepo-tests/integration/tests/run-caching/root-deps.t
+@@ -6,7 +6,7 @@ Warm the cache
+   \xe2\x80\xa2 Packages in scope: another (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  another:build: cache miss, executing 22f33d1d910da7f2
++  another:build: cache miss, executing 2e4e289aeb0b6055
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -19,7 +19,7 @@ All tasks should be a cache miss, even ones that don't depend on changed package
+   \xe2\x80\xa2 Packages in scope: another (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  another:build: cache miss, executing 5dd1314cac1b01ff
++  another:build: cache miss, executing ebc7de7a6c0c5543
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -34,7 +34,7 @@ Cache hit since only tracked files contribute to root dep hash
+   \xe2\x80\xa2 Packages in scope: another (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  another:build: cache hit, suppressing logs 5dd1314cac1b01ff
++  another:build: cache hit, suppressing logs ebc7de7a6c0c5543
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+diff --git a/turborepo-tests/integration/tests/run-logging/errors-only.t b/turborepo-tests/integration/tests/run-logging/errors-only.t
+index 0bd53732a6..403f3aa023 100644
+--- a/turborepo-tests/integration/tests/run-logging/errors-only.t
++++ b/turborepo-tests/integration/tests/run-logging/errors-only.t
+@@ -37,7 +37,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: app-a (esc)
+   \xe2\x80\xa2 Running builderror in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  app-a:builderror: cache miss, executing e86e4a4ebfa716d6
++  app-a:builderror: cache miss, executing 7e337a3261100818
+   app-a:builderror: 
+   app-a:builderror: > builderror
+   app-a:builderror: > echo error-builderror-app-a && exit 1
+@@ -67,7 +67,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: app-a (esc)
+   \xe2\x80\xa2 Running builderror2 in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  app-a:builderror2: cache miss, executing 3b92feb5fb5a32a5
++  app-a:builderror2: cache miss, executing 3731518fa339b920
+   app-a:builderror2: 
+   app-a:builderror2: > builderror2
+   app-a:builderror2: > echo error-builderror2-app-a && exit 1
+diff --git a/turborepo-tests/integration/tests/run-logging/log-order-github.t b/turborepo-tests/integration/tests/run-logging/log-order-github.t
+index 65bcdb3ea1..7e07ce8aa8 100644
+--- a/turborepo-tests/integration/tests/run-logging/log-order-github.t
++++ b/turborepo-tests/integration/tests/run-logging/log-order-github.t
+@@ -9,7 +9,7 @@ because otherwise prysk interprets them as multiline commands
+   \xe2\x80\xa2 Running build in 2 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+   ::group::my-app:build
+-  cache bypass, force executing 387aa1a04fa418fe
++  cache bypass, force executing 0af90ec6a57471be
+   
+   >\sbuild (re)
+   \>\secho building && sleep 1 && echo done (re)
+@@ -18,7 +18,7 @@ because otherwise prysk interprets them as multiline commands
+   done
+   ::endgroup::
+   ::group::util:build
+-  cache bypass, force executing 348fb645686fa0b8
++  cache bypass, force executing 2da422600daca8be
+   
+   >\sbuild (re)
+   \>\ssleep 0.5 && echo building && sleep 1 && echo completed (re)
+@@ -37,7 +37,7 @@ because otherwise prysk interprets them as multiline commands
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+   ::group::util:build
+-  util:build: cache bypass, force executing 348fb645686fa0b8
++  util:build: cache bypass, force executing 2da422600daca8be
+   util:build: 
+   util:build: > build
+   util:build: > sleep 0.5 && echo building && sleep 1 && echo completed
+@@ -57,7 +57,7 @@ Verify that errors are grouped properly
+   \xe2\x80\xa2 Running fail in 2 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+   \x1b[;31mutil:fail\x1b[;0m (esc)
+-  cache miss, executing e53b8d17f063e6c0
++  cache miss, executing 91d719104281046f
+   
+   \> fail (re)
+   \> echo failing; exit 1 (re)
+diff --git a/turborepo-tests/integration/tests/run-logging/log-prefix.t b/turborepo-tests/integration/tests/run-logging/log-prefix.t
+index 6e6292f065..d9af3064fe 100644
+--- a/turborepo-tests/integration/tests/run-logging/log-prefix.t
++++ b/turborepo-tests/integration/tests/run-logging/log-prefix.t
+@@ -6,7 +6,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: app-a (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  cache miss, executing aa8bd45244bccb8b
++  cache miss, executing 612027951a2848ce
+   
+   \> build (re)
+   \> echo build-app-a (re)
+@@ -30,7 +30,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: app-a (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  cache hit, replaying logs aa8bd45244bccb8b
++  cache hit, replaying logs 612027951a2848ce
+   
+   \> build (re)
+   \> echo build-app-a (re)
+@@ -46,7 +46,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: app-a (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  app-a:build: cache hit, replaying logs aa8bd45244bccb8b
++  app-a:build: cache hit, replaying logs 612027951a2848ce
+   app-a:build: 
+   app-a:build: > build
+   app-a:build: > echo build-app-a
+diff --git a/turborepo-tests/integration/tests/run-logging/verbosity.t b/turborepo-tests/integration/tests/run-logging/verbosity.t
+index a683148b0a..3c009b31a4 100644
+--- a/turborepo-tests/integration/tests/run-logging/verbosity.t
++++ b/turborepo-tests/integration/tests/run-logging/verbosity.t
+@@ -6,7 +6,7 @@ Verbosity level 1
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache bypass, force executing fad2a643cb480b55
++  util:build: cache bypass, force executing bf1798d3e46e1b48
+   util:build: 
+   util:build: > build
+   util:build: > echo building
+@@ -21,7 +21,7 @@ Verbosity level 1
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache bypass, force executing fad2a643cb480b55
++  util:build: cache bypass, force executing bf1798d3e46e1b48
+   util:build: 
+   util:build: > build
+   util:build: > echo building
+diff --git a/turborepo-tests/integration/tests/run-summary/discovery.t b/turborepo-tests/integration/tests/run-summary/discovery.t
+index a8e0895a43..67c430c6b4 100644
+--- a/turborepo-tests/integration/tests/run-summary/discovery.t
++++ b/turborepo-tests/integration/tests/run-summary/discovery.t
+@@ -6,7 +6,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache miss, executing 270f1ef47a80f1d1
++  my-app:build: cache miss, executing 0555ce94ca234049
+   my-app:build: 
+   my-app:build: > build
+   my-app:build: > echo building
+diff --git a/turborepo-tests/integration/tests/run-summary/error.t b/turborepo-tests/integration/tests/run-summary/error.t
+index 1596e01d07..9867b44d74 100644
+--- a/turborepo-tests/integration/tests/run-summary/error.t
++++ b/turborepo-tests/integration/tests/run-summary/error.t
+@@ -32,7 +32,7 @@ Validate that we got a full task summary for the failed task with an error in .e
+     "taskId": "my-app#maybefails",
+     "task": "maybefails",
+     "package": "my-app",
+-    "hash": "e766224b19492c97",
++    "hash": "9f05a7188fdf4e93",
+     "inputs": {
+       ".env.local": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+       "package.json": "1746e0db2361085b5953a6a3beab08c24af5bc08"
+diff --git a/turborepo-tests/integration/tests/run/continue.t b/turborepo-tests/integration/tests/run/continue.t
+index 628d173195..d35ffac9b2 100644
+--- a/turborepo-tests/integration/tests/run/continue.t
++++ b/turborepo-tests/integration/tests/run/continue.t
+@@ -5,7 +5,7 @@ Run without --continue
+   \xe2\x80\xa2 Packages in scope: my-app, other-app, some-lib (esc)
+   \xe2\x80\xa2 Running build in 3 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  some-lib:build: cache miss, executing 071e589156801650
++  some-lib:build: cache miss, executing ab8c4a02e3facf55
+   some-lib:build: 
+   some-lib:build: > build
+   some-lib:build: > exit 2
+@@ -31,7 +31,7 @@ Run without --continue, and with only errors.
+   \xe2\x80\xa2 Packages in scope: my-app, other-app, some-lib (esc)
+   \xe2\x80\xa2 Running build in 3 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  some-lib:build: cache miss, executing 071e589156801650
++  some-lib:build: cache miss, executing ab8c4a02e3facf55
+   some-lib:build: 
+   some-lib:build: > build
+   some-lib:build: > exit 2
+@@ -56,7 +56,7 @@ Run with --continue
+   \xe2\x80\xa2 Packages in scope: my-app, other-app, some-lib (esc)
+   \xe2\x80\xa2 Running build in 3 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  some-lib:build: cache miss, executing 071e589156801650
++  some-lib:build: cache miss, executing ab8c4a02e3facf55
+   some-lib:build: 
+   some-lib:build: > build
+   some-lib:build: > exit 2
+@@ -66,7 +66,7 @@ Run with --continue
+   some-lib:build: npm ERR!   in workspace: some-lib 
+   some-lib:build: npm ERR!   at location: (.*)(\/|\\)apps(\/|\\)some-lib  (re)
+   some-lib:build: command finished with error, but continuing...
+-  other-app:build: cache miss, executing f7d23d1c894c1f09
++  other-app:build: cache miss, executing babf2f6b1d6ace47
+   other-app:build: 
+   other-app:build: > build
+   other-app:build: > exit 3
+diff --git a/turborepo-tests/integration/tests/run/force.t b/turborepo-tests/integration/tests/run/force.t
+index 907cd37581..264d1d2fd1 100644
+--- a/turborepo-tests/integration/tests/run/force.t
++++ b/turborepo-tests/integration/tests/run/force.t
+@@ -24,7 +24,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache miss, executing 270f1ef47a80f1d1
++  my-app:build: cache miss, executing 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -36,7 +36,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache bypass, force executing 270f1ef47a80f1d1
++  my-app:build: cache bypass, force executing 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -47,7 +47,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache bypass, force executing 270f1ef47a80f1d1
++  my-app:build: cache bypass, force executing 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -58,7 +58,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache hit, suppressing logs 270f1ef47a80f1d1
++  my-app:build: cache hit, suppressing logs 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -69,7 +69,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache bypass, force executing 270f1ef47a80f1d1
++  my-app:build: cache bypass, force executing 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -81,7 +81,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache hit, suppressing logs 270f1ef47a80f1d1
++  my-app:build: cache hit, suppressing logs 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -92,7 +92,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache bypass, force executing 270f1ef47a80f1d1
++  my-app:build: cache bypass, force executing 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -103,7 +103,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache hit, suppressing logs 270f1ef47a80f1d1
++  my-app:build: cache hit, suppressing logs 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -114,7 +114,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache bypass, force executing 270f1ef47a80f1d1
++  my-app:build: cache bypass, force executing 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -126,7 +126,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache hit, suppressing logs 270f1ef47a80f1d1
++  my-app:build: cache hit, suppressing logs 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -137,7 +137,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache bypass, force executing 270f1ef47a80f1d1
++  my-app:build: cache bypass, force executing 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -148,7 +148,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache hit, suppressing logs 270f1ef47a80f1d1
++  my-app:build: cache hit, suppressing logs 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -159,7 +159,7 @@ baseline to generate cache
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:build: cache bypass, force executing 270f1ef47a80f1d1
++  my-app:build: cache bypass, force executing 0555ce94ca234049
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+diff --git a/turborepo-tests/integration/tests/run/gitignored-inputs.t b/turborepo-tests/integration/tests/run/gitignored-inputs.t
+index f8d2c8c882..5c2f835fe4 100644
+--- a/turborepo-tests/integration/tests/run/gitignored-inputs.t
++++ b/turborepo-tests/integration/tests/run/gitignored-inputs.t
+@@ -16,7 +16,7 @@ Some helper functions to parse the summary file
+ 
+ Just run the util package, it's simpler
+   $ ${TURBO} run build --filter=util --output-logs=hash-only --summarize | grep "util:build: cache"
+-  util:build: cache miss, executing 355a92b6a1cc5f24
++  util:build: cache miss, executing 11cff3dd389fdfed
+ 
+   $ FIRST=$(/bin/ls .turbo/runs/*.json | head -n1)
+   $ echo $(getSummaryTaskId $FIRST "util#build") | jq -r '.inputs."internal.txt"'
+@@ -30,7 +30,7 @@ Change the content of internal.txt
+ 
+ Hash does not change, because it is gitignored
+   $ ${TURBO} run build --filter=util --output-logs=hash-only --summarize | grep "util:build: cache"
+-  util:build: cache miss, executing 511d34a1853ba4ab
++  util:build: cache miss, executing a489883a3c7cd307
+ 
+ The internal.txt hash should be different from the one before
+   $ SECOND=$(/bin/ls .turbo/runs/*.json | head -n1)
+diff --git a/turborepo-tests/integration/tests/run/globs.t b/turborepo-tests/integration/tests/run/globs.t
+index fa45e9ca27..b4878ff689 100644
+--- a/turborepo-tests/integration/tests/run/globs.t
++++ b/turborepo-tests/integration/tests/run/globs.t
+@@ -5,7 +5,7 @@ Verify that input directory change causes cache miss
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache miss, executing d5b281b8322da71e
++  util:build: cache miss, executing 5af1a9188f522439
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -16,7 +16,7 @@ Verify that input directory change causes cache miss
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache miss, executing 886797b8d9d1a464
++  util:build: cache miss, executing 1b809be951dcbf2e
+   
+    Tasks:    1 successful, 1 total
+   Cached:    0 cached, 1 total
+@@ -29,7 +29,7 @@ Verify that input directory change causes cache miss
+   \xe2\x80\xa2 Packages in scope: util (esc)
+   \xe2\x80\xa2 Running build in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache hit, suppressing logs 886797b8d9d1a464
++  util:build: cache hit, suppressing logs 1b809be951dcbf2e
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+diff --git a/turborepo-tests/integration/tests/run/one-script-error.t b/turborepo-tests/integration/tests/run/one-script-error.t
+index 14bfd97f7f..77de8eff33 100644
+--- a/turborepo-tests/integration/tests/run/one-script-error.t
++++ b/turborepo-tests/integration/tests/run/one-script-error.t
+@@ -7,13 +7,13 @@ Note that npm reports any failed script as exit code 1, even though we "exit 2"
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running error in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:okay: cache miss, executing 96496b6b9252855e
++  my-app:okay: cache miss, executing 61545c7738a28273
+   my-app:okay: 
+   my-app:okay: > okay
+   my-app:okay: > echo working
+   my-app:okay: 
+   my-app:okay: working
+-  my-app:error: cache miss, executing 470e35f414b048e3
++  my-app:error: cache miss, executing fe9f1118e6072fce
+   my-app:error: 
+   my-app:error: > error
+   my-app:error: > exit 2
+@@ -38,13 +38,13 @@ Make sure error isn't cached
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running error in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:okay: cache hit, replaying logs 96496b6b9252855e
++  my-app:okay: cache hit, replaying logs 61545c7738a28273
+   my-app:okay: 
+   my-app:okay: > okay
+   my-app:okay: > echo working
+   my-app:okay: 
+   my-app:okay: working
+-  my-app:error: cache miss, executing 470e35f414b048e3
++  my-app:error: cache miss, executing fe9f1118e6072fce
+   my-app:error: 
+   my-app:error: > error
+   my-app:error: > exit 2
+@@ -69,13 +69,13 @@ Make sure error code isn't swallowed with continue
+   \xe2\x80\xa2 Packages in scope: my-app (esc)
+   \xe2\x80\xa2 Running okay2 in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  my-app:okay: cache hit, replaying logs 96496b6b9252855e
++  my-app:okay: cache hit, replaying logs 61545c7738a28273
+   my-app:okay: 
+   my-app:okay: > okay
+   my-app:okay: > echo working
+   my-app:okay: 
+   my-app:okay: working
+-  my-app:error: cache miss, executing 470e35f414b048e3
++  my-app:error: cache miss, executing fe9f1118e6072fce
+   my-app:error: 
+   my-app:error: > error
+   my-app:error: > exit 2
+@@ -85,7 +85,7 @@ Make sure error code isn't swallowed with continue
+   my-app:error: npm ERR!   in workspace: my-app 
+   my-app:error: npm ERR!   at location: .*apps(\/|\\)my-app  (re)
+   my-app:error: command finished with error, but continuing...
+-  my-app:okay2: cache miss, executing 17aa4a3dcf0a74a6
++  my-app:okay2: cache miss, executing a24768ab20e24dd3
+   my-app:okay2: 
+   my-app:okay2: > okay2
+   my-app:okay2: > echo working
+diff --git a/turborepo-tests/integration/tests/run/single-package/dry-run.t b/turborepo-tests/integration/tests/run/single-package/dry-run.t
+index 058808becc..2efd36a1e4 100644
+--- a/turborepo-tests/integration/tests/run/single-package/dry-run.t
++++ b/turborepo-tests/integration/tests/run/single-package/dry-run.t
+@@ -13,19 +13,20 @@ Check
+     Inferred Global Env Vars Values       = 
+     Global Passed Through Env Vars        = 
+     Global Passed Through Env Vars Values = 
++    Engines Values                        = 
+   
+   Tasks to Run
+   build
+     Task                           = build\s* (re)
+-    Hash                           = 81a933c332d3f388
+-    Cached (Local)                 = false
+-    Cached (Remote)                = false
+-    Command                        = echo building > foo.txt
+-    Outputs                        = foo.txt
+-    Log File                       = .turbo(\/|\\)turbo-build.log (re)
+-    Dependencies                   = 
+-    Dependents                     = 
+-    Inputs Files Considered        = 5
++    Hash                           = 7ece7b62aad25615
++    Cached \(Local\)                 = false\s* (re)
++    Cached \(Remote\)                = false\s* (re)
++    Command                        = echo building > foo.txt\s* (re)
++    Outputs                        = foo.txt\s* (re)
++    Log File                       = .turbo(\/|\\)turbo-build.log\s* (re)
++    Dependencies                   =\s* (re)
++    Dependents                     =\s* (re)
++    Inputs Files Considered        = 5\s* (re)
+     Env Vars                       = 
+     Env Vars Values                = 
+     Inferred Env Vars Values       = 
+diff --git a/turborepo-tests/integration/tests/run/single-package/no-config.t b/turborepo-tests/integration/tests/run/single-package/no-config.t
+index e068bcd506..a50efedaa9 100644
+--- a/turborepo-tests/integration/tests/run/single-package/no-config.t
++++ b/turborepo-tests/integration/tests/run/single-package/no-config.t
+@@ -15,19 +15,20 @@ Check
+     Inferred Global Env Vars Values       = 
+     Global Passed Through Env Vars        = 
+     Global Passed Through Env Vars Values = 
++    Engines Values                        = 
+   
+   Tasks to Run
+   build
+     Task                           = build\s* (re)
+-    Hash                           = 12c592ddc0e53a5c
+-    Cached (Local)                 = false
+-    Cached (Remote)                = false
+-    Command                        = echo building > foo.txt
+-    Outputs                        = 
+-    Log File                       = .turbo(\/|\\)turbo-build.log (re)
+-    Dependencies                   = 
+-    Dependents                     = 
+-    Inputs Files Considered        = 4
++    Hash                           = e2b99dad85a4ff66
++    Cached \(Local\)                 = false\s* (re)
++    Cached \(Remote\)                = false\s* (re)
++    Command                        = echo building > foo.txt\s* (re)
++    Outputs                        =\s* (re)
++    Log File                       = .turbo(\/|\\)turbo-build.log\s* (re)
++    Dependencies                   =\s* (re)
++    Dependents                     =\s* (re)
++    Inputs Files Considered        = 4\s* (re)
+     Env Vars                       = 
+     Env Vars Values                = 
+     Inferred Env Vars Values       = 
+@@ -50,7 +51,7 @@ Run real once
+   $ ${TURBO} run build
+   \xe2\x80\xa2 Running build (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache bypass, force executing 12c592ddc0e53a5c
++  build: cache bypass, force executing e2b99dad85a4ff66
+   build: 
+   build: > build
+   build: > echo building > foo.txt
+@@ -64,7 +65,7 @@ Run a second time, verify no caching because there is no config
+   $ ${TURBO} run build
+   \xe2\x80\xa2 Running build (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache bypass, force executing 12c592ddc0e53a5c
++  build: cache bypass, force executing e2b99dad85a4ff66
+   build: 
+   build: > build
+   build: > echo building > foo.txt
+diff --git a/turborepo-tests/integration/tests/run/single-package/run-yarn.t b/turborepo-tests/integration/tests/run/single-package/run-yarn.t
+index 29ac054d46..7c304c4f08 100644
+--- a/turborepo-tests/integration/tests/run/single-package/run-yarn.t
++++ b/turborepo-tests/integration/tests/run/single-package/run-yarn.t
+@@ -5,7 +5,7 @@ Check
+   $ ${TURBO} run build
+   \xe2\x80\xa2 Running build (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache miss, executing 34db97233d5773b8
++  build: cache miss, executing a6fef17cc2efc81c
+   build: yarn run v1.22.17
+   build: warning package.json: No license field
+   build: $ echo building > foo.txt
+@@ -18,7 +18,7 @@ Check
+   $ ${TURBO} run build
+   \xe2\x80\xa2 Running build (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache hit, replaying logs 34db97233d5773b8
++  build: cache hit, replaying logs a6fef17cc2efc81c
+   build: yarn run v1.22.17
+   build: warning package.json: No license field
+   build: $ echo building > foo.txt
+diff --git a/turborepo-tests/integration/tests/run/single-package/run.t b/turborepo-tests/integration/tests/run/single-package/run.t
+index ca40d5e418..26e7e3b09e 100644
+--- a/turborepo-tests/integration/tests/run/single-package/run.t
++++ b/turborepo-tests/integration/tests/run/single-package/run.t
+@@ -5,7 +5,7 @@ Check
+   $ ${TURBO} run build
+   \xe2\x80\xa2 Running build (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache miss, executing 81a933c332d3f388
++  build: cache miss, executing 7ece7b62aad25615
+   build: 
+   build: > build
+   build: > echo building > foo.txt
+@@ -22,7 +22,7 @@ Run a second time, verify caching works because there is a config
+   $ ${TURBO} run build
+   \xe2\x80\xa2 Running build (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache hit, replaying logs 81a933c332d3f388
++  build: cache hit, replaying logs 7ece7b62aad25615
+   build: 
+   build: > build
+   build: > echo building > foo.txt
+diff --git a/turborepo-tests/integration/tests/run/single-package/with-deps-dry-run.t b/turborepo-tests/integration/tests/run/single-package/with-deps-dry-run.t
+index 077d7a2a8d..3c5e504cfd 100644
+--- a/turborepo-tests/integration/tests/run/single-package/with-deps-dry-run.t
++++ b/turborepo-tests/integration/tests/run/single-package/with-deps-dry-run.t
+@@ -13,19 +13,20 @@ Check
+     Inferred Global Env Vars Values       = 
+     Global Passed Through Env Vars        = 
+     Global Passed Through Env Vars Values = 
++    Engines Values                        = 
+   
+   Tasks to Run
+   build
+     Task                           = build\s* (re)
+-    Hash                           = 81a933c332d3f388
+-    Cached (Local)                 = false
+-    Cached (Remote)                = false
+-    Command                        = echo building > foo.txt
+-    Outputs                        = foo.txt
+-    Log File                       = .turbo(\/|\\)turbo-build.log (re)
+-    Dependencies                   = 
+-    Dependents                     = test
+-    Inputs Files Considered        = 5
++    Hash                           = 7ece7b62aad25615
++    Cached \(Local\)                 = false\s* (re)
++    Cached \(Remote\)                = false\s* (re)
++    Command                        = echo building > foo.txt\s* (re)
++    Outputs                        = foo.txt\s* (re)
++    Log File                       = .turbo(\/|\\)turbo-build.log\s* (re)
++    Dependencies                   =\s* (re)
++    Dependents                     = test\s* (re)
++    Inputs Files Considered        = 5\s* (re)
+     Env Vars                       = 
+     Env Vars Values                = 
+     Inferred Env Vars Values       = 
+@@ -35,15 +36,15 @@ Check
+     Framework                      = 
+   test
+     Task                           = test\s* (re)
+-    Hash                           = 785d8ef1115bde3b
+-    Cached (Local)                 = false
+-    Cached (Remote)                = false
+-    Command                        = cat foo.txt
+-    Outputs                        = 
+-    Log File                       = .turbo(\/|\\)turbo-test.log (re)
+-    Dependencies                   = build
+-    Dependents                     = 
+-    Inputs Files Considered        = 5
++    Hash                           = cb5839f7284aa5f3
++    Cached \(Local\)                 = false\s* (re)
++    Cached \(Remote\)                = false\s* (re)
++    Command                        = cat foo.txt\s* (re)
++    Outputs                        =\s* (re)
++    Log File                       = .turbo(\/|\\)turbo-test.log\s* (re)
++    Dependencies                   = build\s* (re)
++    Dependents                     =\s* (re)
++    Inputs Files Considered        = 5\s* (re)
+     Env Vars                       = 
+     Env Vars Values                = 
+     Inferred Env Vars Values       = 
+diff --git a/turborepo-tests/integration/tests/run/single-package/with-deps-run.t b/turborepo-tests/integration/tests/run/single-package/with-deps-run.t
+index 7de8cf7410..0050f76b42 100644
+--- a/turborepo-tests/integration/tests/run/single-package/with-deps-run.t
++++ b/turborepo-tests/integration/tests/run/single-package/with-deps-run.t
+@@ -5,12 +5,12 @@ Check
+   $ ${TURBO} run test
+   \xe2\x80\xa2 Running test (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache miss, executing 81a933c332d3f388
++  build: cache miss, executing 7ece7b62aad25615
+   build: 
+   build: > build
+   build: > echo building > foo.txt
+   build: 
+-  test: cache miss, executing 785d8ef1115bde3b
++  test: cache miss, executing cb5839f7284aa5f3
+   test: 
+   test: > test
+   test: > cat foo.txt
+@@ -25,12 +25,12 @@ Run a second time, verify caching works because there is a config
+   $ ${TURBO} run test
+   \xe2\x80\xa2 Running test (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache hit, replaying logs 81a933c332d3f388
++  build: cache hit, replaying logs 7ece7b62aad25615
+   build: 
+   build: > build
+   build: > echo building > foo.txt
+   build: 
+-  test: cache hit, replaying logs 785d8ef1115bde3b
++  test: cache hit, replaying logs cb5839f7284aa5f3
+   test: 
+   test: > test
+   test: > cat foo.txt
+@@ -45,14 +45,13 @@ Run with --output-logs=hash-only
+   $ ${TURBO} run test --output-logs=hash-only
+   \xe2\x80\xa2 Running test (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  build: cache hit, suppressing logs 81a933c332d3f388
+-  test: cache hit, suppressing logs 785d8ef1115bde3b
++  build: cache hit, suppressing logs 7ece7b62aad25615
++  test: cache hit, suppressing logs cb5839f7284aa5f3
+   
+    Tasks:    2 successful, 2 total
+   Cached:    2 cached, 2 total
+     Time:\s*[\.0-9]+m?s >>> FULL TURBO (re)
+   
+-
+ Run with --output-logs=errors-only
+   $ ${TURBO} run test --output-logs=errors-only
+   \xe2\x80\xa2 Running test (esc)
+diff --git a/turborepo-tests/integration/tests/task-dependencies/overwriting.t b/turborepo-tests/integration/tests/task-dependencies/overwriting.t
+index dc8c2b0054..555833f173 100644
+--- a/turborepo-tests/integration/tests/task-dependencies/overwriting.t
++++ b/turborepo-tests/integration/tests/task-dependencies/overwriting.t
+@@ -11,7 +11,7 @@ Test
+ 
+ # workspace-a#generate ran
+   $ cat tmp.log | grep "workspace-a:generate"
+-  workspace-a:generate: cache miss, executing 8ee333277b4c00a0
++  workspace-a:generate: cache miss, executing 9177da2f682aeeb7
+   workspace-a:generate: 
+   workspace-a:generate: > generate
+   workspace-a:generate: > echo generate-workspace-a
+@@ -19,7 +19,7 @@ Test
+   workspace-a:generate: generate-workspace-a
+ workspace-a#build ran
+   $ cat tmp.log | grep "workspace-a:build"
+-  workspace-a:build: cache miss, executing 886936e13f48ddb8
++  workspace-a:build: cache miss, executing f6fe0ec4a3ecb04b
+   workspace-a:build: 
+   workspace-a:build: > build
+   workspace-a:build: > echo build-workspace-a
+@@ -32,7 +32,7 @@ workspace-b#generate DID NOT run
+ 
+ workspace-b#build ran
+   $ cat tmp.log | grep "workspace-b:build"
+-  workspace-b:build: cache miss, executing b10c1a5197eafc5d
++  workspace-b:build: cache miss, executing b0cbf81d4cce38a4
+   workspace-b:build: 
+   workspace-b:build: > build
+   workspace-b:build: > echo build-workspace-b
+diff --git a/turborepo-tests/integration/tests/task-dependencies/root-workspace.t b/turborepo-tests/integration/tests/task-dependencies/root-workspace.t
+index f6d4d34a9c..7ee31d3c99 100644
+--- a/turborepo-tests/integration/tests/task-dependencies/root-workspace.t
++++ b/turborepo-tests/integration/tests/task-dependencies/root-workspace.t
+@@ -5,13 +5,13 @@ This tests asserts that root tasks can depend on workspace#task
+   \xe2\x80\xa2 Packages in scope: //, lib-a (esc)
+   \xe2\x80\xa2 Running mytask in 2 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  lib-a:build: cache miss, executing 5b761e7ac20ce0a6
++  lib-a:build: cache miss, executing eddc59f63124ca26
+   lib-a:build: 
+   lib-a:build: > build
+   lib-a:build: > echo build-lib-a
+   lib-a:build: 
+   lib-a:build: build-lib-a
+-  //:mytask: cache miss, executing 8a3a7db901b3e8cf
++  //:mytask: cache miss, executing 82474628cac2e34c
+   //:mytask: 
+   //:mytask: > mytask
+   //:mytask: > echo root-mytask
+diff --git a/turborepo-tests/integration/tests/task-dependencies/topological.t b/turborepo-tests/integration/tests/task-dependencies/topological.t
+index a6bcd2bd97..41543406c3 100644
+--- a/turborepo-tests/integration/tests/task-dependencies/topological.t
++++ b/turborepo-tests/integration/tests/task-dependencies/topological.t
+@@ -6,13 +6,13 @@ Check my-app#build output
+   \xe2\x80\xa2 Packages in scope: //, my-app, util (esc)
+   \xe2\x80\xa2 Running build in 3 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  util:build: cache miss, executing a4a05b282e52a021
++  util:build: cache miss, executing 3d1f83b683510099
+   util:build: 
+   util:build: > build
+   util:build: > echo building
+   util:build: 
+   util:build: building
+-  my-app:build: cache miss, executing 0e31fb7bb214a760
++  my-app:build: cache miss, executing a24fb33a97cce572
+   my-app:build: 
+   my-app:build: > build
+   my-app:build: > echo building
+diff --git a/turborepo-tests/integration/tests/workspace-configs/add-keys.t b/turborepo-tests/integration/tests/workspace-configs/add-keys.t
+index 2626a5d273..db2141c3e5 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/add-keys.t
++++ b/turborepo-tests/integration/tests/workspace-configs/add-keys.t
+@@ -14,13 +14,13 @@ Setup
+   \xe2\x80\xa2 Packages in scope: add-keys (esc)
+   \xe2\x80\xa2 Running add-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  add-keys:add-keys-underlying-task: cache miss, executing 2bd958e3fcfce743
++  add-keys:add-keys-underlying-task: cache miss, executing 1ce848eeaff2dbd4
+   add-keys:add-keys-underlying-task: 
+   add-keys:add-keys-underlying-task: > add-keys-underlying-task
+   add-keys:add-keys-underlying-task: > echo running-add-keys-underlying-task
+   add-keys:add-keys-underlying-task: 
+   add-keys:add-keys-underlying-task: running-add-keys-underlying-task
+-  add-keys:add-keys-task: cache miss, executing a11556f24e8544ee
++  add-keys:add-keys-task: cache miss, executing b16339834937fd9e
+   add-keys:add-keys-task: 
+   add-keys:add-keys-task: > add-keys-task
+   add-keys:add-keys-task: > echo running-add-keys-task > out/foo.min.txt
+@@ -30,12 +30,6 @@ Setup
+   Cached:    0 cached, 2 total
+     Time:\s*[\.0-9]+m?s  (re)
+   
+-<<<<<<< HEAD
+-=======
+->>>>>>> 37c3c596f1 (chore: update integration tests)
+-<<<<<<< HEAD
+-=======
+->>>>>>> 37c3c596f1 (chore: update integration tests)
+   $ HASH=$(cat tmp.log | grep -E "add-keys:add-keys-task.* executing .*" | awk '{print $5}')
+   $ tar -tf $TARGET_DIR/.turbo/cache/$HASH.tar.zst;
+   apps/add-keys/.turbo/turbo-add-keys-task.log
+@@ -48,13 +42,13 @@ Setup
+   \xe2\x80\xa2 Packages in scope: add-keys (esc)
+   \xe2\x80\xa2 Running add-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  add-keys:add-keys-underlying-task: cache hit, replaying logs 2bd958e3fcfce743
++  add-keys:add-keys-underlying-task: cache hit, replaying logs 1ce848eeaff2dbd4
+   add-keys:add-keys-underlying-task: 
+   add-keys:add-keys-underlying-task: > add-keys-underlying-task
+   add-keys:add-keys-underlying-task: > echo running-add-keys-underlying-task
+   add-keys:add-keys-underlying-task: 
+   add-keys:add-keys-underlying-task: running-add-keys-underlying-task
+-  add-keys:add-keys-task: cache hit, suppressing logs a11556f24e8544ee
++  add-keys:add-keys-task: cache hit, suppressing logs b16339834937fd9e
+   
+    Tasks:    2 successful, 2 total
+   Cached:    2 cached, 2 total
+@@ -66,13 +60,13 @@ Setup
+   \xe2\x80\xa2 Packages in scope: add-keys (esc)
+   \xe2\x80\xa2 Running add-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  add-keys:add-keys-underlying-task: cache miss, executing 0ab311c4d79c6364
++  add-keys:add-keys-underlying-task: cache miss, executing 8a894e7cb2c0a1ea
+   add-keys:add-keys-underlying-task: 
+   add-keys:add-keys-underlying-task: > add-keys-underlying-task
+   add-keys:add-keys-underlying-task: > echo running-add-keys-underlying-task
+   add-keys:add-keys-underlying-task: 
+   add-keys:add-keys-underlying-task: running-add-keys-underlying-task
+-  add-keys:add-keys-task: cache miss, executing f996028b8b4e387b
++  add-keys:add-keys-task: cache miss, executing df66730da80eec8e
+   add-keys:add-keys-task: 
+   add-keys:add-keys-task: > add-keys-task
+   add-keys:add-keys-task: > echo running-add-keys-task > out/foo.min.txt
+@@ -87,13 +81,13 @@ Setup
+   \xe2\x80\xa2 Packages in scope: add-keys (esc)
+   \xe2\x80\xa2 Running add-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  add-keys:add-keys-underlying-task: cache hit, replaying logs 0ab311c4d79c6364
++  add-keys:add-keys-underlying-task: cache hit, replaying logs 8a894e7cb2c0a1ea
+   add-keys:add-keys-underlying-task: 
+   add-keys:add-keys-underlying-task: > add-keys-underlying-task
+   add-keys:add-keys-underlying-task: > echo running-add-keys-underlying-task
+   add-keys:add-keys-underlying-task: 
+   add-keys:add-keys-underlying-task: running-add-keys-underlying-task
+-  add-keys:add-keys-task: cache miss, executing 669ea43ab8c0fc93
++  add-keys:add-keys-task: cache miss, executing 96c5e85515972df5
+   add-keys:add-keys-task: 
+   add-keys:add-keys-task: > add-keys-task
+   add-keys:add-keys-task: > echo running-add-keys-task > out/foo.min.txt
+diff --git a/turborepo-tests/integration/tests/workspace-configs/add-tasks.t b/turborepo-tests/integration/tests/workspace-configs/add-tasks.t
+index 446fdfc632..a01e287e71 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/add-tasks.t
++++ b/turborepo-tests/integration/tests/workspace-configs/add-tasks.t
+@@ -5,7 +5,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: add-tasks (esc)
+   \xe2\x80\xa2 Running added-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  add-tasks:added-task: cache miss, executing 86d698d4e34329fd
++  add-tasks:added-task: cache miss, executing 0c8333ca7685d45f
+   add-tasks:added-task: 
+   add-tasks:added-task: > added-task
+   add-tasks:added-task: > echo running-added-task > out/foo.min.txt
+diff --git a/turborepo-tests/integration/tests/workspace-configs/cache.t b/turborepo-tests/integration/tests/workspace-configs/cache.t
+index cc37a77a08..6674829b25 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/cache.t
++++ b/turborepo-tests/integration/tests/workspace-configs/cache.t
+@@ -13,7 +13,7 @@ This test covers:
+   \xe2\x80\xa2 Packages in scope: cached (esc)
+   \xe2\x80\xa2 Running cached-task-1 in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  cached:cached-task-1: cache miss, executing a49d6b89949c7afa
++  cached:cached-task-1: cache miss, executing da2166fcfd7b56bd
+   cached:cached-task-1: 
+   cached:cached-task-1: > cached-task-1
+   cached:cached-task-1: > echo cached-task-1 > out/foo.min.txt
+@@ -38,7 +38,7 @@ This test covers:
+   \xe2\x80\xa2 Packages in scope: cached (esc)
+   \xe2\x80\xa2 Running cached-task-2 in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  cached:cached-task-2: cache bypass, force executing 44fd51a101b8f481
++  cached:cached-task-2: cache bypass, force executing e42e6c8e2ae6a672
+   cached:cached-task-2: 
+   cached:cached-task-2: > cached-task-2
+   cached:cached-task-2: > echo cached-task-2 > out/foo.min.txt
+@@ -60,7 +60,7 @@ no `cache` config in root, cache:false in workspace
+   \xe2\x80\xa2 Packages in scope: cached (esc)
+   \xe2\x80\xa2 Running cached-task-3 in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  cached:cached-task-3: cache bypass, force executing c0043d1b0a723064
++  cached:cached-task-3: cache bypass, force executing 86ce94afb18567d7
+   cached:cached-task-3: 
+   cached:cached-task-3: > cached-task-3
+   cached:cached-task-3: > echo cached-task-3 > out/foo.min.txt
+@@ -84,7 +84,7 @@ we already have a workspace that doesn't have a config
+   \xe2\x80\xa2 Packages in scope: missing-workspace-config (esc)
+   \xe2\x80\xa2 Running cached-task-4 in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  missing-workspace-config:cached-task-4: cache bypass, force executing 991b90e398c3e30b
++  missing-workspace-config:cached-task-4: cache bypass, force executing f164838b2fe93185
+   missing-workspace-config:cached-task-4: 
+   missing-workspace-config:cached-task-4: > cached-task-4
+   missing-workspace-config:cached-task-4: > echo cached-task-4 > out/foo.min.txt
+diff --git a/turborepo-tests/integration/tests/workspace-configs/config-change.t b/turborepo-tests/integration/tests/workspace-configs/config-change.t
+index 9841d8cccf..0ebb2528ea 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/config-change.t
++++ b/turborepo-tests/integration/tests/workspace-configs/config-change.t
+@@ -3,13 +3,13 @@ Setup
+ 
+ # 1. First run, check the hash
+   $ ${TURBO} run config-change-task --filter=config-change --dry=json | jq .tasks[0].hash
+-  "d93bbb973d5db9f1"
++  "4fbfb44c77d14468"
+ 
+ 2. Run again and assert task hash stays the same
+   $ ${TURBO} run config-change-task --filter=config-change --dry=json | jq .tasks[0].hash
+-  "d93bbb973d5db9f1"
++  "4fbfb44c77d14468"
+ 
+ 3. Change turbo.json and assert that hash changes
+   $ cp $TARGET_DIR/apps/config-change/turbo-changed.json $TARGET_DIR/apps/config-change/turbo.json
+   $ ${TURBO} run config-change-task --filter=config-change --dry=json | jq .tasks[0].hash
+-  "cece46842b2454fe"
++  "01e59b7f88f8a211"
+diff --git a/turborepo-tests/integration/tests/workspace-configs/cross-workspace.t b/turborepo-tests/integration/tests/workspace-configs/cross-workspace.t
+index bd22b9c612..17af56d6da 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/cross-workspace.t
++++ b/turborepo-tests/integration/tests/workspace-configs/cross-workspace.t
+@@ -4,13 +4,13 @@ Setup
+   \xe2\x80\xa2 Packages in scope: cross-workspace (esc)
+   \xe2\x80\xa2 Running cross-workspace-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  blank-pkg:cross-workspace-underlying-task: cache miss, executing 2ca5991c80f91ba1
++  blank-pkg:cross-workspace-underlying-task: cache miss, executing 39566f6362976823
+   blank-pkg:cross-workspace-underlying-task: 
+   blank-pkg:cross-workspace-underlying-task: > cross-workspace-underlying-task
+   blank-pkg:cross-workspace-underlying-task: > echo cross-workspace-underlying-task from blank-pkg
+   blank-pkg:cross-workspace-underlying-task: 
+   blank-pkg:cross-workspace-underlying-task: cross-workspace-underlying-task from blank-pkg
+-  cross-workspace:cross-workspace-task: cache miss, executing d94b9c3284307ca2
++  cross-workspace:cross-workspace-task: cache miss, executing bce507a110930f07
+   cross-workspace:cross-workspace-task: 
+   cross-workspace:cross-workspace-task: > cross-workspace-task
+   cross-workspace:cross-workspace-task: > echo cross-workspace-task
+diff --git a/turborepo-tests/integration/tests/workspace-configs/missing-workspace-config-deps.t b/turborepo-tests/integration/tests/workspace-configs/missing-workspace-config-deps.t
+index 15a2dafd8f..5f7f521c27 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/missing-workspace-config-deps.t
++++ b/turborepo-tests/integration/tests/workspace-configs/missing-workspace-config-deps.t
+@@ -15,14 +15,14 @@ Setup
+   \xe2\x80\xa2 Remote caching disabled (esc)
+ 
+   $ cat tmp.log | grep "missing-workspace-config:missing-workspace-config-task-with-deps"
+-  missing-workspace-config:missing-workspace-config-task-with-deps: cache miss, executing ddbc8e9c98c1613a
++  missing-workspace-config:missing-workspace-config-task-with-deps: cache miss, executing 27111702ff2c516b
+   missing-workspace-config:missing-workspace-config-task-with-deps: 
+   missing-workspace-config:missing-workspace-config-task-with-deps: > missing-workspace-config-task-with-deps
+   missing-workspace-config:missing-workspace-config-task-with-deps: > echo running-missing-workspace-config-task-with-deps > out/foo.min.txt
+   missing-workspace-config:missing-workspace-config-task-with-deps: 
+ 
+   $ cat tmp.log | grep "missing-workspace-config:missing-workspace-config-underlying-task"
+-  missing-workspace-config:missing-workspace-config-underlying-task: cache miss, executing 7804b721631ec9dc
++  missing-workspace-config:missing-workspace-config-underlying-task: cache miss, executing abd612282d80ada6
+   missing-workspace-config:missing-workspace-config-underlying-task: 
+   missing-workspace-config:missing-workspace-config-underlying-task: > missing-workspace-config-underlying-task
+   missing-workspace-config:missing-workspace-config-underlying-task: > echo running-missing-workspace-config-underlying-task
+@@ -30,7 +30,7 @@ Setup
+   missing-workspace-config:missing-workspace-config-underlying-task: running-missing-workspace-config-underlying-task
+ 
+   $ cat tmp.log | grep "blank-pkg:missing-workspace-config-underlying-topo-task"
+-  blank-pkg:missing-workspace-config-underlying-topo-task: cache miss, executing 2ee83ef8fa218e5b
++  blank-pkg:missing-workspace-config-underlying-topo-task: cache miss, executing 9cc1b75893929720
+   blank-pkg:missing-workspace-config-underlying-topo-task: 
+   blank-pkg:missing-workspace-config-underlying-topo-task: > missing-workspace-config-underlying-topo-task
+   blank-pkg:missing-workspace-config-underlying-topo-task: > echo missing-workspace-config-underlying-topo-task from blank-pkg
+diff --git a/turborepo-tests/integration/tests/workspace-configs/missing-workspace-config.t b/turborepo-tests/integration/tests/workspace-configs/missing-workspace-config.t
+index 466cb0c301..2b914c0b42 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/missing-workspace-config.t
++++ b/turborepo-tests/integration/tests/workspace-configs/missing-workspace-config.t
+@@ -11,7 +11,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: missing-workspace-config (esc)
+   \xe2\x80\xa2 Running missing-workspace-config-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  missing-workspace-config:missing-workspace-config-task: cache miss, executing f9dcb73efb6c5269
++  missing-workspace-config:missing-workspace-config-task: cache miss, executing 924463dcfeefce9e
+   missing-workspace-config:missing-workspace-config-task: 
+   missing-workspace-config:missing-workspace-config-task: > missing-workspace-config-task
+   missing-workspace-config:missing-workspace-config-task: > echo running-missing-workspace-config-task > out/foo.min.txt
+@@ -33,7 +33,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: missing-workspace-config (esc)
+   \xe2\x80\xa2 Running missing-workspace-config-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  missing-workspace-config:missing-workspace-config-task: cache hit, suppressing logs f9dcb73efb6c5269
++  missing-workspace-config:missing-workspace-config-task: cache hit, suppressing logs 924463dcfeefce9e
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -45,7 +45,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: missing-workspace-config (esc)
+   \xe2\x80\xa2 Running missing-workspace-config-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  missing-workspace-config:missing-workspace-config-task: cache miss, executing a7bd666ff568b7ac
++  missing-workspace-config:missing-workspace-config-task: cache miss, executing 6393b168ee1654c5
+   missing-workspace-config:missing-workspace-config-task: 
+   missing-workspace-config:missing-workspace-config-task: > missing-workspace-config-task
+   missing-workspace-config:missing-workspace-config-task: > echo running-missing-workspace-config-task > out/foo.min.txt
+@@ -62,7 +62,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: missing-workspace-config (esc)
+   \xe2\x80\xa2 Running missing-workspace-config-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  missing-workspace-config:missing-workspace-config-task: cache hit, suppressing logs a7bd666ff568b7ac
++  missing-workspace-config:missing-workspace-config-task: cache hit, suppressing logs 6393b168ee1654c5
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -73,7 +73,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: missing-workspace-config (esc)
+   \xe2\x80\xa2 Running missing-workspace-config-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  missing-workspace-config:missing-workspace-config-task: cache miss, executing 44b2829e0f461fcc
++  missing-workspace-config:missing-workspace-config-task: cache miss, executing e70657c42c4e2edb
+   missing-workspace-config:missing-workspace-config-task: 
+   missing-workspace-config:missing-workspace-config-task: > missing-workspace-config-task
+   missing-workspace-config:missing-workspace-config-task: > echo running-missing-workspace-config-task > out/foo.min.txt
+@@ -89,7 +89,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: missing-workspace-config (esc)
+   \xe2\x80\xa2 Running cached-task-4 in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  missing-workspace-config:cached-task-4: cache bypass, force executing 02705cb19702f9db
++  missing-workspace-config:cached-task-4: cache bypass, force executing 95ba5489441bdc13
+   missing-workspace-config:cached-task-4: 
+   missing-workspace-config:cached-task-4: > cached-task-4
+   missing-workspace-config:cached-task-4: > echo cached-task-4 > out/foo.min.txt
+diff --git a/turborepo-tests/integration/tests/workspace-configs/omit-keys-deps.t b/turborepo-tests/integration/tests/workspace-configs/omit-keys-deps.t
+index 5f8d9283c1..1486678c3a 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/omit-keys-deps.t
++++ b/turborepo-tests/integration/tests/workspace-configs/omit-keys-deps.t
+@@ -15,14 +15,14 @@ Setup
+   \xe2\x80\xa2 Running omit-keys-task-with-deps in 1 packages (esc)
+ 
+   $ cat tmp.log | grep "omit-keys:omit-keys-task-with-deps"
+-  omit-keys:omit-keys-task-with-deps: cache miss, executing 1554356833ff5f4b
++  omit-keys:omit-keys-task-with-deps: cache miss, executing bbb54c4130d16663
+   omit-keys:omit-keys-task-with-deps: 
+   omit-keys:omit-keys-task-with-deps: > omit-keys-task-with-deps
+   omit-keys:omit-keys-task-with-deps: > echo running-omit-keys-task-with-deps > out/foo.min.txt
+   omit-keys:omit-keys-task-with-deps: 
+ 
+   $ cat tmp.log | grep "omit-keys:omit-keys-underlying-task"
+-  omit-keys:omit-keys-underlying-task: cache miss, executing a789ec01db5a0976
++  omit-keys:omit-keys-underlying-task: cache miss, executing 1aa42011f41a10f1
+   omit-keys:omit-keys-underlying-task: 
+   omit-keys:omit-keys-underlying-task: > omit-keys-underlying-task
+   omit-keys:omit-keys-underlying-task: > echo running-omit-keys-underlying-task
+@@ -30,7 +30,7 @@ Setup
+   omit-keys:omit-keys-underlying-task: running-omit-keys-underlying-task
+ 
+   $ cat tmp.log | grep "blank-pkg:omit-keys-underlying-topo-task"
+-  blank-pkg:omit-keys-underlying-topo-task: cache miss, executing f7bdaf1949934066
++  blank-pkg:omit-keys-underlying-topo-task: cache miss, executing 4510d84de8b1d9b7
+   blank-pkg:omit-keys-underlying-topo-task: 
+   blank-pkg:omit-keys-underlying-topo-task: > omit-keys-underlying-topo-task
+   blank-pkg:omit-keys-underlying-topo-task: > echo omit-keys-underlying-topo-task from blank-pkg
+diff --git a/turborepo-tests/integration/tests/workspace-configs/omit-keys.t b/turborepo-tests/integration/tests/workspace-configs/omit-keys.t
+index b4b7e34985..aae9c5c4ec 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/omit-keys.t
++++ b/turborepo-tests/integration/tests/workspace-configs/omit-keys.t
+@@ -14,7 +14,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: omit-keys (esc)
+   \xe2\x80\xa2 Running omit-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  omit-keys:omit-keys-task: cache miss, executing 2275653d6cc837ea
++  omit-keys:omit-keys-task: cache miss, executing 3494dd1d95d1479e
+   omit-keys:omit-keys-task: 
+   omit-keys:omit-keys-task: > omit-keys-task
+   omit-keys:omit-keys-task: > echo running-omit-keys-task > out/foo.min.txt
+@@ -36,7 +36,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: omit-keys (esc)
+   \xe2\x80\xa2 Running omit-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  omit-keys:omit-keys-task: cache hit, suppressing logs 2275653d6cc837ea
++  omit-keys:omit-keys-task: cache hit, suppressing logs 3494dd1d95d1479e
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -48,7 +48,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: omit-keys (esc)
+   \xe2\x80\xa2 Running omit-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  omit-keys:omit-keys-task: cache miss, executing 4b42c9ab61970715
++  omit-keys:omit-keys-task: cache miss, executing dc03a583d6fdaaf2
+   omit-keys:omit-keys-task: 
+   omit-keys:omit-keys-task: > omit-keys-task
+   omit-keys:omit-keys-task: > echo running-omit-keys-task > out/foo.min.txt
+@@ -65,7 +65,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: omit-keys (esc)
+   \xe2\x80\xa2 Running omit-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  omit-keys:omit-keys-task: cache hit, suppressing logs 4b42c9ab61970715
++  omit-keys:omit-keys-task: cache hit, suppressing logs dc03a583d6fdaaf2
+   
+    Tasks:    1 successful, 1 total
+   Cached:    1 cached, 1 total
+@@ -76,7 +76,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: omit-keys (esc)
+   \xe2\x80\xa2 Running omit-keys-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  omit-keys:omit-keys-task: cache miss, executing f79224ef709d0347
++  omit-keys:omit-keys-task: cache miss, executing 56670bf5aef6bb90
+   omit-keys:omit-keys-task: 
+   omit-keys:omit-keys-task: > omit-keys-task
+   omit-keys:omit-keys-task: > echo running-omit-keys-task > out/foo.min.txt
+diff --git a/turborepo-tests/integration/tests/workspace-configs/override-values-deps.t b/turborepo-tests/integration/tests/workspace-configs/override-values-deps.t
+index 44bff3f544..6bba3588cf 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/override-values-deps.t
++++ b/turborepo-tests/integration/tests/workspace-configs/override-values-deps.t
+@@ -12,7 +12,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: override-values (esc)
+   \xe2\x80\xa2 Running override-values-task-with-deps in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  override-values:override-values-task-with-deps: cache miss, executing 1a68f7b5fcfe887e
++  override-values:override-values-task-with-deps: cache miss, executing 9b51bda96ea87896
+   override-values:override-values-task-with-deps: 
+   override-values:override-values-task-with-deps: > override-values-task-with-deps
+   override-values:override-values-task-with-deps: > echo running-override-values-task-with-deps > out/foo.min.txt
+diff --git a/turborepo-tests/integration/tests/workspace-configs/override-values.t b/turborepo-tests/integration/tests/workspace-configs/override-values.t
+index 9c2639bdd0..def3393964 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/override-values.t
++++ b/turborepo-tests/integration/tests/workspace-configs/override-values.t
+@@ -11,7 +11,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: override-values (esc)
+   \xe2\x80\xa2 Running override-values-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  override-values:override-values-task: cache miss, executing 30f06dcaf1586c63
++  override-values:override-values-task: cache miss, executing ca440a0f61cee7ea
+   override-values:override-values-task: 
+   override-values:override-values-task: > override-values-task
+   override-values:override-values-task: > echo running-override-values-task > lib/bar.min.txt
+@@ -21,9 +21,6 @@ Setup
+   Cached:    0 cached, 1 total
+     Time:\s*[\.0-9]+m?s  (re)
+   
+-<<<<<<< HEAD
+-=======
+->>>>>>> 37c3c596f1 (chore: update integration tests)
+   $ HASH=$(cat tmp.log | grep -E "override-values:override-values-task.* executing .*" | awk '{print $5}')
+   $ tar -tf $TARGET_DIR/.turbo/cache/$HASH.tar.zst;
+   apps/override-values/.turbo/turbo-override-values-task.log
+@@ -36,7 +33,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: override-values (esc)
+   \xe2\x80\xa2 Running override-values-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  override-values:override-values-task: cache hit, replaying logs 30f06dcaf1586c63
++  override-values:override-values-task: cache hit, replaying logs ca440a0f61cee7ea
+   override-values:override-values-task: 
+   override-values:override-values-task: > override-values-task
+   override-values:override-values-task: > echo running-override-values-task > lib/bar.min.txt
+@@ -46,16 +43,13 @@ Setup
+   Cached:    1 cached, 1 total
+     Time:\s*[\.0-9]+m?s >>> FULL TURBO (re)
+   
+-<<<<<<< HEAD
+-=======
+->>>>>>> 37c3c596f1 (chore: update integration tests)
+ 3. Change input file and assert cache miss
+   $ echo "more text" >> $TARGET_DIR/apps/override-values/src/bar.txt
+   $ ${TURBO} run override-values-task --filter=override-values
+   \xe2\x80\xa2 Packages in scope: override-values (esc)
+   \xe2\x80\xa2 Running override-values-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  override-values:override-values-task: cache miss, executing 9d9fe6991167ac4d
++  override-values:override-values-task: cache miss, executing 41f4985cf22b4f8e
+   override-values:override-values-task: 
+   override-values:override-values-task: > override-values-task
+   override-values:override-values-task: > echo running-override-values-task > lib/bar.min.txt
+@@ -71,7 +65,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: override-values (esc)
+   \xe2\x80\xa2 Running override-values-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  override-values:override-values-task: cache hit, replaying logs 9d9fe6991167ac4d
++  override-values:override-values-task: cache hit, replaying logs 41f4985cf22b4f8e
+   override-values:override-values-task: 
+   override-values:override-values-task: > override-values-task
+   override-values:override-values-task: > echo running-override-values-task > lib/bar.min.txt
+@@ -86,7 +80,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: override-values (esc)
+   \xe2\x80\xa2 Running override-values-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  override-values:override-values-task: cache miss, executing 6e7cf8bdd5c83b50
++  override-values:override-values-task: cache miss, executing e78785787e17e37e
+   override-values:override-values-task: 
+   override-values:override-values-task: > override-values-task
+   override-values:override-values-task: > echo running-override-values-task > lib/bar.min.txt
+@@ -101,7 +95,7 @@ Setup
+   \xe2\x80\xa2 Packages in scope: override-values (esc)
+   \xe2\x80\xa2 Running override-values-task in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  override-values:override-values-task: cache hit, replaying logs 6e7cf8bdd5c83b50
++  override-values:override-values-task: cache hit, replaying logs e78785787e17e37e
+   override-values:override-values-task: 
+   override-values:override-values-task: > override-values-task
+   override-values:override-values-task: > echo running-override-values-task > lib/bar.min.txt
+diff --git a/turborepo-tests/integration/tests/workspace-configs/persistent.t b/turborepo-tests/integration/tests/workspace-configs/persistent.t
+index 838c5d6f61..c6ead0abd6 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/persistent.t
++++ b/turborepo-tests/integration/tests/workspace-configs/persistent.t
+@@ -30,13 +30,13 @@ This test covers:
+   \xe2\x80\xa2 Packages in scope: persistent (esc)
+   \xe2\x80\xa2 Running persistent-task-2-parent in 1 packages (esc)
+   \xe2\x80\xa2 Remote caching disabled (esc)
+-  persistent:persistent-task-2: cache miss, executing a1be4f21d178a0ac
++  persistent:persistent-task-2: cache miss, executing 7f08cefb45c613d2
+   persistent:persistent-task-2: 
+   persistent:persistent-task-2: > persistent-task-2
+   persistent:persistent-task-2: > echo persistent-task-2
+   persistent:persistent-task-2: 
+   persistent:persistent-task-2: persistent-task-2
+-  persistent:persistent-task-2-parent: cache miss, executing 3a82d48ad00259f4
++  persistent:persistent-task-2-parent: cache miss, executing affde90eaca06703
+   persistent:persistent-task-2-parent: 
+   persistent:persistent-task-2-parent: > persistent-task-2-parent
+   persistent:persistent-task-2-parent: > echo persistent-task-2-parent

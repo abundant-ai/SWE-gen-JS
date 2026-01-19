@@ -1,0 +1,538 @@
+diff --git a/crates/turborepo-lib/src/cli/mod.rs b/crates/turborepo-lib/src/cli/mod.rs
+index 794db7970d..d5babe4f7f 100644
+--- a/crates/turborepo-lib/src/cli/mod.rs
++++ b/crates/turborepo-lib/src/cli/mod.rs
+@@ -1167,11 +1167,16 @@ pub async fn run(
+ 
+             args.track(&event);
+             event.track_run_code_path(CodePath::Rust);
+-            let exit_code = run::run(base, event).await.inspect(|code| {
+-                if *code != 0 {
+-                    error!("run failed: command  exited ({code})");
+-                }
+-            })?;
++            let exit_code = run::run(base, event)
++                .await
++                .inspect(|code| {
++                    if *code != 0 {
++                        error!("run failed: command  exited ({code})");
++                    }
++                })
++                .inspect_err(|err| {
++                    error!("run failed: {err}");
++                })?;
+             Ok(exit_code)
+         }
+         Command::Prune {
+diff --git a/crates/turborepo-lib/src/config.rs b/crates/turborepo-lib/src/config.rs
+index be0c8110d0..0799858376 100644
+--- a/crates/turborepo-lib/src/config.rs
++++ b/crates/turborepo-lib/src/config.rs
+@@ -25,7 +25,7 @@ pub enum Error {
+     #[error(transparent)]
+     PackageJson(#[from] turborepo_repository::package_json::Error),
+     #[error(
+-        "Could not find turbo.json.\nFollow directions at https://turbo.build/repo/docs to create \
++        "Could not find turbo.json. Follow directions at https://turbo.build/repo/docs to create \
+          one"
+     )]
+     NoTurboJSON,
+diff --git a/crates/turborepo-lib/src/lib.rs b/crates/turborepo-lib/src/lib.rs
+index 8a4c3b3f91..b45df0b708 100644
+--- a/crates/turborepo-lib/src/lib.rs
++++ b/crates/turborepo-lib/src/lib.rs
+@@ -33,6 +33,8 @@ mod tracing;
+ mod turbo_json;
+ mod unescape;
+ 
++use miette::Report;
++
+ pub use crate::{
+     child::spawn_child,
+     cli::Args,
+@@ -41,6 +43,7 @@ pub use crate::{
+     execution_state::ExecutionState,
+     run::package_discovery::DaemonPackageDiscovery,
+ };
++use crate::{engine::BuilderError, shim::Error};
+ 
+ pub fn get_version() -> &'static str {
+     include_str!("../../../version.txt")
+@@ -52,5 +55,49 @@ pub fn get_version() -> &'static str {
+ }
+ 
+ pub fn main() -> Result<i32, shim::Error> {
+-    shim::run()
++    match shim::run() {
++        Ok(code) => Ok(code),
++        // We only print using miette for some errors because we want to keep
++        // compatibility with Go. When we've deleted the Go code we can
++        // move all errors to miette since it provides slightly nicer
++        // printing out of the box.
++        Err(
++            err @ (Error::MultipleCwd(..)
++            | Error::EmptyCwd { .. }
++            | Error::Cli(cli::Error::Run(run::Error::Builder(engine::BuilderError::Config(
++                config::Error::InvalidEnvPrefix { .. },
++            ))))
++            | Error::Cli(cli::Error::Run(run::Error::Config(
++                config::Error::InvalidEnvPrefix { .. },
++            )))
++            | Error::Cli(cli::Error::Run(run::Error::Config(
++                config::Error::TurboJsonParseError(_),
++            )))
++            | Error::Cli(cli::Error::Run(run::Error::Builder(BuilderError::Config(
++                config::Error::TurboJsonParseError(_),
++            ))))
++            | Error::Cli(cli::Error::Run(run::Error::Config(
++                config::Error::PackageTaskInSinglePackageMode { .. },
++            )))
++            | Error::Cli(cli::Error::Run(run::Error::Builder(
++                engine::BuilderError::Validation { .. },
++            )))
++            | Error::Cli(cli::Error::Run(run::Error::Builder(engine::BuilderError::Config(
++                ..,
++            ))))),
++        ) => {
++            println!("{:?}", Report::new(err));
++
++            Ok(1)
++        }
++        // We don't need to print "Turbo error" for Run errors
++        Err(err @ shim::Error::Cli(cli::Error::Run(_))) => Err(err),
++        Err(err) => {
++            // This raw print matches the Go behavior, once we no longer care
++            // about matching formatting we should remove this.
++            println!("Turbo error: {err}");
++
++            Err(err)
++        }
++    }
+ }
+diff --git a/crates/turborepo/src/main.rs b/crates/turborepo/src/main.rs
+index e00c9b6453..592957591f 100644
+--- a/crates/turborepo/src/main.rs
++++ b/crates/turborepo/src/main.rs
+@@ -6,7 +6,6 @@ mod panic_handler;
+ use std::process;
+ 
+ use anyhow::Result;
+-use miette::Report;
+ 
+ use crate::panic_handler::panic_handler;
+ 
+@@ -15,10 +14,7 @@ use crate::panic_handler::panic_handler;
+ fn main() -> Result<()> {
+     std::panic::set_hook(Box::new(panic_handler));
+ 
+-    let exit_code = turborepo_lib::main().unwrap_or_else(|err| {
+-        println!("{:?}", Report::new(err));
+-        1
+-    });
++    let exit_code = turborepo_lib::main().unwrap_or(1);
+ 
+     process::exit(exit_code)
+ }
+diff --git a/turborepo-tests/integration/tests/bad-turbo-json.t b/turborepo-tests/integration/tests/bad-turbo-json.t
+index 2b1c758f7b..5e69867bb9 100644
+--- a/turborepo-tests/integration/tests/bad-turbo-json.t
++++ b/turborepo-tests/integration/tests/bad-turbo-json.t
+@@ -6,6 +6,7 @@ Add turbo.json with unnecessary package task syntax to a package
+ 
+ Run build with package task in non-root turbo.json
+   $ EXPERIMENTAL_RUST_CODEPATH=true ${TURBO} build
++   ERROR  run failed: invalid turbo json
+     x invalid turbo json
+   
+   Error: unnecessary_package_task_syntax (https://turbo.build/messages/unnecessary-package-task-syntax)
+@@ -34,6 +35,7 @@ Use our custom turbo config with an invalid env var
+ 
+ Run build with invalid env var
+   $ EXPERIMENTAL_RUST_CODEPATH=true ${TURBO} build
++   ERROR  run failed: Environment variables should not be prefixed with "$"
+   invalid_env_prefix (https://turbo.build/messages/invalid-env-prefix)
+   
+     x Environment variables should not be prefixed with "$"
+@@ -51,6 +53,7 @@ Run build with invalid env var
+ 
+ Run in single package mode even though we have a task with package syntax
+   $ EXPERIMENTAL_RUST_CODEPATH=true ${TURBO} build --single-package
++   ERROR  run failed: Package tasks (<package>#<task>) are not allowed in single-package repositories: found //#something
+   package_task_in_single_package_mode (https://turbo.build/messages/package-task-in-single-package-mode)
+   
+     x Package tasks (<package>#<task>) are not allowed in single-package
+@@ -72,6 +75,7 @@ Use our custom turbo config with syntax errors
+ 
+ Run build with syntax errors in turbo.json
+   $ EXPERIMENTAL_RUST_CODEPATH=true ${TURBO} build
++   ERROR  run failed: failed to parse turbo json
+   turbo_json_parse_error
+   
+     x failed to parse turbo json
+@@ -111,5 +115,4 @@ Run build with syntax errors in turbo.json
+ 
+ 
+ 
+-
+ [1]
+diff --git a/turborepo-tests/integration/tests/command-version.t b/turborepo-tests/integration/tests/command-version.t
+index f764282530..0cc8aba5a6 100644
+--- a/turborepo-tests/integration/tests/command-version.t
++++ b/turborepo-tests/integration/tests/command-version.t
+@@ -8,6 +8,5 @@ Test version matches that of version.txt
+ 
+ TODO: resolve ambiguity
+   $ ${TURBO} -v
+-    x No command specified
+-  
++  Turbo error: No command specified
+   [1]
+diff --git a/turborepo-tests/integration/tests/config.t b/turborepo-tests/integration/tests/config.t
+index 33aafd373e..b8d2d1054a 100644
+--- a/turborepo-tests/integration/tests/config.t
++++ b/turborepo-tests/integration/tests/config.t
+@@ -48,6 +48,7 @@ Use our custom turbo config with an invalid env var
+ 
+ Run build with invalid env var
+   $ EXPERIMENTAL_RUST_CODEPATH=true ${TURBO} build
++   ERROR  run failed: Environment variables should not be prefixed with "$"
+   invalid_env_prefix (https://turbo.build/messages/invalid-env-prefix)
+   
+     x Environment variables should not be prefixed with "$"
+diff --git a/turborepo-tests/integration/tests/daemon/verbosity.t b/turborepo-tests/integration/tests/daemon/verbosity.t
+index e31248fab5..3784641d8d 100644
+--- a/turborepo-tests/integration/tests/daemon/verbosity.t
++++ b/turborepo-tests/integration/tests/daemon/verbosity.t
+@@ -5,17 +5,17 @@ TURBO_LOG_VERBOSITY should be respected
+   $ TURBO_LOG_VERBOSITY=debug ${TURBO} daemon status > tmp.log 2>&1
+   [1]
+   $ grep --quiet -E "\[DEBUG].*" tmp.log
+-  $ tail -n3 tmp.log | grep --quiet "x unable to connect: daemon is not running"
++  $ tail -n1 tmp.log | grep --quiet "Turbo error: unable to connect: daemon is not running"
+ 
+ -v flag overrides TURBO_LOG_VERBOSITY global setting
+   $ TURBO_LOG_VERBOSITY=debug ${TURBO} daemon status -v > tmp.log 2>&1
+   [1]
+   $ grep --quiet -E "\[DEBUG].*" tmp.log # DEBUG logs not found
+   [1]
+-  $ tail -n3 tmp.log | grep --quiet "x unable to connect: daemon is not running"
++  $ tail -n1 tmp.log | grep --quiet "Turbo error: unable to connect: daemon is not running"
+ 
+ verbosity doesn't override TURBO_LOG_VERBOSITY package settings
+   $ TURBO_LOG_VERBOSITY=turborepo_lib=debug ${TURBO} daemon status -v > tmp.log 2>&1
+   [1]
+   $ grep --quiet -E "\[DEBUG].*" tmp.log
+-  $ tail -n3 tmp.log | grep --quiet "x unable to connect: daemon is not running"
++  $ tail -n1 tmp.log | grep --quiet "Turbo error: unable to connect: daemon is not running"
+diff --git a/turborepo-tests/integration/tests/dry-json/monorepo.t b/turborepo-tests/integration/tests/dry-json/monorepo.t
+index 8e98b70eaa..cf3597f507 100644
+--- a/turborepo-tests/integration/tests/dry-json/monorepo.t
++++ b/turborepo-tests/integration/tests/dry-json/monorepo.t
+@@ -179,6 +179,5 @@ Run again with NODE_ENV set and see the value in the summary. --filter=util work
+ 
+ Tasks that don't exist throw an error
+   $ ${TURBO} run doesnotexist --dry=json
+-    x Could not find the following tasks in project: doesnotexist
+-  
++   ERROR  run failed:( error preparing engine:)? Could not find the following tasks in project: doesnotexist (re)
+   [1]
+diff --git a/turborepo-tests/integration/tests/inference/nested-workspaces.t b/turborepo-tests/integration/tests/inference/nested-workspaces.t
+index 6e2363bde7..55263fc341 100644
+--- a/turborepo-tests/integration/tests/inference/nested-workspaces.t
++++ b/turborepo-tests/integration/tests/inference/nested-workspaces.t
+@@ -22,27 +22,23 @@ Locate a repository with no turbo.json. We'll get the right root, but there's no
+   $ cd $TARGET_DIR/outer/inner-no-turbo && ${TURBO} run build --filter=nothing -vv 1> INNER_NO_TURBO 2>&1
+   [1]
+   $ grep --quiet -E "Repository Root: .*[\/\\]nested_workspaces[\/\\]outer[\/\\]inner-no-turbo" INNER_NO_TURBO
+-  $ grep --quiet "x Could not find turbo.json." INNER_NO_TURBO
+-  $ grep --quiet "| Follow directions at https://turbo.build/repo/docs to create one" INNER_NO_TURBO
++  $ grep --quiet "Could not find turbo.json. Follow directions at https://turbo.build/repo/docs to create one" INNER_NO_TURBO
+ 
+ Locate a repository with no turbo.json. We'll get the right root and inference directory, but there's nothing to run
+   $ cd $TARGET_DIR/outer/inner-no-turbo/apps && ${TURBO} run build --filter=nothing -vv 1> INNER_NO_TURBO_APPS 2>&1
+   [1]
+   $ grep --quiet -E "Repository Root: .*[\/\\]nested_workspaces[\/\\]outer[\/\\]inner-no-turbo" INNER_NO_TURBO_APPS
+-  $ grep --quiet "x Could not find turbo.json." INNER_NO_TURBO_APPS
+-  $ grep --quiet "| Follow directions at https://turbo.build/repo/docs to create one" INNER_NO_TURBO_APPS
++  $ grep --quiet "Could not find turbo.json. Follow directions at https://turbo.build/repo/docs to create one" INNER_NO_TURBO_APPS
+ 
+   $ cd $TARGET_DIR/outer-no-turbo && ${TURBO} run build --filter=nothing -vv 1> OUTER_NO_TURBO 2>&1
+   [1]
+   $ grep --quiet -E "Repository Root: .*[\/\\]nested_workspaces[\/\\]outer-no-turbo" OUTER_NO_TURBO
+-  $ grep --quiet "x Could not find turbo.json." OUTER_NO_TURBO
+-  $ grep --quiet "| Follow directions at https://turbo.build/repo/docs to create one" OUTER_NO_TURBO
++  $ grep --quiet "Could not find turbo.json. Follow directions at https://turbo.build/repo/docs to create one" OUTER_NO_TURBO
+ 
+   $ cd $TARGET_DIR/outer-no-turbo/apps && ${TURBO} run build --filter=nothing -vv 1> OUTER_NO_TURBO_APPS 2>&1
+   [1]
+   $ grep --quiet -E "Repository Root: .*[\/\\]nested_workspaces[\/\\]outer-no-turbo" OUTER_NO_TURBO_APPS
+-  $ grep --quiet "x Could not find turbo.json." OUTER_NO_TURBO_APPS
+-  $ grep --quiet "| Follow directions at https://turbo.build/repo/docs to create one" OUTER_NO_TURBO_APPS
++  $ grep --quiet "Could not find turbo.json. Follow directions at https://turbo.build/repo/docs to create one" OUTER_NO_TURBO_APPS
+ 
+   $ cd $TARGET_DIR/outer-no-turbo/inner && ${TURBO} run build --filter=nothing -vv 1> OUTER_NO_TURBO_INNER 2>&1
+   $ grep --quiet -E "Repository Root: .*[\/\\]nested_workspaces[\/\\]outer-no-turbo[\/\\]inner" OUTER_NO_TURBO_INNER
+@@ -55,12 +51,10 @@ Locate a repository with no turbo.json. We'll get the right root and inference d
+   $ cd $TARGET_DIR/outer-no-turbo/inner-no-turbo && ${TURBO} run build --filter=nothing -vv 1> INNER_NO_TURBO 2>&1
+   [1]
+   $ grep --quiet -E "Repository Root: .*[\/\\]nested_workspaces[\/\\]outer-no-turbo[\/\\]inner-no-turbo" INNER_NO_TURBO
+-  $ grep --quiet "x Could not find turbo.json." INNER_NO_TURBO
+-  $ grep --quiet "| Follow directions at https://turbo.build/repo/docs to create one" INNER_NO_TURBO
++  $ grep --quiet "Could not find turbo.json. Follow directions at https://turbo.build/repo/docs to create one" INNER_NO_TURBO
+ 
+   $ cd $TARGET_DIR/outer-no-turbo/inner-no-turbo/apps && ${TURBO} run build --filter=nothing -vv 1> INNER_NO_TURBO_APPS 2>&1
+   [1]
+   $ grep --quiet -E "Repository Root: .*[\/\\]nested_workspaces[\/\\]outer-no-turbo[\/\\]inner-no-turbo" INNER_NO_TURBO_APPS
+-  $ grep --quiet "x Could not find turbo.json." INNER_NO_TURBO_APPS
+-  $ grep --quiet "| Follow directions at https://turbo.build/repo/docs to create one" INNER_NO_TURBO_APPS
++  $ grep --quiet "Could not find turbo.json. Follow directions at https://turbo.build/repo/docs to create one" INNER_NO_TURBO_APPS
+ 
+diff --git a/turborepo-tests/integration/tests/no-args.t b/turborepo-tests/integration/tests/no-args.t
+index 5150f9a763..1466e57372 100644
+--- a/turborepo-tests/integration/tests/no-args.t
++++ b/turborepo-tests/integration/tests/no-args.t
+@@ -101,8 +101,7 @@ Make sure exit code is 2 when no args are passed
+   [1]
+ 
+   $ ${TURBO} run
+-    x at least one task must be specified
+-  
++  Turbo error: at least one task must be specified
+   [1]
+ 
+ Run again with an environment variable that corresponds to a run argument and assert that
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/1-topological.t b/turborepo-tests/integration/tests/persistent-dependencies/1-topological.t
+index cee436c0de..066d1123fc 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/1-topological.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/1-topological.t
+@@ -13,7 +13,6 @@
+ // app-a#dev
+ // └── pkg-a#dev
+   $ ${TURBO} run dev
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "pkg-a#dev" is a persistent task, "app-a#dev" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "pkg-a#dev" is a persistent task, "app-a#dev" cannot depend on it
+   [1]
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/10-too-many.t b/turborepo-tests/integration/tests/persistent-dependencies/10-too-many.t
+index 026ae7f697..de67114e81 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/10-too-many.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/10-too-many.t
+@@ -2,17 +2,13 @@
+   $ . ${TESTDIR}/../../../helpers/setup_integration_test.sh persistent_dependencies/10-too-many
+ 
+   $ ${TURBO} run build --concurrency=1
+-    x error preparing engine: Invalid persistent task configuration:
+-    | You have 2 persistent tasks but `turbo` is configured for concurrency of
+-    | 1. Set --concurrency to at least 3
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  You have 2 persistent tasks but `turbo` is configured for concurrency of 1. Set --concurrency to at least 3
+   [1]
+ 
+   $ ${TURBO} run build --concurrency=2
+-    x error preparing engine: Invalid persistent task configuration:
+-    | You have 2 persistent tasks but `turbo` is configured for concurrency of
+-    | 2. Set --concurrency to at least 3
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  You have 2 persistent tasks but `turbo` is configured for concurrency of 2. Set --concurrency to at least 3
+   [1]
+ 
+   $ ${TURBO} run build --concurrency=3 > tmp.log 2>&1
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/2-same-workspace.t b/turborepo-tests/integration/tests/persistent-dependencies/2-same-workspace.t
+index 83e3189343..f13e02f502 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/2-same-workspace.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/2-same-workspace.t
+@@ -13,7 +13,6 @@
+ // └── app-a#dev
+ //
+   $ ${TURBO} run build
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "app-a#dev" is a persistent task, "app-a#build" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "app-a#dev" is a persistent task, "app-a#build" cannot depend on it
+   [1]
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/3-workspace-specific.t b/turborepo-tests/integration/tests/persistent-dependencies/3-workspace-specific.t
+index 29de298675..7f9153ce3f 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/3-workspace-specific.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/3-workspace-specific.t
+@@ -17,8 +17,7 @@
+ #
+ # The regex match is liberal, because the build task from either workspace can throw the error
+   $ ${TURBO} run build
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "pkg-a#dev" is a persistent task, "app-a#build" cannot depend on it
+-    | "pkg-a#dev" is a persistent task, "pkg-a#build" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "pkg-a#dev" is a persistent task, "app-a#build" cannot depend on it
++  "pkg-a#dev" is a persistent task, "pkg-a#build" cannot depend on it
+   [1]
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/4-cross-workspace.t b/turborepo-tests/integration/tests/persistent-dependencies/4-cross-workspace.t
+index b3e49dd778..2d2954d35c 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/4-cross-workspace.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/4-cross-workspace.t
+@@ -7,7 +7,6 @@
+ # app-a#dev
+ # └── pkg-a#dev
+   $ ${TURBO} run dev
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "pkg-a#dev" is a persistent task, "app-a#dev" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "pkg-a#dev" is a persistent task, "app-a#dev" cannot depend on it
+   [1]
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/5-root-workspace.t b/turborepo-tests/integration/tests/persistent-dependencies/5-root-workspace.t
+index 2b6b761ff2..4970f2c1dc 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/5-root-workspace.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/5-root-workspace.t
+@@ -13,7 +13,6 @@
+ # └── //#dev
+ #
+   $ ${TURBO} run build
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "//#dev" is a persistent task, "app-a#build" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "//#dev" is a persistent task, "app-a#build" cannot depend on it
+   [1]
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/7-topological-nested.t b/turborepo-tests/integration/tests/persistent-dependencies/7-topological-nested.t
+index 21b349d01a..bb2645aeb3 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/7-topological-nested.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/7-topological-nested.t
+@@ -20,7 +20,6 @@
+ # error message should say. Leaving as-is so we don't have to implement special casing logic to handle
+ # this case.
+   $ ${TURBO} run dev
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "pkg-b#dev" is a persistent task, "pkg-a#dev" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "pkg-b#dev" is a persistent task, "pkg-a#dev" cannot depend on it
+   [1]
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/8-topological-with-extra.t b/turborepo-tests/integration/tests/persistent-dependencies/8-topological-with-extra.t
+index d94429ab6b..cd3a1f478d 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/8-topological-with-extra.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/8-topological-with-extra.t
+@@ -19,7 +19,6 @@
+ // 		 └── workspace-c#build
+ // 		 		 └── workspace-z#dev	// this one is persistent
+   $ ${TURBO} run build
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "pkg-z#dev" is a persistent task, "pkg-b#build" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "pkg-z#dev" is a persistent task, "pkg-b#build" cannot depend on it
+   [1]
+diff --git a/turborepo-tests/integration/tests/persistent-dependencies/9-cross-workspace-nested.t b/turborepo-tests/integration/tests/persistent-dependencies/9-cross-workspace-nested.t
+index c551ca1db7..0a0c609fea 100644
+--- a/turborepo-tests/integration/tests/persistent-dependencies/9-cross-workspace-nested.t
++++ b/turborepo-tests/integration/tests/persistent-dependencies/9-cross-workspace-nested.t
+@@ -12,7 +12,6 @@
+ // 		 		 └── workspace-z#dev // this one is persistent
+ //
+   $ ${TURBO} run build
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "app-z#dev" is a persistent task, "app-c#build" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "app-z#dev" is a persistent task, "app-c#build" cannot depend on it
+   [1]
+diff --git a/turborepo-tests/integration/tests/run/missing-tasks.t b/turborepo-tests/integration/tests/run/missing-tasks.t
+index d36d2c1859..a37d9af19d 100644
+--- a/turborepo-tests/integration/tests/run/missing-tasks.t
++++ b/turborepo-tests/integration/tests/run/missing-tasks.t
+@@ -3,31 +3,22 @@ Setup
+ 
+ # Running non-existent tasks errors
+   $ ${TURBO} run doesnotexist
+-    x Could not find the following tasks in project: doesnotexist
+-  
++   ERROR  run failed:( error preparing engine:)? Could not find the following tasks in project: doesnotexist (re)
+   [1]
+ 
+ # Multiple non-existent tasks also error
+   $ ${TURBO} run doesnotexist alsono
+-    x Could not find the following tasks in project: alsono, doesnotexist
+-  
++   ERROR  run failed:( error preparing engine:)? Could not find the following tasks in project: alsono, doesnotexist (re)
+   [1]
+ 
+ # One good and one bad task does not error
+   $ ${TURBO} run build doesnotexist
+-    x Could not find the following tasks in project: doesnotexist
+-  
++   ERROR  run failed:( error preparing engine:)? Could not find the following tasks in project: doesnotexist (re)
+   [1]
+ 
+ # Bad command
+-  $ ${TURBO} run something --dry > OUTPUT 2>&1
+-  [1]
+-  $ grep --quiet -E "root task (//#)?something \(turbo run build\) looks like it invokes turbo and" OUTPUT
+-  $ grep --quiet -E "might cause a loop" OUTPUT
++  $ ${TURBO} run something --dry 2>&1 | grep --quiet -E "root task (//#)?something \(turbo run build\) looks like it invokes turbo and might cause a loop"
+ 
+ # Bad command
++  $ ${TURBO} run something 2>&1 | grep --quiet -E "root task (//#)?something \(turbo run build\) looks like it invokes turbo and might cause a loop"
+ 
+-  $ ${TURBO} run something > OUTPUT2 2>&1
+-  [1]
+-  $ grep --quiet -E "root task (//#)?something \(turbo run build\) looks like it invokes turbo and" OUTPUT
+-  $ grep --quiet -E "might cause a loop" OUTPUT
+diff --git a/turborepo-tests/integration/tests/task-dependencies/workspace-tasks.t b/turborepo-tests/integration/tests/task-dependencies/workspace-tasks.t
+index e0f6998173..159021d5fb 100644
+--- a/turborepo-tests/integration/tests/task-dependencies/workspace-tasks.t
++++ b/turborepo-tests/integration/tests/task-dependencies/workspace-tasks.t
+@@ -37,8 +37,8 @@ Can depend on root tasks
+ Can't depend on a missing root task
+   $ ${TURBO} run build3 --graph > BUILD3 2>&1
+   [1]
+-  $ cat BUILD3 | grep --quiet --only-match 'x //#not-exists needs an entry in turbo.json before it can be depended on'
+-  $ cat BUILD3 | grep --quiet --only-match 'because it is a task run from the root package'
++  $ cat BUILD3 | grep --only-match '//#not-exists needs an entry in turbo.json before it can be depended on because it is a task run from the root package'
++  //#not-exists needs an entry in turbo.json before it can be depended on because it is a task run from the root package
+ 
+ Package tasks can depend on things
+   $ ${TURBO} run special --graph
+diff --git a/turborepo-tests/integration/tests/workspace-configs/persistent.t b/turborepo-tests/integration/tests/workspace-configs/persistent.t
+index 79d14d51ab..e65e1ced3b 100644
+--- a/turborepo-tests/integration/tests/workspace-configs/persistent.t
++++ b/turborepo-tests/integration/tests/workspace-configs/persistent.t
+@@ -10,10 +10,8 @@ This test covers:
+ # persistent-task-1-parent dependsOn persistent-task-1
+ # persistent-task-1 is persistent:true in the root workspace, and does NOT get overriden in the workspace
+   $ ${TURBO} run persistent-task-1-parent --filter=persistent
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "persistent#persistent-task-1" is a persistent task,
+-    | "persistent#persistent-task-1-parent" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "persistent#persistent-task-1" is a persistent task, "persistent#persistent-task-1-parent" cannot depend on it
+   [1]
+ 
+ # persistent-task-2-parent dependsOn persistent-task-2
+@@ -43,17 +41,13 @@ This test covers:
+ # persistent-task-3 is persistent:true in the root workspace
+ # persistent-task-3 is defined in workspace, but does NOT have the persistent flag
+   $ ${TURBO} run persistent-task-3-parent --filter=persistent
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "persistent#persistent-task-3" is a persistent task,
+-    | "persistent#persistent-task-3-parent" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "persistent#persistent-task-3" is a persistent task, "persistent#persistent-task-3-parent" cannot depend on it
+   [1]
+ 
+ # persistent-task-4-parent dependsOn persistent-task-4
+ # persistent-task-4 has no config in the root workspace, and is set to true in the workspace
+   $ ${TURBO} run persistent-task-4-parent --filter=persistent
+-    x error preparing engine: Invalid persistent task configuration:
+-    | "persistent#persistent-task-4" is a persistent task,
+-    | "persistent#persistent-task-4-parent" cannot depend on it
+-  
++   ERROR  run failed: error preparing engine: Invalid persistent task configuration:
++  "persistent#persistent-task-4" is a persistent task, "persistent#persistent-task-4-parent" cannot depend on it
+   [1]

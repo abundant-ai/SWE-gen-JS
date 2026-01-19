@@ -1,0 +1,655 @@
+diff --git a/.changeset/four-buttons-remember.md b/.changeset/four-buttons-remember.md
+deleted file mode 100644
+index 3c76532bb..000000000
+--- a/.changeset/four-buttons-remember.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'@verdaccio/web': patch
+----
+-
+-chore(web): move utils to web package
+diff --git a/packages/web/package.json b/packages/web/package.json
+index 5b791e1be..261df32b1 100644
+--- a/packages/web/package.json
++++ b/packages/web/package.json
+@@ -37,6 +37,7 @@
+     "@verdaccio/store": "workspace:8.0.0-next-8.15",
+     "@verdaccio/tarball": "workspace:13.0.0-next-8.15",
+     "@verdaccio/url": "workspace:13.0.0-next-8.15",
++    "@verdaccio/utils": "workspace:8.1.0-next-8.15",
+     "debug": "4.4.0",
+     "express": "4.21.2",
+     "lodash": "4.17.21"
+diff --git a/packages/web/src/api/package.ts b/packages/web/src/api/package.ts
+index f996ce5a6..56dae2f7a 100644
+--- a/packages/web/src/api/package.ts
++++ b/packages/web/src/api/package.ts
+@@ -10,8 +10,8 @@ import { WebUrls } from '@verdaccio/middleware';
+ import { Storage } from '@verdaccio/store';
+ import { getLocalRegistryTarballUri } from '@verdaccio/tarball';
+ import { Config, RemoteUser, Version } from '@verdaccio/types';
++import { formatAuthor, generateGravatarUrl } from '@verdaccio/utils';
+ 
+-import { formatAuthor, generateGravatarUrl } from '../author-utils';
+ import { sortByName } from '../web-utils';
+ 
+ export { $RequestExtend, $ResponseExtend, $NextFunctionVer }; // Was required by other packages
+diff --git a/packages/web/src/api/readme.ts b/packages/web/src/api/readme.ts
+index a21ef9d80..529280b79 100644
+--- a/packages/web/src/api/readme.ts
++++ b/packages/web/src/api/readme.ts
+@@ -9,13 +9,15 @@ import { $NextFunctionVer, $RequestExtend, $ResponseExtend, allow } from '@verda
+ import { WebUrls } from '@verdaccio/middleware';
+ import { Storage } from '@verdaccio/store';
+ import { Manifest } from '@verdaccio/types';
++import { isVersionValid } from '@verdaccio/utils';
+ 
+-import { addScope, isVersionValid } from '../web-utils';
++import { AuthorAvatar, addScope } from '../web-utils';
+ 
+ export { $RequestExtend, $ResponseExtend, $NextFunctionVer }; // Was required by other packages
+ 
++// TODO: review this type, should be on @verdacid/types
++export type PackageExt = Manifest & { author: AuthorAvatar; dist?: { tarball: string } };
+ export const NOT_README_FOUND = 'ERROR: No README data found!';
+-
+ const debug = buildDebug('verdaccio:web:api:readme');
+ 
+ const getReadme = (readme) => {
+@@ -85,7 +87,6 @@ function addReadmeWebApi(storage: Storage, auth: Auth): Router {
+         })) as Manifest;
+         debug('readme pkg %o', manifest?.name);
+         res.set(HEADER_TYPE.CONTENT_TYPE, HEADERS.TEXT_PLAIN_UTF8);
+-        // TODO: sanitize query
+         const { v } = req.query;
+         const readme = getReadmeFromManifest(manifest, v);
+         next(getReadme(readme));
+diff --git a/packages/web/src/api/sidebar.ts b/packages/web/src/api/sidebar.ts
+index e817def2c..95d8f9eb0 100644
+--- a/packages/web/src/api/sidebar.ts
++++ b/packages/web/src/api/sidebar.ts
+@@ -9,13 +9,16 @@ import { $NextFunctionVer, $RequestExtend, $ResponseExtend, allow } from '@verda
+ import { WebUrls } from '@verdaccio/middleware';
+ import { Storage } from '@verdaccio/store';
+ import { convertDistRemoteToLocalTarballUrls } from '@verdaccio/tarball';
+-import { Config, Manifest, WebManifest } from '@verdaccio/types';
++import { Config, Manifest, Version } from '@verdaccio/types';
++import { addGravatarSupport, formatAuthor, isVersionValid } from '@verdaccio/utils';
+ 
+-import { addGravatarSupport, formatAuthor } from '../author-utils';
+-import { addScope, deleteProperties, isVersionValid } from '../web-utils';
++import { AuthorAvatar, addScope, deleteProperties } from '../web-utils';
+ 
+ export { $RequestExtend, $ResponseExtend, $NextFunctionVer }; // Was required by other packages
+ 
++export type PackageExt = Manifest & { author: AuthorAvatar; dist?: { tarball: string } };
++
++export type $SidebarPackage = Manifest & { latest: Version };
+ const debug = buildDebug('verdaccio:web:api:sidebar');
+ 
+ function addSidebarWebApi(config: Config, storage: Storage, auth: Auth): Router {
+@@ -51,19 +54,23 @@ function addSidebarWebApi(config: Config, storage: Storage, auth: Auth): Router
+           keepUpLinkData: true,
+           requestOptions,
+         })) as Manifest;
+-        // TODO: sanitize query
+         const { v } = req.query;
+-        let sideBarInfo = { ...info } as WebManifest;
++        let sideBarInfo = { ...info };
+         sideBarInfo.versions = convertDistRemoteToLocalTarballUrls(
+           info,
+           { protocol: req.protocol, headers: req.headers as any, host: req.hostname },
+           config.url_prefix
+         ).versions;
++        // TODO: review this implementation
+         if (typeof v === 'string' && isVersionValid(info, v)) {
++          // @ts-ignore
+           sideBarInfo.latest = sideBarInfo.versions[v];
++          // @ts-ignore
+           sideBarInfo.latest.author = formatAuthor(sideBarInfo.latest.author);
+         } else {
++          // @ts-ignore
+           sideBarInfo.latest = sideBarInfo.versions[info[DIST_TAGS].latest];
++          // @ts-ignore
+           sideBarInfo.latest.author = formatAuthor(sideBarInfo.latest.author);
+         }
+         sideBarInfo = deleteProperties(['readme', '_attachments', '_rev', 'name'], sideBarInfo);
+diff --git a/packages/web/src/author-utils.ts b/packages/web/src/author-utils.ts
+deleted file mode 100644
+index 67addae11..000000000
+--- a/packages/web/src/author-utils.ts
++++ /dev/null
+@@ -1,182 +0,0 @@
+-import { DEFAULT_USER, cryptoUtils } from '@verdaccio/core';
+-import { Author, Person, WebManifest } from '@verdaccio/types';
+-
+-const AVATAR_PROVIDER = 'https://www.gravatar.com/avatar/';
+-
+-export const GENERIC_AVATAR =
+-  'data:image/svg+xml;utf8,' +
+-  encodeURIComponent(
+-    '<svg height="100" viewBox="-27 24 100 100" width="100" xmlns="http://www.w3.org/' +
+-      '2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><defs><circle cx="23" cy="7' +
+-      '4" id="a" r="50"/></defs><use fill="#F5EEE5" overflow="visible" xlink:href="#a"/' +
+-      '><clipPath id="b"><use overflow="visible" xlink:href="#a"/></clipPath><g clip-pa' +
+-      'th="url(#b)"><defs><path d="M36 95.9c0 4 4.7 5.2 7.1 5.8 7.6 2 22.8 5.9 22.8 5.9' +
+-      ' 3.2 1.1 5.7 3.5 7.1 6.6v9.8H-27v-9.8c1.3-3.1 3.9-5.5 7.1-6.6 0 0 15.2-3.9 22.8-' +
+-      '5.9 2.4-.6 7.1-1.8 7.1-5.8V85h26v10.9z" id="c"/></defs><use fill="#E6C19C" overf' +
+-      'low="visible" xlink:href="#c"/><clipPath id="d"><use overflow="visible" xlink:hr' +
+-      'ef="#c"/></clipPath><path clip-path="url(#d)" d="M23.2 35h.2c3.3 0 8.2.2 11.4 2 ' +
+-      '3.3 1.9 7.3 5.6 8.5 12.1 2.4 13.7-2.1 35.4-6.3 42.4-4 6.7-9.8 9.2-13.5 9.4H23h-.' +
+-      '1c-3.7-.2-9.5-2.7-13.5-9.4-4.2-7-8.7-28.7-6.3-42.4 1.2-6.5 5.2-10.2 8.5-12.1 3.2' +
+-      '-1.8 8.1-2 11.4-2h.2z" fill="#D4B08C"/></g><path d="M22.6 40c19.1 0 20.7 13.8 20' +
+-      '.8 15.1 1.1 11.9-3 28.1-6.8 33.7-4 5.9-9.8 8.1-13.5 8.3h-.5c-3.8-.3-9.6-2.5-13.6' +
+-      '-8.4-3.8-5.6-7.9-21.8-6.8-33.8C2.3 53.7 3.5 40 22.6 40z" fill="#F2CEA5"/></svg>'
+-  );
+-
+-/**
+- * Formats author field for webui.
+- * @see https://docs.npmjs.com/files/package.json#author
+- * @param {string|object|undefined} author
+- */
+-export function formatAuthor(author?: Person): any {
+-  let authorDetails = {
+-    name: DEFAULT_USER,
+-    email: '',
+-    url: '',
+-  };
+-
+-  if (author === null || author === undefined) {
+-    return authorDetails;
+-  }
+-
+-  if (typeof author === 'string') {
+-    authorDetails = {
+-      ...authorDetails,
+-      name: author as string,
+-    };
+-  }
+-
+-  if (typeof author === 'object') {
+-    authorDetails = {
+-      ...authorDetails,
+-      ...(author as Author),
+-    };
+-  }
+-
+-  return authorDetails;
+-}
+-
+-export function addGravatarSupport(pkgInfo: WebManifest, online: boolean = true): Author {
+-  const pkgInfoCopy = { ...pkgInfo } as any;
+-  const author: any = pkgInfo?.latest?.author ?? null;
+-  const contributors: Person[] = normalizeAuthors(pkgInfo?.latest?.contributors ?? []);
+-  const maintainers: Person[] = normalizeAuthors(pkgInfo?.latest?.maintainers ?? []);
+-
+-  // for author
+-  if (author && typeof author === 'object') {
+-    const { email } = author as Author;
+-    pkgInfoCopy.latest.author._avatar = generateGravatarUrl(email, online);
+-  } else if (author && typeof author === 'string') {
+-    const { email, name, url } = splitAuthorString(author);
+-    pkgInfoCopy.latest.author = {
+-      _avatar: generateGravatarUrl(email, online),
+-      email,
+-      name,
+-      url,
+-    };
+-  }
+-
+-  // for contributors
+-  if (contributors && contributors.length > 0) {
+-    pkgInfoCopy.latest.contributors = contributors.map((contributor): Person => {
+-      if (typeof contributor === 'object') {
+-        contributor._avatar = generateGravatarUrl(contributor.email, online);
+-      } else if (typeof contributor === 'string') {
+-        const { email, name, url } = splitAuthorString(contributor);
+-        contributor = {
+-          _avatar: generateGravatarUrl(email, online),
+-          email,
+-          name,
+-          url,
+-        };
+-      }
+-
+-      return contributor;
+-    });
+-  }
+-
+-  // for maintainers
+-  if (maintainers && maintainers.length > 0) {
+-    pkgInfoCopy.latest.maintainers = maintainers.map((maintainer): Person => {
+-      if (typeof maintainer === 'object') {
+-        maintainer._avatar = generateGravatarUrl(maintainer.email, online);
+-      } else if (typeof maintainer === 'string') {
+-        const { email, name, url } = splitAuthorString(maintainer);
+-        maintainer = {
+-          _avatar: generateGravatarUrl(email, online),
+-          email,
+-          name,
+-          url,
+-        };
+-      }
+-
+-      return maintainer;
+-    });
+-  }
+-
+-  return pkgInfoCopy;
+-}
+-
+-/**
+- * Generate gravatar url from email address
+- */
+-export function generateGravatarUrl(email: string | void = '', online: boolean = true): string {
+-  if (online && typeof email === 'string' && email.length > 0) {
+-    email = email.trim().toLocaleLowerCase();
+-    const emailMD5 = cryptoUtils.stringToMD5(email);
+-    return `${AVATAR_PROVIDER}${emailMD5}`;
+-  }
+-  return GENERIC_AVATAR;
+-}
+-
+-function normalizeAuthors(authors: Person[]): Person[] {
+-  if (authors === null || authors === undefined) {
+-    return [];
+-  } else if (authors && !Array.isArray(authors)) {
+-    return [authors];
+-  } else if (typeof authors === 'string') {
+-    return [
+-      {
+-        name: authors,
+-      },
+-    ];
+-  }
+-
+-  return authors;
+-}
+-
+-/**
+- * Split author string into name, email and url
+- * Example: "Barney Rubble <b@rubble.com> (http://barnyrubble.tumblr.com/)"
+- * @param {string} author
+- * @returns {Object} { name: string, email: string, url: string }
+- */
+-function splitAuthorString(author: string): { name: string; email?: string; url: string } {
+-  // Limit author string length to prevent ReDoS
+-  const maxLength = 256;
+-  const truncatedAuthor = author.slice(0, maxLength);
+-
+-  // Split on fixed delimiters rather than using regex
+-  const emailStart = truncatedAuthor.indexOf('<');
+-  const emailEnd = truncatedAuthor.indexOf('>');
+-  const urlStart = truncatedAuthor.indexOf('(');
+-  const urlEnd = truncatedAuthor.indexOf(')');
+-
+-  let name = truncatedAuthor;
+-  let email = '';
+-  let url = '';
+-
+-  if (emailStart >= 0 && emailEnd > emailStart) {
+-    name = truncatedAuthor.slice(0, emailStart).trim();
+-    email = truncatedAuthor.slice(emailStart + 1, emailEnd).trim();
+-  }
+-
+-  if (urlStart >= 0 && urlEnd > urlStart) {
+-    url = truncatedAuthor.slice(urlStart + 1, urlEnd).trim();
+-  }
+-
+-  return {
+-    name: name || author,
+-    email,
+-    url,
+-  };
+-}
+diff --git a/packages/web/src/index.ts b/packages/web/src/index.ts
+index b98c191c4..0313883f4 100644
+--- a/packages/web/src/index.ts
++++ b/packages/web/src/index.ts
+@@ -1,3 +1,2 @@
+ export { default, DEFAULT_PLUGIN_UI_THEME } from './middleware';
+-export * from './author-utils';
+ export * from './web-utils';
+diff --git a/packages/web/src/web-utils.ts b/packages/web/src/web-utils.ts
+index d7ac1494e..c6d375f0a 100644
+--- a/packages/web/src/web-utils.ts
++++ b/packages/web/src/web-utils.ts
+@@ -1,6 +1,6 @@
+ import _ from 'lodash';
+ 
+-import { ConfigYaml, Manifest } from '@verdaccio/types';
++import { Author, ConfigYaml } from '@verdaccio/types';
+ 
+ export function hasLogin(config: ConfigYaml) {
+   return _.isNil(config?.web?.login) || config?.web?.login === true;
+@@ -13,6 +13,8 @@ export function sortByName(packages: any[], orderAscending: boolean | void = tru
+   });
+ }
+ 
++export type AuthorAvatar = Author & { avatar?: string };
++
+ export function addScope(scope: string, packageName: string): string {
+   return `@${scope}/${packageName}`;
+ }
+@@ -24,13 +26,3 @@ export function deleteProperties(propertiesToDelete: string[], objectItem: any):
+ 
+   return objectItem;
+ }
+-
+-export function isVersionValid(packageMeta: Manifest, packageVersion: string): boolean {
+-  const hasVersion = typeof packageVersion !== 'undefined';
+-  if (!hasVersion) {
+-    return false;
+-  }
+-
+-  const hasMatchVersion = Object.keys(packageMeta.versions).includes(packageVersion);
+-  return hasMatchVersion;
+-}
+diff --git a/packages/web/test/author-utils.spec.ts b/packages/web/test/author-utils.spec.ts
+deleted file mode 100644
+index c385d1e98..000000000
+--- a/packages/web/test/author-utils.spec.ts
++++ /dev/null
+@@ -1,246 +0,0 @@
+-import { describe, expect, test } from 'vitest';
+-
+-import { DEFAULT_USER } from '@verdaccio/core';
+-
+-import {
+-  GENERIC_AVATAR,
+-  addGravatarSupport,
+-  formatAuthor,
+-  generateGravatarUrl,
+-} from '../src/index';
+-
+-describe('Utilities', () => {
+-  describe('formatAuthor', () => {
+-    test('should check author field different values', () => {
+-      const author = 'verdaccioNpm';
+-      expect(formatAuthor(author).name).toEqual(author);
+-    });
+-    test('should check author field for object value', () => {
+-      const user = {
+-        name: 'Verdaccion NPM',
+-        email: 'verdaccio@verdaccio.org',
+-        url: 'https://verdaccio.org',
+-      };
+-      expect(formatAuthor(user).url).toEqual(user.url);
+-      expect(formatAuthor(user).email).toEqual(user.email);
+-      expect(formatAuthor(user).name).toEqual(user.name);
+-    });
+-    test('should check author field for other value', () => {
+-      // @ts-expect-error
+-      expect(formatAuthor(null).name).toEqual(DEFAULT_USER);
+-      // @ts-expect-error
+-      expect(formatAuthor({}).name).toEqual(DEFAULT_USER);
+-      // @ts-expect-error
+-      expect(formatAuthor([]).name).toEqual(DEFAULT_USER);
+-    });
+-  });
+-
+-  describe('User utilities', () => {
+-    test('should generate gravatar url with email', () => {
+-      const gravatarUrl: string = generateGravatarUrl('user@verdaccio.org');
+-
+-      expect(gravatarUrl).toMatch('https://www.gravatar.com/avatar/');
+-      expect(gravatarUrl).not.toMatch('000000000');
+-    });
+-
+-    test('should generate generic gravatar url', () => {
+-      const gravatarUrl: string = generateGravatarUrl();
+-
+-      expect(gravatarUrl).toMatch(GENERIC_AVATAR);
+-    });
+-  });
+-
+-  describe('addGravatarSupport', () => {
+-    test('check for blank object', () => {
+-      // @ts-ignore
+-      expect(addGravatarSupport({})).toEqual({});
+-    });
+-
+-    test('author, contributors and maintainers fields are not present', () => {
+-      const packageInfo = {
+-        latest: {},
+-      };
+-
+-      // @ts-ignore
+-      expect(addGravatarSupport(packageInfo)).toEqual(packageInfo);
+-    });
+-
+-    test('author field is a blank object', () => {
+-      const packageInfo = { latest: { author: {} } };
+-
+-      // @ts-ignore
+-      expect(addGravatarSupport(packageInfo)).toEqual(packageInfo);
+-    });
+-
+-    test('author field is a string type', () => {
+-      const packageInfo = {
+-        latest: { author: 'user@verdccio.org' },
+-      };
+-      const result = {
+-        latest: {
+-          author: {
+-            name: 'user@verdccio.org',
+-            _avatar: GENERIC_AVATAR,
+-            email: '',
+-            url: '',
+-          },
+-        },
+-      };
+-
+-      // @ts-ignore
+-      expect(addGravatarSupport(packageInfo)).toEqual(result);
+-    });
+-
+-    test('author field is an object type with author information', () => {
+-      const packageInfo = {
+-        latest: { author: { name: 'verdaccio', email: 'user@verdccio.org' } },
+-      };
+-      const result = {
+-        latest: {
+-          author: {
+-            _avatar: 'https://www.gravatar.com/avatar/794d7f6ef93d0689437de3c3e48fadc7',
+-            email: 'user@verdccio.org',
+-            name: 'verdaccio',
+-          },
+-        },
+-      };
+-
+-      // @ts-ignore
+-      expect(addGravatarSupport(packageInfo)).toEqual(result);
+-    });
+-
+-    test('contributor field is a blank array', () => {
+-      const packageInfo = {
+-        latest: {
+-          contributors: [],
+-        },
+-      };
+-
+-      // @ts-ignore
+-      expect(addGravatarSupport(packageInfo)).toEqual(packageInfo);
+-    });
+-
+-    describe('contributors', () => {
+-      test('contributors field has contributors', () => {
+-        const packageInfo = {
+-          latest: {
+-            contributors: [
+-              { name: 'user', email: 'user@verdccio.org' },
+-              { name: 'user1', email: 'user1@verdccio.org' },
+-            ],
+-          },
+-        };
+-
+-        const result = {
+-          latest: {
+-            contributors: [
+-              {
+-                _avatar: 'https://www.gravatar.com/avatar/794d7f6ef93d0689437de3c3e48fadc7',
+-                email: 'user@verdccio.org',
+-                name: 'user',
+-              },
+-              {
+-                _avatar: 'https://www.gravatar.com/avatar/51105a49ce4a9c2bfabf0f6a2cba3762',
+-                email: 'user1@verdccio.org',
+-                name: 'user1',
+-              },
+-            ],
+-          },
+-        };
+-
+-        // @ts-ignore
+-        expect(addGravatarSupport(packageInfo)).toEqual(result);
+-      });
+-
+-      test('contributors field is an object', () => {
+-        const packageInfo = {
+-          latest: {
+-            contributors: { name: 'user', email: 'user@verdccio.org' },
+-          },
+-        };
+-
+-        const result = {
+-          latest: {
+-            contributors: [
+-              {
+-                _avatar: 'https://www.gravatar.com/avatar/794d7f6ef93d0689437de3c3e48fadc7',
+-                email: 'user@verdccio.org',
+-                name: 'user',
+-              },
+-            ],
+-          },
+-        };
+-
+-        // @ts-ignore
+-        expect(addGravatarSupport(packageInfo)).toEqual(result);
+-      });
+-
+-      test('contributors field is a string', () => {
+-        const contributor = 'Barney Rubble <b@rubble.com> (http://barnyrubble.tumblr.com/)';
+-        const packageInfo = {
+-          latest: {
+-            contributors: contributor,
+-          },
+-        };
+-
+-        const result = {
+-          latest: {
+-            contributors: [
+-              {
+-                _avatar: 'https://www.gravatar.com/avatar/35e29ca04b2225aaf1dd91242fcfeb2e',
+-                email: 'b@rubble.com',
+-                name: 'Barney Rubble',
+-                url: 'http://barnyrubble.tumblr.com/',
+-              },
+-            ],
+-          },
+-        };
+-
+-        // @ts-ignore
+-        expect(addGravatarSupport(packageInfo)).toEqual(result);
+-      });
+-    });
+-
+-    test('maintainers field is a blank array', () => {
+-      const packageInfo = {
+-        latest: {
+-          maintainers: [],
+-        },
+-      };
+-
+-      // @ts-ignore
+-      expect(addGravatarSupport(packageInfo)).toEqual(packageInfo);
+-    });
+-
+-    test('maintainers field has maintainers', () => {
+-      const packageInfo = {
+-        latest: {
+-          maintainers: [
+-            { name: 'user', email: 'user@verdccio.org' },
+-            { name: 'user1', email: 'user1@verdccio.org' },
+-          ],
+-        },
+-      };
+-
+-      const result = {
+-        latest: {
+-          maintainers: [
+-            {
+-              _avatar: 'https://www.gravatar.com/avatar/794d7f6ef93d0689437de3c3e48fadc7',
+-              email: 'user@verdccio.org',
+-              name: 'user',
+-            },
+-            {
+-              _avatar: 'https://www.gravatar.com/avatar/51105a49ce4a9c2bfabf0f6a2cba3762',
+-              email: 'user1@verdccio.org',
+-              name: 'user1',
+-            },
+-          ],
+-        },
+-      };
+-
+-      // @ts-ignore
+-      expect(addGravatarSupport(packageInfo)).toEqual(result);
+-    });
+-  });
+-});
+diff --git a/packages/web/test/web-utils.spec.ts b/packages/web/test/web-utils.spec.ts
+index 94d39c1cd..728891e8c 100644
+--- a/packages/web/test/web-utils.spec.ts
++++ b/packages/web/test/web-utils.spec.ts
+@@ -1,6 +1,6 @@
+ import { describe, expect, test } from 'vitest';
+ 
+-import { isVersionValid, sortByName } from '../src/web-utils';
++import { sortByName } from '../src/web-utils';
+ 
+ describe('Utilities', () => {
+   describe('Sort packages', () => {
+@@ -43,28 +43,4 @@ describe('Utilities', () => {
+       ]);
+     });
+   });
+-
+-  describe('isVersionValid', () => {
+-    const manifest = {
+-      versions: {
+-        '1.0.0': {},
+-        '2.0.0': {},
+-      },
+-    };
+-
+-    test('should return true for a valid version', () => {
+-      // @ts-ignore: partial manifest for test
+-      expect(isVersionValid(manifest, '1.0.0')).toBe(true);
+-    });
+-
+-    test('should return false for an invalid version', () => {
+-      // @ts-ignore: partial manifest for test
+-      expect(isVersionValid(manifest, '3.0.0')).toBe(false);
+-    });
+-
+-    test('should return false if version is undefined', () => {
+-      // @ts-ignore: partial manifest for test
+-      expect(isVersionValid(manifest, undefined)).toBe(false);
+-    });
+-  });
+ });
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 36bdc63a3..5c9646b61 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -2224,6 +2224,9 @@ importers:
+       '@verdaccio/url':
+         specifier: workspace:13.0.0-next-8.15
+         version: link:../core/url
++      '@verdaccio/utils':
++        specifier: workspace:8.1.0-next-8.15
++        version: link:../utils
+       debug:
+         specifier: 4.4.0
+         version: 4.4.0(supports-color@5.5.0)

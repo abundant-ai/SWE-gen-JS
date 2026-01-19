@@ -1,0 +1,349 @@
+diff --git a/.changeset/eleven-clouds-visit.md b/.changeset/eleven-clouds-visit.md
+new file mode 100644
+index 0000000000..09bbe7772f
+--- /dev/null
++++ b/.changeset/eleven-clouds-visit.md
+@@ -0,0 +1,5 @@
++---
++'xstate': minor
++---
++
++Refactor callback logic to not send self-event
+diff --git a/packages/core/src/actors/callback.ts b/packages/core/src/actors/callback.ts
+index 4daac863b0..b1196f6796 100644
+--- a/packages/core/src/actors/callback.ts
++++ b/packages/core/src/actors/callback.ts
+@@ -5,26 +5,29 @@ import {
+   AnyEventObject,
+   ActorSystem,
+   ActorRefFrom,
+-  TODO,
+-  Snapshot
++  Snapshot,
++  AnyActorRef
+ } from '../types';
+ import { XSTATE_STOP } from '../constants.ts';
+ 
+-export type CallbackSnapshot<TInput, TEvent> = Snapshot<undefined> & {
++interface CallbackInstanceState<TEvent extends EventObject> {
++  receivers: Set<(e: TEvent) => void> | undefined;
++  dispose: (() => void) | void;
++}
++
++const instanceStates = /* #__PURE__ */ new WeakMap<
++  AnyActorRef,
++  CallbackInstanceState<any>
++>();
++
++export type CallbackSnapshot<TInput> = Snapshot<undefined> & {
+   input: TInput;
+-  _receivers: Set<(e: TEvent) => void>;
+-  _dispose: (() => void) | void;
+ };
+ 
+ export type CallbackActorLogic<
+   TEvent extends EventObject,
+   TInput = unknown
+-> = ActorLogic<
+-  CallbackSnapshot<TInput, TEvent>,
+-  TEvent,
+-  TInput,
+-  ActorSystem<any>
+->;
++> = ActorLogic<CallbackSnapshot<TInput>, TEvent, TInput, ActorSystem<any>>;
+ 
+ export type CallbackActorRef<
+   TEvent extends EventObject,
+@@ -134,35 +137,38 @@ export function fromCallback<TEvent extends EventObject, TInput = unknown>(
+ ): CallbackActorLogic<TEvent, TInput> {
+   const logic: CallbackActorLogic<TEvent, TInput> = {
+     config: invokeCallback,
+-    start: (_state, { self, system }) => {
+-      system._relay(self, self, { type: 'xstate.create' });
+-    },
+-    transition: (state, event, { self, system }) => {
+-      if (event.type === 'xstate.create') {
+-        const sendBack = (eventForParent: AnyEventObject) => {
+-          if (state.status === 'stopped') {
++    start: (state, actorScope) => {
++      const { self, system } = actorScope;
++
++      const callbackState: CallbackInstanceState<TEvent> = {
++        receivers: undefined,
++        dispose: undefined
++      };
++
++      instanceStates.set(self, callbackState);
++
++      callbackState.dispose = invokeCallback({
++        input: state.input,
++        system,
++        self,
++        sendBack: (event) => {
++          if (self.getSnapshot().status === 'stopped') {
+             return;
+           }
+-
+           if (self._parent) {
+-            system._relay(self, self._parent, eventForParent);
++            system._relay(self, self._parent, event);
+           }
+-        };
+-
+-        const receive: Receiver<TEvent> = (newListener) => {
+-          state._receivers.add(newListener);
+-        };
+-
+-        state._dispose = invokeCallback({
+-          input: state.input,
+-          system,
+-          self: self as TODO,
+-          sendBack,
+-          receive
+-        });
+-
+-        return state;
+-      }
++        },
++        receive: (listener) => {
++          callbackState.receivers ??= new Set();
++          callbackState.receivers.add(listener);
++        }
++      });
++    },
++    transition: (state, event, actorScope) => {
++      const callbackState: CallbackInstanceState<TEvent> = instanceStates.get(
++        actorScope.self
++      )!;
+ 
+       if (event.type === XSTATE_STOP) {
+         state = {
+@@ -171,13 +177,11 @@ export function fromCallback<TEvent extends EventObject, TInput = unknown>(
+           error: undefined
+         };
+ 
+-        if (typeof state._dispose === 'function') {
+-          state._dispose();
+-        }
++        callbackState.dispose?.();
+         return state;
+       }
+ 
+-      state._receivers.forEach((receiver) => receiver(event));
++      callbackState.receivers?.forEach((receiver) => receiver(event));
+ 
+       return state;
+     },
+@@ -186,17 +190,11 @@ export function fromCallback<TEvent extends EventObject, TInput = unknown>(
+         status: 'active',
+         output: undefined,
+         error: undefined,
+-        input,
+-        _receivers: new Set(),
+-        _dispose: undefined
++        input
+       };
+     },
+-    getPersistedState: ({ _dispose, _receivers, ...rest }) => rest,
+-    restoreState: (state: any) => ({
+-      _receivers: new Set(),
+-      _dispose: undefined,
+-      ...state
+-    })
++    getPersistedState: (state) => state,
++    restoreState: (state: any) => state
+   };
+ 
+   return logic;
+diff --git a/packages/core/src/actors/observable.ts b/packages/core/src/actors/observable.ts
+index 299f9dc55d..7b11020d9a 100644
+--- a/packages/core/src/actors/observable.ts
++++ b/packages/core/src/actors/observable.ts
+@@ -9,6 +9,10 @@ import {
+   Snapshot
+ } from '../types';
+ 
++const XSTATE_OBSERVABLE_NEXT = 'xstate.observable.next';
++const XSTATE_OBSERVABLE_ERROR = 'xstate.observable.error';
++const XSTATE_OBSERVABLE_COMPLETE = 'xstate.observable.complete';
++
+ export type ObservableSnapshot<TContext, TInput> = Snapshot<undefined> & {
+   context: TContext | undefined;
+   input: TInput | undefined;
+@@ -76,10 +80,6 @@ export function fromObservable<TContext, TInput>(
+     self: ObservableActorRef<TContext>;
+   }) => Subscribable<TContext>
+ ): ObservableActorLogic<TContext, TInput> {
+-  const nextEventType = '$$xstate.next';
+-  const errorEventType = '$$xstate.error';
+-  const completeEventType = '$$xstate.complete';
+-
+   // TODO: add event types
+   const logic: ObservableActorLogic<TContext, TInput> = {
+     config: observableCreator,
+@@ -89,14 +89,14 @@ export function fromObservable<TContext, TInput>(
+       }
+ 
+       switch (event.type) {
+-        case nextEventType: {
++        case XSTATE_OBSERVABLE_NEXT: {
+           const newSnapshot = {
+             ...snapshot,
+             context: event.data as TContext
+           };
+           return newSnapshot;
+         }
+-        case errorEventType:
++        case XSTATE_OBSERVABLE_ERROR:
+           return {
+             ...snapshot,
+             status: 'error',
+@@ -104,7 +104,7 @@ export function fromObservable<TContext, TInput>(
+             input: undefined,
+             _subscription: undefined
+           };
+-        case completeEventType:
++        case XSTATE_OBSERVABLE_COMPLETE:
+           return {
+             ...snapshot,
+             status: 'done',
+@@ -144,13 +144,19 @@ export function fromObservable<TContext, TInput>(
+         self
+       }).subscribe({
+         next: (value) => {
+-          system._relay(self, self, { type: nextEventType, data: value });
++          system._relay(self, self, {
++            type: XSTATE_OBSERVABLE_NEXT,
++            data: value
++          });
+         },
+         error: (err) => {
+-          system._relay(self, self, { type: errorEventType, data: err });
++          system._relay(self, self, {
++            type: XSTATE_OBSERVABLE_ERROR,
++            data: err
++          });
+         },
+         complete: () => {
+-          system._relay(self, self, { type: completeEventType });
++          system._relay(self, self, { type: XSTATE_OBSERVABLE_COMPLETE });
+         }
+       });
+     },
+@@ -208,7 +214,6 @@ export function fromObservable<TContext, TInput>(
+  * canvasActor.start();
+  * ```
+  */
+-
+ export function fromEventObservable<T extends EventObject, TInput>(
+   lazyObservable: ({
+     input,
+@@ -219,9 +224,6 @@ export function fromEventObservable<T extends EventObject, TInput>(
+     self: ObservableActorRef<T>;
+   }) => Subscribable<T>
+ ): ObservableActorLogic<T, TInput> {
+-  const errorEventType = '$$xstate.error';
+-  const completeEventType = '$$xstate.complete';
+-
+   // TODO: event types
+   const logic: ObservableActorLogic<T, TInput> = {
+     config: lazyObservable,
+@@ -231,7 +233,7 @@ export function fromEventObservable<T extends EventObject, TInput>(
+       }
+ 
+       switch (event.type) {
+-        case errorEventType:
++        case XSTATE_OBSERVABLE_ERROR:
+           return {
+             ...state,
+             status: 'error',
+@@ -239,7 +241,7 @@ export function fromEventObservable<T extends EventObject, TInput>(
+             input: undefined,
+             _subscription: undefined
+           };
+-        case completeEventType:
++        case XSTATE_OBSERVABLE_COMPLETE:
+           return {
+             ...state,
+             status: 'done',
+@@ -285,10 +287,13 @@ export function fromEventObservable<T extends EventObject, TInput>(
+           }
+         },
+         error: (err) => {
+-          system._relay(self, self, { type: errorEventType, data: err });
++          system._relay(self, self, {
++            type: XSTATE_OBSERVABLE_ERROR,
++            data: err
++          });
+         },
+         complete: () => {
+-          system._relay(self, self, { type: completeEventType });
++          system._relay(self, self, { type: XSTATE_OBSERVABLE_COMPLETE });
+         }
+       });
+     },
+diff --git a/packages/core/src/actors/promise.ts b/packages/core/src/actors/promise.ts
+index 68f85fdd78..97ebbf8ebb 100644
+--- a/packages/core/src/actors/promise.ts
++++ b/packages/core/src/actors/promise.ts
+@@ -11,16 +11,16 @@ export type PromiseSnapshot<TOutput, TInput> = Snapshot<TOutput> & {
+   input: TInput | undefined;
+ };
+ 
+-const resolveEventType = '$$xstate.resolve';
+-const rejectEventType = '$$xstate.reject';
++const XSTATE_PROMISE_RESOLVE = 'xstate.promise.resolve';
++const XSTATE_PROMISE_REJECT = 'xstate.promise.reject';
+ 
+ export type PromiseActorEvents<T> =
+   | {
+-      type: typeof resolveEventType;
++      type: typeof XSTATE_PROMISE_RESOLVE;
+       data: T;
+     }
+   | {
+-      type: typeof rejectEventType;
++      type: typeof XSTATE_PROMISE_REJECT;
+       data: any;
+     }
+   | {
+@@ -111,7 +111,7 @@ export function fromPromise<TOutput, TInput = unknown>(
+       }
+ 
+       switch (event.type) {
+-        case resolveEventType: {
++        case XSTATE_PROMISE_RESOLVE: {
+           const resolvedValue = (event as any).data;
+           return {
+             ...state,
+@@ -120,7 +120,7 @@ export function fromPromise<TOutput, TInput = unknown>(
+             input: undefined
+           };
+         }
+-        case rejectEventType:
++        case XSTATE_PROMISE_REJECT:
+           return {
+             ...state,
+             status: 'error',
+@@ -153,13 +153,19 @@ export function fromPromise<TOutput, TInput = unknown>(
+           if (self.getSnapshot().status !== 'active') {
+             return;
+           }
+-          system._relay(self, self, { type: resolveEventType, data: response });
++          system._relay(self, self, {
++            type: XSTATE_PROMISE_RESOLVE,
++            data: response
++          });
+         },
+         (errorData) => {
+           if (self.getSnapshot().status !== 'active') {
+             return;
+           }
+-          system._relay(self, self, { type: rejectEventType, data: errorData });
++          system._relay(self, self, {
++            type: XSTATE_PROMISE_REJECT,
++            data: errorData
++          });
+         }
+       );
+     },

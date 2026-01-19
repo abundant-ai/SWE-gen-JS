@@ -1,0 +1,207 @@
+diff --git a/index.d.ts b/index.d.ts
+index 210299a..54f2a1a 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -39,7 +39,7 @@ declare namespace execa {
+ 		readonly localDir?: string;
+ 
+ 		/**
+-		Buffer the output from the spawned process. When buffering is disabled you must consume the output of the `stdout` and `stderr` streams because the promise will not be resolved/rejected until they have completed.
++		Buffer the output from the spawned process. When set to `false`, you must read the output of `stdout` and `stderr` (or `all` if the `all` option is `true`). Otherwise the returned promise will not be resolved/rejected.
+ 
+ 		If the spawned process fails, `error.stdout`, `error.stderr`, and `error.all` will contain the buffered data.
+ 
+@@ -75,6 +75,13 @@ declare namespace execa {
+ 		*/
+ 		readonly reject?: boolean;
+ 
++		/**
++		Add an `.all` property on the promise and the resolved value. The property contains the output of the process with `stdout` and `stderr` interleaved.
++
++		@default false
++		*/
++		readonly all?: boolean;
++
+ 		/**
+ 		Strip the final [newline character](https://en.wikipedia.org/wiki/Newline) from the output.
+ 
+@@ -265,8 +272,12 @@ declare namespace execa {
+ 		extends ExecaSyncReturnValue<StdoutErrorType> {
+ 		/**
+ 		The output of the process with `stdout` and `stderr` interleaved.
++
++		This is `undefined` if either:
++		- the `all` option is `false` (default value)
++		- `execa.sync()` was used
+ 		*/
+-		all: StdoutErrorType;
++		all?: StdoutErrorType;
+ 
+ 		/**
+ 		Whether the process was canceled.
+@@ -287,8 +298,12 @@ declare namespace execa {
+ 		extends ExecaSyncError<StdoutErrorType> {
+ 		/**
+ 		The output of the process with `stdout` and `stderr` interleaved.
++
++		This is `undefined` if either:
++		- the `all` option is `false` (default value)
++		- `execa.sync()` was used
+ 		*/
+-		all: StdoutErrorType;
++		all?: StdoutErrorType;
+ 
+ 		/**
+ 		Whether the process was canceled.
+@@ -325,7 +340,9 @@ declare namespace execa {
+ 		/**
+ 		Stream combining/interleaving [`stdout`](https://nodejs.org/api/child_process.html#child_process_subprocess_stdout) and [`stderr`](https://nodejs.org/api/child_process.html#child_process_subprocess_stderr).
+ 
+-		This is `undefined` when both `stdout` and `stderr` options are set to [`'pipe'`, `'ipc'`, `Stream` or `integer`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
++		This is `undefined` if either:
++			- the `all` option is `false` (the default value)
++			- both `stdout` and `stderr` options are set to [`'inherit'`, `'ipc'`, `Stream` or `integer`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio)
+ 		*/
+ 		all?: ReadableStream;
+ 	}
+diff --git a/index.js b/index.js
+index 8b9df5f..70466bb 100644
+--- a/index.js
++++ b/index.js
+@@ -40,6 +40,7 @@ const handleArgs = (file, args, options = {}) => {
+ 		encoding: 'utf8',
+ 		reject: true,
+ 		cleanup: true,
++		all: false,
+ 		...options,
+ 		windowsHide: true
+ 	};
+@@ -150,7 +151,7 @@ const execa = (file, args, options) => {
+ 
+ 	handleInput(spawned, parsed.options.input);
+ 
+-	spawned.all = makeAllStream(spawned);
++	spawned.all = makeAllStream(spawned, parsed.options);
+ 
+ 	return mergePromise(spawned, handlePromiseOnce);
+ };
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 0b3347c..f1261b3 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -20,7 +20,7 @@ try {
+ 	expectType<string>(unicornsResult.exitCodeName);
+ 	expectType<string>(unicornsResult.stdout);
+ 	expectType<string>(unicornsResult.stderr);
+-	expectType<string>(unicornsResult.all);
++	expectType<string | undefined>(unicornsResult.all);
+ 	expectType<boolean>(unicornsResult.failed);
+ 	expectType<boolean>(unicornsResult.timedOut);
+ 	expectType<boolean>(unicornsResult.isCanceled);
+@@ -34,7 +34,7 @@ try {
+ 	expectType<string>(execaError.exitCodeName);
+ 	expectType<string>(execaError.stdout);
+ 	expectType<string>(execaError.stderr);
+-	expectType<string>(execaError.all);
++	expectType<string | undefined>(execaError.all);
+ 	expectType<boolean>(execaError.failed);
+ 	expectType<boolean>(execaError.timedOut);
+ 	expectType<boolean>(execaError.isCanceled);
+@@ -99,6 +99,7 @@ execa('unicorns', {stderr: 'inherit'});
+ execa('unicorns', {stderr: process.stderr});
+ execa('unicorns', {stderr: 1});
+ execa('unicorns', {stderr: undefined});
++execa('unicorns', {all: true});
+ execa('unicorns', {reject: false});
+ execa('unicorns', {stripFinalNewline: false});
+ execa('unicorns', {extendEnv: false});
+diff --git a/lib/stream.js b/lib/stream.js
+index 827a73f..2a87068 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -19,8 +19,8 @@ const handleInput = (spawned, input) => {
+ };
+ 
+ // `all` interleaves `stdout` and `stderr`
+-const makeAllStream = spawned => {
+-	if (!spawned.stdout && !spawned.stderr) {
++const makeAllStream = (spawned, {all}) => {
++	if (!all || (!spawned.stdout && !spawned.stderr)) {
+ 		return;
+ 	}
+ 
+@@ -53,19 +53,10 @@ const getBufferedData = async (stream, streamPromise) => {
+ };
+ 
+ const getStreamPromise = (stream, {encoding, buffer, maxBuffer}) => {
+-	if (!stream) {
++	if (!stream || !buffer) {
+ 		return;
+ 	}
+ 
+-	if (!buffer) {
+-		// TODO: Use `ret = util.promisify(stream.finished)(stream);` when targeting Node.js 10
+-		return new Promise((resolve, reject) => {
+-			stream
+-				.once('end', resolve)
+-				.once('error', reject);
+-		});
+-	}
+-
+ 	if (encoding) {
+ 		return getStream(stream, {encoding, maxBuffer});
+ 	}
+diff --git a/readme.md b/readme.md
+index b5633f2..fa0e85d 100644
+--- a/readme.md
++++ b/readme.md
+@@ -168,7 +168,9 @@ Type: `ReadableStream | undefined`
+ 
+ Stream combining/interleaving [`stdout`](https://nodejs.org/api/child_process.html#child_process_subprocess_stdout) and [`stderr`](https://nodejs.org/api/child_process.html#child_process_subprocess_stderr).
+ 
+-This is `undefined` when both [`stdout`](#stdout-1) and [`stderr`](#stderr-1) options are set to [`'pipe'`, `'ipc'`, `Stream` or `integer`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
++This is `undefined` if either:
++  - the [`all` option](#all-2) is `false` (the default value)
++  - both [`stdout`](#stdout-1) and [`stderr`](#stderr-1) options are set to [`'inherit'`, `'ipc'`, `Stream` or `integer`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio)
+ 
+ ### execa.sync(file, [arguments], [options])
+ 
+@@ -237,9 +239,13 @@ The output of the process on stderr.
+ 
+ #### all
+ 
+-Type: `string | Buffer`
++Type: `string | Buffer | undefined`
++
++The output of the process with `stdout` and `stderr` interleaved.
+ 
+-The output of the process on both stdout and stderr. `undefined` if `execa.sync()` was used.
++This is `undefined` if either:
++  - the [`all` option](#all-2) is `false` (the default value)
++  - `execa.sync()` was used
+ 
+ #### failed
+ 
+@@ -304,7 +310,7 @@ Preferred path to find locally installed binaries in (use with `preferLocal`).
+ Type: `boolean`<br>
+ Default: `true`
+ 
+-Buffer the output from the spawned process. When buffering is disabled you must consume the output of the `stdout` and `stderr` streams because the promise will not be resolved/rejected until they have completed.
++Buffer the output from the spawned process. When set to `false`, you must read the output of [`stdout`](#stdout-1) and [`stderr`](#stderr-1) (or [`all`](#all) if the [`all`](#all-2) option is `true`). Otherwise the returned promise will not be resolved/rejected.
+ 
+ If the spawned process fails, [`error.stdout`](#stdout), [`error.stderr`](#stderr), and [`error.all`](#all) will contain the buffered data.
+ 
+@@ -336,6 +342,13 @@ Default: `pipe`
+ 
+ Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
++#### all
++
++Type: `boolean`<br>
++Default: `false`
++
++Add an `.all` property on the [promise](#all) and the [resolved value](#all-1). The property contains the output of the process with `stdout` and `stderr` interleaved.
++
+ #### reject
+ 
+ Type: `boolean`<br>

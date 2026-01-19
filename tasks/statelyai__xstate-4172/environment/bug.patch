@@ -1,0 +1,715 @@
+diff --git a/.changeset/mean-pianos-explode.md b/.changeset/mean-pianos-explode.md
+deleted file mode 100644
+index bd4ec8506b..0000000000
+--- a/.changeset/mean-pianos-explode.md
++++ /dev/null
+@@ -1,37 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-The `onSnapshot: { ... }` transition object is now supported for invoked machines, observables, promises, and transition functions:
+-
+-```ts
+-const machine = createMachine({
+-  // ...
+-  invoke: [
+-    {
+-      src: createMachine({ ... }),
+-      onSnapshot: {
+-        actions: (context, event) => {
+-          event.snapshot; // machine state
+-        }
+-      }
+-    },
+-    {
+-      src: fromObservable(() => ...),
+-      onSnapshot: {
+-        actions: (context, event) => {
+-          event.snapshot; // observable value
+-        }
+-      }
+-    },
+-    {
+-      src: fromTransition((state, event) => { ... }, /* ... */),
+-      onSnapshot: {
+-        actions: (context, event) => {
+-          event.snapshot; // transition function return value
+-        }
+-      }
+-    }
+-  ]
+-});
+-```
+diff --git a/packages/core/src/Machine.ts b/packages/core/src/Machine.ts
+index 3b1ddf69a5..7a3cf1afbf 100644
+--- a/packages/core/src/Machine.ts
++++ b/packages/core/src/Machine.ts
+@@ -8,11 +8,7 @@ import {
+   Prop,
+   AnyEventObject
+ } from './types.ts';
+-import {
+-  TypegenConstraint,
+-  ResolveTypegenMeta,
+-  TypegenDisabled
+-} from './typegenTypes.ts';
++import { TypegenConstraint, ResolveTypegenMeta } from './typegenTypes.ts';
+ import { StateMachine } from './StateMachine.ts';
+ 
+ export function createMachine<
+@@ -25,10 +21,7 @@ export function createMachine<
+   TTag extends string,
+   TInput,
+   TOutput extends NonReducibleUnknown,
+-  // it's important to have at least one default type parameter here
+-  // it allows us to benefit from contextual type instantiation as it makes us to pass the hasInferenceCandidatesOrDefault check in the compiler
+-  // we should be able to remove this when we start inferring TConfig, with it we'll always have an inference candidate
+-  TTypesMeta extends TypegenConstraint = TypegenDisabled
++  TTypesMeta extends TypegenConstraint
+ >(
+   config: MachineConfig<
+     TContext,
+diff --git a/packages/core/src/actions/invoke.ts b/packages/core/src/actions/invoke.ts
+index 51398c0873..c1307c3021 100644
+--- a/packages/core/src/actions/invoke.ts
++++ b/packages/core/src/actions/invoke.ts
+@@ -10,8 +10,7 @@ import {
+   AnyState,
+   EventObject,
+   MachineContext,
+-  ParameterizedObject,
+-  Snapshot
++  ParameterizedObject
+ } from '../types.ts';
+ import { resolveReferencedActor } from '../utils.ts';
+ 
+@@ -23,14 +22,12 @@ function resolveInvoke(
+     id,
+     systemId,
+     src,
+-    input,
+-    syncSnapshot
++    input
+   }: {
+     id: string;
+     systemId: string | undefined;
+     src: string;
+     input?: unknown;
+-    syncSnapshot: boolean;
+   }
+ ) {
+   const referenced = resolveReferencedActor(
+@@ -56,22 +53,6 @@ function resolveInvoke(
+             })
+           : configuredInput
+     });
+-
+-    if (syncSnapshot) {
+-      actorRef.subscribe({
+-        next: (snapshot: Snapshot<unknown>) => {
+-          if (snapshot.status === 'active') {
+-            actorContext.self.send({
+-              type: `xstate.snapshot.${id}`,
+-              snapshot
+-            });
+-          }
+-        },
+-        error: () => {
+-          /* TODO */
+-        }
+-      });
+-    }
+   }
+ 
+   if (isDevelopment && !actorRef) {
+@@ -133,14 +114,12 @@ export function invoke<
+   id,
+   systemId,
+   src,
+-  input,
+-  onSnapshot
++  input
+ }: {
+   id: string;
+   systemId: string | undefined;
+   src: string;
+   input?: unknown;
+-  onSnapshot?: {}; // TODO: transition object
+ }): InvokeAction<TContext, TExpressionEvent, TExpressionAction, TEvent> {
+   function invoke(
+     _: ActionArgs<TContext, TExpressionEvent, TExpressionAction, TEvent>
+@@ -155,7 +134,6 @@ export function invoke<
+   invoke.systemId = systemId;
+   invoke.src = src;
+   invoke.input = input;
+-  invoke.syncSnapshot = !!onSnapshot;
+ 
+   invoke.resolve = resolveInvoke;
+   invoke.execute = executeInvoke;
+diff --git a/packages/core/src/actors/observable.ts b/packages/core/src/actors/observable.ts
+index 952aac8c09..929000f153 100644
+--- a/packages/core/src/actors/observable.ts
++++ b/packages/core/src/actors/observable.ts
+@@ -56,10 +56,19 @@ export function fromObservable<TContext, TInput>(
+ 
+       switch (event.type) {
+         case nextEventType: {
+-          return {
++          const newSnapshot = {
+             ...snapshot,
+             context: event.data as TContext
+           };
++          // match the exact timing of events sent by machines
++          // send actions are not executed immediately
++          defer(() => {
++            self._parent?.send({
++              type: `xstate.snapshot.${id}`,
++              data: newSnapshot
++            });
++          });
++          return newSnapshot;
+         }
+         case errorEventType:
+           return {
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index dd9a29d914..66e9658c40 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -10,7 +10,6 @@ import {
+   InputFrom,
+   IsLiteralString,
+   ProvidedActor,
+-  Snapshot,
+   TODO
+ } from './types.ts';
+ import { resolveReferencedActor } from './utils.ts';
+@@ -27,7 +26,6 @@ type SpawnOptions<
+           id: TActor['id'];
+           systemId?: string;
+           input?: InputFrom<TActor['logic']>;
+-          syncSnapshot?: boolean;
+         }
+       ]
+     : [
+@@ -35,7 +33,6 @@ type SpawnOptions<
+           id?: string;
+           systemId?: string;
+           input?: InputFrom<TActor['logic']>;
+-          syncSnapshot?: boolean;
+         }
+       ]
+   : never;
+@@ -54,7 +51,6 @@ export type Spawner<TActor extends ProvidedActor> = IsLiteralString<
+         id?: string;
+         systemId?: string;
+         input?: unknown;
+-        syncSnapshot?: boolean;
+       }
+     ) => TLogic extends string ? AnyActorRef : ActorRefFrom<TLogic>;
+ 
+@@ -80,7 +76,7 @@ export function createSpawner(
+       const input = 'input' in options ? options.input : referenced.input;
+ 
+       // TODO: this should also receive `src`
+-      const actorRef = createActor(referenced.src, {
++      const actor = createActor(referenced.src, {
+         id: options.id,
+         parent: actorContext.self,
+         input:
+@@ -93,51 +89,16 @@ export function createSpawner(
+             : input,
+         systemId
+       }) as any;
+-      spawnedChildren[actorRef.id] = actorRef;
+-
+-      if (options.syncSnapshot) {
+-        actorRef.subscribe({
+-          next: (snapshot: Snapshot<unknown>) => {
+-            if (snapshot.status === 'active') {
+-              actorContext.self.send({
+-                type: `xstate.snapshot.${actorRef.id}`,
+-                snapshot
+-              });
+-            }
+-          },
+-          error: () => {
+-            /* TODO */
+-          }
+-        });
+-      }
+-      return actorRef;
++      spawnedChildren[actor.id] = actor;
++      return actor;
+     } else {
+       // TODO: this should also receive `src`
+-      const actorRef = createActor(src, {
++      return createActor(src, {
+         id: options.id,
+         parent: actorContext.self,
+         input: options.input,
+         systemId
+       });
+-
+-      if (options.syncSnapshot) {
+-        actorRef.subscribe({
+-          next: (snapshot: Snapshot<unknown>) => {
+-            if (snapshot.status === 'active') {
+-              actorContext.self.send({
+-                type: `xstate.snapshot.${actorRef.id}`,
+-                snapshot,
+-                id: actorRef.id
+-              });
+-            }
+-          },
+-          error: () => {
+-            /* TODO */
+-          }
+-        });
+-      }
+-
+-      return actorRef;
+     }
+   };
+   return (src, options) => {
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 0a0c35ac28..da0353234e 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -402,7 +402,7 @@ export interface InvokeDefinition<
+     | SingleOrArray<
+         TransitionConfig<
+           TContext,
+-          SnapshotEvent,
++          SnapshotEvent<unknown>,
+           TEvent,
+           TActor,
+           TAction,
+@@ -715,7 +715,7 @@ export type InvokeConfig<
+         | SingleOrArray<
+             TransitionConfigOrTarget<
+               TContext,
+-              SnapshotEvent,
++              SnapshotEvent<any>, // TODO: consider replacing with `unknown`
+               TEvent,
+               TActor,
+               TAction,
+@@ -1373,7 +1373,7 @@ export type MachineConfig<
+   // TODO: make it conditionally required
+   output?: Mapper<TContext, DoneStateEvent, TOutput, TEvent> | TOutput;
+ }) &
+-  (MachineContext extends TContext
++  (Equals<TContext, MachineContext> extends true
+     ? { context?: InitialContext<LowInfer<TContext>, TActor, TInput> }
+     : { context: InitialContext<LowInfer<TContext>, TActor, TInput> });
+ 
+@@ -1443,11 +1443,9 @@ export interface ErrorActorEvent<TErrorData = unknown> extends EventObject {
+   data: TErrorData;
+ }
+ 
+-export interface SnapshotEvent<
+-  TSnapshot extends Snapshot<unknown> = Snapshot<unknown>
+-> extends EventObject {
++export interface SnapshotEvent<TData = unknown> extends EventObject {
+   type: `xstate.snapshot.${string}`;
+-  snapshot: TSnapshot;
++  data: TData;
+ }
+ 
+ export interface DoneStateEvent<TOutput = unknown> extends EventObject {
+@@ -1975,6 +1973,22 @@ export interface ActorContext<
+ 
+ export type AnyActorContext = ActorContext<any, any, any>;
+ 
++export type ActorStatusObject<TOutput> =
++  | {
++      status: 'done';
++      output: TOutput;
++    }
++  | {
++      status: 'error';
++      error: unknown;
++    }
++  | {
++      status: 'stopped';
++    }
++  | {
++      status: 'active';
++    };
++
+ export type Snapshot<TOutput> =
+   | {
+       status: 'active';
+diff --git a/packages/core/test/actor.test.ts b/packages/core/test/actor.test.ts
+index ae7ae9e9b0..4292810a09 100644
+--- a/packages/core/test/actor.test.ts
++++ b/packages/core/test/actor.test.ts
+@@ -413,10 +413,7 @@ describe('spawning observables', () => {
+         idle: {
+           entry: assign({
+             observableRef: ({ spawn }) => {
+-              const ref = spawn(observableLogic, {
+-                id: 'int',
+-                syncSnapshot: true
+-              });
++              const ref = spawn(observableLogic, { id: 'int' });
+ 
+               return ref;
+             }
+@@ -424,7 +421,7 @@ describe('spawning observables', () => {
+           on: {
+             'xstate.snapshot.int': {
+               target: 'success',
+-              guard: ({ event }) => event.snapshot.context === 5
++              guard: ({ event }) => event.data.context === 5
+             }
+           }
+         },
+@@ -455,13 +452,12 @@ describe('spawning observables', () => {
+         states: {
+           idle: {
+             entry: assign({
+-              observableRef: ({ spawn }) =>
+-                spawn('interval', { id: 'int', syncSnapshot: true })
++              observableRef: ({ spawn }) => spawn('interval', { id: 'int' })
+             }),
+             on: {
+               'xstate.snapshot.int': {
+                 target: 'success',
+-                guard: ({ event }) => event.snapshot.context === 5
++                guard: ({ event }) => event.data.context === 5
+               }
+             }
+           },
+@@ -499,10 +495,7 @@ describe('spawning observables', () => {
+         idle: {
+           entry: assign({
+             observableRef: ({ spawn }) => {
+-              const ref = spawn(observableLogic, {
+-                id: 'int',
+-                syncSnapshot: true
+-              });
++              const ref = spawn(observableLogic, { id: 'int' });
+ 
+               return ref;
+             }
+@@ -512,7 +505,7 @@ describe('spawning observables', () => {
+               target: 'success',
+               guard: ({ context, event }) => {
+                 return (
+-                  event.snapshot.context === 1 &&
++                  event.data.context === 1 &&
+                   context.observableRef.getSnapshot().context === 1
+                 );
+               }
+@@ -556,7 +549,7 @@ describe('spawning observables', () => {
+               onSnapshot: {
+                 target: 'success',
+                 guard: ({ event }) => {
+-                  return event.snapshot.context === 3;
++                  return event.data.context === 3;
+                 }
+               }
+             }
+@@ -610,7 +603,7 @@ describe('spawning observables', () => {
+               onSnapshot: {
+                 target: 'success',
+                 guard: ({ event }) => {
+-                  return event.snapshot.context === 3;
++                  return event.data.context === 3;
+                 }
+               }
+             }
+@@ -1025,12 +1018,9 @@ describe('actors', () => {
+       });
+       countService.start();
+ 
++      debugger;
+       countService.send({ type: 'INC' });
+       countService.send({ type: 'INC' });
+-
+-      expect(
+-        countService.getSnapshot().context.count?.getSnapshot().context
+-      ).toBe(2);
+     });
+ 
+     it('should work with a promise logic (fulfill)', (done) => {
+diff --git a/packages/core/test/interpreter.test.ts b/packages/core/test/interpreter.test.ts
+index 227eb57b18..ce0010c674 100644
+--- a/packages/core/test/interpreter.test.ts
++++ b/packages/core/test/interpreter.test.ts
+@@ -1596,41 +1596,27 @@ describe('interpreter', () => {
+ 
+     it('state.children should reference invoked child actors (observable)', (done) => {
+       const interval$ = interval(10);
+-      const intervalLogic = fromObservable(() => interval$);
+ 
+-      const parentMachine = createMachine(
+-        {
+-          types: {} as {
+-            actors: {
+-              src: 'intervalLogic';
+-              logic: typeof intervalLogic;
+-            };
+-          },
+-          initial: 'active',
+-          states: {
+-            active: {
+-              invoke: {
+-                id: 'childActor',
+-                src: 'intervalLogic',
+-                onSnapshot: {
+-                  target: 'success',
+-                  guard: ({ event }) => {
+-                    return event.snapshot.context === 3;
+-                  }
++      const parentMachine = createMachine({
++        initial: 'active',
++        states: {
++          active: {
++            invoke: {
++              id: 'childActor',
++              src: fromObservable(() => interval$),
++              onSnapshot: {
++                target: 'success',
++                guard: ({ event }) => {
++                  return event.data.context === 3;
+                 }
+               }
+-            },
+-            success: {
+-              type: 'final'
+             }
+-          }
+-        },
+-        {
+-          actors: {
+-            intervalLogic
++          },
++          success: {
++            type: 'final'
+           }
+         }
+-      );
++      });
+ 
+       const service = createActor(parentMachine);
+       service.subscribe({
+diff --git a/packages/core/test/invoke.test.ts b/packages/core/test/invoke.test.ts
+index cac3802946..3caae39253 100644
+--- a/packages/core/test/invoke.test.ts
++++ b/packages/core/test/invoke.test.ts
+@@ -1274,47 +1274,6 @@ describe('invoke', () => {
+         });
+         service.start();
+       });
+-
+-      it('should not emit onSnapshot if stopped', (done) => {
+-        const machine = createMachine({
+-          initial: 'active',
+-          states: {
+-            active: {
+-              invoke: {
+-                src: fromPromise(() =>
+-                  createPromise((res) => {
+-                    setTimeout(() => res(42), 5);
+-                  })
+-                ),
+-                onSnapshot: {}
+-              },
+-              on: {
+-                deactivate: 'inactive'
+-              }
+-            },
+-            inactive: {
+-              on: {
+-                '*': {
+-                  actions: ({ event }) => {
+-                    if (event.snapshot) {
+-                      throw new Error(
+-                        `Received unexpected event: ${event.type}`
+-                      );
+-                    }
+-                  }
+-                }
+-              }
+-            }
+-          }
+-        });
+-
+-        const actor = createActor(machine).start();
+-        actor.send({ type: 'deactivate' });
+-
+-        setTimeout(() => {
+-          done();
+-        }, 10);
+-      });
+     });
+   });
+ 
+@@ -1891,9 +1850,7 @@ describe('invoke', () => {
+             invoke: {
+               src: fromObservable(() => interval(10)),
+               onSnapshot: {
+-                actions: assign({
+-                  count: ({ event }) => event.snapshot.context
+-                })
++                actions: assign({ count: ({ event }) => event.data.context })
+               }
+             },
+             always: {
+@@ -1937,7 +1894,7 @@ describe('invoke', () => {
+               src: fromObservable(() => interval(10).pipe(take(5))),
+               onSnapshot: {
+                 actions: assign({
+-                  count: ({ event }) => event.snapshot.context
++                  count: ({ event }) => event.data.context
+                 })
+               },
+               onDone: {
+@@ -1989,9 +1946,7 @@ describe('invoke', () => {
+                 )
+               ),
+               onSnapshot: {
+-                actions: assign({
+-                  count: ({ event }) => event.snapshot.context
+-                })
++                actions: assign({ count: ({ event }) => event.data.context })
+               },
+               onError: {
+                 target: 'success',
+@@ -2021,40 +1976,18 @@ describe('invoke', () => {
+     });
+ 
+     it('should work with input', (done) => {
+-      const childLogic = fromObservable(({ input }: { input: number }) =>
+-        of(input)
+-      );
+-
+-      const machine = createMachine(
+-        {
+-          types: {} as {
+-            actors: {
+-              src: 'childLogic';
+-              logic: typeof childLogic;
+-            };
+-          },
+-          context: { received: undefined },
+-          invoke: {
+-            src: 'childLogic',
+-            input: 42,
+-            onSnapshot: {
+-              actions: ({ event }) => {
+-                if (
+-                  event.snapshot.status === 'active' &&
+-                  event.snapshot.context === 42
+-                ) {
+-                  done();
+-                }
+-              }
++      const machine = createMachine({
++        invoke: {
++          src: fromObservable(({ input }) => of(input)),
++          input: 42,
++          onSnapshot: {
++            actions: ({ event }) => {
++              expect(event.data.context).toEqual(42);
++              done();
+             }
+           }
+-        },
+-        {
+-          actors: {
+-            childLogic
+-          }
+         }
+-      );
++      });
+ 
+       createActor(machine).start();
+     });
+@@ -2415,39 +2348,6 @@ describe('invoke', () => {
+ 
+       countService.send({ type: 'INC' });
+     });
+-
+-    it('should emit onSnapshot', (done) => {
+-      const doublerLogic = fromTransition(
+-        (_, event: { type: 'update'; value: number }) => event.value * 2,
+-        0
+-      );
+-      const machine = createMachine(
+-        {
+-          types: {} as {
+-            actors: { src: 'doublerLogic'; logic: typeof doublerLogic };
+-          },
+-          invoke: {
+-            id: 'doubler',
+-            src: 'doublerLogic',
+-            onSnapshot: {
+-              actions: ({ event }) => {
+-                if (event.snapshot.context === 42) {
+-                  done();
+-                }
+-              }
+-            }
+-          },
+-          entry: sendTo('doubler', { type: 'update', value: 21 }, { delay: 10 })
+-        },
+-        {
+-          actors: {
+-            doublerLogic
+-          }
+-        }
+-      );
+-
+-      createActor(machine).start();
+-    });
+   });
+ 
+   describe('with machines', () => {
+@@ -2500,44 +2400,6 @@ describe('invoke', () => {
+       actor.subscribe({ complete: () => done() });
+       actor.start();
+     });
+-
+-    it('should emit onSnapshot', (done) => {
+-      const childMachine = createMachine({
+-        initial: 'a',
+-        states: {
+-          a: {
+-            after: {
+-              10: 'b'
+-            }
+-          },
+-          b: {}
+-        }
+-      });
+-      const machine = createMachine(
+-        {
+-          types: {} as {
+-            actors: { src: 'childMachine'; logic: typeof childMachine };
+-          },
+-          invoke: {
+-            src: 'childMachine',
+-            onSnapshot: {
+-              actions: ({ event }) => {
+-                if (event.snapshot.value === 'b') {
+-                  done();
+-                }
+-              }
+-            }
+-          }
+-        },
+-        {
+-          actors: {
+-            childMachine
+-          }
+-        }
+-      );
+-
+-      createActor(machine).start();
+-    });
+   });
+ 
+   describe('multiple simultaneous services', () => {

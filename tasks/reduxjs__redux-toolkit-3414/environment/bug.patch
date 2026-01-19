@@ -1,0 +1,484 @@
+diff --git a/docs/api/actionCreatorMiddleware.mdx b/docs/api/actionCreatorMiddleware.mdx
+deleted file mode 100644
+index 2248a164..00000000
+--- a/docs/api/actionCreatorMiddleware.mdx
++++ /dev/null
+@@ -1,67 +0,0 @@
+----
+-id: actionCreatorMiddleware
+-title: Action Creator Middleware
+-sidebar_label: Action Creator Middleware
+-hide_title: true
+----
+-
+-&nbsp;
+-
+-# Action Creator Middleware
+-
+-A custom middleware that detects if an action creator has been mistakenly dispatched, instead of being called before dispatching.
+-
+-A common mistake is to call `dispatch(actionCreator)` instead of `dispatch(actionCreator())`.
+-This tends to "work" as the action creator has the static `type` property, but can lead to unexpected behaviour.
+-
+-## Options
+-
+-```ts no-transpile
+-export interface ActionCreatorInvariantMiddlewareOptions {
+-  /**
+-   * The function to identify whether a value is an action creator.
+-   * The default checks for a function with a static type property and match method.
+-   */
+-  isActionCreator?: (action: unknown) => action is Function & { type?: unknown }
+-}
+-```
+-
+-## Exports
+-
+-### `createActionCreatorInvariantMiddleware`
+-
+-Creates an instance of the action creator check middleware, with the given options.
+-
+-You will most likely not need to call this yourself, as `getDefaultMiddleware` already does so.
+-Example:
+-
+-```ts
+-// file: reducer.ts noEmit
+-
+-export default function (state = {}, action: any) {
+-  return state
+-}
+-
+-// file: store.ts
+-
+-import {
+-  configureStore,
+-  createActionCreatorInvariantMiddleware,
+-} from '@reduxjs/toolkit'
+-import reducer from './reducer'
+-
+-// Augment middleware to consider all functions with a static type property to be action creators
+-const isActionCreator = (
+-  action: unknown
+-): action is Function & { type: unknown } =>
+-  typeof action === 'function' && 'type' in action
+-
+-const actionCreatorMiddleware = createActionCreatorInvariantMiddleware({
+-  isActionCreator,
+-})
+-
+-const store = configureStore({
+-  reducer,
+-  middleware: [actionCreatorMiddleware],
+-})
+-```
+diff --git a/docs/api/getDefaultMiddleware.mdx b/docs/api/getDefaultMiddleware.mdx
+index 568dd708..a574d445 100644
+--- a/docs/api/getDefaultMiddleware.mdx
++++ b/docs/api/getDefaultMiddleware.mdx
+@@ -70,7 +70,7 @@ It is preferable to use the chainable `.concat(...)` and `.prepend(...)` methods
+ 
+ One of the goals of Redux Toolkit is to provide opinionated defaults and prevent common mistakes. As part of that,
+ `getDefaultMiddleware` includes some middleware that are added **in development builds of your app only** to
+-provide runtime checks for three common issues:
++provide runtime checks for two common issues:
+ 
+ - [Immutability check middleware](./immutabilityMiddleware.mdx): deeply compares
+   state values for mutations. It can detect mutations in reducers during a dispatch, and also mutations that occur between
+@@ -82,21 +82,13 @@ provide runtime checks for three common issues:
+   such as functions, Promises, Symbols, and other non-plain-JS-data values. When a non-serializable value is detected, a
+   console error will be printed with the key path for where the non-serializable value was detected.
+ 
+-- [Action creator check middleware](./actionCreatorMiddleware.mdx): another custom middleware created specifically for use in Redux Toolkit.
+-  Identifies when an action creator was mistakenly dispatched without being called, and warns to console with the action type.
+-
+ In addition to these development tool middleware, it also adds [`redux-thunk`](https://github.com/reduxjs/redux-thunk)
+ by default, since thunks are the basic recommended side effects middleware for Redux.
+ 
+ Currently, the return value is:
+ 
+ ```js
+-const middleware = [
+-  actionCreatorInvariant,
+-  immutableStateInvariant,
+-  thunk,
+-  serializableStateInvariant,
+-]
++const middleware = [thunk, immutableStateInvariant, serializableStateInvariant]
+ ```
+ 
+ ### Production
+@@ -161,15 +153,10 @@ interface SerializableStateInvariantMiddlewareOptions {
+   // See "Serializability Middleware" page for definition
+ }
+ 
+-interface ActionCreatorInvariantMiddlewareOptions {
+-  // See "Action Creator Middleware" page for definition
+-}
+-
+ interface GetDefaultMiddlewareOptions {
+   thunk?: boolean | ThunkOptions
+   immutableCheck?: boolean | ImmutableStateInvariantMiddlewareOptions
+   serializableCheck?: boolean | SerializableStateInvariantMiddlewareOptions
+-  actionCreatorCheck?: boolean | ActionCreatorInvariantMiddlewareOptions
+ }
+ 
+ function getDefaultMiddleware<S = any>(
+diff --git a/packages/toolkit/src/actionCreatorInvariantMiddleware.ts b/packages/toolkit/src/actionCreatorInvariantMiddleware.ts
+deleted file mode 100644
+index 1f3a47e0..00000000
+--- a/packages/toolkit/src/actionCreatorInvariantMiddleware.ts
++++ /dev/null
+@@ -1,34 +0,0 @@
+-import type { Middleware } from 'redux'
+-import { isActionCreator as isRTKAction } from './createAction'
+-
+-export interface ActionCreatorInvariantMiddlewareOptions {
+-  /**
+-   * The function to identify whether a value is an action creator.
+-   * The default checks for a function with a static type property and match method.
+-   */
+-  isActionCreator?: (action: unknown) => action is Function & { type?: unknown }
+-}
+-
+-export function getMessage(type?: unknown) {
+-  const splitType = type ? `${type}`.split('/') : []
+-  const actionName = splitType[splitType.length - 1] || 'actionCreator'
+-  return `Detected an action creator with type "${
+-    type || 'unknown'
+-  }" being dispatched. 
+-Make sure you're calling the action creator before dispatching, i.e. \`dispatch(${actionName}())\` instead of \`dispatch(${actionName})\`. This is necessary even if the action has no payload.`
+-}
+-
+-export function createActionCreatorInvariantMiddleware(
+-  options: ActionCreatorInvariantMiddlewareOptions = {}
+-): Middleware {
+-  if (process.env.NODE_ENV === 'production') {
+-    return () => (next) => (action) => next(action)
+-  }
+-  const { isActionCreator = isRTKAction } = options
+-  return () => (next) => (action) => {
+-    if (isActionCreator(action)) {
+-      console.warn(getMessage(action.type))
+-    }
+-    return next(action)
+-  }
+-}
+diff --git a/packages/toolkit/src/createAction.ts b/packages/toolkit/src/createAction.ts
+index 155672c3..ab52d1c4 100644
+--- a/packages/toolkit/src/createAction.ts
++++ b/packages/toolkit/src/createAction.ts
+@@ -5,7 +5,6 @@ import type {
+   IfVoid,
+   IsAny,
+ } from './tsHelpers'
+-import { hasMatchFunction } from './tsHelpers'
+ import isPlainObject from './isPlainObject'
+ 
+ /**
+@@ -294,20 +293,6 @@ export function isAction(action: unknown): action is Action<unknown> {
+   return isPlainObject(action) && 'type' in action
+ }
+ 
+-/**
+- * Returns true if value is an RTK-like action creator, with a static type property and match method.
+- */
+-export function isActionCreator(
+-  action: unknown
+-): action is BaseActionCreator<unknown, string> & Function {
+-  return (
+-    typeof action === 'function' &&
+-    'type' in action &&
+-    // hasMatchFunction only wants Matchers but I don't see the point in rewriting it
+-    hasMatchFunction(action as any)
+-  )
+-}
+-
+ /**
+  * Returns true if value is an action with a string type and valid Flux Standard Action keys.
+  */
+diff --git a/packages/toolkit/src/getDefaultMiddleware.ts b/packages/toolkit/src/getDefaultMiddleware.ts
+index d74ac89a..e54a6676 100644
+--- a/packages/toolkit/src/getDefaultMiddleware.ts
++++ b/packages/toolkit/src/getDefaultMiddleware.ts
+@@ -1,8 +1,6 @@
+ import type { Middleware, AnyAction } from 'redux'
+ import type { ThunkMiddleware } from 'redux-thunk'
+ import thunkMiddleware from 'redux-thunk'
+-import type { ActionCreatorInvariantMiddlewareOptions } from './actionCreatorInvariantMiddleware'
+-import { createActionCreatorInvariantMiddleware } from './actionCreatorInvariantMiddleware'
+ import type { ImmutableStateInvariantMiddlewareOptions } from './immutableStateInvariantMiddleware'
+ /* PROD_START_REMOVE_UMD */
+ import { createImmutableStateInvariantMiddleware } from './immutableStateInvariantMiddleware'
+@@ -25,7 +23,6 @@ interface GetDefaultMiddlewareOptions {
+   thunk?: boolean | ThunkOptions
+   immutableCheck?: boolean | ImmutableStateInvariantMiddlewareOptions
+   serializableCheck?: boolean | SerializableStateInvariantMiddlewareOptions
+-  actionCreatorCheck?: boolean | ActionCreatorInvariantMiddlewareOptions
+ }
+ 
+ export type ThunkMiddlewareFor<
+@@ -44,7 +41,6 @@ export type CurriedGetDefaultMiddleware<S = any> = <
+     thunk: true
+     immutableCheck: true
+     serializableCheck: true
+-    actionCreatorCheck: true
+   }
+ >(
+   options?: O
+@@ -76,7 +72,6 @@ export function getDefaultMiddleware<
+     thunk: true
+     immutableCheck: true
+     serializableCheck: true
+-    actionCreatorCheck: true
+   }
+ >(
+   options: O = {} as O
+@@ -85,7 +80,6 @@ export function getDefaultMiddleware<
+     thunk = true,
+     immutableCheck = true,
+     serializableCheck = true,
+-    actionCreatorCheck = true,
+   } = options
+ 
+   let middlewareArray = new MiddlewareArray<Middleware[]>()
+@@ -126,17 +120,6 @@ export function getDefaultMiddleware<
+         createSerializableStateInvariantMiddleware(serializableOptions)
+       )
+     }
+-    if (actionCreatorCheck) {
+-      let actionCreatorOptions: ActionCreatorInvariantMiddlewareOptions = {}
+-
+-      if (!isBoolean(actionCreatorCheck)) {
+-        actionCreatorOptions = actionCreatorCheck
+-      }
+-
+-      middlewareArray.unshift(
+-        createActionCreatorInvariantMiddleware(actionCreatorOptions)
+-      )
+-    }
+   }
+ 
+   return middlewareArray as any
+diff --git a/packages/toolkit/src/index.ts b/packages/toolkit/src/index.ts
+index f3ebdae1..3ea76348 100644
+--- a/packages/toolkit/src/index.ts
++++ b/packages/toolkit/src/index.ts
+@@ -40,7 +40,6 @@ export {
+   createAction,
+   getType,
+   isAction,
+-  isActionCreator,
+   isFSA as isFluxStandardAction,
+ } from './createAction'
+ export type {
+@@ -79,8 +78,6 @@ export type {
+   CaseReducerWithPrepare,
+   SliceActionCreator,
+ } from './createSlice'
+-export type { ActionCreatorInvariantMiddlewareOptions } from './actionCreatorInvariantMiddleware'
+-export { createActionCreatorInvariantMiddleware } from './actionCreatorInvariantMiddleware'
+ export {
+   // js
+   createImmutableStateInvariantMiddleware,
+diff --git a/packages/toolkit/src/tests/actionCreatorInvariantMiddleware.test.ts b/packages/toolkit/src/tests/actionCreatorInvariantMiddleware.test.ts
+deleted file mode 100644
+index bf65a011..00000000
+--- a/packages/toolkit/src/tests/actionCreatorInvariantMiddleware.test.ts
++++ /dev/null
+@@ -1,64 +0,0 @@
+-import type { ActionCreatorInvariantMiddlewareOptions } from '@internal/actionCreatorInvariantMiddleware'
+-import { getMessage } from '@internal/actionCreatorInvariantMiddleware'
+-import { createActionCreatorInvariantMiddleware } from '@internal/actionCreatorInvariantMiddleware'
+-import type { Dispatch, MiddlewareAPI } from '@reduxjs/toolkit'
+-import { createAction } from '@reduxjs/toolkit'
+-
+-describe('createActionCreatorInvariantMiddleware', () => {
+-  const consoleSpy = jest.spyOn(console, 'warn').mockImplementation(() => {})
+-
+-  afterEach(() => {
+-    consoleSpy.mockClear()
+-  })
+-  afterAll(() => {
+-    consoleSpy.mockRestore()
+-  })
+-
+-  const dummyAction = createAction('aSlice/anAction')
+-
+-  it('sends the action through the middleware chain', () => {
+-    const next: Dispatch = (action) => ({
+-      ...action,
+-      returned: true,
+-    })
+-    const dispatch = createActionCreatorInvariantMiddleware()(
+-      {} as MiddlewareAPI
+-    )(next)
+-
+-    expect(dispatch(dummyAction())).toEqual({
+-      ...dummyAction(),
+-      returned: true,
+-    })
+-  })
+-
+-  const makeActionTester = (
+-    options?: ActionCreatorInvariantMiddlewareOptions
+-  ) =>
+-    createActionCreatorInvariantMiddleware(options)({} as MiddlewareAPI)(
+-      (action) => action
+-    )
+-
+-  it('logs a warning to console if an action creator is mistakenly dispatched', () => {
+-    const testAction = makeActionTester()
+-
+-    testAction(dummyAction())
+-
+-    expect(consoleSpy).not.toHaveBeenCalled()
+-
+-    testAction(dummyAction)
+-
+-    expect(consoleSpy).toHaveBeenLastCalledWith(getMessage(dummyAction.type))
+-  })
+-
+-  it('allows passing a custom predicate', () => {
+-    let predicateCalled = false
+-    const testAction = makeActionTester({
+-      isActionCreator(action): action is Function {
+-        predicateCalled = true
+-        return false
+-      },
+-    })
+-    testAction(dummyAction())
+-    expect(predicateCalled).toBe(true)
+-  })
+-})
+diff --git a/packages/toolkit/src/tests/configureStore.test.ts b/packages/toolkit/src/tests/configureStore.test.ts
+index 1801b5a1..aa93a5f8 100644
+--- a/packages/toolkit/src/tests/configureStore.test.ts
++++ b/packages/toolkit/src/tests/configureStore.test.ts
+@@ -75,10 +75,9 @@ describe('configureStore', () => {
+         Object
+       )
+       expect(redux.applyMiddleware).toHaveBeenCalledWith(
+-        expect.any(Function), // immutableCheck
+         expect.any(Function), // thunk
+-        expect.any(Function), // serializableCheck
+-        expect.any(Function) // actionCreatorCheck
++        expect.any(Function), // immutableCheck
++        expect.any(Function) // serializableCheck
+       )
+       expect(devtools.composeWithDevTools).toHaveBeenCalled() // @remap-prod-remove-line-line
+       expect(redux.createStore).toHaveBeenCalledWith(
+diff --git a/packages/toolkit/src/tests/getDefaultMiddleware.test.ts b/packages/toolkit/src/tests/getDefaultMiddleware.test.ts
+index e0778942..2367ae40 100644
+--- a/packages/toolkit/src/tests/getDefaultMiddleware.test.ts
++++ b/packages/toolkit/src/tests/getDefaultMiddleware.test.ts
+@@ -15,7 +15,6 @@ import thunk from 'redux-thunk'
+ import type { ThunkMiddleware } from 'redux-thunk'
+ 
+ import { expectType } from './helpers'
+-import { BaseActionCreator } from '@internal/createAction'
+ 
+ describe('getDefaultMiddleware', () => {
+   const ORIGINAL_NODE_ENV = process.env.NODE_ENV
+@@ -36,37 +35,31 @@ describe('getDefaultMiddleware', () => {
+     expect(middleware.length).toBeGreaterThan(1)
+   })
+ 
+-  const defaultMiddleware = getDefaultMiddleware()
+-
+   it('removes the thunk middleware if disabled', () => {
+     const middleware = getDefaultMiddleware({ thunk: false })
+     // @ts-ignore
+     expect(middleware.includes(thunk)).toBe(false)
+-    expect(middleware.length).toBe(defaultMiddleware.length - 1)
++    expect(middleware.length).toBe(2)
+   })
+ 
+   it('removes the immutable middleware if disabled', () => {
++    const defaultMiddleware = getDefaultMiddleware()
+     const middleware = getDefaultMiddleware({ immutableCheck: false })
+     expect(middleware.length).toBe(defaultMiddleware.length - 1)
+   })
+ 
+   it('removes the serializable middleware if disabled', () => {
++    const defaultMiddleware = getDefaultMiddleware()
+     const middleware = getDefaultMiddleware({ serializableCheck: false })
+     expect(middleware.length).toBe(defaultMiddleware.length - 1)
+   })
+ 
+-  it('removes the action creator middleware if disabled', () => {
+-    const middleware = getDefaultMiddleware({ actionCreatorCheck: false })
+-    expect(middleware.length).toBe(defaultMiddleware.length - 1)
+-  })
+-
+   it('allows passing options to thunk', () => {
+     const extraArgument = 42 as const
+     const middleware = getDefaultMiddleware({
+       thunk: { extraArgument },
+       immutableCheck: false,
+       serializableCheck: false,
+-      actionCreatorCheck: false,
+     })
+ 
+     const m2 = getDefaultMiddleware({
+@@ -136,7 +129,6 @@ describe('getDefaultMiddleware', () => {
+         },
+       },
+       serializableCheck: false,
+-      actionCreatorCheck: false,
+     })
+ 
+     const reducer = () => ({})
+@@ -161,7 +153,6 @@ describe('getDefaultMiddleware', () => {
+           return true
+         },
+       },
+-      actionCreatorCheck: false,
+     })
+ 
+     const reducer = () => ({})
+@@ -177,33 +168,6 @@ describe('getDefaultMiddleware', () => {
+   })
+ })
+ 
+-it('allows passing options to actionCreatorCheck', () => {
+-  let actionCreatorCheckWasCalled = false
+-
+-  const middleware = getDefaultMiddleware({
+-    thunk: false,
+-    immutableCheck: false,
+-    serializableCheck: false,
+-    actionCreatorCheck: {
+-      isActionCreator: (action: unknown): action is Function => {
+-        actionCreatorCheckWasCalled = true
+-        return false
+-      },
+-    },
+-  })
+-
+-  const reducer = () => ({})
+-
+-  const store = configureStore({
+-    reducer,
+-    middleware,
+-  })
+-
+-  store.dispatch({ type: 'TEST_ACTION' })
+-
+-  expect(actionCreatorCheckWasCalled).toBe(true)
+-})
+-
+ describe('MiddlewareArray functionality', () => {
+   const middleware1: Middleware = () => (next) => (action) => next(action)
+   const middleware2: Middleware = () => (next) => (action) => next(action)
+diff --git a/website/sidebars.json b/website/sidebars.json
+index 17dfccfe..b469f3c8 100644
+--- a/website/sidebars.json
++++ b/website/sidebars.json
+@@ -41,7 +41,6 @@
+             "api/getDefaultMiddleware",
+             "api/immutabilityMiddleware",
+             "api/serializabilityMiddleware",
+-            "api/actionCreatorMiddleware",
+             "api/createListenerMiddleware",
+             "api/autoBatchEnhancer"
+           ]

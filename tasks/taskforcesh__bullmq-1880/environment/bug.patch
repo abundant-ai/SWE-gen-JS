@@ -1,0 +1,280 @@
+diff --git a/python/bullmq/scripts.py b/python/bullmq/scripts.py
+index 1af46ce606..ce9b1e7faa 100644
+--- a/python/bullmq/scripts.py
++++ b/python/bullmq/scripts.py
+@@ -36,7 +36,7 @@ class Scripts:
+             "moveStalledJobsToWait": redisClient.register_script(self.getScript("moveStalledJobsToWait-8.lua")),
+             "pause": redisClient.register_script(self.getScript("pause-4.lua")),
+             "obliterate": redisClient.register_script(self.getScript("obliterate-2.lua")),
+-            "reprocessJob": redisClient.register_script(self.getScript("reprocessJob-6.lua")),
++            "reprocessJob": redisClient.register_script(self.getScript("reprocessJob-4.lua")),
+             "retryJob": redisClient.register_script(self.getScript("retryJob-8.lua")),
+             "retryJobs": redisClient.register_script(self.getScript("retryJobs-6.lua")),
+             "saveStacktrace": redisClient.register_script(self.getScript("saveStacktrace-1.lua")),
+@@ -165,8 +165,6 @@ class Scripts:
+         keys.append(self.keys['events'])
+         keys.append(self.keys[state])
+         keys.append(self.keys['wait'])
+-        keys.append(self.keys['meta'])
+-        keys.append(self.keys['paused'])
+         
+         args = [
+             job.id,
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index c7a3cb5e0a..5ee4cafc02 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -762,9 +762,7 @@ export class Scripts {
+       this.queue.toKey(job.id),
+       this.queue.keys.events,
+       this.queue.toKey(state),
+-      this.queue.keys.wait,
+-      this.queue.keys.meta,
+-      this.queue.keys.paused,
++      this.queue.toKey('wait'),
+     ];
+ 
+     const args = [
+@@ -916,6 +914,37 @@ export class Scripts {
+     }
+     return result;
+   }
++
++  /*
++//   *
++//    * Attempts to reprocess a job
++//    *
++//    * @param {Job} job
++//    * @param {Object} options
++//    * @param {String} options.state The expected job state. If the job is not found
++//    * on the provided state, then it's not reprocessed. Supported states: 'failed', 'completed'
++//    *
++//    * @return {Promise<Number>} Returns a promise that evaluates to a return code:
++//    * 1 means the operation was a success
++//    * 0 means the job does not exist
++//    * -1 means the job is currently locked and can't be retried.
++//    * -2 means the job was not found in the expected set
++
++  static reprocessJob(job: Jov, state: string) {
++    var queue = job.queue;
++
++    var keys = [
++      queue.toKey(job.id),
++      queue.toKey(job.id) + ':lock',
++      queue.toKey(state),
++      queue.toKey('wait'),
++    ];
++
++    var args = [job.id, (job.opts.lifo ? 'R' : 'L') + 'PUSH', queue.token];
++
++    return queue.client.reprocessJob(keys.concat(args));
++  }
++  */
+ }
+ 
+ export function raw2NextJobData(raw: any[]) {
+diff --git a/src/commands/reprocessJob-6.lua b/src/commands/reprocessJob-4.lua
+similarity index 80%
+rename from src/commands/reprocessJob-6.lua
+rename to src/commands/reprocessJob-4.lua
+index 22991cc970..7ffffd33b9 100644
+--- a/src/commands/reprocessJob-6.lua
++++ b/src/commands/reprocessJob-4.lua
+@@ -6,8 +6,6 @@
+     KEYS[2] events stream
+     KEYS[3] job state
+     KEYS[4] wait key
+-    KEYS[5] meta
+-    KEYS[6] paused key
+ 
+     ARGV[1] job.id
+     ARGV[2] (job.opts.lifo ? 'R' : 'L') + 'PUSH'
+@@ -20,18 +18,12 @@
+     -3 means the job was not found in the expected set.
+ ]]
+ local rcall = redis.call;
+-
+--- Includes
+---- @include "includes/getTargetQueueList"
+-
+ if (rcall("EXISTS", KEYS[1]) == 1) then
+   local jobId = ARGV[1]
+   if (rcall("ZREM", KEYS[3], jobId) == 1) then
++    rcall(ARGV[2], KEYS[4], jobId)
+     rcall("HDEL", KEYS[1], "finishedOn", "processedOn", ARGV[3])
+ 
+-    local target = getTargetQueueList(KEYS[5], KEYS[4], KEYS[6])
+-    rcall(ARGV[2], target, jobId)
+-
+     -- Emit waiting event
+     rcall("XADD", KEYS[2], "*", "event", "waiting", "jobId", jobId, "prev", ARGV[4]);
+     return 1
+diff --git a/src/types/job-options.ts b/src/types/job-options.ts
+index 3d615fdb98..fb88534fe6 100644
+--- a/src/types/job-options.ts
++++ b/src/types/job-options.ts
+@@ -15,9 +15,4 @@ export type RedisJobOptions = BaseJobOptions & {
+    * If true, moves parent to failed.
+    */
+   fpof?: boolean;
+-
+-  /**
+-   * Maximum amount of log entries that will be preserved
+-   */
+-  kl?: number;
+ };
+diff --git a/tests/test_worker.ts b/tests/test_worker.ts
+index 197fdcd8e5..7e69458409 100644
+--- a/tests/test_worker.ts
++++ b/tests/test_worker.ts
+@@ -1313,44 +1313,6 @@ describe('workers', function () {
+     await worker.close();
+   });
+ 
+-  describe('when queue is paused and retry a job', () => {
+-    it('moves job to paused', async () => {
+-      const worker = new Worker(
+-        queueName,
+-        async () => {
+-          await delay(100);
+-        },
+-        { connection },
+-      );
+-      await worker.waitUntilReady();
+-
+-      const completing = new Promise<void>((resolve, reject) => {
+-        worker.once('completed', async job => {
+-          try {
+-            expect(job).to.be.ok;
+-            expect(job.data.foo).to.be.eql('bar');
+-          } catch (err) {
+-            reject(err);
+-          }
+-          resolve();
+-        });
+-      });
+-
+-      const job = await queue.add('test', { foo: 'bar' });
+-      expect(job.id).to.be.ok;
+-      expect(job.data.foo).to.be.eql('bar');
+-
+-      await completing;
+-      await queue.pause();
+-      await job.retry('completed');
+-
+-      const pausedJobsCount = await queue.getJobCountByTypes('paused');
+-      expect(pausedJobsCount).to.be.equal(1);
+-
+-      await worker.close();
+-    });
+-  });
+-
+   it('retry a job that fails using job retry method', async () => {
+     let called = 0;
+     let failedOnce = false;
+@@ -1536,6 +1498,53 @@ describe('workers', function () {
+     await worker.close();
+   });
+ 
++  describe('when retrying jobs', () => {
++    it('deletes token after moving jobs to delayed', async function () {
++      const worker = new Worker(
++        queueName,
++        async job => {
++          if (job.attemptsMade !== 3) {
++            throw new Error('error');
++          }
++          return delay(100);
++        },
++        {
++          connection,
++          lockDuration: 10000,
++          lockRenewTime: 3000, // The lock will not be updated
++        },
++      );
++      await worker.waitUntilReady();
++
++      const client = await queue.client;
++
++      const job = await queue.add(
++        'test',
++        { bar: 'baz' },
++        { attempts: 3, backoff: 100 },
++      );
++
++      worker.on('failed', async () => {
++        const token = await client.get(`bull:${queueName}:${job.id}:lock`);
++        expect(token).to.be.null;
++      });
++
++      const workerCompleted = new Promise<void>(resolve => {
++        worker.once('completed', () => {
++          resolve();
++        });
++      });
++
++      await workerCompleted;
++
++      const token = await client.get(`bull:${queueName}:${job.id}:lock`);
++
++      expect(token).to.be.null;
++
++      await worker.close();
++    });
++  });
++
+   it('continues processing after a worker has stalled', async function () {
+     let first = true;
+     this.timeout(10000);
+@@ -1862,51 +1871,6 @@ describe('workers', function () {
+   });
+ 
+   describe('Retries and backoffs', () => {
+-    it('deletes token after moving jobs to delayed', async function () {
+-      const worker = new Worker(
+-        queueName,
+-        async job => {
+-          if (job.attemptsMade !== 3) {
+-            throw new Error('error');
+-          }
+-          return delay(100);
+-        },
+-        {
+-          connection,
+-          lockDuration: 10000,
+-          lockRenewTime: 3000, // The lock will not be updated
+-        },
+-      );
+-      await worker.waitUntilReady();
+-
+-      const client = await queue.client;
+-
+-      const job = await queue.add(
+-        'test',
+-        { bar: 'baz' },
+-        { attempts: 3, backoff: 100 },
+-      );
+-
+-      worker.on('failed', async () => {
+-        const token = await client.get(`bull:${queueName}:${job.id}:lock`);
+-        expect(token).to.be.null;
+-      });
+-
+-      const workerCompleted = new Promise<void>(resolve => {
+-        worker.once('completed', () => {
+-          resolve();
+-        });
+-      });
+-
+-      await workerCompleted;
+-
+-      const token = await client.get(`bull:${queueName}:${job.id}:lock`);
+-
+-      expect(token).to.be.null;
+-
+-      await worker.close();
+-    });
+-
+     describe('when attempts is 1 and job fails', () => {
+       it('should execute job only once and emits retries-exhausted event', async () => {
+         const worker = new Worker(

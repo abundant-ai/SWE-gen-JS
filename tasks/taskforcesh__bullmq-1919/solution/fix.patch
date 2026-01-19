@@ -1,0 +1,89 @@
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 6d4d0aaf63..774c2cd5ed 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -888,10 +888,11 @@ export class Scripts {
+       this.queue.keys.paused,
+       this.queue.keys.meta,
+       this.queue.keys.limiter,
++      this.queue.keys.priority,
+       this.queue.keys.events,
+     ];
+ 
+-    const args = [jobId, token];
++    const args = [jobId, token, this.queue.toKey(jobId)];
+ 
+     const pttl = await (<any>client).moveJobFromActiveToWait(keys.concat(args));
+ 
+diff --git a/src/commands/addJob-8.lua b/src/commands/addJob-8.lua
+index 2b6c7191db..fd282e45ba 100644
+--- a/src/commands/addJob-8.lua
++++ b/src/commands/addJob-8.lua
+@@ -33,7 +33,7 @@
+             [6]  waitChildrenKey key.
+             [7]  parent dependencies key.
+             [8]  parent? {id, queueKey}
+-            [9] repeat job key
++            [9]  repeat job key
+             
+       ARGV[2] Json stringified job data
+       ARGV[3] msgpacked options
+diff --git a/src/commands/moveJobFromActiveToWait-9.lua b/src/commands/moveJobFromActiveToWait-9.lua
+new file mode 100644
+index 0000000000..0a2ea53efe
+--- /dev/null
++++ b/src/commands/moveJobFromActiveToWait-9.lua
+@@ -0,0 +1,53 @@
++--[[
++  Function to move job from active state to wait.
++  Input:
++    KEYS[1] active key
++    KEYS[2] wait key
++    
++    KEYS[3] stalled key
++    KEYS[4] job lock key
++    KEYS[5] paused key
++    KEYS[6] meta key
++    KEYS[7] limiter key
++    KEYS[8] priority key
++    KEYS[9] event key
++
++    ARGV[1] job id
++    ARGV[2] lock token
++    ARGV[3] job id key
++]]
++local rcall = redis.call
++
++-- Includes
++--- @include "includes/addJobWithPriority"
++--- @include "includes/getTargetQueueList"
++
++local jobId = ARGV[1]
++local token = ARGV[2]
++local lockKey = KEYS[4]
++
++local lockToken = rcall("GET", lockKey)
++local pttl = rcall("PTTL", KEYS[7])
++if lockToken == token and pttl > 0 then
++  local removed = rcall("LREM", KEYS[1], 1, jobId)
++  if (removed > 0) then
++    local target = getTargetQueueList(KEYS[6], KEYS[2], KEYS[5])
++
++    rcall("SREM", KEYS[3], jobId)
++
++    local priority = tonumber(rcall("HGET", ARGV[3], "priority")) or 0
++
++    if priority > 0 then
++      addJobWithPriority(KEYS[8], priority, target, jobId)
++    else
++      rcall("RPUSH", target, jobId)
++    end
++
++    rcall("DEL", lockKey)
++
++    -- Emit waiting event
++    rcall("XADD", KEYS[9], "*", "event", "waiting", "jobId", jobId)
++  end
++end
++
++return pttl

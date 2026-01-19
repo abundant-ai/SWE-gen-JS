@@ -1,0 +1,104 @@
+diff --git a/packages/action-listener-middleware/src/index.ts b/packages/action-listener-middleware/src/index.ts
+index f4b41658..e32ef109 100644
+--- a/packages/action-listener-middleware/src/index.ts
++++ b/packages/action-listener-middleware/src/index.ts
+@@ -32,7 +32,7 @@ import type {
+   ForkedTaskExecutor,
+   ForkedTask,
+ } from './types'
+-import { assertFunction } from './utils'
++import { assertFunction, catchRejection } from './utils'
+ import { TaskAbortError } from './exceptions'
+ import {
+   runTask,
+@@ -161,7 +161,10 @@ const createTakePattern = <S>(
+     }
+   }
+ 
+-  return take as TakePattern<S>
++  return ((
++    predicate: AnyActionListenerPredicate<S>,
++    timeout: number | undefined
++  ) => catchRejection(take(predicate, timeout))) as TakePattern<S>
+ }
+ 
+ /** Accepts the possible options for creating a listener, and returns a formatted listener entry */
+diff --git a/packages/action-listener-middleware/src/task.ts b/packages/action-listener-middleware/src/task.ts
+index efa1e12e..dbf92a0d 100644
+--- a/packages/action-listener-middleware/src/task.ts
++++ b/packages/action-listener-middleware/src/task.ts
+@@ -1,6 +1,6 @@
+ import { TaskAbortError } from './exceptions'
+ import type { TaskResult } from './types'
+-import { noop } from './utils'
++import { noop, catchRejection } from './utils'
+ 
+ /**
+  * Synchronously raises {@link TaskAbortError} if the task tied to the input `signal` has been cancelled.
+@@ -23,20 +23,17 @@ export const promisifyAbortSignal = (
+   signal: AbortSignal,
+   reason?: string
+ ): Promise<never> => {
+-  const promise = new Promise<never>((_, reject) => {
+-    const notifyRejection = () => reject(new TaskAbortError(reason))
++  return catchRejection(
++    new Promise<never>((_, reject) => {
++      const notifyRejection = () => reject(new TaskAbortError(reason))
+ 
+-    if (signal.aborted) {
+-      notifyRejection()
+-    } else {
+-      signal.addEventListener('abort', notifyRejection, { once: true })
+-    }
+-  })
+-
+-  // We do not want 'unhandledRejection' warnings or crashes caused by cancelled tasks
+-  promise.catch(noop)
+-
+-  return promise
++      if (signal.aborted) {
++        notifyRejection()
++      } else {
++        signal.addEventListener('abort', notifyRejection, { once: true })
++      }
++    })
++  )
+ }
+ 
+ /**
+@@ -74,11 +71,13 @@ export const runTask = async <T>(
+  * @returns
+  */
+ export const createPause = <T>(signal: AbortSignal) => {
+-  return async (promise: Promise<T>): Promise<T> => {
+-    validateActive(signal)
+-    const result = await Promise.race([promisifyAbortSignal(signal), promise])
+-    validateActive(signal)
+-    return result
++  return (promise: Promise<T>): Promise<T> => {
++    return catchRejection(
++      Promise.race([promisifyAbortSignal(signal), promise]).then((output) => {
++        validateActive(signal)
++        return output
++      })
++    )
+   }
+ }
+ 
+diff --git a/packages/action-listener-middleware/src/utils.ts b/packages/action-listener-middleware/src/utils.ts
+index 631ad078..cc8044fe 100644
+--- a/packages/action-listener-middleware/src/utils.ts
++++ b/packages/action-listener-middleware/src/utils.ts
+@@ -11,3 +11,12 @@ export const assertFunction: (
+ }
+ 
+ export const noop = () => {}
++
++export const catchRejection = <T>(
++  promise: Promise<T>,
++  onError = noop
++): Promise<T> => {
++  promise.catch(onError)
++
++  return promise
++}

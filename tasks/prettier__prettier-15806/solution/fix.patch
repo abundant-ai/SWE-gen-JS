@@ -1,0 +1,388 @@
+diff --git a/changelog_unreleased/javascript/15806.md b/changelog_unreleased/javascript/15806.md
+new file mode 100644
+index 000000000..8c14c4ebb
+--- /dev/null
++++ b/changelog_unreleased/javascript/15806.md
+@@ -0,0 +1,51 @@
++#### Fix inconsistencies for optional-chaining (#15806 by @fisker)
++
++Only happens when using `typescript`, `meriyah` or other ESTree parsers except `babel`.
++
++<!-- prettier-ignore -->
++```js
++// Input
++function someFunctionName() {
++  return isEqual(a.map(([t, _]) => t?.id), b.map(([t, _]) => t?.id));
++  return isEqual(a?.map(([t, _]) => t?.id), b?.map(([t, _]) => t?.id));
++}
++theValue = Object.entries(someLongObjectName).filter(
++  ([listingId]) => someListToCompareToHere.includes(listingId),
++);
++theValue = Object.entries(someLongObjectName).filter(
++  ([listingId]) => someListToCompareToHere?.includes(listingId),
++);
++
++// Prettier stable
++function someFunctionName() {
++  return isEqual(
++    a.map(([t, _]) => t?.id),
++    b.map(([t, _]) => t?.id),
++  );
++  return isEqual(a?.map(([t, _]) => t?.id), b?.map(([t, _]) => t?.id));
++}
++theValue = Object.entries(someLongObjectName).filter(([listingId]) =>
++  someListToCompareToHere.includes(listingId),
++);
++theValue = Object.entries(someLongObjectName).filter(
++  ([listingId]) => someListToCompareToHere?.includes(listingId),
++);
++
++// Prettier main
++function someFunctionName() {
++  return isEqual(
++    a.map(([t, _]) => t?.id),
++    b.map(([t, _]) => t?.id),
++  );
++  return isEqual(
++    a?.map(([t, _]) => t?.id),
++    b?.map(([t, _]) => t?.id),
++  );
++}
++theValue = Object.entries(someLongObjectName).filter(([listingId]) =>
++  someListToCompareToHere.includes(listingId),
++);
++theValue = Object.entries(someLongObjectName).filter(([listingId]) =>
++  someListToCompareToHere?.includes(listingId),
++);
++```
+diff --git a/src/language-js/print/call-expression.js b/src/language-js/print/call-expression.js
+index 461e1f940..ec1344fae 100644
+--- a/src/language-js/print/call-expression.js
++++ b/src/language-js/print/call-expression.js
+@@ -61,7 +61,11 @@ function printCallExpression(path, options, print) {
+     !isDynamicImport &&
+     !isNew &&
+     isMemberish(node.callee) &&
+-    !path.call((path) => pathNeedsParens(path, options), "callee")
++    !path.call(
++      (path) => pathNeedsParens(path, options),
++      "callee",
++      ...(node.callee.type === "ChainExpression" ? ["expression"] : []),
++    )
+   ) {
+     return printMemberChain(path, options, print);
+   }
+diff --git a/src/language-js/print/member-chain.js b/src/language-js/print/member-chain.js
+index 18ba57e6f..a6c1dc325 100644
+--- a/src/language-js/print/member-chain.js
++++ b/src/language-js/print/member-chain.js
+@@ -50,6 +50,14 @@ import {
+ // MemberExpression and CallExpression. We need to traverse the AST
+ // and make groups out of it to print it in the desired way.
+ function printMemberChain(path, options, print) {
++  /* c8 ignore next 6 */
++  if (path.node.type === "ChainExpression") {
++    return path.call(
++      () => printMemberChain(path, options, print),
++      "expression",
++    );
++  }
++
+   const { parent } = path;
+   const isExpressionStatement =
+     !parent || parent.type === "ExpressionStatement";
+@@ -88,6 +96,11 @@ function printMemberChain(path, options, print) {
+ 
+   function rec(path) {
+     const { node } = path;
++
++    if (node.type === "ChainExpression") {
++      return path.call(() => rec(path), "expression");
++    }
++
+     if (
+       isCallExpression(node) &&
+       (isMemberish(node.callee) || isCallExpression(node.callee))
+diff --git a/src/language-js/print/member.js b/src/language-js/print/member.js
+index 4dcc9735a..19a835c78 100644
+--- a/src/language-js/print/member.js
++++ b/src/language-js/print/member.js
+@@ -1,19 +1,31 @@
+ import { group, indent, label, softline } from "../../document/builders.js";
+ import {
++  getCallArguments,
+   isCallExpression,
+   isMemberExpression,
+   isNumericLiteral,
+ } from "../utils/index.js";
+ import { printOptionalToken } from "./misc.js";
+ 
++const isCallExpressionWithArguments = (node) => {
++  if (node.type === "ChainExpression" || node.type === "TSNonNullExpression") {
++    node = node.expression;
++  }
++  return isCallExpression(node) && getCallArguments(node).length > 0;
++};
++
+ function printMemberExpression(path, options, print) {
+   const objectDoc = print("object");
+   const lookupDoc = printMemberLookup(path, options, print);
+-  const { node, parent } = path;
++  const { node } = path;
+   const firstNonMemberParent = path.findAncestor(
+     (node) =>
+       !(isMemberExpression(node) || node.type === "TSNonNullExpression"),
+   );
++  const firstNonChainElementWrapperParent = path.findAncestor(
++    (node) =>
++      !(node.type === "ChainExpression" || node.type === "TSNonNullExpression"),
++  );
+ 
+   const shouldInline =
+     (firstNonMemberParent &&
+@@ -24,13 +36,10 @@ function printMemberExpression(path, options, print) {
+     node.computed ||
+     (node.object.type === "Identifier" &&
+       node.property.type === "Identifier" &&
+-      !isMemberExpression(parent)) ||
+-    ((parent.type === "AssignmentExpression" ||
+-      parent.type === "VariableDeclarator") &&
+-      ((isCallExpression(node.object) && node.object.arguments.length > 0) ||
+-        (node.object.type === "TSNonNullExpression" &&
+-          isCallExpression(node.object.expression) &&
+-          node.object.expression.arguments.length > 0) ||
++      !isMemberExpression(firstNonChainElementWrapperParent)) ||
++    ((firstNonChainElementWrapperParent.type === "AssignmentExpression" ||
++      firstNonChainElementWrapperParent.type === "VariableDeclarator") &&
++      (isCallExpressionWithArguments(node.object) ||
+         objectDoc.label?.memberChain));
+ 
+   return label(objectDoc.label, [
+diff --git a/src/language-js/utils/create-type-check-function.js b/src/language-js/utils/create-type-check-function.js
+index d29b1176b..631f90e8e 100644
+--- a/src/language-js/utils/create-type-check-function.js
++++ b/src/language-js/utils/create-type-check-function.js
+@@ -1,5 +1,12 @@
+-function createTypeCheckFunction(types) {
+-  types = new Set(types);
++/** @typedef {import("../types/estree.js").Node} Node */
++/** @typedef {import("../types/estree.js").Comment} Comment */
++
++/**
++ * @param {string[]} typesArray
++ * @returns {(node: Node | Comment) => Boolean}
++ */
++function createTypeCheckFunction(typesArray) {
++  const types = new Set(typesArray);
+   return (node) => types.has(node?.type);
+ }
+ 
+diff --git a/src/language-js/utils/index.js b/src/language-js/utils/index.js
+index 020f18d58..6c256c3c7 100644
+--- a/src/language-js/utils/index.js
++++ b/src/language-js/utils/index.js
+@@ -124,10 +124,6 @@ const isLineComment = createTypeCheckFunction([
+   "InterpreterDirective",
+ ]);
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isExportDeclaration = createTypeCheckFunction([
+   "ExportDefaultDeclaration",
+   "DeclareExportDeclaration",
+@@ -136,19 +132,11 @@ const isExportDeclaration = createTypeCheckFunction([
+   "DeclareExportAllDeclaration",
+ ]);
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isArrayOrTupleExpression = createTypeCheckFunction([
+   "ArrayExpression",
+   "TupleExpression",
+ ]);
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isObjectOrRecordExpression = createTypeCheckFunction([
+   "ObjectExpression",
+   "RecordExpression",
+@@ -191,10 +179,6 @@ function isRegExpLiteral(node) {
+   );
+ }
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isLiteral = createTypeCheckFunction([
+   "Literal",
+   "BooleanLiteral",
+@@ -207,10 +191,6 @@ const isLiteral = createTypeCheckFunction([
+   "StringLiteral",
+ ]);
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isSingleWordType = createTypeCheckFunction([
+   "Identifier",
+   "ThisExpression",
+@@ -220,20 +200,12 @@ const isSingleWordType = createTypeCheckFunction([
+   "Import",
+ ]);
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isObjectType = createTypeCheckFunction([
+   "ObjectTypeAnnotation",
+   "TSTypeLiteral",
+   "TSMappedType",
+ ]);
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isFunctionOrArrowExpression = createTypeCheckFunction([
+   "FunctionExpression",
+   "ArrowFunctionExpression",
+@@ -269,10 +241,6 @@ function isAngularTestWrapper(node) {
+   );
+ }
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isJsxElement = createTypeCheckFunction(["JSXElement", "JSXFragment"]);
+ 
+ function isGetterOrSetter(node) {
+@@ -314,10 +282,6 @@ function isTypeAnnotationAFunction(node) {
+   );
+ }
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+ const isBinaryish = createTypeCheckFunction([
+   "BinaryExpression",
+   "LogicalExpression",
+@@ -438,23 +402,22 @@ function isTestCall(node, parent) {
+   return false;
+ }
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+-const isCallExpression = createTypeCheckFunction([
+-  "CallExpression",
+-  "OptionalCallExpression",
+-]);
++/** @return {(node: Node) => boolean} */
++const skipChainExpression = (fn) => (node) => {
++  if (node?.type === "ChainExpression") {
++    node = node.expression;
++  }
+ 
+-/**
+- * @param {Node} node
+- * @returns {boolean}
+- */
+-const isMemberExpression = createTypeCheckFunction([
+-  "MemberExpression",
+-  "OptionalMemberExpression",
+-]);
++  return fn(node);
++};
++
++const isCallExpression = skipChainExpression(
++  createTypeCheckFunction(["CallExpression", "OptionalCallExpression"]),
++);
++
++const isMemberExpression = skipChainExpression(
++  createTypeCheckFunction(["MemberExpression", "OptionalMemberExpression"]),
++);
+ 
+ /**
+  *
+@@ -717,7 +680,7 @@ function isFunctionCompositionArgs(args) {
+         return true;
+       }
+     } else if (isCallExpression(arg)) {
+-      for (const childArg of arg.arguments) {
++      for (const childArg of getCallArguments(arg)) {
+         if (isFunctionOrArrowExpression(childArg)) {
+           return true;
+         }
+@@ -1050,6 +1013,10 @@ function getCallArguments(node) {
+     return callArgumentsCache.get(node);
+   }
+ 
++  if (node.type === "ChainExpression") {
++    return getCallArguments(node.expression);
++  }
++
+   let args = node.arguments;
+   if (node.type === "ImportExpression") {
+     args = [node.source];
+@@ -1071,6 +1038,14 @@ function getCallArguments(node) {
+ 
+ function iterateCallArgumentsPath(path, iteratee) {
+   const { node } = path;
++
++  if (node.type === "ChainExpression") {
++    return path.call(
++      () => iterateCallArgumentsPath(path, iteratee),
++      "expression",
++    );
++  }
++
+   if (node.type === "ImportExpression") {
+     path.call((sourcePath) => iteratee(sourcePath, 0), "source");
+ 
+@@ -1089,17 +1064,22 @@ function iterateCallArgumentsPath(path, iteratee) {
+ }
+ 
+ function getCallArgumentSelector(node, index) {
++  const selectors = [];
++  if (node.type === "ChainExpression") {
++    selectors.push("expression");
++  }
++
+   if (node.type === "ImportExpression") {
+     if (index === 0 || index === (node.attributes || node.options ? -2 : -1)) {
+-      return "source";
++      return [...selectors, "source"];
+     }
+     // import attributes
+     if (node.attributes && (index === 1 || index === -1)) {
+-      return "attributes";
++      return [...selectors, "attributes"];
+     }
+     // deprecated import assertions
+     if (node.options && (index === 1 || index === -1)) {
+-      return "options";
++      return [...selectors, "options"];
+     }
+     throw new RangeError("Invalid argument index");
+   }
+@@ -1110,7 +1090,7 @@ function getCallArgumentSelector(node, index) {
+   if (index < 0 || index >= node.arguments.length) {
+     throw new RangeError("Invalid argument index");
+   }
+-  return ["arguments", index];
++  return [...selectors, "arguments", index];
+ }
+ 
+ function isPrettierIgnoreComment(comment) {

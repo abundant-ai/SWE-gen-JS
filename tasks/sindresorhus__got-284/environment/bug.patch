@@ -1,0 +1,544 @@
+diff --git a/index.js b/index.js
+index 439ff17..cb55f7d 100644
+--- a/index.js
++++ b/index.js
+@@ -7,7 +7,6 @@ const Transform = require('stream').Transform;
+ const urlLib = require('url');
+ const fs = require('fs');
+ const querystring = require('querystring');
+-const CacheableRequest = require('cacheable-request');
+ const duplexer3 = require('duplexer3');
+ const intoStream = require('into-stream');
+ const isStream = require('is-stream');
+@@ -88,8 +87,7 @@ function requestAsEventEmitter(opts) {
+ 
+ 		let progressInterval;
+ 
+-		const cacheableRequest = new CacheableRequest(fn.request, opts.cache);
+-		const cacheReq = cacheableRequest(opts, res => {
++		const req = fn.request(opts, res => {
+ 			clearInterval(progressInterval);
+ 
+ 			ee.emit('uploadProgress', {
+@@ -174,7 +172,7 @@ function requestAsEventEmitter(opts) {
+ 
+ 				const response = opts.decompress === true &&
+ 					typeof decompressResponse === 'function' &&
+-					opts.method !== 'HEAD' ? decompressResponse(progressStream) : progressStream;
++					req.method !== 'HEAD' ? decompressResponse(progressStream) : progressStream;
+ 
+ 				if (!opts.decompress && ['gzip', 'deflate'].indexOf(res.headers['content-encoding']) !== -1) {
+ 					opts.encoding = null;
+@@ -192,66 +190,62 @@ function requestAsEventEmitter(opts) {
+ 			});
+ 		});
+ 
+-		cacheReq.on('error', err => ee.emit('error', new got.CacheError(err, opts)));
++		req.once('error', err => {
++			clearInterval(progressInterval);
+ 
+-		cacheReq.on('request', req => {
+-			req.once('error', err => {
+-				clearInterval(progressInterval);
++			const backoff = opts.retries(++retryCount, err);
+ 
+-				const backoff = opts.retries(++retryCount, err);
++			if (backoff) {
++				setTimeout(get, backoff, opts);
++				return;
++			}
+ 
+-				if (backoff) {
+-					setTimeout(get, backoff, opts);
+-					return;
+-				}
++			ee.emit('error', new got.RequestError(err, opts));
++		});
+ 
+-				ee.emit('error', new got.RequestError(err, opts));
++		ee.on('request', req => {
++			ee.emit('uploadProgress', {
++				percent: 0,
++				transferred: 0,
++				total: uploadBodySize
+ 			});
+ 
+-			ee.on('request', req => {
+-				ee.emit('uploadProgress', {
+-					percent: 0,
+-					transferred: 0,
+-					total: uploadBodySize
+-				});
+-
+-				req.connection.on('connect', () => {
+-					const uploadEventFrequency = 150;
++			req.connection.on('connect', () => {
++				const uploadEventFrequency = 150;
+ 
+-					progressInterval = setInterval(() => {
+-						const lastUploaded = uploaded;
+-						const headersSize = Buffer.byteLength(req._header);
+-						uploaded = req.connection.bytesWritten - headersSize;
++				progressInterval = setInterval(() => {
++					const lastUploaded = uploaded;
++					const headersSize = Buffer.byteLength(req._header);
++					uploaded = req.connection.bytesWritten - headersSize;
+ 
+-						// Prevent the known issue of `bytesWritten` being larger than body size
+-						if (uploadBodySize && uploaded > uploadBodySize) {
+-							uploaded = uploadBodySize;
+-						}
++					// Prevent the known issue of `bytesWritten` being larger than body size
++					if (uploadBodySize && uploaded > uploadBodySize) {
++						uploaded = uploadBodySize;
++					}
+ 
+-						// Don't emit events with unchanged progress and
+-						// prevent last event from being emitted, because
+-						// it's emitted when `response` is emitted
+-						if (uploaded === lastUploaded || uploaded === uploadBodySize) {
+-							return;
+-						}
++					// Don't emit events with unchanged progress and
++					// prevent last event from being emitted, because
++					// it's emitted when `response` is emitted
++					if (uploaded === lastUploaded || uploaded === uploadBodySize) {
++						return;
++					}
+ 
+-						ee.emit('uploadProgress', {
+-							percent: uploadBodySize ? uploaded / uploadBodySize : 0,
+-							transferred: uploaded,
+-							total: uploadBodySize
+-						});
+-					}, uploadEventFrequency);
+-				});
++					ee.emit('uploadProgress', {
++						percent: uploadBodySize ? uploaded / uploadBodySize : 0,
++						transferred: uploaded,
++						total: uploadBodySize
++					});
++				}, uploadEventFrequency);
+ 			});
++		});
+ 
+-			if (opts.gotTimeout) {
+-				clearInterval(progressInterval);
+-				timedOut(req, opts.gotTimeout);
+-			}
++		if (opts.gotTimeout) {
++			clearInterval(progressInterval);
++			timedOut(req, opts.gotTimeout);
++		}
+ 
+-			setImmediate(() => {
+-				ee.emit('request', req);
+-			});
++		setImmediate(() => {
++			ee.emit('request', req);
+ 		});
+ 	};
+ 
+@@ -276,7 +270,7 @@ function asPromise(opts) {
+ 
+ 	const proxy = new EventEmitter();
+ 
+-	const promise = timeoutFn(new PCancelable((onCancel, resolve, reject) => {
++	const cancelable = new PCancelable((onCancel, resolve, reject) => {
+ 		const ee = requestAsEventEmitter(opts);
+ 		let cancelOnRequest = false;
+ 
+@@ -338,7 +332,11 @@ function asPromise(opts) {
+ 		ee.on('error', reject);
+ 		ee.on('uploadProgress', proxy.emit.bind(proxy, 'uploadProgress'));
+ 		ee.on('downloadProgress', proxy.emit.bind(proxy, 'downloadProgress'));
+-	}));
++	});
++
++	const promise = timeoutFn(cancelable);
++
++	promise.cancel = cancelable.cancel.bind(cancelable);
+ 
+ 	promise.on = (name, fn) => {
+ 		proxy.on(name, fn);
+@@ -436,9 +434,8 @@ function normalizeArguments(url, opts) {
+ 		{
+ 			path: '',
+ 			retries: 2,
+-			cache: false,
+ 			decompress: true,
+-			useElectronNet: true
++			useElectronNet: false
+ 		},
+ 		url,
+ 		{
+@@ -574,6 +571,7 @@ for (const method of methods) {
+ class StdError extends Error {
+ 	constructor(message, error, opts) {
+ 		super(message);
++		Error.captureStackTrace(this, this.constructor);
+ 		this.name = 'StdError';
+ 
+ 		if (error.code !== undefined) {
+@@ -591,13 +589,6 @@ class StdError extends Error {
+ 	}
+ }
+ 
+-got.CacheError = class extends StdError {
+-	constructor(error, opts) {
+-		super(error.message, error, opts);
+-		this.name = 'CacheError';
+-	}
+-};
+-
+ got.RequestError = class extends StdError {
+ 	constructor(error, opts) {
+ 		super(error.message, error, opts);
+@@ -649,4 +640,6 @@ got.UnsupportedProtocolError = class extends StdError {
+ 	}
+ };
+ 
++got.CancelError = PCancelable.CancelError;
++
+ module.exports = got;
+diff --git a/package.json b/package.json
+index 46a5f37..d6a5e60 100644
+--- a/package.json
++++ b/package.json
+@@ -50,7 +50,6 @@
+ 		"electron"
+ 	],
+ 	"dependencies": {
+-		"cacheable-request": "^2.0.0",
+ 		"decompress-response": "^3.2.0",
+ 		"duplexer3": "^0.1.4",
+ 		"get-stream": "^3.0.0",
+diff --git a/readme.md b/readme.md
+index 147e849..65e019c 100644
+--- a/readme.md
++++ b/readme.md
+@@ -19,7 +19,6 @@ Created because [`request`](https://github.com/request/request) is bloated *(sev
+ 
+ - [Promise & stream API](#api)
+ - [Request cancelation](#aborting-the-request)
+-- [RFC compliant caching](#cache-adapters)
+ - [Follows redirects](#followredirect)
+ - [Retries on network failure](#retries)
+ - [Progress events](#onuploadprogress-progress)
+@@ -70,10 +69,6 @@ It's a `GET` request by default, but can be changed in `options`.
+ 
+ Returns a Promise for a `response` object with a `body` property, a `url` property with the request URL or the final URL after redirects, and a `requestUrl` property with the original request URL.
+ 
+-The response object will normally be a [Node.js HTTP response stream](https://nodejs.org/api/http.html#http_class_http_incomingmessage), however if returned from the cache it will be a [responselike object](https://github.com/lukechilds/responselike) which behaves in the same way.
+-
+-The response will also have a `fromCache` property set with a boolean value.
+-
+ ##### url
+ 
+ Type: `string` `Object`
+@@ -175,19 +170,12 @@ Decompress the response automatically.
+ 
+ If this is disabled, a compressed response is returned as a `Buffer`. This may be useful if you want to handle decompression yourself or stream the raw compressed data.
+ 
+-###### cache
+-
+-Type: `Object`<br>
+-Default: `false`
+-
+-[Cache adapter instance](#cache-adapters) for storing cached data.
+-
+ ###### useElectronNet
+ 
+ Type: `boolean`<br>
+-Default: `true`
++Default: `false`
+ 
+-When used in Electron, Got will automatically use [`electron.net`](https://electron.atom.io/docs/api/net/) instead of the Node.js `http` module. It should be fully compatible, but you can turn it off here if you encounter a problem. Please open an issue if you do!
++When used in Electron, Got will use [`electron.net`](https://electron.atom.io/docs/api/net/) instead of the Node.js `http` module. According to the Electron docs, it should be fully compatible, but it's not entirely. See [#315](https://github.com/sindresorhus/got/issues/315).
+ 
+ 
+ #### Streams
+@@ -265,10 +253,6 @@ Each error contains (if available) `statusCode`, `statusMessage`, `host`, `hostn
+ 
+ In Promise mode, the `response` is attached to the error.
+ 
+-#### got.CacheError
+-
+-When a cache method fails, for example if the database goes down, or there's a filesystem error.
+-
+ #### got.RequestError
+ 
+ When a request fails. Contains a `code` property with error class code, like `ECONNREFUSED`.
+@@ -293,63 +277,45 @@ When server redirects you more than 10 times. Includes a `redirectUrls` property
+ 
+ When given an unsupported protocol.
+ 
++#### got.CancelError
+ 
+-## Aborting the request
++When the request is aborted with `.cancel()`.
+ 
+-The promise returned by Got has a `.cancel()` function which, when called, aborts the request.
+ 
+-<a name="cache-adapters"></a>
+-## Cache
++## Aborting the request
+ 
+-You can use the JavaScript `Map` type as an in memory cache:
++The promise returned by Got has a [`.cancel()`](https://github.com/sindresorhus/p-cancelable) method which, when called, aborts the request.
+ 
+ ```js
+-const got = require('got');
+-const map = new Map();
++const request = got(url, options);
+ 
+-(async () => {
+-    let response = await got('todomvc.com', {cache: map});
+-    console.log(response.fromCache);
+-    //=> false
++request.catch(err => {
++  if (request.canceled) {
++    // Handle cancelation
++  }
+ 
+-    response = await got('todomvc.com', {cache: map});
+-    console.log(response.fromCache);
+-    //=> true
+-})();
+-```
+-
+-Got uses [Keyv](https://github.com/lukechilds/keyv) internally to support a wide range of storage adapters. For something more scalable you could use an [official Keyv storage adapter](https://github.com/lukechilds/keyv#official-storage-adapters):
++  // Handle other errors
++});
+ 
++request.cancel();
+ ```
+-npm install @keyv/redis
+-```
+-
+-```js
+-const got = require('got');
+-const KeyvRedis = require('@keyv/redis');
+ 
+-const redis = new KeyvRedis('redis://user:pass@localhost:6379');
++Or
+ 
+-got('todomvc.com', {cache: redis});
+-```
++```js
++const request = got(url, options);
+ 
+-Got supports anything that follows the Map API so it's easy to write your own storage adapter or use a third-party solution.
++request.catch(err => {
++  if (err instanceof got.CancelError) {
++    // Handle cancelation
++  }
+ 
+-For example, the following are all valid storage adapters
++  // Handle other errors
++});
+ 
+-```js
+-const storageAdapter = new Map();
+-// or
+-const storageAdapter = require('./my-storage-adapter');
+-// or
+-const QuickLRU = require('quick-lru');
+-const storageAdapter = new QuickLRU({maxSize: 1000});
+-
+-got('todomvc.com', {cache: storageAdapter});
++request.cancel();
+ ```
+ 
+-View the [Keyv docs](https://github.com/lukechilds/keyv) for more information on how to use storage adapters.
+-
+ 
+ ## Proxies
+ 
+@@ -516,6 +482,7 @@ Bear in mind, if you send an `if-modified-since` header and receive a `304 Not M
+ 
+ - [gh-got](https://github.com/sindresorhus/gh-got) - Convenience wrapper for interacting with the GitHub API
+ - [travis-got](https://github.com/samverschueren/travis-got) - Convenience wrapper for interacting with the Travis API
++- [graphql-got](https://github.com/kevva/graphql-got) - Convenience wrapper for got to interact with GraphQL
+ 
+ 
+ ## Created by
+diff --git a/test/cache.js b/test/cache.js
+deleted file mode 100644
+index 04a8423..0000000
+--- a/test/cache.js
++++ /dev/null
+@@ -1,107 +0,0 @@
+-import test from 'ava';
+-import got from '../';
+-import {createServer} from './helpers/server';
+-
+-let s;
+-
+-test.before('setup', async () => {
+-	s = await createServer();
+-
+-	let noStoreIndex = 0;
+-	s.on('/no-store', (req, res) => {
+-		res.setHeader('Cache-Control', 'public, no-cache, no-store');
+-		res.end(noStoreIndex.toString());
+-		noStoreIndex++;
+-	});
+-
+-	let cacheIndex = 0;
+-	s.on('/cache', (req, res) => {
+-		res.setHeader('Cache-Control', 'public, max-age=60');
+-		res.end(cacheIndex.toString());
+-		cacheIndex++;
+-	});
+-
+-	let status301Index = 0;
+-	s.on('/301', (req, res) => {
+-		if (status301Index === 0) {
+-			res.setHeader('Cache-Control', 'public, max-age=60');
+-			res.setHeader('Location', s.url + '/302');
+-			res.statusCode = 301;
+-		}
+-		res.end();
+-		status301Index++;
+-	});
+-
+-	let status302Index = 0;
+-	s.on('/302', (req, res) => {
+-		if (status302Index === 0) {
+-			res.setHeader('Cache-Control', 'public, max-age=60');
+-			res.setHeader('Location', s.url + '/cache');
+-			res.statusCode = 302;
+-		}
+-		res.end();
+-		status302Index++;
+-	});
+-
+-	await s.listen(s.port);
+-});
+-
+-test('Non cacheable responses are not cached', async t => {
+-	const endpoint = '/no-store';
+-	const cache = new Map();
+-
+-	const firstResponseInt = Number((await got(s.url + endpoint, {cache})).body);
+-	const secondResponseInt = Number((await got(s.url + endpoint, {cache})).body);
+-
+-	t.is(cache.size, 0);
+-	t.true(firstResponseInt < secondResponseInt);
+-});
+-
+-test('Cacheable responses are cached', async t => {
+-	const endpoint = '/cache';
+-	const cache = new Map();
+-
+-	const firstResponse = await got(s.url + endpoint, {cache});
+-	const secondResponse = await got(s.url + endpoint, {cache});
+-
+-	t.is(cache.size, 1);
+-	t.is(firstResponse.body, secondResponse.body);
+-});
+-
+-test('Cached response is re-encoded to current encoding option', async t => {
+-	const endpoint = '/cache';
+-	const cache = new Map();
+-	const firstEncoding = 'base64';
+-	const secondEncoding = 'hex';
+-
+-	const firstResponse = await got(s.url + endpoint, {cache, encoding: firstEncoding});
+-	const secondResponse = await got(s.url + endpoint, {cache, encoding: secondEncoding});
+-
+-	const expectedSecondResponseBody = Buffer.from(firstResponse.body, firstEncoding).toString(secondEncoding);
+-
+-	t.is(cache.size, 1);
+-	t.is(secondResponse.body, expectedSecondResponseBody);
+-});
+-
+-test('Redirects are cached and re-used internally', async t => {
+-	const endpoint = '/301';
+-	const cache = new Map();
+-
+-	const firstResponse = await got(s.url + endpoint, {cache});
+-	const secondResponse = await got(s.url + endpoint, {cache});
+-
+-	t.is(cache.size, 3);
+-	t.is(firstResponse.body, secondResponse.body);
+-});
+-
+-test('Cache error throws got.CacheError', async t => {
+-	const endpoint = '/no-store';
+-	const cache = {};
+-
+-	const err = await t.throws(got(s.url + endpoint, {cache}));
+-	t.is(err.name, 'CacheError');
+-});
+-
+-test.after('cleanup', async () => {
+-	await s.close();
+-});
+diff --git a/test/cancel.js b/test/cancel.js
+index eada726..caa2d15 100644
+--- a/test/cancel.js
++++ b/test/cancel.js
+@@ -47,6 +47,25 @@ test('cancel in-progress request', async t => {
+ 	await t.notThrows(helper.aborted, 'Request finished instead of aborting.');
+ });
+ 
++test('cancel in-progress request with timeout', async t => {
++	const helper = await createAbortServer();
++	const body = new Readable({
++		read() {}
++	});
++	body.push('1');
++
++	const p = got(helper.url, {body, timeout: 10000});
++
++	// Wait for the stream to be established before canceling
++	setTimeout(() => {
++		p.cancel();
++		body.push(null);
++	}, 100);
++
++	await t.throws(p, PCancelable.CancelError);
++	await t.notThrows(helper.aborted, 'Request finished instead of aborting.');
++});
++
+ test('cancel immediately', async t => {
+ 	const s = await createServer();
+ 	const aborted = new Promise((resolve, reject) => {
+@@ -66,3 +85,35 @@ test('cancel immediately', async t => {
+ 	await t.throws(p);
+ 	await t.notThrows(aborted, 'Request finished instead of aborting.');
+ });
++
++test('recover from cancelation using cancelable promise attribute', async t => {
++	// Canceled before connection started
++	const p = got('http://example.com');
++	const recover = p.catch(err => {
++		if (p.canceled) {
++			return;
++		}
++
++		throw err;
++	});
++
++	p.cancel();
++
++	await t.notThrows(recover);
++});
++
++test('recover from cancellation using error instance', async t => {
++	// Canceled before connection started
++	const p = got('http://example.com');
++	const recover = p.catch(err => {
++		if (err instanceof got.CancelError) {
++			return;
++		}
++
++		throw err;
++	});
++
++	p.cancel();
++
++	await t.notThrows(recover);
++});

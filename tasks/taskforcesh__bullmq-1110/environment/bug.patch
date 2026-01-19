@@ -1,0 +1,452 @@
+diff --git a/docs/gitbook/patterns/process-step-jobs.md b/docs/gitbook/patterns/process-step-jobs.md
+index 359eac61be..b19e0dfaad 100644
+--- a/docs/gitbook/patterns/process-step-jobs.md
++++ b/docs/gitbook/patterns/process-step-jobs.md
+@@ -71,7 +71,7 @@ const worker = new Worker(
+             {
+               parent: {
+                 id: job.id,
+-                queue: job.queueQualifiedName,
++                queue: `bull:${parentQueueName}`,
+               },
+             },
+           );
+@@ -89,7 +89,7 @@ const worker = new Worker(
+             {
+               parent: {
+                 id: job.id,
+-                queue: job.queueQualifiedName,
++                queue: `${job.prefix}:${job.queueName}`,
+               },
+             },
+           );
+@@ -124,86 +124,3 @@ const worker = new Worker(
+ {% hint style="info" %}
+ Bullmq-Pro: this pattern could be handled by using observables; in that case, we do not need to save next step.
+ {% endhint %}
+-
+-# Chaining Flows
+-
+-Another use case is to add flows at runtime and then wait for the children to complete.
+-
+-For example, we can add children dynamically in the processor function of a worker. This could be handled in this way:
+-
+-```typescript
+-enum Step {
+-  Initial,
+-  Second,
+-  Third,
+-  Finish,
+-}
+-
+-const flow = new FlowProducer({ connection });
+-const worker = new Worker(
+-  parentQueueName,
+-  async (job, token) => {
+-    let step = job.data.step;
+-    while (step !== Step.Finish) {
+-      switch (step) {
+-        case Step.Initial: {
+-          await doInitialStepStuff();
+-          await flow.add({
+-            name: 'child-job',
+-            queueName: 'childrenQueueName',
+-            data: {},
+-            children: [
+-              {
+-                name,
+-                data: { idx: 0, foo: 'bar' },
+-                queueName: 'grandchildrenQueueName',
+-              },
+-              {
+-                name,
+-                data: { idx: 1, foo: 'baz' },
+-                queueName: 'grandchildrenQueueName',
+-              },
+-            ],
+-            opts: {
+-              parent: {
+-                id: job.id,
+-                queue: job.queueQualifiedName,
+-              },
+-            },
+-          });
+-
+-          await job.update({
+-            step: Step.Second,
+-          });
+-          step = Step.Second;
+-          break;
+-        }
+-        case Step.Second: {
+-          await doSecondStepStuff();
+-          await job.update({
+-            step: Step.Third,
+-          });
+-          step = Step.Third;
+-          break;
+-        }
+-        case Step.Third: {
+-          const shouldWait = await job.moveToWaitingChildren(token);
+-          if (!shouldWait) {
+-            await job.update({
+-              step: Step.Finish,
+-            });
+-            step = Step.Finish;
+-            return Step.Finish;
+-          } else {
+-            return;
+-          }
+-        }
+-        default: {
+-          throw new Error('invalid step');
+-        }
+-      }
+-    }
+-  },
+-  { connection },
+-);
+-```
+diff --git a/src/classes/flow-producer.ts b/src/classes/flow-producer.ts
+index a028d7d039..3618d3c13c 100644
+--- a/src/classes/flow-producer.ts
++++ b/src/classes/flow-producer.ts
+@@ -163,20 +163,10 @@ export class FlowProducer extends EventEmitter {
+     const client = await this.connection.client;
+     const multi = client.multi();
+ 
+-    const parentOpts = flow?.opts?.parent;
+-    const parentKey = getParentKey(parentOpts);
+-    const parentDependenciesKey = parentKey
+-      ? `${parentKey}:dependencies`
+-      : undefined;
+-
+     const jobsTree = this.addNode({
+       multi,
+       node: flow,
+       queuesOpts: opts?.queuesOptions,
+-      parent: {
+-        parentOpts,
+-        parentDependenciesKey,
+-      },
+     });
+ 
+     await multi.exec();
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index eb150975d8..d5dcbdf7b8 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -664,21 +664,10 @@ export class Job<
+     return this.queue.name;
+   }
+ 
+-  /**
+-   * @returns the prefix that is used.
+-   */
+   get prefix(): string {
+     return this.queue.opts.prefix;
+   }
+ 
+-  /**
+-   * @returns it includes the prefix, the namespace separator :, and queue name.
+-   * @see https://www.gnu.org/software/gawk/manual/html_node/Qualified-Names.html
+-   */
+-  get queueQualifiedName(): string {
+-    return `${this.prefix}:${this.queueName}`;
+-  }
+-
+   /**
+    * Get current state.
+    *
+diff --git a/src/interfaces/flow-job.ts b/src/interfaces/flow-job.ts
+index 61176f4d3a..fda8833092 100644
+--- a/src/interfaces/flow-job.ts
++++ b/src/interfaces/flow-job.ts
+@@ -1,19 +1,15 @@
+ import { JobsOptions } from '../types';
+ import { QueueOptions } from './queue-options';
+ 
+-interface FlowJobBase<T> {
++export interface FlowJob {
+   name: string;
+   queueName: string;
+   data?: any;
+   prefix?: string;
+-  opts?: Omit<T, 'repeat'>;
+-  children?: FlowChildJob[];
++  opts?: Omit<JobsOptions, 'parent' | 'repeat'>;
++  children?: FlowJob[];
+ }
+ 
+-export type FlowChildJob = FlowJobBase<Omit<JobsOptions, 'parent'>>;
+-
+-export type FlowJob = FlowJobBase<JobsOptions>;
+-
+ export type FlowQueuesOpts = Record<
+   string,
+   Omit<QueueOptions, 'connection' | 'prefix'>
+diff --git a/tests/test_clean.ts b/tests/test_clean.ts
+index aefe8c4904..da91c49407 100644
+--- a/tests/test_clean.ts
++++ b/tests/test_clean.ts
+@@ -450,7 +450,7 @@ describe('Cleaner', () => {
+                       {
+                         parent: {
+                           id: job.id,
+-                          queue: job.queueQualifiedName,
++                          queue: `${job.prefix}:${job.queueName}`,
+                         },
+                       },
+                     );
+diff --git a/tests/test_flow.ts b/tests/test_flow.ts
+index ddcaa406b7..a3947830ed 100644
+--- a/tests/test_flow.ts
++++ b/tests/test_flow.ts
+@@ -128,226 +128,6 @@ describe('flows', () => {
+     await removeAllQueueData(new IORedis(), parentQueueName);
+   });
+ 
+-  it('should allow parent opts on the root job', async () => {
+-    const name = 'child-job';
+-    const values = [{ bar: 'something' }, { baz: 'something' }];
+-
+-    const parentQueueName = `parent-queue-${v4()}`;
+-    const grandparentQueueName = `grandparent-queue-${v4()}`;
+-    const grandparentQueue = new Queue(grandparentQueueName, { connection });
+-    const grandparentJob = await grandparentQueue.add('grandparent', {
+-      foo: 'bar',
+-    });
+-
+-    let childrenProcessor,
+-      parentProcessor,
+-      processedChildren = 0;
+-    const processingChildren = new Promise<void>(
+-      resolve =>
+-        (childrenProcessor = async (job: Job) => {
+-          processedChildren++;
+-
+-          if (processedChildren == values.length) {
+-            resolve();
+-          }
+-          return values[job.data.idx];
+-        }),
+-    );
+-
+-    const processingParent = new Promise<void>((resolve, reject) => [
+-      (parentProcessor = async (job: Job) => {
+-        try {
+-          const { processed, nextProcessedCursor } = await job.getDependencies({
+-            processed: {},
+-          });
+-          expect(nextProcessedCursor).to.be.equal(0);
+-          expect(Object.keys(processed)).to.have.length(2);
+-
+-          const childrenValues = await job.getChildrenValues();
+-
+-          for (let i = 0; i < values.length; i++) {
+-            const jobKey = queue.toKey(tree.children[i].job.id);
+-            expect(childrenValues[jobKey]).to.be.deep.equal(values[i]);
+-          }
+-          resolve();
+-        } catch (err) {
+-          console.error(err);
+-          reject(err);
+-        }
+-      }),
+-    ]);
+-
+-    const parentWorker = new Worker(parentQueueName, parentProcessor, {
+-      connection,
+-    });
+-    const childrenWorker = new Worker(queueName, childrenProcessor, {
+-      connection,
+-    });
+-    await parentWorker.waitUntilReady();
+-    await childrenWorker.waitUntilReady();
+-
+-    const flow = new FlowProducer({ connection });
+-    const tree = await flow.add({
+-      name: 'parent-job',
+-      queueName: parentQueueName,
+-      data: {},
+-      children: [
+-        { name, data: { idx: 0, foo: 'bar' }, queueName },
+-        { name, data: { idx: 1, foo: 'baz' }, queueName },
+-      ],
+-      opts: {
+-        parent: {
+-          id: grandparentJob.id,
+-          queue: `bull:${grandparentQueueName}`,
+-        },
+-      },
+-    });
+-
+-    expect(tree).to.have.property('job');
+-    expect(tree).to.have.property('children');
+-
+-    const { children, job } = tree;
+-
+-    expect(job.parentKey).to.be.equal(
+-      `bull:${grandparentQueueName}:${grandparentJob.id}`,
+-    );
+-    const parentState = await job.getState();
+-
+-    expect(parentState).to.be.eql('waiting-children');
+-    expect(children).to.have.length(2);
+-
+-    await processingChildren;
+-    await childrenWorker.close();
+-
+-    await processingParent;
+-    await parentWorker.close();
+-
+-    await flow.close();
+-
+-    await grandparentQueue.close();
+-    await removeAllQueueData(new IORedis(), grandparentQueueName);
+-    await removeAllQueueData(new IORedis(), parentQueueName);
+-  });
+-
+-  describe('when chaining flows at runtime using step jobs', () => {
+-    it('should wait children as one step of the parent job', async function () {
+-      this.timeout(8000);
+-      const childrenQueueName = `children-queue-${v4()}`;
+-      const grandchildrenQueueName = `grandchildren-queue-${v4()}`;
+-
+-      enum Step {
+-        Initial,
+-        Second,
+-        Third,
+-        Finish,
+-      }
+-
+-      const flow = new FlowProducer({ connection });
+-
+-      const childrenWorker = new Worker(
+-        childrenQueueName,
+-        async () => {
+-          await delay(10);
+-        },
+-        { connection },
+-      );
+-      const grandchildrenWorker = new Worker(
+-        grandchildrenQueueName,
+-        async () => {
+-          await delay(10);
+-        },
+-        { connection },
+-      );
+-
+-      const worker = new Worker(
+-        queueName,
+-        async (job, token) => {
+-          let step = job.data.step;
+-          while (step !== Step.Finish) {
+-            switch (step) {
+-              case Step.Initial: {
+-                await flow.add({
+-                  name: 'child-job',
+-                  queueName: childrenQueueName,
+-                  data: {},
+-                  children: [
+-                    {
+-                      name: 'grandchild-job',
+-                      data: { idx: 0, foo: 'bar' },
+-                      queueName: grandchildrenQueueName,
+-                    },
+-                    {
+-                      name: 'grandchild-job',
+-                      data: { idx: 1, foo: 'baz' },
+-                      queueName: grandchildrenQueueName,
+-                    },
+-                  ],
+-                  opts: {
+-                    parent: {
+-                      id: job.id,
+-                      queue: job.queueQualifiedName,
+-                    },
+-                  },
+-                });
+-                await job.update({
+-                  step: Step.Second,
+-                });
+-                step = Step.Second;
+-                break;
+-              }
+-              case Step.Second: {
+-                await job.update({
+-                  step: Step.Third,
+-                });
+-                step = Step.Third;
+-                break;
+-              }
+-              case Step.Third: {
+-                const shouldWait = await job.moveToWaitingChildren(token);
+-                if (!shouldWait) {
+-                  await job.update({
+-                    step: Step.Finish,
+-                  });
+-                  step = Step.Finish;
+-                  return Step.Finish;
+-                } else {
+-                  return;
+-                }
+-              }
+-              default: {
+-                throw new Error('invalid step');
+-              }
+-            }
+-          }
+-        },
+-        { connection },
+-      );
+-      await childrenWorker.waitUntilReady();
+-      await grandchildrenWorker.waitUntilReady();
+-      await worker.waitUntilReady();
+-
+-      await queue.add(
+-        'test',
+-        { step: Step.Initial },
+-        {
+-          attempts: 3,
+-          backoff: 1000,
+-        },
+-      );
+-
+-      await new Promise<void>(resolve => {
+-        worker.on('completed', job => {
+-          expect(job.returnvalue).to.equal(Step.Finish);
+-          resolve();
+-        });
+-      });
+-
+-      await flow.close();
+-      await worker.close();
+-      await childrenWorker.close();
+-    });
+-  });
+-
+   describe('when moving jobs from wait to active continuing', async () => {
+     it('begins with attemptsMade as 1', async () => {
+       let parentProcessor,
+diff --git a/tests/test_worker.ts b/tests/test_worker.ts
+index 913fcab20d..a9ecc62301 100644
+--- a/tests/test_worker.ts
++++ b/tests/test_worker.ts
+@@ -7,6 +7,7 @@ import { v4 } from 'uuid';
+ import {
+   Queue,
+   QueueEvents,
++  QueueScheduler,
+   Job,
+   UnrecoverableError,
+   Worker,
+@@ -2054,7 +2055,7 @@ describe('workers', function () {
+                       {
+                         parent: {
+                           id: job.id,
+-                          queue: job.queueQualifiedName,
++                          queue: `${job.prefix}:${job.queueName}`,
+                         },
+                       },
+                     );

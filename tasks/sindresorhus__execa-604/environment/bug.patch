@@ -1,0 +1,356 @@
+diff --git a/index.d.ts b/index.d.ts
+index 6ce169d..0a07c4f 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -12,8 +12,6 @@ export type StdioOption =
+ 	| number
+ 	| undefined;
+ 
+-export type StdinOption = StdioOption | Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array>;
+-
+ type EncodingOption =
+   | 'utf8'
+   // eslint-disable-next-line unicorn/text-encoding-identifier-case
+@@ -88,11 +86,9 @@ export type CommonOptions<EncodingType extends EncodingOption = DefaultEncodingO
+ 	/**
+ 	Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+-	It can also be an [`Iterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_iterable_protocol) or an [`AsyncIterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols), providing neither [`execaSync()`](#execasyncfile-arguments-options), the [`input` option](#input) nor the [`inputFile` option](#inputfile) is used.
+-
+ 	@default `inherit` with `$`, `pipe` otherwise
+ 	*/
+-	readonly stdin?: StdinOption;
++	readonly stdin?: StdioOption;
+ 
+ 	/**
+ 	Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+diff --git a/index.js b/index.js
+index 4ee707b..8d830bb 100644
+--- a/index.js
++++ b/index.js
+@@ -7,7 +7,7 @@ import stripFinalNewline from 'strip-final-newline';
+ import {npmRunPathEnv} from 'npm-run-path';
+ import onetime from 'onetime';
+ import {makeError} from './lib/error.js';
+-import {handleStdioOption, normalizeStdioNode} from './lib/stdio.js';
++import {normalizeStdio, normalizeStdioNode} from './lib/stdio.js';
+ import {spawnedKill, spawnedCancel, setupTimeout, validateTimeout, setExitHandler} from './lib/kill.js';
+ import {addPipeMethods} from './lib/pipe.js';
+ import {validateInputOptions, handleInput, getSpawnedResult, makeAllStream, handleInputSync} from './lib/stream.js';
+@@ -52,14 +52,14 @@ const handleArguments = (file, args, options = {}) => {
+ 
+ 	options.env = getEnv(options);
+ 
+-	const stdioStreams = handleStdioOption(options);
++	options.stdio = normalizeStdio(options);
+ 
+ 	if (process.platform === 'win32' && path.basename(file, '.exe') === 'cmd') {
+ 		// #116
+ 		args.unshift('/q');
+ 	}
+ 
+-	return {file, args, options, parsed, stdioStreams};
++	return {file, args, options, parsed};
+ };
+ 
+ const handleOutput = (options, value, error) => {
+@@ -82,7 +82,7 @@ export function execa(file, args, options) {
+ 	logCommand(escapedCommand, parsed.options);
+ 
+ 	validateTimeout(parsed.options);
+-	validateInputOptions(parsed.options, parsed.stdioStreams);
++	validateInputOptions(parsed.options);
+ 
+ 	let spawned;
+ 	try {
+@@ -116,7 +116,7 @@ export function execa(file, args, options) {
+ 	spawned.cancel = spawnedCancel.bind(null, spawned, context);
+ 
+ 	const handlePromise = async () => {
+-		const [{error, exitCode, signal, timedOut}, stdoutResult, stderrResult, allResult] = await getSpawnedResult(spawned, parsed.options, parsed.stdioStreams, processDone);
++		const [{error, exitCode, signal, timedOut}, stdoutResult, stderrResult, allResult] = await getSpawnedResult(spawned, parsed.options, processDone);
+ 		const stdout = handleOutput(parsed.options, stdoutResult);
+ 		const stderr = handleOutput(parsed.options, stderrResult);
+ 		const all = handleOutput(parsed.options, allResult);
+@@ -160,7 +160,7 @@ export function execa(file, args, options) {
+ 
+ 	const handlePromiseOnce = onetime(handlePromise);
+ 
+-	handleInput(spawned, parsed.options, parsed.stdioStreams);
++	handleInput(spawned, parsed.options);
+ 
+ 	spawned.all = makeAllStream(spawned, parsed.options);
+ 
+@@ -175,8 +175,8 @@ export function execaSync(file, args, options) {
+ 	const escapedCommand = getEscapedCommand(file, args);
+ 	logCommand(escapedCommand, parsed.options);
+ 
+-	validateInputOptions(parsed.options, parsed.stdioStreams);
+-	const inputOption = handleInputSync(parsed.options, parsed.stdioStreams);
++	validateInputOptions(parsed.options);
++	const inputOption = handleInputSync(parsed.options);
+ 
+ 	let result;
+ 	try {
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 0f5a6de..7d01cb9 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -128,18 +128,6 @@ try {
+ 	expectType<string | undefined>(execaError.originalMessage);
+ }
+ 
+-const stringGenerator = function * () {
+-	yield '';
+-};
+-
+-const binaryGenerator = function * () {
+-	yield new Uint8Array(0);
+-};
+-
+-const numberGenerator = function * () {
+-	yield 0;
+-};
+-
+ /* eslint-disable @typescript-eslint/no-floating-promises */
+ execa('unicorns', {cleanup: false});
+ execa('unicorns', {preferLocal: false});
+@@ -158,12 +146,6 @@ execa('unicorns', {stdin: 'ipc'});
+ execa('unicorns', {stdin: 'ignore'});
+ execa('unicorns', {stdin: 'inherit'});
+ execa('unicorns', {stdin: process.stdin});
+-execa('unicorns', {stdin: ['']});
+-execa('unicorns', {stdin: [new Uint8Array(0)]});
+-execa('unicorns', {stdin: stringGenerator()});
+-execa('unicorns', {stdin: binaryGenerator()});
+-expectError(execa('unicorns', {stdin: [0]}));
+-expectError(execa('unicorns', {stdin: numberGenerator()}));
+ execa('unicorns', {stdin: 1});
+ execa('unicorns', {stdin: undefined});
+ execa('unicorns', {stdout: 'pipe'});
+diff --git a/lib/stdio.js b/lib/stdio.js
+index 750649b..e8c1132 100644
+--- a/lib/stdio.js
++++ b/lib/stdio.js
+@@ -1,41 +1,5 @@
+-import {Readable} from 'node:stream';
+-import {isStream} from 'is-stream';
+-
+ const aliases = ['stdin', 'stdout', 'stderr'];
+ 
+-const isIterableStdin = stdinOption => typeof stdinOption === 'object'
+-	&& stdinOption !== null
+-	&& !isStream(stdinOption)
+-	&& (typeof stdinOption[Symbol.asyncIterator] === 'function' || typeof stdinOption[Symbol.iterator] === 'function');
+-
+-const transformStdioItem = (stdioItem, index) => {
+-	if (index === 0 && isIterableStdin(stdioItem)) {
+-		return 'pipe';
+-	}
+-
+-	return stdioItem;
+-};
+-
+-const transformStdio = stdio => Array.isArray(stdio)
+-	? stdio.map((stdioItem, index) => transformStdioItem(stdioItem, index))
+-	: stdio;
+-
+-const getStdioStreams = stdio => {
+-	if (!Array.isArray(stdio) || !isIterableStdin(stdio[0])) {
+-		return {};
+-	}
+-
+-	const stdinIterableStream = Readable.from(stdio[0]);
+-	return {stdinIterableStream};
+-};
+-
+-export const handleStdioOption = options => {
+-	const stdio = normalizeStdio(options);
+-	const stdioStreams = getStdioStreams(stdio);
+-	options.stdio = transformStdio(stdio);
+-	return stdioStreams;
+-};
+-
+ const hasAlias = options => aliases.some(alias => options[alias] !== undefined);
+ 
+ export const normalizeStdio = options => {
+diff --git a/lib/stream.js b/lib/stream.js
+index 556c521..234706d 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -1,32 +1,17 @@
+-import {once} from 'node:events';
+ import {createReadStream, readFileSync} from 'node:fs';
+ import {setTimeout} from 'node:timers/promises';
+ import {isStream} from 'is-stream';
+ import getStream, {getStreamAsBuffer} from 'get-stream';
+ import mergeStreams from '@sindresorhus/merge-streams';
+ 
+-export const validateInputOptions = ({input, inputFile}, {stdinIterableStream}) => {
++export const validateInputOptions = ({input, inputFile}) => {
+ 	if (input !== undefined && inputFile !== undefined) {
+ 		throw new TypeError('The `input` and `inputFile` options cannot be both set.');
+ 	}
+-
+-	if (stdinIterableStream !== undefined) {
+-		if (input !== undefined) {
+-			throw new TypeError('The `stdin` option cannot be an iterable when the `input` option is set.');
+-		}
+-
+-		if (inputFile !== undefined) {
+-			throw new TypeError('The `stdin` option cannot be an iterable when the `inputFile` option is set.');
+-		}
+-	}
+ };
+ 
+ // `input` and `inputFile` option in sync mode
+-export const handleInputSync = ({input, inputFile}, {stdinIterableStream}) => {
+-	if (stdinIterableStream !== undefined) {
+-		throw new TypeError('The `stdin` option cannot be an iterable in sync mode');
+-	}
+-
++export const handleInputSync = ({input, inputFile}) => {
+ 	const inputOption = typeof inputFile === 'string' ? readFileSync(inputFile) : input;
+ 
+ 	if (isStream(inputOption)) {
+@@ -37,12 +22,7 @@ export const handleInputSync = ({input, inputFile}, {stdinIterableStream}) => {
+ };
+ 
+ // `input` and `inputFile` option in async mode
+-export const handleInput = (spawned, {input, inputFile}, {stdinIterableStream}) => {
+-	if (stdinIterableStream !== undefined) {
+-		stdinIterableStream.pipe(spawned.stdin);
+-		return;
+-	}
+-
++export const handleInput = (spawned, {input, inputFile}) => {
+ 	const inputOption = typeof inputFile === 'string' ? createReadStream(inputFile) : input;
+ 
+ 	if (inputOption === undefined) {
+@@ -106,24 +86,14 @@ const applyEncoding = async (stream, maxBuffer, encoding) => {
+ 	return buffer.toString(encoding);
+ };
+ 
+-// Handle any errors thrown by the iterable passed to the `stdin` option, if any.
+-// We do not consume nor wait on that stream though, since it could potentially be infinite (like `process.stdin` in an interactive TTY).
+-const throwOnStreamsError = streams => streams.filter(Boolean).map(stream => throwOnStreamError(stream));
+-
+-const throwOnStreamError = async stream => {
+-	const [error] = await once(stream, 'error');
+-	throw error;
+-};
+-
+ // Retrieve result of child process: exit code, signal, error, streams (stdout/stderr/all)
+-export const getSpawnedResult = async (spawned, {encoding, buffer, maxBuffer}, {stdinIterableStream}, processDone) => {
++export const getSpawnedResult = async (spawned, {encoding, buffer, maxBuffer}, processDone) => {
+ 	const stdoutPromise = getStreamPromise(spawned.stdout, {encoding, buffer, maxBuffer});
+ 	const stderrPromise = getStreamPromise(spawned.stderr, {encoding, buffer, maxBuffer});
+ 	const allPromise = getStreamPromise(spawned.all, {encoding, buffer, maxBuffer: maxBuffer * 2});
+-	const processDoneOrStreamsError = Promise.race([processDone, ...throwOnStreamsError([stdinIterableStream])]);
+ 
+ 	try {
+-		return await Promise.all([processDoneOrStreamsError, stdoutPromise, stderrPromise, allPromise]);
++		return await Promise.all([processDone, stdoutPromise, stderrPromise, allPromise]);
+ 	} catch (error) {
+ 		spawned.kill();
+ 		return Promise.all([
+diff --git a/readme.md b/readme.md
+index a5d8610..18dab0c 100644
+--- a/readme.md
++++ b/readme.md
+@@ -559,13 +559,11 @@ If the input is not a file, use the [`input` option](#input) instead.
+ 
+ #### stdin
+ 
+-Type: `string | number | Stream | undefined | Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array>`\
++Type: `string | number | Stream | undefined`\
+ Default: `inherit` with [`$`](#command), `pipe` otherwise
+ 
+ Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+-It can also be an [`Iterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_iterable_protocol) or an [`AsyncIterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols), providing neither [`execaSync()`](#execasyncfile-arguments-options), the [`input` option](#input) nor the [`inputFile` option](#inputfile) is used.
+-
+ #### stdout
+ 
+ Type: `string | number | Stream | undefined`\
+diff --git a/test/stream.js b/test/stream.js
+index 8483903..dcf6a26 100644
+--- a/test/stream.js
++++ b/test/stream.js
+@@ -97,76 +97,6 @@ test('stdout/stderr/all are undefined if ignored in sync mode', t => {
+ 	t.is(all, undefined);
+ });
+ 
+-test('stdin option can be a sync iterable of strings', async t => {
+-	const {stdout} = await execa('stdin.js', {stdin: ['foo', 'bar']});
+-	t.is(stdout, 'foobar');
+-});
+-
+-const textEncoder = new TextEncoder();
+-const binaryFoo = textEncoder.encode('foo');
+-const binaryBar = textEncoder.encode('bar');
+-
+-test('stdin option can be a sync iterable of Uint8Arrays', async t => {
+-	const {stdout} = await execa('stdin.js', {stdin: [binaryFoo, binaryBar]});
+-	t.is(stdout, 'foobar');
+-});
+-
+-const stringGenerator = function * () {
+-	yield * ['foo', 'bar'];
+-};
+-
+-const binaryGenerator = function * () {
+-	yield * [binaryFoo, binaryBar];
+-};
+-
+-const throwingGenerator = function * () {
+-	yield 'foo';
+-	throw new Error('generator error');
+-};
+-
+-test('stdin option can be an async iterable of strings', async t => {
+-	const {stdout} = await execa('stdin.js', {stdin: stringGenerator()});
+-	t.is(stdout, 'foobar');
+-});
+-
+-test('stdin option can be an async iterable of Uint8Arrays', async t => {
+-	const {stdout} = await execa('stdin.js', {stdin: binaryGenerator()});
+-	t.is(stdout, 'foobar');
+-});
+-
+-test('stdin option cannot be a sync iterable with execa.sync()', t => {
+-	t.throws(() => {
+-		execaSync('stdin.js', {stdin: ['foo', 'bar']});
+-	}, {message: /an iterable in sync mode/});
+-});
+-
+-test('stdin option cannot be an async iterable with execa.sync()', t => {
+-	t.throws(() => {
+-		execaSync('stdin.js', {stdin: stringGenerator()});
+-	}, {message: /an iterable in sync mode/});
+-});
+-
+-test('stdin option cannot be an iterable when "input" is used', t => {
+-	t.throws(() => {
+-		execa('stdin.js', {stdin: ['foo', 'bar'], input: 'foobar'});
+-	}, {message: /when the `input` option/});
+-});
+-
+-test('stdin option cannot be an iterable when "inputFile" is used', t => {
+-	t.throws(() => {
+-		execa('stdin.js', {stdin: ['foo', 'bar'], inputFile: 'dummy.txt'});
+-	}, {message: /when the `inputFile` option/});
+-});
+-
+-test('stdin option cannot be a generic iterable string', async t => {
+-	await t.throwsAsync(() => execa('stdin.js', {stdin: 'foobar'}), {code: 'ERR_INVALID_SYNC_FORK_INPUT'});
+-});
+-
+-test('stdin option handles errors in iterables', async t => {
+-	const {originalMessage} = await t.throwsAsync(() => execa('stdin.js', {stdin: throwingGenerator()}));
+-	t.is(originalMessage, 'generator error');
+-});
+-
+ test('input option can be a String', async t => {
+ 	const {stdout} = await execa('stdin.js', {input: 'foobar'});
+ 	t.is(stdout, 'foobar');

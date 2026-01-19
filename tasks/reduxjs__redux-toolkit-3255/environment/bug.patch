@@ -1,0 +1,550 @@
+diff --git a/docs/rtk-query/api/created-api/api-slice-utils.mdx b/docs/rtk-query/api/created-api/api-slice-utils.mdx
+index cae293e8..6471d812 100644
+--- a/docs/rtk-query/api/created-api/api-slice-utils.mdx
++++ b/docs/rtk-query/api/created-api/api-slice-utils.mdx
+@@ -29,8 +29,7 @@ Some of the TS types on this page are pseudocode to illustrate intent, as the ac
+ const updateQueryData = (
+   endpointName: string,
+   args: any,
+-  updateRecipe: (draft: Draft<CachedState>) => void,
+-  updateProvided?: boolean
++  updateRecipe: (draft: Draft<CachedState>) => void
+ ) => ThunkAction<PatchCollection, PartialState, any, AnyAction>;
+ 
+ interface PatchCollection {
+@@ -44,7 +43,6 @@ interface PatchCollection {
+   - `endpointName`: a string matching an existing endpoint name
+   - `args`: an argument matching that used for a previous query call, used to determine which cached dataset needs to be updated
+   - `updateRecipe`: an Immer `produce` callback that can apply changes to the cached state
+-  - `updateProvided`: a boolean indicating whether the endpoint's provided tags should be re-calculated based on the updated cache. Defaults to `false`.
+ 
+ #### Description
+ 
+@@ -157,8 +155,7 @@ await dispatch(
+ const patchQueryData = (
+   endpointName: string,
+   args: any
+-  patches: Patch[],
+-  updateProvided?: boolean
++  patches: Patch[]
+ ) => ThunkAction<void, PartialState, any, AnyAction>;
+ ```
+ 
+@@ -166,7 +163,6 @@ const patchQueryData = (
+   - `endpointName`: a string matching an existing endpoint name
+   - `args`: a cache key, used to determine which cached dataset needs to be updated
+   - `patches`: an array of patches (or inverse patches) to apply to cached state. These would typically be obtained from the result of dispatching [`updateQueryData`](#updatequerydata)
+-  - `updateProvided`: a boolean indicating whether the endpoint's provided tags should be re-calculated based on the updated cache. Defaults to `false`.
+ 
+ #### Description
+ 
+@@ -233,42 +229,42 @@ dispatch(api.util.prefetch('getPosts', undefined, { force: true }))
+ ```
+ 
+ ### `selectInvalidatedBy`
+-
++ 
+ #### Signature
+-
++ 
+ ```ts no-transpile
+-function selectInvalidatedBy(
+-  state: RootState,
+-  tags: ReadonlyArray<TagDescription<string>>
+-): Array<{
+-  endpointName: string
+-  originalArgs: any
+-  queryCacheKey: QueryCacheKey
+-}>
++ function selectInvalidatedBy(
++   state: RootState,
++   tags: ReadonlyArray<TagDescription<string>>
++ ): Array<{
++   endpointName: string
++   originalArgs: any
++   queryCacheKey: QueryCacheKey
++ }>
+ ```
+-
++ 
+ - **Parameters**
+   - `state`: the root state
+   - `tags`: a readonly array of invalidated tags, where the provided `TagDescription` is one of the strings provided to the [`tagTypes`](../createApi.mdx#tagtypes) property of the api. e.g.
+     - `[TagType]`
+     - `[{ type: TagType }]`
+     - `[{ type: TagType, id: number | string }]`
+-
++ 
+ #### Description
+-
++ 
+ A function that can select query parameters to be invalidated.
+-
++ 
+ The function accepts two arguments
+-- the root state and
+-- the cache tags to be invalidated.
+-
++  - the root state and
++  - the cache tags to be invalidated.
++ 
+ It returns an array that contains
+-- the endpoint name,
+-- the original args and
+-- the queryCacheKey.
+-
++  - the endpoint name,
++  - the original args and
++  - the queryCacheKey.
++ 
+ #### Example
+-
++ 
+ ```ts no-transpile
+ dispatch(api.util.selectInvalidatedBy(state, ['Post']))
+ dispatch(api.util.selectInvalidatedBy(state, [{ type: 'Post', id: 1 }]))
+diff --git a/packages/toolkit/src/query/core/buildSlice.ts b/packages/toolkit/src/query/core/buildSlice.ts
+index ee6605f3..6d0a2e57 100644
+--- a/packages/toolkit/src/query/core/buildSlice.ts
++++ b/packages/toolkit/src/query/core/buildSlice.ts
+@@ -29,7 +29,6 @@ import { calculateProvidedByThunk } from './buildThunks'
+ import type {
+   AssertTagTypes,
+   EndpointDefinitions,
+-  FullTagDescription,
+   QueryDefinition,
+ } from '../endpointDefinitions'
+ import type { Patch } from 'immer'
+@@ -126,22 +125,17 @@ export function buildSlice({
+         },
+         prepare: prepareAutoBatched<QuerySubstateIdentifier>(),
+       },
+-      queryResultPatched: {
+-        reducer(
+-          draft,
+-          {
+-            payload: { queryCacheKey, patches },
+-          }: PayloadAction<
+-            QuerySubstateIdentifier & { patches: readonly Patch[] }
+-          >
+-        ) {
+-          updateQuerySubstateIfExists(draft, queryCacheKey, (substate) => {
+-            substate.data = applyPatches(substate.data as any, patches.concat())
+-          })
+-        },
+-        prepare: prepareAutoBatched<
++      queryResultPatched(
++        draft,
++        {
++          payload: { queryCacheKey, patches },
++        }: PayloadAction<
+           QuerySubstateIdentifier & { patches: readonly Patch[] }
+-        >(),
++        >
++      ) {
++        updateQuerySubstateIfExists(draft, queryCacheKey, (substate) => {
++          substate.data = applyPatches(substate.data as any, patches.concat())
++        })
+       },
+     },
+     extraReducers(builder) {
+@@ -331,42 +325,7 @@ export function buildSlice({
+   const invalidationSlice = createSlice({
+     name: `${reducerPath}/invalidation`,
+     initialState: initialState as InvalidationState<string>,
+-    reducers: {
+-      updateProvidedBy: {
+-        reducer(
+-          draft,
+-          action: PayloadAction<{
+-            queryCacheKey: QueryCacheKey
+-            providedTags: readonly FullTagDescription<string>[]
+-          }>
+-        ) {
+-          const { queryCacheKey, providedTags } = action.payload
+-
+-          for (const tagTypeSubscriptions of Object.values(draft)) {
+-            for (const idSubscriptions of Object.values(tagTypeSubscriptions)) {
+-              const foundAt = idSubscriptions.indexOf(queryCacheKey)
+-              if (foundAt !== -1) {
+-                idSubscriptions.splice(foundAt, 1)
+-              }
+-            }
+-          }
+-
+-          for (const { type, id } of providedTags) {
+-            const subscribedQueries = ((draft[type] ??= {})[
+-              id || '__internal_without_id'
+-            ] ??= [])
+-            const alreadySubscribed = subscribedQueries.includes(queryCacheKey)
+-            if (!alreadySubscribed) {
+-              subscribedQueries.push(queryCacheKey)
+-            }
+-          }
+-        },
+-        prepare: prepareAutoBatched<{
+-          queryCacheKey: QueryCacheKey
+-          providedTags: readonly FullTagDescription<string>[]
+-        }>(),
+-      },
+-    },
++    reducers: {},
+     extraReducers(builder) {
+       builder
+         .addCase(
+@@ -412,13 +371,27 @@ export function buildSlice({
+             )
+             const { queryCacheKey } = action.meta.arg
+ 
+-            invalidationSlice.caseReducers.updateProvidedBy(
+-              draft,
+-              invalidationSlice.actions.updateProvidedBy({
+-                queryCacheKey,
+-                providedTags,
+-              })
+-            )
++            for (const tagTypeSubscriptions of Object.values(draft)) {
++              for (const idSubscriptions of Object.values(
++                tagTypeSubscriptions
++              )) {
++                const foundAt = idSubscriptions.indexOf(queryCacheKey)
++                if (foundAt !== -1) {
++                  idSubscriptions.splice(foundAt, 1)
++                }
++              }
++            }
++
++            for (const { type, id } of providedTags) {
++              const subscribedQueries = ((draft[type] ??= {})[
++                id || '__internal_without_id'
++              ] ??= [])
++              const alreadySubscribed =
++                subscribedQueries.includes(queryCacheKey)
++              if (!alreadySubscribed) {
++                subscribedQueries.push(queryCacheKey)
++              }
++            }
+           }
+         )
+     },
+@@ -524,7 +497,6 @@ export function buildSlice({
+     ...subscriptionSlice.actions,
+     ...internalSubscriptionsSlice.actions,
+     ...mutationSlice.actions,
+-    ...invalidationSlice.actions,
+     /** @deprecated has been renamed to `removeMutationResult` */
+     unsubscribeMutationResult: mutationSlice.actions.removeMutationResult,
+     resetApiState,
+diff --git a/packages/toolkit/src/query/core/buildThunks.ts b/packages/toolkit/src/query/core/buildThunks.ts
+index adbcae83..458b9edd 100644
+--- a/packages/toolkit/src/query/core/buildThunks.ts
++++ b/packages/toolkit/src/query/core/buildThunks.ts
+@@ -20,7 +20,6 @@ import type {
+   QueryArgFrom,
+   QueryDefinition,
+   ResultTypeFrom,
+-  FullTagDescription,
+ } from '../endpointDefinitions'
+ import { isQueryDefinition } from '../endpointDefinitions'
+ import { calculateProvidedBy } from '../endpointDefinitions'
+@@ -165,8 +164,7 @@ export type PatchQueryDataThunk<
+ > = <EndpointName extends QueryKeys<Definitions>>(
+   endpointName: EndpointName,
+   args: QueryArgFrom<Definitions[EndpointName]>,
+-  patches: readonly Patch[],
+-  updateProvided?: boolean
++  patches: readonly Patch[]
+ ) => ThunkAction<void, PartialState, any, AnyAction>
+ 
+ export type UpdateQueryDataThunk<
+@@ -175,8 +173,7 @@ export type UpdateQueryDataThunk<
+ > = <EndpointName extends QueryKeys<Definitions>>(
+   endpointName: EndpointName,
+   args: QueryArgFrom<Definitions[EndpointName]>,
+-  updateRecipe: Recipe<ResultTypeFrom<Definitions[EndpointName]>>,
+-  updateProvided?: boolean
++  updateRecipe: Recipe<ResultTypeFrom<Definitions[EndpointName]>>
+ ) => ThunkAction<PatchCollection, PartialState, any, AnyAction>
+ 
+ export type UpsertQueryDataThunk<
+@@ -225,87 +222,57 @@ export function buildThunks<
+   context: { endpointDefinitions },
+   serializeQueryArgs,
+   api,
+-  assertTagType,
+ }: {
+   baseQuery: BaseQuery
+   reducerPath: ReducerPath
+   context: ApiContext<Definitions>
+   serializeQueryArgs: InternalSerializeQueryArgs
+   api: Api<BaseQuery, Definitions, ReducerPath, any>
+-  assertTagType: AssertTagTypes
+ }) {
+   type State = RootState<any, string, ReducerPath>
+ 
+   const patchQueryData: PatchQueryDataThunk<EndpointDefinitions, State> =
+-    (endpointName, args, patches, updateProvided) => (dispatch, getState) => {
++    (endpointName, args, patches) => (dispatch) => {
+       const endpointDefinition = endpointDefinitions[endpointName]
+-
+-      const queryCacheKey = serializeQueryArgs({
+-        queryArgs: args,
+-        endpointDefinition,
+-        endpointName,
+-      })
+-
+-      dispatch(
+-        api.internalActions.queryResultPatched({ queryCacheKey, patches })
+-      )
+-
+-      if (!updateProvided) {
+-        return
+-      }
+-
+-      const newValue = api.endpoints[endpointName].select(args)(getState())
+-
+-      const providedTags = calculateProvidedBy(
+-        endpointDefinition.providesTags,
+-        newValue.data,
+-        undefined,
+-        args,
+-        {},
+-        assertTagType
+-      )
+-
+       dispatch(
+-        api.internalActions.updateProvidedBy({ queryCacheKey, providedTags })
++        api.internalActions.queryResultPatched({
++          queryCacheKey: serializeQueryArgs({
++            queryArgs: args,
++            endpointDefinition,
++            endpointName,
++          }),
++          patches,
++        })
+       )
+     }
+ 
+   const updateQueryData: UpdateQueryDataThunk<EndpointDefinitions, State> =
+-    (endpointName, args, updateRecipe, updateProvided = true) =>
+-    (dispatch, getState) => {
+-      const endpointDefinition = api.endpoints[endpointName]
+-
+-      const currentState = endpointDefinition.select(args)(getState())
+-
++    (endpointName, args, updateRecipe) => (dispatch, getState) => {
++      const currentState = (
++        api.endpoints[endpointName] as ApiEndpointQuery<any, any>
++      ).select(args)(getState())
+       let ret: PatchCollection = {
+         patches: [],
+         inversePatches: [],
+         undo: () =>
+           dispatch(
+-            api.util.patchQueryData(
+-              endpointName,
+-              args,
+-              ret.inversePatches,
+-              updateProvided
+-            )
++            api.util.patchQueryData(endpointName, args, ret.inversePatches)
+           ),
+       }
+       if (currentState.status === QueryStatus.uninitialized) {
+         return ret
+       }
+-      let newValue
+       if ('data' in currentState) {
+         if (isDraftable(currentState.data)) {
+-          const [value, patches, inversePatches] = produceWithPatches(
++          const [, patches, inversePatches] = produceWithPatches(
+             currentState.data,
+             updateRecipe
+           )
+           ret.patches.push(...patches)
+           ret.inversePatches.push(...inversePatches)
+-          newValue = value
+         } else {
+-          newValue = updateRecipe(currentState.data)
+-          ret.patches.push({ op: 'replace', path: [], value: newValue })
++          const value = updateRecipe(currentState.data)
++          ret.patches.push({ op: 'replace', path: [], value })
+           ret.inversePatches.push({
+             op: 'replace',
+             path: [],
+@@ -314,9 +281,7 @@ export function buildThunks<
+         }
+       }
+ 
+-      dispatch(
+-        api.util.patchQueryData(endpointName, args, ret.patches, updateProvided)
+-      )
++      dispatch(api.util.patchQueryData(endpointName, args, ret.patches))
+ 
+       return ret
+     }
+diff --git a/packages/toolkit/src/query/core/module.ts b/packages/toolkit/src/query/core/module.ts
+index 1e760115..2cb9ac76 100644
+--- a/packages/toolkit/src/query/core/module.ts
++++ b/packages/toolkit/src/query/core/module.ts
+@@ -518,7 +518,6 @@ export const coreModule = (): Module<CoreModule> => ({
+       context,
+       api,
+       serializeQueryArgs,
+-      assertTagType,
+     })
+ 
+     const { reducer, actions: sliceActions } = buildSlice({
+diff --git a/packages/toolkit/src/query/tests/optimisticUpdates.test.tsx b/packages/toolkit/src/query/tests/optimisticUpdates.test.tsx
+index 40b3c683..65237090 100644
+--- a/packages/toolkit/src/query/tests/optimisticUpdates.test.tsx
++++ b/packages/toolkit/src/query/tests/optimisticUpdates.test.tsx
+@@ -1,7 +1,6 @@
+ import { createApi } from '@reduxjs/toolkit/query/react'
+ import { actionsReducer, hookWaitFor, setupApiStore, waitMs } from './helpers'
+ import { renderHook, act } from '@testing-library/react'
+-import type { InvalidationState } from '../core/apiState'
+ 
+ interface Post {
+   id: string
+@@ -27,13 +26,6 @@ const api = createApi({
+       query: (id) => `post/${id}`,
+       providesTags: ['Post'],
+     }),
+-    listPosts: build.query<Post[], void>({
+-      query: () => `posts`,
+-      providesTags: (result) => [
+-        ...(result?.map(({ id }) => ({ type: 'Post' as const, id })) ?? []),
+-        'Post',
+-      ],
+-    }),
+     updatePost: build.mutation<void, Pick<Post, 'id'> & Partial<Post>>({
+       query: ({ id, ...patch }) => ({
+         url: `post/${id}`,
+@@ -192,126 +184,6 @@ describe('updateQueryData', () => {
+     expect(result.current.data).toEqual(dataBefore)
+   })
+ 
+-  test('updates (list) cache values including provided tags, undos that', async () => {
+-    baseQuery
+-      .mockResolvedValueOnce([
+-        {
+-          id: '3',
+-          title: 'All about cheese.',
+-          contents: 'TODO',
+-        },
+-      ])
+-      .mockResolvedValueOnce(42)
+-    const { result } = renderHook(() => api.endpoints.listPosts.useQuery(), {
+-      wrapper: storeRef.wrapper,
+-    })
+-    await hookWaitFor(() => expect(result.current.isSuccess).toBeTruthy())
+-
+-    let provided!: InvalidationState<'Post'>
+-    act(() => {
+-      provided = storeRef.store.getState().api.provided
+-    })
+-
+-    const provided3 = provided['Post']['3']
+-
+-    let returnValue!: ReturnType<ReturnType<typeof api.util.updateQueryData>>
+-    act(() => {
+-      returnValue = storeRef.store.dispatch(
+-        api.util.updateQueryData(
+-          'listPosts',
+-          undefined,
+-          (draft) => {
+-            draft.push({
+-              id: '4',
+-              title: 'Mostly about cheese.',
+-              contents: 'TODO',
+-            })
+-          },
+-          true
+-        )
+-      )
+-    })
+-
+-    act(() => {
+-      provided = storeRef.store.getState().api.provided
+-    })
+-
+-    const provided4 = provided['Post']['4']
+-
+-    expect(provided4).toEqual(provided3)
+-
+-    act(() => {
+-      returnValue.undo()
+-    })
+-
+-    act(() => {
+-      provided = storeRef.store.getState().api.provided
+-    })
+-
+-    const provided4Next = provided['Post']['4']
+-
+-    expect(provided4Next).toEqual([])
+-  })
+-
+-  test('updates (list) cache values excluding provided tags, undos that', async () => {
+-    baseQuery
+-      .mockResolvedValueOnce([
+-        {
+-          id: '3',
+-          title: 'All about cheese.',
+-          contents: 'TODO',
+-        },
+-      ])
+-      .mockResolvedValueOnce(42)
+-    const { result } = renderHook(() => api.endpoints.listPosts.useQuery(), {
+-      wrapper: storeRef.wrapper,
+-    })
+-    await hookWaitFor(() => expect(result.current.isSuccess).toBeTruthy())
+-
+-    let provided!: InvalidationState<'Post'>
+-    act(() => {
+-      provided = storeRef.store.getState().api.provided
+-    })
+-
+-    let returnValue!: ReturnType<ReturnType<typeof api.util.updateQueryData>>
+-    act(() => {
+-      returnValue = storeRef.store.dispatch(
+-        api.util.updateQueryData(
+-          'listPosts',
+-          undefined,
+-          (draft) => {
+-            draft.push({
+-              id: '4',
+-              title: 'Mostly about cheese.',
+-              contents: 'TODO',
+-            })
+-          },
+-          false
+-        )
+-      )
+-    })
+-
+-    act(() => {
+-      provided = storeRef.store.getState().api.provided
+-    })
+-
+-    const provided4 = provided['Post']['4']
+-
+-    expect(provided4).toEqual(undefined)
+-
+-    act(() => {
+-      returnValue.undo()
+-    })
+-
+-    act(() => {
+-      provided = storeRef.store.getState().api.provided
+-    })
+-
+-    const provided4Next = provided['Post']['4']
+-
+-    expect(provided4Next).toEqual(undefined)
+-  })
+-
+   test('does not update non-existing values', async () => {
+     baseQuery
+       .mockImplementationOnce(async () => ({

@@ -1,0 +1,163 @@
+diff --git a/lib/pipe.js b/lib/pipe.js
+index 07c5634..4a38001 100644
+--- a/lib/pipe.js
++++ b/lib/pipe.js
+@@ -1,11 +1,13 @@
+ import {ChildProcess} from 'node:child_process';
+ import {isWritableStream} from 'is-stream';
++import {STANDARD_STREAMS_ALIASES} from './stdio/utils.js';
+ 
+-export const pipeToProcess = ({spawned, stdioStreamsGroups, options}, targetProcess, streamName = 'stdout') => {
++export const pipeToProcess = ({spawned, stdioStreamsGroups, options}, targetProcess, streamName) => {
+ 	validateTargetProcess(targetProcess);
+ 
+-	const inputStream = getInputStream(spawned, streamName, stdioStreamsGroups);
+-	validateStdioOption(inputStream, spawned, streamName, options);
++	const streamIndex = getStreamIndex(streamName);
++	const inputStream = getInputStream(spawned, streamIndex, stdioStreamsGroups);
++	validateStdioOption(inputStream, streamIndex, streamName, options);
+ 
+ 	inputStream.pipe(targetProcess.stdin);
+ 	return targetProcess;
+@@ -23,57 +25,71 @@ const validateTargetProcess = targetProcess => {
+ 
+ const isExecaChildProcess = target => target instanceof ChildProcess && typeof target.then === 'function';
+ 
+-const getInputStream = (spawned, streamName, stdioStreamsGroups) => {
+-	if (VALID_STREAM_NAMES.has(streamName)) {
+-		return spawned[streamName];
++const getStreamIndex = (streamName = 'stdout') => STANDARD_STREAMS_ALIASES.includes(streamName)
++	? STANDARD_STREAMS_ALIASES.indexOf(streamName)
++	: streamName;
++
++const getInputStream = (spawned, streamIndex, stdioStreamsGroups) => {
++	if (streamIndex === 'all') {
++		return spawned.all;
+ 	}
+ 
+-	if (streamName === 'stdin') {
++	if (streamIndex === 0) {
+ 		throw new TypeError('The second argument must not be "stdin".');
+ 	}
+ 
+-	if (!Number.isInteger(streamName) || streamName < 0) {
+-		throw new TypeError(`The second argument must not be "${streamName}".
++	if (!Number.isInteger(streamIndex) || streamIndex < 0) {
++		throw new TypeError(`The second argument must not be "${streamIndex}".
+ It must be "stdout", "stderr", "all" or a file descriptor integer.
+ It is optional and defaults to "stdout".`);
+ 	}
+ 
+-	const stdioStreams = stdioStreamsGroups[streamName];
++	const stdioStreams = stdioStreamsGroups[streamIndex];
+ 	if (stdioStreams === undefined) {
+-		throw new TypeError(`The second argument must not be ${streamName}: that file descriptor does not exist.
++		throw new TypeError(`The second argument must not be ${streamIndex}: that file descriptor does not exist.
+ Please set the "stdio" option to ensure that file descriptor exists.`);
+ 	}
+ 
+ 	if (stdioStreams[0].direction === 'input') {
+-		throw new TypeError(`The second argument must not be ${streamName}: it must be a readable stream, not writable.`);
++		throw new TypeError(`The second argument must not be ${streamIndex}: it must be a readable stream, not writable.`);
+ 	}
+ 
+-	return spawned.stdio[streamName];
++	return spawned.stdio[streamIndex];
+ };
+ 
+-const VALID_STREAM_NAMES = new Set(['stdout', 'stderr', 'all']);
+-
+-const validateStdioOption = (inputStream, spawned, streamName, options) => {
++const validateStdioOption = (inputStream, streamIndex, streamName, options) => {
+ 	if (inputStream !== null && inputStream !== undefined) {
+ 		return;
+ 	}
+ 
+-	if (streamName === 'all' && !options.all) {
++	if (streamIndex === 'all' && !options.all) {
+ 		throw new TypeError('The "all" option must be true to use `childProcess.pipe(targetProcess, "all")`.');
+ 	}
+ 
+-	throw new TypeError(`The "${getInvalidStdioOption(inputStream, spawned, options)}" option's value is incompatible with using \`childProcess.pipe(targetProcess)\`.
++	const {optionName, optionValue} = getInvalidStdioOption(streamIndex, options);
++	const pipeArgument = streamName === undefined ? '' : `, ${streamName}`;
++	throw new TypeError(`The \`${optionName}: ${serializeOptionValue(optionValue)}\` option is incompatible with using \`childProcess.pipe(targetProcess${pipeArgument})\`.
+ Please set this option with "pipe" instead.`);
+ };
+ 
+-const getInvalidStdioOption = (inputStream, spawned, options) => {
+-	if (inputStream === spawned.stdout && options.stdout !== undefined) {
+-		return 'stdout';
++const getInvalidStdioOption = (streamIndex, {stdout, stderr, stdio}) => {
++	const usedIndex = streamIndex === 'all' ? 1 : streamIndex;
++
++	if (usedIndex === 1 && stdout !== undefined) {
++		return {optionName: 'stdout', optionValue: stdout};
+ 	}
+ 
+-	if (inputStream === spawned.stderr && options.stderr !== undefined) {
+-		return 'stderr';
++	if (usedIndex === 2 && stderr !== undefined) {
++		return {optionName: 'stderr', optionValue: stderr};
++	}
++
++	return {optionName: `stdio[${usedIndex}]`, optionValue: stdio[usedIndex]};
++};
++
++const serializeOptionValue = optionValue => {
++	if (typeof optionValue === 'string') {
++		return `"${optionValue}"`;
+ 	}
+ 
+-	return 'stdio';
++	return typeof optionValue === 'number' ? `${optionValue}` : 'Stream';
+ };
+diff --git a/lib/stdio/normalize.js b/lib/stdio/normalize.js
+index c95179c..128596d 100644
+--- a/lib/stdio/normalize.js
++++ b/lib/stdio/normalize.js
+@@ -1,3 +1,5 @@
++import {STANDARD_STREAMS_ALIASES} from './utils.js';
++
+ // Add support for `stdin`/`stdout`/`stderr` as an alias for `stdio`
+ export const normalizeStdio = options => {
+ 	if (!options) {
+@@ -7,11 +9,11 @@ export const normalizeStdio = options => {
+ 	const {stdio} = options;
+ 
+ 	if (stdio === undefined) {
+-		return aliases.map(alias => options[alias]);
++		return STANDARD_STREAMS_ALIASES.map(alias => options[alias]);
+ 	}
+ 
+ 	if (hasAlias(options)) {
+-		throw new Error(`It's not possible to provide \`stdio\` in combination with one of ${aliases.map(alias => `\`${alias}\``).join(', ')}`);
++		throw new Error(`It's not possible to provide \`stdio\` in combination with one of ${STANDARD_STREAMS_ALIASES.map(alias => `\`${alias}\``).join(', ')}`);
+ 	}
+ 
+ 	if (typeof stdio === 'string') {
+@@ -22,13 +24,11 @@ export const normalizeStdio = options => {
+ 		throw new TypeError(`Expected \`stdio\` to be of type \`string\` or \`Array\`, got \`${typeof stdio}\``);
+ 	}
+ 
+-	const length = Math.max(stdio.length, aliases.length);
++	const length = Math.max(stdio.length, STANDARD_STREAMS_ALIASES.length);
+ 	return Array.from({length}, (value, index) => stdio[index]);
+ };
+ 
+-const hasAlias = options => aliases.some(alias => options[alias] !== undefined);
+-
+-const aliases = ['stdin', 'stdout', 'stderr'];
++const hasAlias = options => STANDARD_STREAMS_ALIASES.some(alias => options[alias] !== undefined);
+ 
+ // Same but for `execaNode()`, i.e. push `ipc` unless already present
+ export const normalizeStdioNode = options => {
+diff --git a/lib/stdio/utils.js b/lib/stdio/utils.js
+index b6c876f..88d9523 100644
+--- a/lib/stdio/utils.js
++++ b/lib/stdio/utils.js
+@@ -25,3 +25,4 @@ export const pipeStreams = async (source, destination) => {
+ 
+ export const isStandardStream = stream => STANDARD_STREAMS.includes(stream);
+ export const STANDARD_STREAMS = [process.stdin, process.stdout, process.stderr];
++export const STANDARD_STREAMS_ALIASES = ['stdin', 'stdout', 'stderr'];

@@ -1,0 +1,190 @@
+diff --git a/.changeset/green-eagles-boil.md b/.changeset/green-eagles-boil.md
+deleted file mode 100644
+index bf1ee71eb..000000000
+--- a/.changeset/green-eagles-boil.md
++++ /dev/null
+@@ -1,6 +0,0 @@
+----
+-'@verdaccio/auth': patch
+-'@verdaccio/api': patch
+----
+-
+-fix: E409 username is already registered (adduser)
+diff --git a/packages/api/src/user.ts b/packages/api/src/user.ts
+index e42f4ba41..05b58c42e 100644
+--- a/packages/api/src/user.ts
++++ b/packages/api/src/user.ts
+@@ -28,11 +28,7 @@ export default function (route: Router, auth: Auth, config: Config, logger: Logg
+     function (req: $RequestExtend, res: Response, next: $NextFunctionVer): void {
+       debug('verifying user');
+ 
+-      if (
+-        !req.remote_user ||
+-        typeof req.remote_user.name !== 'string' ||
+-        req.remote_user.name === ''
+-      ) {
++      if (typeof req.remote_user.name !== 'string' || req.remote_user.name === '') {
+         debug('user not logged in');
+         res.status(HTTP_STATUS.OK);
+         return next({ ok: false });
+diff --git a/packages/auth/src/utils.ts b/packages/auth/src/utils.ts
+index 3b3328d50..fa5929c8b 100644
+--- a/packages/auth/src/utils.ts
++++ b/packages/auth/src/utils.ts
+@@ -166,9 +166,7 @@ export function getDefaultPlugins(logger: Logger): pluginUtils.Auth<Config> {
+ 
+     adduser(_user: string, _password: string, cb: pluginUtils.AuthUserCallback): void {
+       debug('triggered default adduser method');
+-      // since adduser is not implemented but optional, continue without error
+-      // this assumes that the user is added by an external system
+-      cb(null, true);
++      return cb(errorUtils.getConflict(API_ERROR.BAD_USERNAME_PASSWORD));
+     },
+ 
+     // @ts-ignore
+diff --git a/packages/auth/test/auth-utils.spec.ts b/packages/auth/test/auth-utils.spec.ts
+index 65d8d5d20..5eba75f73 100644
+--- a/packages/auth/test/auth-utils.spec.ts
++++ b/packages/auth/test/auth-utils.spec.ts
+@@ -123,12 +123,11 @@ describe('Auth utilities', () => {
+       });
+     });
+ 
+-    test('add user should not fail by default (default)', () => {
++    test('add user should fail by default (default)', () => {
+       const plugin = getDefaultPlugins({ trace: vi.fn() });
+       // @ts-ignore
+-      plugin.adduser('foo', 'bar', (error: any, access: any) => {
+-        expect(error).toEqual(null);
+-        expect(access).toEqual(true);
++      plugin.adduser('foo', 'bar', (error: any) => {
++        expect(error).toEqual(errorUtils.getForbidden(API_ERROR.BAD_USERNAME_PASSWORD));
+       });
+     });
+   });
+diff --git a/packages/auth/test/auth.spec.ts b/packages/auth/test/auth.spec.ts
+index 982562dcf..d2dd88912 100644
+--- a/packages/auth/test/auth.spec.ts
++++ b/packages/auth/test/auth.spec.ts
+@@ -4,7 +4,14 @@ import supertest from 'supertest';
+ import { describe, expect, test, vi } from 'vitest';
+ 
+ import { Config as AppConfig, ROLES, createRemoteUser, getDefaultConfig } from '@verdaccio/config';
+-import { HEADERS, HTTP_STATUS, SUPPORT_ERRORS, TOKEN_BEARER, errorUtils } from '@verdaccio/core';
++import {
++  API_ERROR,
++  HEADERS,
++  HTTP_STATUS,
++  SUPPORT_ERRORS,
++  TOKEN_BEARER,
++  errorUtils,
++} from '@verdaccio/core';
+ import { logger, setup } from '@verdaccio/logger';
+ import { errorReportingMiddleware, final, handleError } from '@verdaccio/middleware';
+ import { Config } from '@verdaccio/types';
+@@ -252,7 +259,7 @@ describe('AuthTest', () => {
+     describe('no custom allow_access implementation provided', () => {
+       // when allow_access is not implemented, the groups must match
+       // exactly with the packages access group
+-      test('should fail if groups do not match exactly', async () => {
++      test('should fails if groups do not match exactly', async () => {
+         const config: Config = new AppConfig({ ...authProfileConf });
+         config.checkSecretKey('12345');
+         const auth: Auth = new Auth(config, logger);
+@@ -301,7 +308,7 @@ describe('AuthTest', () => {
+     describe('no custom allow_publish implementation provided', () => {
+       // when allow_access is not implemented, the groups must match
+       // exactly with the packages access group
+-      test('should fail if groups do not match exactly', async () => {
++      test('should fails if groups do not match exactly', async () => {
+         const config: Config = new AppConfig({ ...authProfileConf });
+         config.checkSecretKey('12345');
+         const auth: Auth = new Auth(config, logger);
+@@ -347,7 +354,7 @@ describe('AuthTest', () => {
+   });
+   describe('allow_unpublish', () => {
+     describe('no custom allow_unpublish implementation provided', () => {
+-      test('should fail if groups do not match exactly', async () => {
++      test('should fails if groups do not match exactly', async () => {
+         const config: Config = new AppConfig({ ...authProfileConf });
+         config.checkSecretKey('12345');
+ 
+@@ -432,7 +439,7 @@ describe('AuthTest', () => {
+     describe('error handling', () => {
+       // when allow_access is not implemented, the groups must match
+       // exactly with the packages access group
+-      test('should not fail if adduser is not implemented', async () => {
++      test('should fails with bad password if adduser is not implemented', async () => {
+         const config: Config = new AppConfig({ ...authProfileConf });
+         config.checkSecretKey('12345');
+         const auth: Auth = new Auth(config, logger);
+@@ -444,21 +451,12 @@ describe('AuthTest', () => {
+         auth.add_user('juan', 'password', callback);
+ 
+         expect(callback).toHaveBeenCalledTimes(1);
+-        expect(callback).toHaveBeenCalledWith(null, {
+-          groups: [
+-            'test',
+-            ROLES.$ALL,
+-            ROLES.$AUTH,
+-            ROLES.DEPRECATED_ALL,
+-            ROLES.DEPRECATED_AUTH,
+-            ROLES.ALL,
+-          ],
+-          name: 'juan',
+-          real_groups: ['test'],
+-        });
++        expect(callback).toHaveBeenCalledWith(
++          errorUtils.getConflict(API_ERROR.BAD_USERNAME_PASSWORD)
++        );
+       });
+ 
+-      test('should fail if adduser fails internally (exception)', async () => {
++      test('should fails if adduser fails internally (exception)', async () => {
+         const config: Config = new AppConfig({
+           ...getDefaultConfig(),
+           plugins: path.join(__dirname, './partials/plugin'),
+@@ -473,14 +471,14 @@ describe('AuthTest', () => {
+ 
+         const callback = vi.fn();
+ 
+-        // note: username to make plugin fail
++        // note: fail uas username make plugin fails
+         auth.add_user('fail', 'password', callback);
+ 
+         expect(callback).toHaveBeenCalledTimes(1);
+         expect(callback).toHaveBeenCalledWith(new Error('bad username'));
+       });
+ 
+-      test('should skip to the next plugin and fail', async () => {
++      test('should skip to the next plugin and fails', async () => {
+         const config: Config = new AppConfig({
+           ...getDefaultConfig(),
+           plugins: path.join(__dirname, './partials/plugin'),
+@@ -497,22 +495,13 @@ describe('AuthTest', () => {
+ 
+         const callback = vi.fn();
+ 
+-        // note: username to make plugin fail
++        // note: fail uas username make plugin fails
+         auth.add_user('skip', 'password', callback);
+ 
+         expect(callback).toHaveBeenCalledTimes(1);
+-        expect(callback).toHaveBeenCalledWith(null, {
+-          groups: [
+-            'test',
+-            ROLES.$ALL,
+-            ROLES.$AUTH,
+-            ROLES.DEPRECATED_ALL,
+-            ROLES.DEPRECATED_AUTH,
+-            ROLES.ALL,
+-          ],
+-          name: 'skip',
+-          real_groups: ['test'],
+-        });
++        expect(callback).toHaveBeenCalledWith(
++          errorUtils.getConflict(API_ERROR.BAD_USERNAME_PASSWORD)
++        );
+       });
+     });
+     test('should success if adduser', async () => {

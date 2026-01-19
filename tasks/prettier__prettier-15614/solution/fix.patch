@@ -1,0 +1,253 @@
+diff --git a/src/language-html/clean.js b/src/language-html/clean.js
+index c095b4290..c12531dde 100644
+--- a/src/language-html/clean.js
++++ b/src/language-html/clean.js
+@@ -38,8 +38,8 @@ function clean(ast, newNode) {
+     delete newNode.value;
+   }
+ 
+-  if (ast.type === "block") {
+-    for (const parameter of newNode.parameters) {
++  if (ast.type === "angularControlFlowBlock" && newNode.parameters?.children) {
++    for (const parameter of newNode.parameters.children) {
+       if (embeddedAngularControlFlowBlocks.has(ast.name)) {
+         delete parameter.expression;
+       } else {
+diff --git a/src/language-html/embed.js b/src/language-html/embed.js
+index 42e5d1947..8118aae2f 100644
+--- a/src/language-html/embed.js
++++ b/src/language-html/embed.js
+@@ -145,12 +145,8 @@ function embed(path, options) {
+     case "front-matter":
+       return (textToDoc) => printFrontMatter(node, textToDoc);
+ 
+-    // TODO: This should work on `blockParameter`, but currently we don't have a parser for it.
+-    case "block":
+-      if (
+-        !embeddedAngularControlFlowBlocks.has(node.name) ||
+-        node.parameters.length === 0
+-      ) {
++    case "angularControlFlowBlockParameters":
++      if (!embeddedAngularControlFlowBlocks.has(path.parent.name)) {
+         return;
+       }
+ 
+diff --git a/src/language-html/embed/angular-control-flow-block-parameters.js b/src/language-html/embed/angular-control-flow-block-parameters.js
+index 821944648..46750cd5d 100644
+--- a/src/language-html/embed/angular-control-flow-block-parameters.js
++++ b/src/language-html/embed/angular-control-flow-block-parameters.js
+@@ -1,16 +1,25 @@
+ import { formatAttributeValue, shouldHugJsExpression } from "./utils.js";
+ 
+-async function printAngularControlFlowBlockParameters(
++function printAngularControlFlowBlockParameters(
+   textToDoc,
+   print,
+   path,
+-  /* options,*/
++  options,
+ ) {
+   const { node } = path;
+-  const code = node.parameters.map(({ expression }) => expression).join("; ");
+ 
+-  const doc = await formatAttributeValue(
+-    code,
++  const content = options.originalText.slice(
++    node.sourceSpan.start.offset,
++    node.sourceSpan.end.offset,
++  );
++  const isEmpty = /^\s*$/.test(content);
++
++  if (isEmpty) {
++    return "";
++  }
++
++  return formatAttributeValue(
++    content,
+     textToDoc,
+     {
+       parser: "__ng_directive",
+@@ -19,9 +28,6 @@ async function printAngularControlFlowBlockParameters(
+     },
+     shouldHugJsExpression,
+   );
+-
+-  // We have to put the doc on the node, since `node.parameters` is not a valid "node"
+-  node.__embed_parameters_doc = doc;
+ }
+ 
+ export default printAngularControlFlowBlockParameters;
+diff --git a/src/language-html/parser-html.js b/src/language-html/parser-html.js
+index fdfb0214d..96e75556a 100644
+--- a/src/language-html/parser-html.js
++++ b/src/language-html/parser-html.js
+@@ -11,6 +11,7 @@ import {
+ import parseFrontMatter from "../utils/front-matter/parse.js";
+ import inferParser from "../utils/infer-parser.js";
+ import createError from "../common/parser-create-error.js";
++import isNonEmptyArray from "../utils/is-non-empty-array.js";
+ import HTML_TAGS from "./utils/html-tag-names.evaluate.js";
+ import HTML_ELEMENT_ATTRIBUTES from "./utils/html-elements-attributes.evaluate.js";
+ import isUnknownNamespace from "./utils/is-unknown-namespace.js";
+@@ -39,10 +40,31 @@ import { locStart, locEnd } from "./loc.js";
+  */
+ 
+ // `@else    if`
+-function normalizeAngularControlFlowBlockName(node) {
+-  if (node.type === "block") {
+-    node.name = node.name.toLowerCase().replaceAll(/\s+/g, " ").trim();
++function normalizeAngularControlFlowBlock(node) {
++  if (node.type !== "block") {
++    return;
+   }
++
++  node.name = node.name.toLowerCase().replaceAll(/\s+/g, " ").trim();
++  node.type = "angularControlFlowBlock";
++
++  if (!isNonEmptyArray(node.parameters)) {
++    delete node.parameters;
++    return;
++  }
++
++  for (const parameter of node.parameters) {
++    parameter.type = "angularControlFlowBlockParameter";
++  }
++
++  node.parameters = {
++    type: "angularControlFlowBlockParameters",
++    children: node.parameters,
++    sourceSpan: new ParseSourceSpan(
++      node.parameters[0].sourceSpan.start,
++      node.parameters.at(-1).sourceSpan.end,
++    ),
++  };
+ }
+ 
+ /**
+@@ -244,7 +266,6 @@ function ngHtmlParser(input, parseOptions, options) {
+         addTagDefinition(node);
+         normalizeName(node);
+         fixSourceSpan(node);
+-        normalizeAngularControlFlowBlockName(node);
+       }
+     })(),
+     rootNodes,
+@@ -351,6 +372,8 @@ function parse(
+         node.parent.replaceChild(node, ieConditionalComment);
+       }
+     }
++
++    normalizeAngularControlFlowBlock(node);
+   });
+ 
+   return ast;
+diff --git a/src/language-html/print/angular-control-flow-block.js b/src/language-html/print/angular-control-flow-block.js
+index b579143d3..812270cc8 100644
+--- a/src/language-html/print/angular-control-flow-block.js
++++ b/src/language-html/print/angular-control-flow-block.js
+@@ -26,15 +26,8 @@ function printAngularControlFlowBlock(path, options, print) {
+ 
+   docs.push("@", node.name);
+ 
+-  if (node.parameters.length > 0) {
+-    const parametersDoc = group(
+-      node.__embed_parameters_doc ?? [
+-        indent([softline, join([";", line], path.map(print, "parameters"))]),
+-        softline,
+-      ],
+-    );
+-
+-    docs.push(" (", parametersDoc, ")");
++  if (node.parameters) {
++    docs.push(" (", group(print("parameters")), ")");
+   }
+ 
+   docs.push(" {");
+@@ -64,7 +57,7 @@ function printAngularControlFlowBlock(path, options, print) {
+ function shouldCloseBlock(node, names) {
+   return !(
+     names.size > 0 &&
+-    node.next?.type === "block" &&
++    node.next?.type === "angularControlFlowBlock" &&
+     names.has(node.next.name)
+   );
+ }
+@@ -75,10 +68,17 @@ function findPreviousBlock(path) {
+   for (let i = index - 1; i >= 0; i--) {
+     const sibling = siblings[i];
+ 
+-    if (sibling.type === "block") {
++    if (sibling.type === "angularControlFlowBlock") {
+       return sibling;
+     }
+   }
+ }
+ 
+-export { printAngularControlFlowBlock };
++function printAngularControlFlowBlockParameters(path, options, print) {
++  return [
++    indent([softline, join([";", line], path.map(print, "children"))]),
++    softline,
++  ];
++}
++
++export { printAngularControlFlowBlock, printAngularControlFlowBlockParameters };
+diff --git a/src/language-html/print/tag.js b/src/language-html/print/tag.js
+index 86f5a53c8..db77aaedf 100644
+--- a/src/language-html/print/tag.js
++++ b/src/language-html/print/tag.js
+@@ -128,7 +128,7 @@ function needsToBorrowPrevClosingTagEndMarker(node) {
+   return (
+     node.prev &&
+     node.prev.type !== "docType" &&
+-    node.type !== "block" &&
++    node.type !== "angularControlFlowBlock" &&
+     !isTextLikeNode(node.prev) &&
+     node.isLeadingSpaceSensitive &&
+     !node.hasLeadingSpaces
+diff --git a/src/language-html/printer-html.js b/src/language-html/printer-html.js
+index ee2f5c8a1..1adabfdc0 100644
+--- a/src/language-html/printer-html.js
++++ b/src/language-html/printer-html.js
+@@ -21,7 +21,10 @@ import {
+ } from "./print/tag.js";
+ import { printElement } from "./print/element.js";
+ import { printChildren } from "./print/children.js";
+-import { printAngularControlFlowBlock } from "./print/angular-control-flow-block.js";
++import {
++  printAngularControlFlowBlock,
++  printAngularControlFlowBlockParameters,
++} from "./print/angular-control-flow-block.js";
+ import getVisitorKeys from "./get-visitor-keys.js";
+ 
+ function genericPrint(path, options, print) {
+@@ -39,9 +42,11 @@ function genericPrint(path, options, print) {
+     case "ieConditionalComment":
+       return printElement(path, options, print);
+ 
+-    case "block":
++    case "angularControlFlowBlock":
+       return printAngularControlFlowBlock(path, options, print);
+-    case "blockParameter":
++    case "angularControlFlowBlockParameters":
++      return printAngularControlFlowBlockParameters(path, options, print);
++    case "angularControlFlowBlockParameter":
+       return htmlWhitespaceUtils.trim(node.expression);
+ 
+     case "ieConditionalStartComment":
+diff --git a/src/language-html/visitor-keys.js b/src/language-html/visitor-keys.js
+index 9fef1bb20..1952fcf5e 100644
+--- a/src/language-html/visitor-keys.js
++++ b/src/language-html/visitor-keys.js
+@@ -11,8 +11,9 @@ const visitorKeys = {
+   comment: [],
+   attribute: [],
+   cdata: [],
+-  block: ["children", "parameters"],
+-  blockParameter: [],
++  angularControlFlowBlock: ["children", "parameters"],
++  angularControlFlowBlockParameters: ["children"],
++  angularControlFlowBlockParameter: [],
+ };
+ 
+ export default visitorKeys;

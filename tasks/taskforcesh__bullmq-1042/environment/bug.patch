@@ -1,0 +1,163 @@
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index ffd155aa63..caebbdd128 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -323,13 +323,10 @@ export class Job<
+    * @param data - the data that will replace the current jobs data.
+    */
+   async update(data: DataType): Promise<void> {
+-    this.data = data;
++    const client = await this.queue.client;
+ 
+-    return Scripts.updateData<DataType, ReturnType, NameType>(
+-      this.queue,
+-      this,
+-      data,
+-    );
++    this.data = data;
++    await client.hset(this.toKey(this.id), 'data', JSON.stringify(data));
+   }
+ 
+   /**
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index aca2dc0964..d11f7e16ad 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -203,23 +203,6 @@ export class Scripts {
+     return (<any>client).extendLock(args);
+   }
+ 
+-  static async updateData<T = any, R = any, N extends string = string>(
+-    queue: MinimalQueue,
+-    job: Job<T, R, N>,
+-    data: T,
+-  ): Promise<void> {
+-    const client = await queue.client;
+-
+-    const keys = [queue.toKey(job.id)];
+-    const dataJson = JSON.stringify(data);
+-
+-    const result = await (<any>client).updateData(keys.concat([dataJson]));
+-
+-    if (result < 0) {
+-      throw this.finishedErrors(result, job.id, 'updateData');
+-    }
+-  }
+-
+   static async updateProgress<T = any, R = any, N extends string = string>(
+     queue: MinimalQueue,
+     job: Job<T, R, N>,
+@@ -230,9 +213,10 @@ export class Scripts {
+     const keys = [queue.toKey(job.id), queue.keys.events];
+     const progressJson = JSON.stringify(progress);
+ 
+-    const result = await (<any>client).updateProgress(
+-      keys.concat([job.id, progressJson]),
+-    );
++    const result = await (<any>client).updateProgress(keys, [
++      job.id,
++      progressJson,
++    ]);
+ 
+     if (result < 0) {
+       throw this.finishedErrors(result, job.id, 'updateProgress');
+diff --git a/src/commands/includes/batches.lua b/src/commands/includes/batches.lua
+index b8e6d48065..479a832300 100644
+--- a/src/commands/includes/batches.lua
++++ b/src/commands/includes/batches.lua
+@@ -1,9 +1,3 @@
+---[[
+-  Function to loop in batches.
+-  Just a bit of warning, some commands as ZREM
+-  could receive a maximum of 7000 parameters per call.
+-]]
+-
+ local function batches(n, batchSize)
+   local i = 0
+ 
+diff --git a/src/commands/updateData-1.lua b/src/commands/updateData-1.lua
+deleted file mode 100644
+index 130b6e565b..0000000000
+--- a/src/commands/updateData-1.lua
++++ /dev/null
+@@ -1,16 +0,0 @@
+---[[
+-  Update job data
+-
+-  Input:
+-    KEYS[1] Job id key
+-  
+-    ARGV[1] data        
+-]]
+-local rcall = redis.call
+-
+-if rcall("EXISTS",KEYS[1]) == 1 then -- // Make sure job exists
+-  rcall("HSET", KEYS[1], "data", ARGV[1])
+-  return 0
+-else
+-  return -1
+-end
+diff --git a/src/commands/updateProgress-2.lua b/src/commands/updateProgress-2.lua
+index 7c5f136e2d..d5a252a2a0 100644
+--- a/src/commands/updateProgress-2.lua
++++ b/src/commands/updateProgress-2.lua
+@@ -1,15 +1,15 @@
+ --[[
+   Update job progress
+ 
+-  Input:
+-    KEYS[1] Job id key
+-    KEYS[2] event stream key
+-  
+-    ARGV[1] id
+-    ARGV[2] progress
+-    
+-  Event:
+-    progress(jobId, progress)
++     Input:
++        KEYS[1] Job id key
++        KEYS[2] event stream key
++      
++        ARGV[1] id
++        ARGV[2] progress
++        
++      Event:
++        progress(jobId, progress)
+ ]]
+ local rcall = redis.call
+ 
+@@ -20,3 +20,4 @@ if rcall("EXISTS",KEYS[1]) == 1 then -- // Make sure job exists
+ else
+   return -1
+ end
++
+diff --git a/tests/test_job.ts b/tests/test_job.ts
+index 1a5f33804d..0aa5e818c9 100644
+--- a/tests/test_job.ts
++++ b/tests/test_job.ts
+@@ -186,16 +186,6 @@ describe('Job', function () {
+       const updatedJob = await Job.fromId(queue, job.id);
+       expect(updatedJob.data).to.be.eql({ baz: 'qux' });
+     });
+-
+-    describe('when job is removed', () => {
+-      it('throws error', async function () {
+-        const job = await Job.create(queue, 'test', { foo: 'bar' });
+-        await job.remove();
+-        await expect(job.update({ foo: 'baz' })).to.be.rejectedWith(
+-          `Missing key for job ${job.id}. updateData`,
+-        );
+-      });
+-    });
+   });
+ 
+   describe('.remove', function () {
+@@ -255,7 +245,7 @@ describe('Job', function () {
+ 
+   // TODO: Add more remove tests
+ 
+-  describe('.progressProgress', function () {
++  describe('.progress', function () {
+     it('can set and get progress as number', async function () {
+       const job = await Job.create(queue, 'test', { foo: 'bar' });
+       await job.updateProgress(42);

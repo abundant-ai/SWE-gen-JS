@@ -1,0 +1,985 @@
+diff --git a/packages/create-turbo/__tests__/git.test.ts b/packages/create-turbo/__tests__/git.test.ts
+index c88147737d..b52681fc79 100644
+--- a/packages/create-turbo/__tests__/git.test.ts
++++ b/packages/create-turbo/__tests__/git.test.ts
+@@ -7,8 +7,6 @@ import {
+   DEFAULT_IGNORE,
+   GIT_REPO_COMMAND,
+   HG_REPO_COMMAND,
+-  isInGitRepository,
+-  isInMercurialRepository,
+   tryGitInit,
+   removeGitDirectory,
+ } from "../src/utils/git";
+@@ -19,228 +17,262 @@ describe("git", () => {
+     expect(DEFAULT_IGNORE).toContain(".turbo");
+   });
+ 
+-  describe("isInGitRepository", () => {
+-    it("returns true when in a repo", async () => {
+-      const mockExecSync = jest
+-        .spyOn(childProcess, "execSync")
+-        .mockReturnValue("true");
+-
+-      const result = isInGitRepository();
+-      expect(result).toBe(true);
+-
+-      expect(mockExecSync).toHaveBeenCalledWith(GIT_REPO_COMMAND, {
+-        stdio: "ignore",
+-      });
+-      mockExecSync.mockRestore();
++  describe("tryGitInit", () => {
++    const { useFixture } = setupTestFixtures({
++      directory: path.join(__dirname, "../"),
++      options: { emptyFixture: true },
+     });
+ 
+-    it("returns false when not in a repo", async () => {
++    it("inits a repo with a single commit", async () => {
++      const { root } = useFixture({ fixture: `git` });
+       const mockExecSync = jest
+         .spyOn(childProcess, "execSync")
+-        .mockImplementation(() => {
++        .mockImplementationOnce(() => {
++          // git repo check fails (not in git repo)
+           throw new Error(
+             "fatal: not a git repository (or any of the parent directories): .git"
+           );
+-        });
+-
+-      const result = isInGitRepository();
+-      expect(result).toBe(false);
++        })
++        .mockImplementationOnce(() => {
++          // hg repo check fails (not in hg repo)
++          throw new Error("abort: no repository found (.hg not found)");
++        })
++        .mockReturnValue("success");
+ 
+-      expect(mockExecSync).toHaveBeenCalledWith(GIT_REPO_COMMAND, {
+-        stdio: "ignore",
+-      });
+-      mockExecSync.mockRestore();
+-    });
++      const result = tryGitInit(root);
++      expect(result).toBe(true);
+ 
+-    it("returns false on error", async () => {
+-      const mockExecSync = jest
+-        .spyOn(childProcess, "execSync")
+-        .mockImplementation(() => {
+-          throw new Error("unknown error");
++      // Verify the exact sequence of commands (all with cwd: root)
++      const calls = [
++        GIT_REPO_COMMAND,
++        HG_REPO_COMMAND,
++        "git init",
++        "git checkout -b main",
++        "git add -A",
++        'git commit -m "Initial commit from create-turbo"',
++      ];
++      expect(mockExecSync).toHaveBeenCalledTimes(calls.length);
++      calls.forEach((call) => {
++        expect(mockExecSync).toHaveBeenCalledWith(call, {
++          stdio: "ignore",
++          cwd: root,
+         });
+-
+-      const result = isInGitRepository();
+-      expect(result).toBe(false);
+-
+-      expect(mockExecSync).toHaveBeenCalledWith(GIT_REPO_COMMAND, {
+-        stdio: "ignore",
+       });
+       mockExecSync.mockRestore();
+     });
+-  });
+ 
+-  describe("isInMercurialRepository", () => {
+-    it("returns true when in a repo", async () => {
++    it("creates exactly one commit with all changes", async () => {
++      const { root } = useFixture({ fixture: `git` });
++      const commitCalls: Array<string> = [];
+       const mockExecSync = jest
+         .spyOn(childProcess, "execSync")
+-        .mockReturnValue("true");
++        .mockImplementation((command) => {
++          const cmd = command.toString();
++          if (cmd === GIT_REPO_COMMAND) {
++            throw new Error(
++              "fatal: not a git repository (or any of the parent directories): .git"
++            );
++          }
++          if (cmd === HG_REPO_COMMAND) {
++            throw new Error("abort: no repository found (.hg not found)");
++          }
++          if (cmd.startsWith("git commit")) {
++            commitCalls.push(cmd);
++          }
++          return "success";
++        });
+ 
+-      const result = isInMercurialRepository();
+-      expect(result).toBe(true);
++      tryGitInit(root);
+ 
+-      expect(mockExecSync).toHaveBeenCalledWith(HG_REPO_COMMAND, {
+-        stdio: "ignore",
+-      });
++      // Should have exactly one commit call
++      expect(commitCalls).toHaveLength(1);
++      expect(commitCalls[0]).toBe(
++        'git commit -m "Initial commit from create-turbo"'
++      );
+       mockExecSync.mockRestore();
+     });
+ 
+-    it("returns false when not in a repo", async () => {
++    it("runs all git commands in the project root directory", async () => {
++      const { root } = useFixture({ fixture: `git` });
++      const cwdValues: Array<string | undefined> = [];
+       const mockExecSync = jest
+         .spyOn(childProcess, "execSync")
+-        .mockImplementation(() => {
+-          throw new Error("abort: no repository found (.hg not found)");
++        .mockImplementation((command, options) => {
++          const opts = options as { cwd?: string };
++          cwdValues.push(opts.cwd);
++          const cmd = command.toString();
++          if (cmd === GIT_REPO_COMMAND) {
++            throw new Error("not in git repo");
++          }
++          if (cmd === HG_REPO_COMMAND) {
++            throw new Error("not in hg repo");
++          }
++          return "success";
+         });
+ 
+-      const result = isInMercurialRepository();
+-      expect(result).toBe(false);
++      tryGitInit(root);
+ 
+-      expect(mockExecSync).toHaveBeenCalledWith(HG_REPO_COMMAND, {
+-        stdio: "ignore",
+-      });
++      // All commands should have cwd set to root
++      expect(cwdValues.every((cwd) => cwd === root)).toBe(true);
+       mockExecSync.mockRestore();
+     });
+ 
+-    it("returns false on error", async () => {
++    it("skips init if already in a git repo", async () => {
++      const { root } = useFixture({
++        fixture: `git`,
++      });
+       const mockExecSync = jest
+         .spyOn(childProcess, "execSync")
+-        .mockImplementation(() => {
+-          throw new Error("unknown error");
+-        });
++        .mockReturnValueOnce("true") // git repo check succeeds
++        .mockReturnValue("success");
+ 
+-      const result = isInMercurialRepository();
++      const result = tryGitInit(root);
+       expect(result).toBe(false);
+ 
+-      expect(mockExecSync).toHaveBeenCalledWith(HG_REPO_COMMAND, {
++      // Should only call git repo check
++      expect(mockExecSync).toHaveBeenCalledTimes(1);
++      expect(mockExecSync).toHaveBeenCalledWith(GIT_REPO_COMMAND, {
+         stdio: "ignore",
++        cwd: root,
+       });
+       mockExecSync.mockRestore();
+     });
+-  });
+-
+-  describe("tryGitInit", () => {
+-    const { useFixture } = setupTestFixtures({
+-      directory: path.join(__dirname, "../"),
+-      options: { emptyFixture: true },
+-    });
+ 
+-    it("inits a repo successfully", async () => {
++    it("returns false on unexpected error during init", async () => {
+       const { root } = useFixture({ fixture: `git` });
+       const mockExecSync = jest
+         .spyOn(childProcess, "execSync")
+         .mockImplementationOnce(() => {
++          // not in git repo
+           throw new Error(
+             "fatal: not a git repository (or any of the parent directories): .git"
+           );
+         })
+         .mockImplementationOnce(() => {
++          // not in hg repo
+           throw new Error("abort: no repository found (.hg not found)");
+         })
+-        .mockReturnValue("success");
++        .mockImplementationOnce(() => {
++          // git init fails
++          throw new Error("fatal: 128");
++        });
+ 
+-      const result = tryGitInit(root, "test commit");
+-      expect(result).toBe(true);
++      const result = tryGitInit(root);
++      expect(result).toBe(false);
+ 
+-      const calls = [
++      const calls: Array<string> = [
++        GIT_REPO_COMMAND,
++        HG_REPO_COMMAND,
+         "git init",
+-        "git checkout -b main",
+-        "git add -A",
+-        'git commit --author="Turbobot <turbobot@vercel.com>" -am "test commit"',
+       ];
+-      expect(mockExecSync).toHaveBeenCalledTimes(calls.length + 2);
++
++      expect(mockExecSync).toHaveBeenCalledTimes(calls.length);
+       calls.forEach((call) => {
+         expect(mockExecSync).toHaveBeenCalledWith(call, {
+           stdio: "ignore",
++          cwd: root,
+         });
+       });
+       mockExecSync.mockRestore();
+     });
+ 
+-    it("skips init if already in a repo", async () => {
+-      const { root } = useFixture({
+-        fixture: `git`,
+-      });
++    it("cleans up .git directory on failure after init", async () => {
++      const { root } = useFixture({ fixture: `git` });
++      const mockRmSync = jest.spyOn(fs, "rmSync").mockImplementation(() => {});
+       const mockExecSync = jest
+         .spyOn(childProcess, "execSync")
+-        .mockReturnValueOnce("true")
+-        .mockReturnValue("success");
++        .mockImplementationOnce(() => {
++          // not in git repo
++          throw new Error(
++            "fatal: not a git repository (or any of the parent directories): .git"
++          );
++        })
++        .mockImplementationOnce(() => {
++          // not in hg repo
++          throw new Error("abort: no repository found (.hg not found)");
++        })
++        .mockReturnValueOnce("success") // git init succeeds
++        .mockImplementationOnce(() => {
++          // git checkout -b main fails
++          throw new Error("fatal: could not checkout branch");
++        });
+ 
+-      const result = tryGitInit(root, "test commit");
++      const result = tryGitInit(root);
+       expect(result).toBe(false);
+ 
+-      const calls: string[] = [];
+-
+-      // 1 call for isInGitRepository
+-      expect(mockExecSync).toHaveBeenCalledTimes(calls.length + 1);
+-      calls.forEach((call) => {
+-        expect(mockExecSync).toHaveBeenCalledWith(call, {
+-          stdio: "ignore",
+-        });
++      // Should clean up the .git directory
++      expect(mockRmSync).toHaveBeenCalledWith(path.join(root, ".git"), {
++        recursive: true,
++        force: true,
+       });
+       mockExecSync.mockRestore();
++      mockRmSync.mockRestore();
+     });
+ 
+-    it("returns false on unexpected error", async () => {
++    it("cleans up .git directory when user has no git config (commit fails)", async () => {
+       const { root } = useFixture({ fixture: `git` });
++      const mockRmSync = jest.spyOn(fs, "rmSync").mockImplementation(() => {});
+       const mockExecSync = jest
+         .spyOn(childProcess, "execSync")
+         .mockImplementationOnce(() => {
++          // not in git repo
+           throw new Error(
+             "fatal: not a git repository (or any of the parent directories): .git"
+           );
+         })
+         .mockImplementationOnce(() => {
++          // not in hg repo
+           throw new Error("abort: no repository found (.hg not found)");
+         })
++        .mockReturnValueOnce("success") // git init
++        .mockReturnValueOnce("success") // git checkout -b main
++        .mockReturnValueOnce("success") // git add -A
+         .mockImplementationOnce(() => {
+-          throw new Error("fatal: 128");
++          // git commit fails due to missing user config
++          throw new Error(
++            "fatal: unable to auto-detect email address (got 'user@localhost')"
++          );
+         });
+ 
+-      const result = tryGitInit(root, "test commit");
++      const result = tryGitInit(root);
+       expect(result).toBe(false);
+ 
+-      const calls: string[] = [GIT_REPO_COMMAND, HG_REPO_COMMAND, "git init"];
+-
+-      expect(mockExecSync).toHaveBeenCalledTimes(calls.length);
+-      calls.forEach((call) => {
+-        expect(mockExecSync).toHaveBeenCalledWith(call, {
+-          stdio: "ignore",
+-        });
++      // Should clean up the .git directory since init succeeded but commit failed
++      expect(mockRmSync).toHaveBeenCalledWith(path.join(root, ".git"), {
++        recursive: true,
++        force: true,
+       });
+       mockExecSync.mockRestore();
++      mockRmSync.mockRestore();
+     });
+ 
+-    it("cleans up from partial init on failure", async () => {
+-      const { root } = useFixture({ fixture: `git` });
++    it("skips init if already in a mercurial repo", async () => {
++      const { root } = useFixture({
++        fixture: `git`,
++      });
+       const mockExecSync = jest
+         .spyOn(childProcess, "execSync")
+         .mockImplementationOnce(() => {
++          // not in git repo
+           throw new Error(
+             "fatal: not a git repository (or any of the parent directories): .git"
+           );
+         })
+-        .mockImplementationOnce(() => {
+-          throw new Error("abort: no repository found (.hg not found)");
+-        })
+-        .mockReturnValueOnce("success")
+-        .mockReturnValueOnce("success")
+-        .mockImplementationOnce(() => {
+-          throw new Error("fatal: could not add files");
+-        });
++        .mockReturnValueOnce("true") // hg repo check succeeds (is in hg repo)
++        .mockReturnValue("success");
+ 
+-      const result = tryGitInit(root, "test commit");
++      const result = tryGitInit(root);
+       expect(result).toBe(false);
+ 
+-      const calls = [
+-        "git rev-parse --is-inside-work-tree",
+-        "hg --cwd . root",
+-        "git init",
+-      ];
+-
+-      expect(mockExecSync).toHaveBeenCalledTimes(calls.length + 2);
+-      calls.forEach((call) => {
+-        expect(mockExecSync).toHaveBeenCalledWith(call, {
+-          stdio: "ignore",
+-        });
++      // Should call git repo check, then hg repo check, then stop
++      expect(mockExecSync).toHaveBeenCalledTimes(2);
++      expect(mockExecSync).toHaveBeenCalledWith(GIT_REPO_COMMAND, {
++        stdio: "ignore",
++        cwd: root,
++      });
++      expect(mockExecSync).toHaveBeenCalledWith(HG_REPO_COMMAND, {
++        stdio: "ignore",
++        cwd: root,
+       });
+       mockExecSync.mockRestore();
+     });
+diff --git a/packages/create-turbo/__tests__/index.test.ts b/packages/create-turbo/__tests__/index.test.ts
+index a0211a1b9a..8ead71187d 100644
+--- a/packages/create-turbo/__tests__/index.test.ts
++++ b/packages/create-turbo/__tests__/index.test.ts
+@@ -277,7 +277,7 @@ describe("create-turbo", () => {
+     mockExecSync.mockRestore();
+   });
+ 
+-  it("removes .git directory when --no-git flag is used", async () => {
++  it("does not initialize git and removes .git directory when --no-git flag is used", async () => {
+     const { root } = useFixture({ fixture: "create-turbo-no-git" });
+     const packageManager = "npm";
+ 
+@@ -313,6 +313,10 @@ describe("create-turbo", () => {
+         return "success";
+       });
+ 
++    const mockTryGitInit = jest
++      .spyOn(gitUtils, "tryGitInit")
++      .mockReturnValue(true);
++
+     const mockRemoveGitDirectory = jest
+       .spyOn(gitUtils, "removeGitDirectory")
+       .mockReturnValue(true);
+@@ -321,20 +325,22 @@ describe("create-turbo", () => {
+       packageManager,
+       skipInstall: true,
+       example: "default",
+-      noGit: true,
++      git: false,
+       telemetry,
+     });
+ 
++    expect(mockTryGitInit).not.toHaveBeenCalled();
+     expect(mockRemoveGitDirectory).toHaveBeenCalledWith(root);
+ 
+     mockAvailablePackageManagers.mockRestore();
+     mockCreateProject.mockRestore();
+     mockGetWorkspaceDetails.mockRestore();
+     mockExecSync.mockRestore();
++    mockTryGitInit.mockRestore();
+     mockRemoveGitDirectory.mockRestore();
+   });
+ 
+-  it("does not remove .git directory when --no-git flag is not used", async () => {
++  it("initializes git and does not remove .git directory when --no-git flag is not used", async () => {
+     const { root } = useFixture({ fixture: "create-turbo-with-git" });
+     const packageManager = "npm";
+ 
+@@ -370,6 +376,10 @@ describe("create-turbo", () => {
+         return "success";
+       });
+ 
++    const mockTryGitInit = jest
++      .spyOn(gitUtils, "tryGitInit")
++      .mockReturnValue(true);
++
+     const mockRemoveGitDirectory = jest
+       .spyOn(gitUtils, "removeGitDirectory")
+       .mockReturnValue(true);
+@@ -378,16 +388,18 @@ describe("create-turbo", () => {
+       packageManager,
+       skipInstall: true,
+       example: "default",
+-      noGit: false,
++      git: true,
+       telemetry,
+     });
+ 
++    expect(mockTryGitInit).toHaveBeenCalledWith(root);
+     expect(mockRemoveGitDirectory).not.toHaveBeenCalled();
+ 
+     mockAvailablePackageManagers.mockRestore();
+     mockCreateProject.mockRestore();
+     mockGetWorkspaceDetails.mockRestore();
+     mockExecSync.mockRestore();
++    mockTryGitInit.mockRestore();
+     mockRemoveGitDirectory.mockRestore();
+   });
+ });
+diff --git a/packages/create-turbo/src/cli.ts b/packages/create-turbo/src/cli.ts
+index 7e31d9682c..0105f0f409 100644
+--- a/packages/create-turbo/src/cli.ts
++++ b/packages/create-turbo/src/cli.ts
+@@ -86,11 +86,7 @@ createTurboCli
+   --example-path foo/bar
+ `
+   )
+-  .option(
+-    "--no-git",
+-    "Remove the .git directory after creating the project",
+-    false
+-  )
++  .option("--no-git", "Skip initializing a git repository")
+   .version(cliPkg.version, "-v, --version", "Output the current version")
+   .helpOption("-h, --help", "Display help for command")
+   .action(create);
+diff --git a/packages/create-turbo/src/commands/create/index.ts b/packages/create-turbo/src/commands/create/index.ts
+index 8af8a525c9..df2f7f5262 100644
+--- a/packages/create-turbo/src/commands/create/index.ts
++++ b/packages/create-turbo/src/commands/create/index.ts
+@@ -13,12 +13,7 @@ import {
+   DownloadError,
+   logger,
+ } from "@turbo/utils";
+-import {
+-  tryGitCommit,
+-  tryGitInit,
+-  tryGitAdd,
+-  removeGitDirectory,
+-} from "../../utils/git";
++import { tryGitInit, removeGitDirectory } from "../../utils/git";
+ import { isOnline } from "../../utils/isOnline";
+ import { transforms } from "../../transforms";
+ import { TransformError } from "../../transforms/errors";
+@@ -83,7 +78,7 @@ export async function create(
+ 
+   let isMaintainedByCoreTeam = false;
+ 
+-  const { packageManager, skipInstall, skipTransforms, noGit } = opts;
++  const { packageManager, skipInstall, skipTransforms, git } = opts;
+ 
+   const [online, availablePackageManagers] = await Promise.all([
+     isOnline(),
+@@ -129,9 +124,6 @@ export async function create(
+ 
+   const { hasPackageJson, availableScripts, repoInfo } = projectData;
+ 
+-  // create a new git repo after creating the project
+-  tryGitInit(root, `feat(create-turbo): create ${exampleName}`);
+-
+   // read the project after creating it to get details about workspaces, package manager, etc.
+   let project: Project = {} as Project;
+   try {
+@@ -159,14 +151,6 @@ export async function create(
+           opts,
+         });
+ 
+-        if (transformResult.result === "success") {
+-          // add first to ensure any transforms that add new files are included
+-          tryGitAdd();
+-          tryGitCommit(
+-            `feat(create-turbo): apply ${transformResult.name} transform`
+-          );
+-        }
+-
+         if (transformResult.metaJson?.maintainedByCoreTeam) {
+           isMaintainedByCoreTeam = true;
+         }
+@@ -252,7 +236,6 @@ export async function create(
+         },
+       });
+ 
+-      tryGitCommit("feat(create-turbo): install dependencies");
+       loader.stop();
+     }
+   }
+@@ -312,11 +295,17 @@ export async function create(
+     logger.log("- Run a command twice to hit cache");
+   }
+ 
+-  // remove .git directory if --no-git flag is used
+-  if (noGit) {
+-    if (!removeGitDirectory(root)) {
+-      logger.warn("Failed to remove '.git' directory");
++  // Initialize git repository with a single commit containing all changes
++  // This is done at the end so all files (including transforms and installed deps) are in one commit
++  // Note: git defaults to true, --no-git sets it to false
++  if (git !== false) {
++    if (tryGitInit(root)) {
++      info("Initialized a git repository.");
+     }
++  } else {
++    // User explicitly doesn't want git - remove any .git directory
++    // (e.g., if the example template came with one)
++    removeGitDirectory(root);
+   }
+ 
+   opts.telemetry?.trackCommandStatus({ command: "create", status: "end" });
+diff --git a/packages/create-turbo/src/commands/create/prompts.ts b/packages/create-turbo/src/commands/create/prompts.ts
+index 5448f9622a..272c4b7b14 100644
+--- a/packages/create-turbo/src/commands/create/prompts.ts
++++ b/packages/create-turbo/src/commands/create/prompts.ts
+@@ -56,7 +56,7 @@ export async function packageManager({
+       { pm: "npm", label: "npm" },
+       { pm: "pnpm", label: "pnpm" },
+       { pm: "yarn", label: "yarn" },
+-      { pm: "bun", label: "Bun" },
++      { pm: "bun", label: "bun" },
+     ].map(({ pm, label }) => ({
+       name: label,
+       value: pm,
+diff --git a/packages/create-turbo/src/commands/create/types.ts b/packages/create-turbo/src/commands/create/types.ts
+index bd835849d2..2ec47db49c 100644
+--- a/packages/create-turbo/src/commands/create/types.ts
++++ b/packages/create-turbo/src/commands/create/types.ts
+@@ -10,6 +10,6 @@ export interface CreateCommandOptions {
+   turboVersion?: string;
+   example?: string;
+   examplePath?: string;
+-  noGit?: boolean;
++  git?: boolean;
+   telemetry: CreateTurboTelemetry | undefined;
+ }
+diff --git a/packages/create-turbo/src/utils/git.ts b/packages/create-turbo/src/utils/git.ts
+index ba1ed9b7ff..56807d1b66 100644
+--- a/packages/create-turbo/src/utils/git.ts
++++ b/packages/create-turbo/src/utils/git.ts
+@@ -32,41 +32,50 @@ yarn-error.log*
+ export const GIT_REPO_COMMAND = "git rev-parse --is-inside-work-tree";
+ export const HG_REPO_COMMAND = "hg --cwd . root";
+ 
+-export function isInGitRepository(): boolean {
++function isInGitRepository(root: string): boolean {
+   try {
+-    execSync(GIT_REPO_COMMAND, { stdio: "ignore" });
++    execSync(GIT_REPO_COMMAND, { stdio: "ignore", cwd: root });
+     return true;
+   } catch (_) {
+-    // do nothing
++    return false;
+   }
+-  return false;
+ }
+ 
+-export function isInMercurialRepository(): boolean {
++function isInMercurialRepository(root: string): boolean {
+   try {
+-    execSync(HG_REPO_COMMAND, { stdio: "ignore" });
++    execSync(HG_REPO_COMMAND, { stdio: "ignore", cwd: root });
+     return true;
+   } catch (_) {
+-    // do nothing
++    return false;
+   }
+-  return false;
+ }
+ 
+-export function tryGitInit(root: string, message: string): boolean {
++/**
++ * Initialize a git repository in the given directory with a single commit.
++ * This should be called once at the end of the create process, after all
++ * files have been created and transforms have been applied.
++ *
++ * @param root - The absolute path to the directory where the git repository should be initialized
++ * @returns true if the repository was initialized successfully, false otherwise
++ */
++export function tryGitInit(root: string): boolean {
++  // Skip if already in a git or mercurial repository
++  if (isInGitRepository(root) || isInMercurialRepository(root)) {
++    return false;
++  }
++
+   let didInit = false;
+   try {
+-    if (isInGitRepository() || isInMercurialRepository()) {
+-      return false;
+-    }
+-
+-    execSync("git init", { stdio: "ignore" });
+-    execSync("git add -A", { stdio: "ignore" });
+-
++    execSync("git init", { stdio: "ignore", cwd: root });
+     didInit = true;
+ 
+-    execSync("git checkout -b main", { stdio: "ignore" });
++    execSync("git checkout -b main", { stdio: "ignore", cwd: root });
++    execSync("git add -A", { stdio: "ignore", cwd: root });
++    execSync('git commit -m "Initial commit from create-turbo"', {
++      stdio: "ignore",
++      cwd: root,
++    });
+ 
+-    gitCommit(message);
+     return true;
+   } catch (err) {
+     if (didInit) {
+@@ -80,36 +89,6 @@ export function tryGitInit(root: string, message: string): boolean {
+   }
+ }
+ 
+-export function tryGitCommit(message: string): boolean {
+-  try {
+-    gitCommit(message);
+-    return true;
+-  } catch (err) {
+-    return false;
+-  }
+-}
+-
+-export function tryGitAdd(): void {
+-  try {
+-    gitAddAll();
+-  } catch (err) {
+-    // do nothing
+-  }
+-}
+-
+-function gitAddAll() {
+-  execSync("git add -A", { stdio: "ignore" });
+-}
+-
+-function gitCommit(message: string) {
+-  execSync(
+-    `git commit --author="Turbobot <turbobot@vercel.com>" -am "${message}"`,
+-    {
+-      stdio: "ignore",
+-    }
+-  );
+-}
+-
+ export function removeGitDirectory(root: string): boolean {
+   try {
+     rmSync(path.join(root, ".git"), { recursive: true, force: true });
+diff --git a/packages/turbo-utils/__tests__/examples.test.ts b/packages/turbo-utils/__tests__/examples.test.ts
+index 013df1ad29..835a7a6b33 100644
+--- a/packages/turbo-utils/__tests__/examples.test.ts
++++ b/packages/turbo-utils/__tests__/examples.test.ts
+@@ -64,35 +64,6 @@ describe("examples", () => {
+         expect.objectContaining({ method: "HEAD" })
+       );
+     });
+-
+-    it("uses proxy agent when https_proxy is set", async () => {
+-      const originalEnv = process.env.https_proxy;
+-      process.env.https_proxy = "http://proxy.example.com:8080";
+-
+-      try {
+-        global.fetch = jest.fn(() =>
+-          Promise.resolve({ ok: true } as Response)
+-        ) as typeof fetch;
+-
+-        const url = "https://github.com/vercel/turborepo/";
+-        await isUrlOk(url);
+-
+-        // Verify that fetch was called with a dispatcher option
+-        expect(global.fetch).toHaveBeenCalledWith(
+-          url,
+-          expect.objectContaining({
+-            method: "HEAD",
+-            dispatcher: expect.anything(),
+-          })
+-        );
+-      } finally {
+-        if (originalEnv === undefined) {
+-          delete process.env.https_proxy;
+-        } else {
+-          process.env.https_proxy = originalEnv;
+-        }
+-      }
+-    });
+   });
+ 
+   describe("getRepoInfo", () => {
+@@ -475,93 +446,5 @@ describe("examples", () => {
+         readFileSync(join(testDir, "a", "b", "c", "deep.txt"), "utf-8")
+       ).toBe("Deep file");
+     });
+-
+-    it("uses proxy agent when HTTPS_PROXY is set", async () => {
+-      const originalEnv = process.env.HTTPS_PROXY;
+-      process.env.HTTPS_PROXY = "http://proxy.example.com:8080";
+-
+-      try {
+-        const mockBody = await createMockTarballBody([
+-          { path: "file.txt", content: "Hello" },
+-        ]);
+-
+-        global.fetch = jest.fn(() =>
+-          Promise.resolve({
+-            ok: true,
+-            body: mockBody,
+-          } as Response)
+-        ) as typeof fetch;
+-
+-        await streamingExtract({
+-          url: "https://example.com/tarball.tar.gz",
+-          root: testDir,
+-          strip: 1,
+-          filter: () => true,
+-        });
+-
+-        // Verify that fetch was called with a dispatcher option
+-        expect(global.fetch).toHaveBeenCalledWith(
+-          "https://example.com/tarball.tar.gz",
+-          expect.objectContaining({
+-            dispatcher: expect.anything(),
+-          })
+-        );
+-      } finally {
+-        if (originalEnv === undefined) {
+-          delete process.env.HTTPS_PROXY;
+-        } else {
+-          process.env.HTTPS_PROXY = originalEnv;
+-        }
+-      }
+-    });
+-
+-    it("does not use proxy agent when no proxy env vars are set", async () => {
+-      const originalHttpsProxy = process.env.HTTPS_PROXY;
+-      const originalHttpProxy = process.env.HTTP_PROXY;
+-      const originalHttpsProxyLower = process.env.https_proxy;
+-      const originalHttpProxyLower = process.env.http_proxy;
+-
+-      delete process.env.HTTPS_PROXY;
+-      delete process.env.HTTP_PROXY;
+-      delete process.env.https_proxy;
+-      delete process.env.http_proxy;
+-
+-      try {
+-        const mockBody = await createMockTarballBody([
+-          { path: "file.txt", content: "Hello" },
+-        ]);
+-
+-        global.fetch = jest.fn(() =>
+-          Promise.resolve({
+-            ok: true,
+-            body: mockBody,
+-          } as Response)
+-        ) as typeof fetch;
+-
+-        await streamingExtract({
+-          url: "https://example.com/tarball.tar.gz",
+-          root: testDir,
+-          strip: 1,
+-          filter: () => true,
+-        });
+-
+-        // Verify that fetch was called with undefined dispatcher
+-        expect(global.fetch).toHaveBeenCalledWith(
+-          "https://example.com/tarball.tar.gz",
+-          expect.objectContaining({
+-            dispatcher: undefined,
+-          })
+-        );
+-      } finally {
+-        if (originalHttpsProxy !== undefined)
+-          process.env.HTTPS_PROXY = originalHttpsProxy;
+-        if (originalHttpProxy !== undefined)
+-          process.env.HTTP_PROXY = originalHttpProxy;
+-        if (originalHttpsProxyLower !== undefined)
+-          process.env.https_proxy = originalHttpsProxyLower;
+-        if (originalHttpProxyLower !== undefined)
+-          process.env.http_proxy = originalHttpProxyLower;
+-      }
+-    });
+   });
+ });
+diff --git a/packages/turbo-utils/package.json b/packages/turbo-utils/package.json
+index 52ca64f6a4..196301d430 100644
+--- a/packages/turbo-utils/package.json
++++ b/packages/turbo-utils/package.json
+@@ -57,8 +57,5 @@
+     "ts-node": "10.9.2",
+     "typescript": "5.5.4",
+     "update-check": "1.5.4"
+-  },
+-  "dependencies": {
+-    "undici": "^6.21.0"
+   }
+ }
+diff --git a/packages/turbo-utils/src/examples.ts b/packages/turbo-utils/src/examples.ts
+index f8393dcf98..be857c7fc8 100644
+--- a/packages/turbo-utils/src/examples.ts
++++ b/packages/turbo-utils/src/examples.ts
+@@ -8,51 +8,14 @@ import { dirname, resolve, relative, join } from "node:path";
+ import { tmpdir } from "node:os";
+ import { execFileSync } from "node:child_process";
+ import { Parse, type ReadEntry, extract } from "tar";
+-import { ProxyAgent, type Dispatcher } from "undici";
+ import { error, warn } from "./logger";
+ 
+ const REQUEST_TIMEOUT = 10000;
+ const DOWNLOAD_TIMEOUT = 120000;
+ 
+ /**
+- * Gets proxy URL from environment variables.
+- * Checks both lowercase and uppercase variants.
+- */
+-function getProxyForUrl(url: string): string | undefined {
+-  const parsedUrl = new URL(url);
+-  const isHttps = parsedUrl.protocol === "https:";
+-
+-  if (isHttps) {
+-    return (
+-      process.env.https_proxy ||
+-      process.env.HTTPS_PROXY ||
+-      process.env.http_proxy ||
+-      process.env.HTTP_PROXY
+-    );
+-  }
+-  return process.env.http_proxy || process.env.HTTP_PROXY;
+-}
+-
+-let cachedProxyAgent: ProxyAgent | undefined;
+-let cachedProxyUrl: string | undefined;
+-
+-/**
+- * Gets or creates a ProxyAgent for the given proxy URL.
+- * Caches the agent to avoid creating multiple instances.
+- */
+-function getProxyAgent(proxyUrl: string): ProxyAgent {
+-  if (cachedProxyAgent && cachedProxyUrl === proxyUrl) {
+-    return cachedProxyAgent;
+-  }
+-  cachedProxyUrl = proxyUrl;
+-  cachedProxyAgent = new ProxyAgent(proxyUrl);
+-  return cachedProxyAgent;
+-}
+-
+-/**
+- * Performs a fetch request with an automatic timeout and proxy support.
++ * Performs a fetch request with an automatic timeout.
+  * Centralizes the AbortController + setTimeout pattern to avoid repetition.
+- * Automatically respects HTTP_PROXY/HTTPS_PROXY environment variables.
+  */
+ async function fetchWithTimeout(
+   url: string,
+@@ -65,16 +28,9 @@ async function fetchWithTimeout(
+   }, timeoutMs);
+ 
+   try {
+-    const proxyUrl = getProxyForUrl(url);
+-    const dispatcher: Dispatcher | undefined = proxyUrl
+-      ? getProxyAgent(proxyUrl)
+-      : undefined;
+-
+     return await fetch(url, {
+       ...options,
+       signal: controller.signal,
+-      // @ts-expect-error - dispatcher is a valid option for undici's fetch
+-      dispatcher,
+     });
+   } finally {
+     clearTimeout(timeoutId);
+@@ -250,16 +206,7 @@ export async function streamingExtract({
+   const createdDirs = new Set<string>();
+ 
+   try {
+-    const proxyUrl = getProxyForUrl(url);
+-    const dispatcher: Dispatcher | undefined = proxyUrl
+-      ? getProxyAgent(proxyUrl)
+-      : undefined;
+-
+-    const response = await fetch(url, {
+-      signal: controller.signal,
+-      // @ts-expect-error - dispatcher is a valid option for undici's fetch
+-      dispatcher,
+-    });
++    const response = await fetch(url, { signal: controller.signal });
+     if (!response.ok || !response.body) {
+       throw new Error(`Failed to download: ${response.status}`);
+     }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 198b29feaf..28f9a77021 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -837,10 +837,6 @@ importers:
+         version: 4.19.1
+ 
+   packages/turbo-utils:
+-    dependencies:
+-      undici:
+-        specifier: ^6.21.0
+-        version: 6.23.0
+     devDependencies:
+       '@arethetypeswrong/cli':
+         specifier: 0.18.2
+@@ -8382,10 +8378,6 @@ packages:
+     resolution: {integrity: sha512-3ItfzbrhDlINjaP0duwnNsKpDQk3acHI3gVJ1z4fmwMK31k5G9OVIAMLSIaP6w4FaGkaAkN6zaQO9LUvZ1t7VA==}
+     engines: {node: '>=14.0'}
+ 
+-  undici@6.23.0:
+-    resolution: {integrity: sha512-VfQPToRA5FZs/qJxLIinmU59u0r7LXqoJkCzinq3ckNJp3vKEh7jTWN589YQ5+aoAC/TGRLyJLCPKcLQbM8r9g==}
+-    engines: {node: '>=18.17'}
+-
+   unicode-emoji-modifier-base@1.0.0:
+     resolution: {integrity: sha512-yLSH4py7oFH3oG/9K+XWrz1pSi3dfUrWEnInbxMfArOfc1+33BlGPQtLsOYwvdMy11AwUBetYuaRxSPqgkq+8g==}
+     engines: {node: '>=4'}
+@@ -17386,8 +17378,6 @@ snapshots:
+     dependencies:
+       '@fastify/busboy': 2.1.0
+ 
+-  undici@6.23.0: {}
+-
+   unicode-emoji-modifier-base@1.0.0: {}
+ 
+   unified@11.0.5:

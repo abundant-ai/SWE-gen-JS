@@ -1,0 +1,628 @@
+diff --git a/.changeset/curvy-seahorses-obey.md b/.changeset/curvy-seahorses-obey.md
+new file mode 100644
+index 0000000000..cfa9d1510b
+--- /dev/null
++++ b/.changeset/curvy-seahorses-obey.md
+@@ -0,0 +1,5 @@
++---
++'xstate': patch
++---
++
++Fixed type-related issue that prevented guards `not('checkFoo')` from being used in machines.
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index 29e8a74e70..7e3ff12717 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -374,10 +374,16 @@ export class StateNode<
+           !guard ||
+           evaluateGuard<TContext, TEvent>(guard, resolvedContext, event, state);
+       } catch (err: any) {
++        const guardType =
++          typeof guard === 'string'
++            ? guard
++            : typeof guard === 'object'
++            ? guard.type
++            : undefined;
+         throw new Error(
+-          `Unable to evaluate guard '${
+-            guard!.type
+-          }' in transition for event '${eventType}' in state node '${
++          `Unable to evaluate guard ${
++            guardType ? `'${guardType}' ` : ''
++          }in transition for event '${eventType}' in state node '${
+             this.id
+           }':\n${err.message}`
+         );
+diff --git a/packages/core/src/actions/choose.ts b/packages/core/src/actions/choose.ts
+index 7697ca5fe2..04814be5cc 100644
+--- a/packages/core/src/actions/choose.ts
++++ b/packages/core/src/actions/choose.ts
+@@ -8,7 +8,7 @@ import {
+   ActionArgs,
+   ParameterizedObject
+ } from '../types.ts';
+-import { evaluateGuard, toGuardDefinition } from '../guards.ts';
++import { evaluateGuard } from '../guards.ts';
+ import { toArray } from '../utils.ts';
+ 
+ function resolve(
+@@ -22,14 +22,9 @@ function resolve(
+   }
+ ) {
+   const matchedActions = branches.find((condition) => {
+-    const guard =
+-      condition.guard &&
+-      toGuardDefinition(
+-        condition.guard,
+-        (guardType) => state.machine.implementations.guards[guardType]
+-      );
+     return (
+-      !guard || evaluateGuard(guard, state.context, actionArgs.event, state)
++      !condition.guard ||
++      evaluateGuard(condition.guard, state.context, actionArgs.event, state)
+     );
+   })?.actions;
+ 
+diff --git a/packages/core/src/guards.ts b/packages/core/src/guards.ts
+index eb802dedeb..250cdd1278 100644
+--- a/packages/core/src/guards.ts
++++ b/packages/core/src/guards.ts
+@@ -1,172 +1,198 @@
++import isDevelopment from '#is-development';
+ import type {
+   EventObject,
+   StateValue,
+-  BooleanGuardDefinition,
+-  GuardConfig,
+-  GuardDefinition,
+-  GuardPredicate,
+   MachineContext,
+-  TODO
++  TODO,
++  ParameterizedObject,
++  AnyState
+ } from './types.ts';
+ import { isStateId } from './stateUtils.ts';
+-import type { State } from './State.ts';
++import { State } from './State.ts';
++
++export type GuardPredicate<
++  TContext extends MachineContext,
++  TExpressionEvent extends EventObject
++> = (args: GuardArgs<TContext, TExpressionEvent>) => boolean;
++
++export interface GuardArgs<
++  TContext extends MachineContext,
++  TExpressionEvent extends EventObject
++> {
++  context: TContext;
++  event: TExpressionEvent;
++  guard: ParameterizedObject | undefined;
++}
++
++export type Guard<
++  TContext extends MachineContext,
++  TEvent extends EventObject
++> = string | ParameterizedObject | GuardPredicate<TContext, TEvent>;
++
++export type UnknownGuard = Guard<MachineContext, EventObject>;
++
++interface BuiltinGuard {
++  (): boolean;
++  check: (
++    state: AnyState,
++    guardArgs: GuardArgs<any, any>,
++    params: unknown
++  ) => boolean;
++}
++
++function checkStateIn(
++  state: AnyState,
++  _: GuardArgs<any, any>,
++  { stateValue }: { stateValue: StateValue }
++) {
++  if (typeof stateValue === 'string' && isStateId(stateValue)) {
++    return state.configuration.some((sn) => sn.id === stateValue.slice(1));
++  }
++
++  return state.matches(stateValue);
++}
+ 
+ export function stateIn<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+->(stateValue: StateValue): GuardDefinition<TContext, TEvent> {
+-  return {
+-    type: 'xstate.guard:in',
+-    params: { stateValue },
+-    predicate: ({ state }) => {
+-      if (typeof stateValue === 'string' && isStateId(stateValue)) {
+-        return state.configuration.some((sn) => sn.id === stateValue.slice(1));
+-      }
+-
+-      return state.matches(stateValue);
++>(stateValue: StateValue) {
++  function stateIn(_: GuardArgs<TContext, TEvent>) {
++    if (isDevelopment) {
++      throw new Error(`This isn't supposed to be called`);
+     }
+-  };
++    return false;
++  }
++
++  stateIn.check = checkStateIn;
++  stateIn.stateValue = stateValue;
++
++  return stateIn;
++}
++
++function checkNot(
++  state: AnyState,
++  { context, event }: GuardArgs<any, any>,
++  { guards }: { guards: readonly UnknownGuard[] }
++) {
++  return !evaluateGuard(guards[0], context, event, state);
+ }
+ 
+ export function not<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+->(
+-  guard: GuardConfig<TContext, TEvent>
+-): BooleanGuardDefinition<TContext, TEvent> {
+-  return {
+-    type: 'xstate.boolean',
+-    params: { op: 'not' },
+-    children: [toGuardDefinition(guard)],
+-    predicate: ({ evaluate, guard, context, event, state }) => {
+-      return !evaluate(guard.children![0], context, event, state);
++>(guard: Guard<TContext, TEvent>) {
++  function not() {
++    if (isDevelopment) {
++      throw new Error(`This isn't supposed to be called`);
+     }
+-  };
++    return false;
++  }
++
++  not.check = checkNot;
++  not.guards = [guard];
++
++  return not;
++}
++
++function checkAnd(
++  state: AnyState,
++  { context, event }: GuardArgs<any, any>,
++  { guards }: { guards: readonly UnknownGuard[] }
++) {
++  return guards.every((guard) => evaluateGuard(guard, context, event, state));
+ }
+ 
+ export function and<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+->(
+-  guards: Array<GuardConfig<TContext, TEvent>>
+-): BooleanGuardDefinition<TContext, TEvent> {
+-  return {
+-    type: 'xstate.boolean',
+-    params: { op: 'and' },
+-    children: guards.map((guard) => toGuardDefinition(guard)),
+-    predicate: ({ evaluate, guard, context, event, state }) => {
+-      return guard.children!.every((childGuard) => {
+-        return evaluate(childGuard, context, event, state);
+-      });
++>(guards: ReadonlyArray<Guard<TContext, TEvent>>) {
++  function and() {
++    if (isDevelopment) {
++      throw new Error(`This isn't supposed to be called`);
+     }
+-  };
++    return false;
++  }
++
++  and.check = checkAnd;
++  and.guards = guards;
++
++  return and;
++}
++
++function checkOr(
++  state: AnyState,
++  { context, event }: GuardArgs<any, any>,
++  { guards }: { guards: readonly UnknownGuard[] }
++) {
++  return guards.some((guard) => evaluateGuard(guard, context, event, state));
+ }
+ 
+ export function or<TContext extends MachineContext, TEvent extends EventObject>(
+-  guards: Array<GuardConfig<TContext, TEvent>>
+-): BooleanGuardDefinition<TContext, TEvent> {
+-  return {
+-    type: 'xstate.boolean',
+-    params: { op: 'or' },
+-    children: guards.map((guard) => toGuardDefinition(guard)),
+-    predicate: ({ evaluate, guard, context, event, state }) => {
+-      return guard.children!.some((childGuard) => {
+-        return evaluate(childGuard, context, event, state);
+-      });
++  guards: ReadonlyArray<Guard<TContext, TEvent>>
++) {
++  function or() {
++    if (isDevelopment) {
++      throw new Error(`This isn't supposed to be called`);
+     }
+-  };
++    return false;
++  }
++
++  or.check = checkOr;
++  or.guards = guards;
++
++  return or;
+ }
+ 
++// TODO: throw on cycles (depth check should be enough)
+ export function evaluateGuard<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+ >(
+-  guard: GuardDefinition<TContext, TEvent>,
++  guard: UnknownGuard,
+   context: TContext,
+   event: TEvent,
+   state: State<TContext, TEvent, TODO, TODO>
+ ): boolean {
+   const { machine } = state;
++  const isInline = typeof guard === 'function';
+ 
+-  const predicate =
+-    machine?.implementations?.guards?.[guard.type] ?? guard.predicate;
++  const resolved = isInline
++    ? guard
++    : machine.implementations.guards?.[
++        typeof guard === 'string' ? guard : guard.type
++      ];
+ 
+-  if (!predicate) {
+-    throw new Error(`Guard '${guard.type}' is not implemented.'.`);
++  if (!isInline && !resolved) {
++    throw new Error(
++      `Guard '${
++        typeof guard === 'string' ? guard : guard.type
++      }' is not implemented.'.`
++    );
+   }
+ 
+-  return predicate({
++  if (typeof resolved !== 'function') {
++    return evaluateGuard(resolved, context, event, state);
++  }
++
++  const guardArgs = {
+     context,
+     event,
+-    state,
+-    guard,
+-    evaluate: evaluateGuard
+-  });
+-}
++    guard: isInline
++      ? undefined
++      : typeof guard === 'string'
++      ? { type: guard }
++      : guard
++  };
+ 
+-export function toGuardDefinition<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+->(
+-  guardConfig: GuardConfig<TContext, TEvent>,
+-  getPredicate?: (
+-    guardType: string
+-  ) => GuardPredicate<TContext, TEvent> | GuardDefinition<TContext, TEvent>
+-): GuardDefinition<TContext, TEvent> {
+-  // TODO: check for cycles and consider a refactor to more lazily evaluated guards
+-  // TODO: resolve this more recursively: https://github.com/statelyai/xstate/pull/4064#discussion_r1229915724
+-  if (typeof guardConfig === 'string') {
+-    const predicateOrDef = getPredicate?.(guardConfig);
+-
+-    if (typeof predicateOrDef === 'function') {
+-      return {
+-        type: guardConfig,
+-        predicate: predicateOrDef,
+-        params: { type: guardConfig }
+-      };
+-    } else if (predicateOrDef) {
+-      return predicateOrDef;
+-    } else {
+-      return {
+-        type: guardConfig,
+-        params: { type: guardConfig }
+-      };
+-    }
++  if (!('check' in resolved)) {
++    return resolved(guardArgs);
+   }
+ 
+-  if (typeof guardConfig === 'function') {
+-    return {
+-      type: guardConfig.name,
+-      predicate: guardConfig,
+-      params: {
+-        type: guardConfig.name,
+-        name: guardConfig.name
+-      }
+-    };
+-  }
++  const builtinGuard = resolved as unknown as BuiltinGuard;
+ 
+-  const predicateOrDef = getPredicate?.(guardConfig.type);
+-
+-  if (typeof predicateOrDef === 'function') {
+-    return {
+-      type: guardConfig.type,
+-      params: guardConfig.params || guardConfig,
+-      children: (
+-        guardConfig.children as Array<GuardConfig<TContext, TEvent>>
+-      )?.map((childGuard) => toGuardDefinition(childGuard, getPredicate)),
+-      predicate:
+-        getPredicate?.(guardConfig.type) || (guardConfig as any).predicate
+-    };
+-  } else if (predicateOrDef) {
+-    return predicateOrDef;
+-  } else {
+-    return {
+-      type: guardConfig.type,
+-      params: guardConfig.params || guardConfig,
+-      children: (
+-        guardConfig.children as Array<GuardConfig<TContext, TEvent>>
+-      )?.map((childGuard) => toGuardDefinition(childGuard, getPredicate)),
+-      predicate: (guardConfig as any).predicate
+-    };
+-  }
++  return builtinGuard.check(
++    state,
++    guardArgs,
++    resolved // this holds all params
++  );
+ }
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index cb24554a88..819627c251 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -13,7 +13,7 @@ import {
+   STATE_IDENTIFIER,
+   WILDCARD
+ } from './constants.ts';
+-import { evaluateGuard, toGuardDefinition } from './guards.ts';
++import { evaluateGuard } from './guards.ts';
+ import { ActorStatus } from './interpreter.ts';
+ import {
+   ActionArgs,
+@@ -349,7 +349,6 @@ export function formatTransition<
+ ): AnyTransitionDefinition {
+   const normalizedTarget = normalizeTarget(transitionConfig.target);
+   const reenter = transitionConfig.reenter ?? false;
+-  const { guards } = stateNode.machine.implementations;
+   const target = resolveTarget(stateNode, normalizedTarget);
+ 
+   // TODO: should this be part of a lint rule instead?
+@@ -361,12 +360,7 @@ export function formatTransition<
+   const transition = {
+     ...transitionConfig,
+     actions: toArray(transitionConfig.actions),
+-    guard: transitionConfig.guard
+-      ? toGuardDefinition(
+-          transitionConfig.guard,
+-          (guardType) => guards[guardType]
+-        )
+-      : undefined,
++    guard: transitionConfig.guard as never,
+     target,
+     source: stateNode,
+     reenter,
+@@ -1435,7 +1429,7 @@ export function resolveActionsAndContext<
+       continue;
+     }
+ 
+-    const args = {
++    const actionArgs = {
+       context: intermediateState.context,
+       event,
+       self: actorCtx?.self,
+@@ -1449,9 +1443,9 @@ export function resolveActionsAndContext<
+ 
+     if (!('resolve' in resolved)) {
+       if (actorCtx?.self.status === ActorStatus.Running) {
+-        resolved(args);
++        resolved(actionArgs);
+       } else {
+-        actorCtx?.defer(() => resolved(args));
++        actorCtx?.defer(() => resolved(actionArgs));
+       }
+       continue;
+     }
+@@ -1461,7 +1455,7 @@ export function resolveActionsAndContext<
+     const [nextState, params, actions] = builtinAction.resolve(
+       actorCtx,
+       intermediateState,
+-      args,
++      actionArgs,
+       resolved // this holds all params
+     );
+     intermediateState = nextState;
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 8a9f103de0..8e828932b4 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -10,6 +10,7 @@ import {
+   AreAllImplementationsAssumedToBeProvided
+ } from './typegenTypes.ts';
+ import { PromiseActorLogic } from './actors/promise.ts';
++import { Guard, GuardPredicate, UnknownGuard } from './guards.ts';
+ 
+ /**
+  * `T | unknown` reduces to `unknown` and that can be problematic when it comes to contextual typing.
+@@ -76,11 +77,11 @@ export interface ParameterizedObject {
+ 
+ export interface UnifiedArg<
+   TContext extends MachineContext,
+-  TEvent extends EventObject
++  TExpressionEvent extends EventObject
+ > {
+   context: TContext;
+-  event: TEvent;
+-  self: ActorRef<TEvent>;
++  event: TExpressionEvent;
++  self: ActorRef<TExpressionEvent>; // TODO: this should refer to `TEvent`
+   system: ActorSystem<any>;
+ }
+ 
+@@ -164,7 +165,7 @@ export interface ChooseBranch<
+   TEvent extends EventObject = TExpressionEvent,
+   TAction extends ParameterizedObject = ParameterizedObject
+ > {
+-  guard?: GuardConfig<TContext, TExpressionEvent>;
++  guard?: Guard<TContext, TExpressionEvent>;
+   actions: Actions<TContext, TExpressionEvent, TEvent, undefined, TAction>;
+ }
+ 
+@@ -223,88 +224,6 @@ export interface StateValueMap {
+  */
+ export type StateValue = string | StateValueMap;
+ 
+-export type GuardPredicate<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> = (
+-  args: {
+-    context: TContext;
+-    event: TEvent;
+-  } & GuardArgs<TContext, TEvent>
+-) => boolean;
+-
+-export interface DefaultGuardObject<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> extends ParameterizedObject {
+-  /**
+-   * Nested guards
+-   */
+-  children?: Array<GuardObject<TContext, TEvent>>;
+-  predicate?: GuardPredicate<TContext, TEvent>;
+-}
+-
+-export type GuardEvaluator<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> = (
+-  guard: GuardDefinition<TContext, TEvent>,
+-  context: TContext,
+-  event: TEvent,
+-  state: State<TContext, TEvent, TODO, TODO>
+-) => boolean;
+-
+-export interface GuardArgs<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> {
+-  state: State<TContext, TEvent, TODO, TODO>;
+-  guard: GuardDefinition<TContext, TEvent>;
+-  evaluate: GuardEvaluator<TContext, TEvent>;
+-}
+-
+-export type GuardConfig<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> = string | GuardPredicate<TContext, TEvent> | GuardObject<TContext, TEvent>;
+-
+-export type GuardObject<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> = BooleanGuardObject<TContext, TEvent> | DefaultGuardObject<TContext, TEvent>;
+-
+-export interface GuardDefinition<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> {
+-  type: string;
+-  children?: Array<GuardDefinition<TContext, TEvent>>;
+-  predicate?: GuardPredicate<TContext, TEvent>;
+-  params: { [key: string]: any };
+-}
+-
+-export interface BooleanGuardObject<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> extends ParameterizedObject {
+-  type: 'xstate.boolean';
+-  children: Array<GuardConfig<TContext, TEvent>>;
+-  params: {
+-    op: 'and' | 'or' | 'not';
+-  };
+-  predicate: undefined;
+-}
+-
+-export interface BooleanGuardDefinition<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> extends GuardDefinition<TContext, TEvent> {
+-  type: 'xstate.boolean';
+-  params: {
+-    op: 'and' | 'or' | 'not';
+-  };
+-}
+-
+ export type TransitionTarget = SingleOrArray<string>;
+ 
+ export interface TransitionConfig<
+@@ -313,7 +232,7 @@ export interface TransitionConfig<
+   TEvent extends EventObject,
+   TAction extends ParameterizedObject
+ > {
+-  guard?: GuardConfig<TContext, TExpressionEvent>;
++  guard?: Guard<TContext, TExpressionEvent>;
+   actions?: Actions<TContext, TExpressionEvent, TEvent, undefined, TAction>;
+   reenter?: boolean;
+   target?: TransitionTarget | undefined;
+@@ -938,7 +857,7 @@ type MachineImplementationsGuards<
+         TContext,
+         Cast<Prop<TIndexedEvents, TEventsCausingGuards[K]>, EventObject>
+       >
+-    | GuardConfig<
++    | Guard<
+         TContext,
+         Cast<Prop<TIndexedEvents, TEventsCausingGuards[K]>, EventObject>
+       >;
+@@ -1344,18 +1263,25 @@ export type PropertyMapper<
+ export interface TransitionDefinition<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+-> extends Omit<TransitionConfig<TContext, TEvent, TEvent, TODO>, 'target'> {
++> extends Omit<
++    TransitionConfig<TContext, TEvent, TEvent, TODO>,
++    | 'target'
++    // `guard` is correctly rejected by `extends` here and `actions` should be too
++    // however, `any` passed to `TransitionConfig` as `TAction` collapses its `.actions` to `any` and it's accidentally allowed here
++    // it doesn't exactly have to be incorrect, we are overriding this here anyway but it looks like a lucky accident rather than smth done on purpose
++    | 'guard'
++  > {
+   target: ReadonlyArray<StateNode<TContext, TEvent>> | undefined;
+   source: StateNode<TContext, TEvent>;
+   actions: readonly UnknownAction[];
+   reenter: boolean;
+-  guard?: GuardDefinition<TContext, TEvent>;
++  guard?: UnknownGuard;
+   eventType: TEvent['type'] | '*';
+   toJSON: () => {
+     target: string[] | undefined;
+     source: string;
+     actions: readonly UnknownAction[];
+-    guard?: GuardDefinition<TContext, TEvent>;
++    guard?: UnknownGuard;
+     eventType: TEvent['type'] | '*';
+     meta?: Record<string, any>;
+   };

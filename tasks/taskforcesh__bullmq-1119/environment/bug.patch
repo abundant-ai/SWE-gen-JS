@@ -1,0 +1,325 @@
+diff --git a/src/classes/queue-base.ts b/src/classes/queue-base.ts
+index 7987c56fcc..cd8c889efb 100644
+--- a/src/classes/queue-base.ts
++++ b/src/classes/queue-base.ts
+@@ -32,11 +32,7 @@ export class QueueBase extends EventEmitter {
+       );
+     }
+ 
+-    this.connection = new Connection(
+-      opts.connection,
+-      opts.sharedConnection,
+-      opts.blockingConnection,
+-    );
++    this.connection = new Connection(opts.connection, opts.sharedConnection);
+     this.connection.on('error', this.emit.bind(this, 'error'));
+ 
+     const queueKeys = new QueueKeys(opts.prefix);
+diff --git a/src/classes/queue-events.ts b/src/classes/queue-events.ts
+index 92e071e8ab..64da3e413d 100644
+--- a/src/classes/queue-events.ts
++++ b/src/classes/queue-events.ts
+@@ -201,7 +201,6 @@ export class QueueEvents extends QueueBase {
+         connection: isRedisInstance(connection)
+           ? (<RedisClient>connection).duplicate()
+           : connection,
+-        blockingConnection: true,
+       },
+       Connection,
+     );
+diff --git a/src/classes/queue-scheduler.ts b/src/classes/queue-scheduler.ts
+index 23642dd0ea..0a34cb5cc4 100644
+--- a/src/classes/queue-scheduler.ts
++++ b/src/classes/queue-scheduler.ts
+@@ -65,7 +65,6 @@ export class QueueScheduler extends QueueBase {
+           ? (<RedisClient>connection).duplicate()
+           : connection,
+         sharedConnection: false,
+-        blockingConnection: true,
+       },
+       Connection,
+     );
+diff --git a/src/classes/queue.ts b/src/classes/queue.ts
+index 0028c96f2d..bf0503dad7 100644
+--- a/src/classes/queue.ts
++++ b/src/classes/queue.ts
+@@ -104,7 +104,6 @@ export class Queue<
+       name,
+       {
+         sharedConnection: isRedisInstance(opts?.connection),
+-        blockingConnection: false,
+         ...opts,
+       },
+       Connection,
+diff --git a/src/classes/redis-connection.ts b/src/classes/redis-connection.ts
+index 4a9e3958ae..c60f8dbf77 100644
+--- a/src/classes/redis-connection.ts
++++ b/src/classes/redis-connection.ts
+@@ -6,21 +6,17 @@ import { CONNECTION_CLOSED_ERROR_MSG } from 'ioredis/built/utils';
+ import * as semver from 'semver';
+ import { scriptLoader } from '../commands';
+ import { ConnectionOptions, RedisOptions, RedisClient } from '../interfaces';
+-import {
+-  isRedisCluster,
+-  isRedisInstance,
+-  isNotConnectionError,
+-} from '../utils';
++import { isRedisInstance, isNotConnectionError } from '../utils';
+ 
+ import * as path from 'path';
+ 
+ const overrideMessage = [
+-  'BullMQ: WARNING! Your redis options maxRetriesPerRequest must be null',
+-  'and will be overridden by BullMQ.',
++  'BullMQ: WARNING! Your redis options maxRetriesPerRequest must be null and enableReadyCheck false',
++  'and will be overrided by BullMQ.',
+ ].join(' ');
+ 
+ const deprecationMessage = [
+-  'BullMQ: DEPRECATION WARNING! Your redis options maxRetriesPerRequest must be null.',
++  'BullMQ: DEPRECATION WARNING! Your redis options maxRetriesPerRequest must be null and enableReadyCheck false.',
+   'On the next versions having this settings will throw an exception',
+ ].join(' ');
+ 
+@@ -30,21 +26,19 @@ export class RedisConnection extends EventEmitter {
+   static minimumVersion = '5.0.0';
+   protected _client: RedisClient;
+ 
+-  private readonly opts: RedisOptions;
+   private initializing: Promise<RedisClient>;
+   private closing: boolean;
+   private version: string;
+   private handleClientError: (e: Error) => void;
+ 
+   constructor(
+-    opts?: ConnectionOptions,
++    private readonly opts?: ConnectionOptions,
+     private readonly shared: boolean = false,
+-    private readonly blocking = true,
+   ) {
+     super();
+ 
+     if (!isRedisInstance(opts)) {
+-      this.checkBlockingOptions(overrideMessage, opts);
++      this.checkOptions(overrideMessage, <RedisOptions>opts);
+ 
+       this.opts = {
+         port: 6379,
+@@ -53,22 +47,21 @@ export class RedisConnection extends EventEmitter {
+           return Math.min(Math.exp(times), 20000);
+         },
+         ...opts,
++        maxRetriesPerRequest: null,
++        enableReadyCheck: false,
+       };
+-
+-      if (this.blocking) {
+-        this.opts.maxRetriesPerRequest = null;
+-      }
++      this.checkUpstashHost(this.opts.host);
+     } else {
+-      this._client = opts;
+-      this.opts = isRedisCluster(this._client)
+-        ? this._client.options.redisOptions
+-        : this._client.options;
++      this._client = <RedisClient>opts;
++      let options = <IORedis.RedisOptions>this._client.options;
++      if ((<IORedis.ClusterOptions>options)?.redisOptions) {
++        options = (<IORedis.ClusterOptions>options).redisOptions;
++      }
+ 
+-      this.checkBlockingOptions(deprecationMessage, this.opts);
++      this.checkOptions(deprecationMessage, options);
++      this.checkUpstashHost(options.host);
+     }
+ 
+-    this.checkUpstashHost(this.opts.host);
+-
+     this.handleClientError = (err: Error): void => {
+       this.emit('error', err);
+     };
+@@ -77,8 +70,8 @@ export class RedisConnection extends EventEmitter {
+     this.initializing.catch(err => this.emit('error', err));
+   }
+ 
+-  private checkBlockingOptions(msg: string, options?: RedisOptions) {
+-    if (this.blocking && options && options.maxRetriesPerRequest) {
++  private checkOptions(msg: string, options?: IORedis.RedisOptions) {
++    if (options && (options.maxRetriesPerRequest || options.enableReadyCheck)) {
+       console.error(msg);
+     }
+   }
+@@ -145,8 +138,9 @@ export class RedisConnection extends EventEmitter {
+   }
+ 
+   private async init() {
++    const opts = this.opts as RedisOptions;
+     if (!this._client) {
+-      this._client = new IORedis(this.opts);
++      this._client = new IORedis(opts);
+     }
+ 
+     this._client.on('error', this.handleClientError);
+@@ -154,7 +148,7 @@ export class RedisConnection extends EventEmitter {
+     await RedisConnection.waitUntilReady(this._client);
+     await this.loadCommands();
+ 
+-    if (this.opts && this.opts.skipVersionCheck !== true && !this.closing) {
++    if (opts && opts.skipVersionCheck !== true && !this.closing) {
+       this.version = await this.getRedisVersion();
+       const version = semver.valid(semver.coerce(this.version));
+       if (semver.lt(version, RedisConnection.minimumVersion)) {
+diff --git a/src/classes/worker.ts b/src/classes/worker.ts
+index 881ce95262..1cafbff0ea 100644
+--- a/src/classes/worker.ts
++++ b/src/classes/worker.ts
+@@ -146,11 +146,7 @@ export class Worker<
+   ) {
+     super(
+       name,
+-      {
+-        ...opts,
+-        sharedConnection: isRedisInstance(opts.connection),
+-        blockingConnection: true,
+-      },
++      { ...opts, sharedConnection: isRedisInstance(opts.connection) },
+       Connection,
+     );
+ 
+diff --git a/src/interfaces/queue-options.ts b/src/interfaces/queue-options.ts
+index 8608529ece..6b6713d954 100644
+--- a/src/interfaces/queue-options.ts
++++ b/src/interfaces/queue-options.ts
+@@ -20,11 +20,6 @@ export interface QueueBaseOptions {
+    */
+   sharedConnection?: boolean;
+ 
+-  /**
+-   * Denotes commands should retry indefinitely.
+-   */
+-  blockingConnection?: boolean;
+-
+   /**
+    * Prefix for all queue keys.
+    */
+diff --git a/src/interfaces/redis-options.ts b/src/interfaces/redis-options.ts
+index 985a9a87d1..bec30d2cec 100644
+--- a/src/interfaces/redis-options.ts
++++ b/src/interfaces/redis-options.ts
+@@ -1,15 +1,7 @@
+-import type * as IORedis from 'ioredis';
++import { Redis, RedisOptions as BaseRedisOptions, ClusterOptions, Cluster } from 'ioredis';
+ 
+-interface BaseOptions {
++export type RedisOptions = (BaseRedisOptions | ClusterOptions) & {
+   skipVersionCheck?: boolean;
+-}
++};
+ 
+-export type RedisOptions = IORedis.RedisOptions & BaseOptions;
+-
+-export type ClusterOptions = IORedis.ClusterOptions & BaseOptions;
+-
+-export type ConnectionOptions =
+-  | RedisOptions
+-  | ClusterOptions
+-  | IORedis.Redis
+-  | IORedis.Cluster;
++export type ConnectionOptions = RedisOptions | Redis | Cluster;
+diff --git a/src/utils.ts b/src/utils.ts
+index fc319c6a95..f81c01a6ca 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -1,4 +1,4 @@
+-import { Cluster, Redis } from 'ioredis';
++import { Cluster } from 'ioredis';
+ // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+ // @ts-ignore
+ import { CONNECTION_CLOSED_ERROR_MSG } from 'ioredis/built/utils';
+@@ -60,7 +60,7 @@ export function delay(ms: number): Promise<void> {
+   });
+ }
+ 
+-export function isRedisInstance(obj: any): obj is Redis | Cluster {
++export function isRedisInstance(obj: any): boolean {
+   if (!obj) {
+     return false;
+   }
+@@ -68,10 +68,6 @@ export function isRedisInstance(obj: any): obj is Redis | Cluster {
+   return redisApi.every(name => typeof obj[name] === 'function');
+ }
+ 
+-export function isRedisCluster(obj: unknown): obj is Cluster {
+-  return isRedisInstance(obj) && (<Cluster>obj).isCluster;
+-}
+-
+ export async function removeAllQueueData(
+   client: RedisClient,
+   queueName: string,
+diff --git a/tests/test_connection.ts b/tests/test_connection.ts
+index 2e3653885e..d146f329c4 100644
+--- a/tests/test_connection.ts
++++ b/tests/test_connection.ts
+@@ -2,6 +2,7 @@ import { expect } from 'chai';
+ import * as IORedis from 'ioredis';
+ import { v4 } from 'uuid';
+ import { Queue, Job, Worker, QueueBase } from '../src/classes';
++import { RedisClient } from '../src/interfaces';
+ import { removeAllQueueData } from '../src/utils';
+ 
+ describe('connection', () => {
+@@ -19,35 +20,26 @@ describe('connection', () => {
+     await removeAllQueueData(new IORedis(), queueName);
+   });
+ 
+-  describe('blocking', () => {
+-    it('should override maxRetriesPerRequest: null as redis options', async () => {
+-      const queue = new QueueBase(queueName, {
+-        connection: {
+-          host: 'localhost',
+-          maxRetriesPerRequest: 20,
+-        },
+-      });
+-
+-      const options = <IORedis.RedisOptions>(await queue.client).options;
+-
+-      expect(options.maxRetriesPerRequest).to.be.equal(null);
+-    });
+-  });
+-
+-  describe('non-blocking', () => {
+-    it('should not override any redis options', async () => {
+-      const queue = new QueueBase(queueName, {
+-        connection: {
+-          host: 'localhost',
+-          maxRetriesPerRequest: 20,
+-        },
+-        blockingConnection: false,
+-      });
+-
+-      const options = <IORedis.RedisOptions>(await queue.client).options;
++  it('should override maxRetriesPerRequest: null and enableReadyCheck: false as redis options', async () => {
++    const opts = {
++      connection: {
++        host: 'localhost',
++        maxRetriesPerRequest: 20,
++        enableReadyCheck: true,
++      },
++    };
+ 
+-      expect(options.maxRetriesPerRequest).to.be.equal(20);
+-    });
++    function checkOptions(client: RedisClient) {
++      expect(
++        (<IORedis.RedisOptions>client.options).maxRetriesPerRequest,
++      ).to.be.equal(null);
++      expect(
++        (<IORedis.RedisOptions>client.options).enableReadyCheck,
++      ).to.be.equal(false);
++    }
++
++    const queue = new QueueBase(queueName, opts);
++    checkOptions(await queue.client);
+   });
+ 
+   describe('when host belongs to Upstash', async () => {

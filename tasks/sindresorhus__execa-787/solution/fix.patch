@@ -1,0 +1,351 @@
+diff --git a/index.js b/index.js
+index 083456d..1d00839 100644
+--- a/index.js
++++ b/index.js
+@@ -155,6 +155,7 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 	const controller = new AbortController();
+ 	setMaxListeners(Number.POSITIVE_INFINITY, controller.signal);
+ 
++	const originalStreams = [...spawned.stdio];
+ 	pipeOutputAsync(spawned, stdioStreamsGroups, controller);
+ 	cleanupOnExit(spawned, options, controller);
+ 
+@@ -162,12 +163,12 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 	spawned.all = makeAllStream(spawned, options);
+ 	spawned.pipe = pipeToProcess.bind(undefined, {spawned, stdioStreamsGroups, options});
+ 
+-	const promise = handlePromise({spawned, options, stdioStreamsGroups, command, escapedCommand, controller});
++	const promise = handlePromise({spawned, options, stdioStreamsGroups, originalStreams, command, escapedCommand, controller});
+ 	mergePromise(spawned, promise);
+ 	return spawned;
+ }
+ 
+-const handlePromise = async ({spawned, options, stdioStreamsGroups, command, escapedCommand, controller}) => {
++const handlePromise = async ({spawned, options, stdioStreamsGroups, originalStreams, command, escapedCommand, controller}) => {
+ 	const context = {timedOut: false};
+ 
+ 	const [
+@@ -175,7 +176,7 @@ const handlePromise = async ({spawned, options, stdioStreamsGroups, command, esc
+ 		[, exitCode, signal],
+ 		stdioResults,
+ 		allResult,
+-	] = await getSpawnedResult({spawned, options, context, stdioStreamsGroups, controller});
++	] = await getSpawnedResult({spawned, options, context, stdioStreamsGroups, originalStreams, controller});
+ 	controller.abort();
+ 
+ 	const stdio = stdioResults.map(stdioResult => handleOutput(options, stdioResult));
+diff --git a/lib/stdio/async.js b/lib/stdio/async.js
+index 7ec9749..b459b33 100644
+--- a/lib/stdio/async.js
++++ b/lib/stdio/async.js
+@@ -42,7 +42,7 @@ export const pipeOutputAsync = (spawned, stdioStreamsGroups, controller) => {
+ 
+ 	for (const stdioStreams of stdioStreamsGroups) {
+ 		for (const generatorStream of stdioStreams.filter(({type}) => type === 'generator')) {
+-			pipeGenerator(spawned, generatorStream, controller);
++			pipeGenerator(spawned, generatorStream);
+ 		}
+ 
+ 		for (const nonGeneratorStream of stdioStreams.filter(({type}) => type !== 'generator')) {
+@@ -51,7 +51,7 @@ export const pipeOutputAsync = (spawned, stdioStreamsGroups, controller) => {
+ 	}
+ 
+ 	for (const [index, inputStreams] of Object.entries(inputStreamsGroups)) {
+-		pipeStreams(inputStreams, spawned.stdio[index], controller);
++		pipeStreams(inputStreams, spawned.stdio[index]);
+ 	}
+ };
+ 
+@@ -63,7 +63,7 @@ const pipeStdioOption = (spawned, {type, value, direction, index}, inputStreamsG
+ 	setStandardStreamMaxListeners(value, controller);
+ 
+ 	if (direction === 'output') {
+-		pipeStreams([spawned.stdio[index]], value, controller);
++		pipeStreams([spawned.stdio[index]], value);
+ 	} else {
+ 		inputStreamsGroups[index] = [...(inputStreamsGroups[index] ?? []), value];
+ 	}
+@@ -88,10 +88,9 @@ const setStandardStreamMaxListeners = (stream, {signal}) => {
+ };
+ 
+ // `source.pipe(destination)` adds at most 1 listener for each event.
+-// We also listen for the stream's completion using `finished()`, which adds 1 more listener.
+ // If `stdin` option is an array, the values might be combined with `merge-streams`.
+ // That library also listens for `source` end, which adds 1 more listener.
+-const maxListenersIncrement = 3;
++const maxListenersIncrement = 2;
+ 
+ // The stream error handling is performed by the piping logic above, which cannot be performed before process spawning.
+ // If the process spawning fails (e.g. due to an invalid command), the streams need to be manually destroyed.
+diff --git a/lib/stdio/generator.js b/lib/stdio/generator.js
+index 84da40c..8f67d14 100644
+--- a/lib/stdio/generator.js
++++ b/lib/stdio/generator.js
+@@ -112,11 +112,11 @@ Instead, \`yield\` should either be called with a value, or not be called at all
+ };
+ 
+ // `childProcess.stdin|stdout|stderr|stdio` is directly mutated.
+-export const pipeGenerator = (spawned, {value, direction, index}, controller) => {
++export const pipeGenerator = (spawned, {value, direction, index}) => {
+ 	if (direction === 'output') {
+-		pipeStreams([spawned.stdio[index]], value, controller);
++		pipeStreams([spawned.stdio[index]], value);
+ 	} else {
+-		pipeStreams([value], spawned.stdio[index], controller);
++		pipeStreams([value], spawned.stdio[index]);
+ 	}
+ 
+ 	const streamProperty = PROCESS_STREAM_PROPERTIES[index];
+diff --git a/lib/stdio/pipeline.js b/lib/stdio/pipeline.js
+index 269aefc..c903526 100644
+--- a/lib/stdio/pipeline.js
++++ b/lib/stdio/pipeline.js
+@@ -1,59 +1,67 @@
+ import {finished} from 'node:stream/promises';
+-import {setImmediate} from 'node:timers/promises';
+ import mergeStreams from '@sindresorhus/merge-streams';
+ import {isStandardStream} from './utils.js';
+ 
+ // Like `Stream.pipeline(source, destination)`, but does not destroy standard streams.
+-// Also, it prevents some race conditions described below.
+ // `sources` might be a single stream, or multiple ones combined with `merge-stream`.
+-export const pipeStreams = (sources, destination, controller) => {
++export const pipeStreams = (sources, destination) => {
++	const finishedStreams = new Set();
++
+ 	if (sources.length === 1) {
+ 		sources[0].pipe(destination);
+ 	} else {
+ 		const mergedSource = mergeStreams(sources);
+ 		mergedSource.pipe(destination);
+-		handleDestinationComplete(mergedSource, destination, controller);
++		handleDestinationComplete(mergedSource, destination, finishedStreams);
+ 	}
+ 
+ 	for (const source of sources) {
+-		handleSourceAbortOrError(source, destination, controller);
+-		handleDestinationComplete(source, destination, controller);
++		handleSourceAbortOrError(source, destination, finishedStreams);
++		handleDestinationComplete(source, destination, finishedStreams);
+ 	}
+ };
+ 
+ // `source.pipe(destination)` makes `destination` end when `source` ends.
+ // But it does not propagate aborts or errors. This function does it.
+-const handleSourceAbortOrError = async (source, destination, {signal}) => {
+-	if (isStandardStream(destination)) {
++const handleSourceAbortOrError = async (source, destination, finishedStreams) => {
++	if (isStandardStream(source) || isStandardStream(destination)) {
+ 		return;
+ 	}
+ 
+ 	try {
+-		await finished(source, {cleanup: true, signal});
+-	} catch {
+-		await destroyStream(destination);
++		await onFinishedStream(source, finishedStreams);
++	} catch (error) {
++		destroyStream(destination, finishedStreams, error);
+ 	}
+ };
+ 
+ // The `destination` should never complete before the `source`.
+-// If it does, this indicates something abnormal, so we abort `source`.
+-const handleDestinationComplete = async (source, destination, {signal}) => {
+-	if (isStandardStream(source)) {
++// If it does, this indicates something abnormal, so we abort or error `source`.
++const handleDestinationComplete = async (source, destination, finishedStreams) => {
++	if (isStandardStream(source) || isStandardStream(destination)) {
+ 		return;
+ 	}
+ 
+ 	try {
+-		await finished(destination, {cleanup: true, signal});
+-	} catch {} finally {
+-		await destroyStream(source);
++		await onFinishedStream(destination, finishedStreams);
++		destroyStream(source, finishedStreams);
++	} catch (error) {
++		destroyStream(source, finishedStreams, error);
++	}
++};
++
++// Both functions above call each other recursively.
++// `finishedStreams` prevents this cycle.
++const onFinishedStream = async (stream, finishedStreams) => {
++	try {
++		return await finished(stream, {cleanup: true});
++	} finally {
++		finishedStreams.add(stream);
+ 	}
+ };
+ 
+-// Propagating errors across different streams in the same pipeline can create race conditions.
+-// For example, a `Duplex` stream might propagate an error on its writable side and another on its readable side.
+-// This leads to different errors being thrown at the top-level based on the result of that race condition.
+-// We solve this by waiting for one macrotask with `setImmediate()`.
+-const destroyStream = async stream => {
+-	await setImmediate();
+-	stream.destroy();
++const destroyStream = (stream, finishedStreams, error) => {
++	if (!finishedStreams.has(stream)) {
++		stream.destroy(error);
++	}
+ };
+diff --git a/lib/stream.js b/lib/stream.js
+index b807628..4f95599 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -1,4 +1,4 @@
+-import {once, addAbortListener} from 'node:events';
++import {addAbortListener} from 'node:events';
+ import {finished} from 'node:stream/promises';
+ import {setImmediate} from 'node:timers/promises';
+ import getStream, {getStreamAsArrayBuffer, getStreamAsArray} from 'get-stream';
+@@ -26,11 +26,25 @@ const getBufferedData = async (streamPromise, encoding) => {
+ 	}
+ };
+ 
+-const getStdioPromise = ({stream, stdioStreams, encoding, buffer, maxBuffer}) => stdioStreams[0].direction === 'output'
+-	? getStreamPromise({stream, encoding, buffer, maxBuffer})
+-	: undefined;
+-
+-const getAllPromise = ({spawned, encoding, buffer, maxBuffer}) => getStreamPromise({stream: getAllStream(spawned, encoding), encoding, buffer, maxBuffer: maxBuffer * 2});
++// Read the contents of `childProcess.std*` and|or wait for its completion
++const waitForChildStreams = ({spawned, stdioStreamsGroups, encoding, buffer, maxBuffer, waitForStream}) => spawned.stdio.map((stream, index) => waitForChildStream({
++	stream,
++	direction: stdioStreamsGroups[index][0].direction,
++	encoding,
++	buffer,
++	maxBuffer,
++	waitForStream,
++}));
++
++// Read the contents of `childProcess.all` and|or wait for its completion
++const waitForAllStream = ({spawned, encoding, buffer, maxBuffer, waitForStream}) => waitForChildStream({
++	stream: getAllStream(spawned, encoding),
++	direction: 'output',
++	encoding,
++	buffer,
++	maxBuffer: maxBuffer * 2,
++	waitForStream,
++});
+ 
+ // When `childProcess.stdout` is in objectMode but not `childProcess.stderr` (or the opposite), we need to use both:
+ //  - `getStreamAsArray()` for the chunks in objectMode, to return as an array without changing each chunk
+@@ -49,14 +63,19 @@ const allStreamGenerator = {
+ 	readableObjectMode: true,
+ };
+ 
+-const getStreamPromise = async ({stream, encoding, buffer, maxBuffer}) => {
++const waitForChildStream = async ({stream, direction, encoding, buffer, maxBuffer, waitForStream}) => {
+ 	if (!stream) {
+ 		return;
+ 	}
+ 
++	if (direction === 'input') {
++		await waitForStream(stream);
++		return;
++	}
++
+ 	if (!buffer) {
+ 		await Promise.all([
+-			finished(stream, {cleanup: true, readable: true, writable: false}),
++			waitForStream(stream),
+ 			resumeStream(stream),
+ 		]);
+ 		return;
+@@ -83,19 +102,18 @@ const resumeStream = async stream => {
+ 
+ const applyEncoding = (contents, encoding) => encoding === 'buffer' ? new Uint8Array(contents) : contents;
+ 
++// Transforms replace `childProcess.std*`, which means they are not exposed to users.
++// However, we still want to wait for their completion.
++const waitForOriginalStreams = (originalStreams, spawned, waitForStream) => originalStreams
++	.filter((stream, index) => stream !== spawned.stdio[index])
++	.map(stream => waitForStream(stream));
++
+ // Some `stdin`/`stdout`/`stderr` options create a stream, e.g. when passing a file path.
+ // The `.pipe()` method automatically ends that stream when `childProcess` ends.
+ // This makes sure we wait for the completion of those streams, in order to catch any error.
+-const waitForCustomStreamsEnd = stdioStreamsGroups => stdioStreamsGroups.flat()
++const waitForCustomStreamsEnd = (stdioStreamsGroups, waitForStream) => stdioStreamsGroups.flat()
+ 	.filter(({type, value}) => type !== 'native' && !isStandardStream(value))
+-	.map(({value}) => finished(value, {cleanup: true}));
+-
+-const throwIfStreamError = stream => stream === null ? [] : [throwOnStreamError(stream)];
+-
+-const throwOnStreamError = async stream => {
+-	const [error] = await once(stream, 'error');
+-	throw error;
+-};
++	.map(({value}) => waitForStream(value));
+ 
+ // Like `once()` except it never rejects, especially not on `error` event.
+ const pEvent = (eventEmitter, eventName, {signal}) => new Promise(resolve => {
+@@ -109,6 +127,23 @@ const pEvent = (eventEmitter, eventName, {signal}) => new Promise(resolve => {
+ 	});
+ });
+ 
++// Wraps `finished(stream)` to handle the following case:
++//  - When the child process exits, Node.js automatically calls `childProcess.stdin.destroy()`, which we need to ignore.
++//  - However, we still need to throw if `childProcess.stdin.destroy()` is called before child process exit.
++const onFinishedStream = async ([originalStdin], processExitPromise, stream) => {
++	const finishedPromise = finished(stream, {cleanup: true});
++	if (stream !== originalStdin) {
++		await finishedPromise;
++		return;
++	}
++
++	try {
++		await finishedPromise;
++	} catch {
++		await Promise.race([processExitPromise, finishedPromise]);
++	}
++};
++
+ const throwOnProcessError = async processErrorPromise => {
+ 	const [, error] = await processErrorPromise;
+ 	throw error;
+@@ -131,15 +166,18 @@ export const getSpawnedResult = async ({
+ 	options: {encoding, buffer, maxBuffer, timeoutDuration: timeout},
+ 	context,
+ 	stdioStreamsGroups,
++	originalStreams,
+ 	controller,
+ }) => {
+ 	const processSpawnPromise = pEvent(spawned, 'spawn', controller);
+ 	const processErrorPromise = pEvent(spawned, 'error', controller);
+ 	const processExitPromise = pEvent(spawned, 'exit', controller);
++	const waitForStream = onFinishedStream.bind(undefined, originalStreams, processExitPromise);
+ 
+-	const stdioPromises = spawned.stdio.map((stream, index) => getStdioPromise({stream, stdioStreams: stdioStreamsGroups[index], encoding, buffer, maxBuffer}));
+-	const allPromise = getAllPromise({spawned, encoding, buffer, maxBuffer});
+-	const customStreamsEndPromises = waitForCustomStreamsEnd(stdioStreamsGroups);
++	const stdioPromises = waitForChildStreams({spawned, stdioStreamsGroups, encoding, buffer, maxBuffer, waitForStream});
++	const allPromise = waitForAllStream({spawned, encoding, buffer, maxBuffer, waitForStream});
++	const originalPromises = waitForOriginalStreams(originalStreams, spawned, waitForStream);
++	const customStreamsEndPromises = waitForCustomStreamsEnd(stdioStreamsGroups, waitForStream);
+ 
+ 	try {
+ 		return await Promise.race([
+@@ -148,10 +186,10 @@ export const getSpawnedResult = async ({
+ 				processExitPromise,
+ 				Promise.all(stdioPromises),
+ 				allPromise,
++				...originalPromises,
+ 				...customStreamsEndPromises,
+ 			]),
+ 			throwOnProcessError(processErrorPromise),
+-			...throwIfStreamError(spawned.stdin),
+ 			...throwOnTimeout(timeout, context, controller),
+ 		]);
+ 	} catch (error) {
+@@ -161,6 +199,7 @@ export const getSpawnedResult = async ({
+ 			waitForFailedProcess(processSpawnPromise, processErrorPromise, processExitPromise),
+ 			Promise.all(stdioPromises.map(stdioPromise => getBufferedData(stdioPromise, encoding))),
+ 			getBufferedData(allPromise, encoding),
++			Promise.allSettled(originalPromises),
+ 			Promise.allSettled(customStreamsEndPromises),
+ 		]);
+ 	}

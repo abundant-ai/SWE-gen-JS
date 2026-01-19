@@ -1,0 +1,546 @@
+diff --git a/docs/rtk-query/usage/code-generation.mdx b/docs/rtk-query/usage/code-generation.mdx
+index 6df7f51f..6c735ba1 100644
+--- a/docs/rtk-query/usage/code-generation.mdx
++++ b/docs/rtk-query/usage/code-generation.mdx
+@@ -87,9 +87,7 @@ interface SimpleUsage {
+   exportName?: string
+   argSuffix?: string
+   responseSuffix?: string
+-  hooks?:
+-    | boolean
+-    | { queries: boolean; lazyQueries: boolean; mutations: boolean }
++  hooks?: boolean
+   outputFile: string
+   filterEndpoints?:
+     | string
+@@ -133,10 +131,6 @@ const withOverride: ConfigFile = {
+ }
+ ```
+ 
+-#### Generating hooks
+-
+-Setting `hooks: true` will generate `useQuery` and `useMuation` hook exports. If you also want `useLazyQuery` hooks generated or more granular control, you can also pass an object in the shape of: `{ queries: boolean; lazyQueries: boolean; mutations: boolean }`.
+-
+ #### Multiple output files
+ 
+ ```ts no-transpile title="openapi-config.ts"
+diff --git a/packages/rtk-query-codegen-openapi/src/generate.ts b/packages/rtk-query-codegen-openapi/src/generate.ts
+index 0636f5dd..44562a6f 100644
+--- a/packages/rtk-query-codegen-openapi/src/generate.ts
++++ b/packages/rtk-query-codegen-openapi/src/generate.ts
+@@ -142,14 +142,7 @@ export async function generateApi(
+         ...Object.values(interfaces),
+         ...apiGen['aliases'],
+         ...(hooks
+-          ? [
+-              generateReactHooks({
+-                exportName: generatedApiName,
+-                operationDefinitions,
+-                endpointOverrides,
+-                config: hooks,
+-              }),
+-            ]
++          ? [generateReactHooks({ exportName: generatedApiName, operationDefinitions, endpointOverrides })]
+           : []),
+       ],
+       factory.createToken(ts.SyntaxKind.EndOfFileToken),
+diff --git a/packages/rtk-query-codegen-openapi/src/generators/react-hooks.ts b/packages/rtk-query-codegen-openapi/src/generators/react-hooks.ts
+index 70e59254..4171878b 100644
+--- a/packages/rtk-query-codegen-openapi/src/generators/react-hooks.ts
++++ b/packages/rtk-query-codegen-openapi/src/generators/react-hooks.ts
+@@ -1,87 +1,49 @@
+ import ts from 'typescript';
+ import { getOperationName } from '@rtk-query/oazapfts-patched/lib/codegen/generate';
+ import { capitalize, isQuery } from '../utils';
+-import type { OperationDefinition, EndpointOverrides, ConfigFile } from '../types';
++import type { OperationDefinition, EndpointOverrides } from '../types';
+ import { getOverrides } from '../generate';
+ import { factory } from '../utils/factory';
+ 
+-type HooksConfigOptions = NonNullable<ConfigFile['hooks']>;
+-
+ type GetReactHookNameParams = {
+   operationDefinition: OperationDefinition;
+   endpointOverrides: EndpointOverrides[] | undefined;
+-  config: HooksConfigOptions;
+-};
+-
+-type CreateBindingParams = {
+-  operationDefinition: OperationDefinition;
+-  overrides?: EndpointOverrides;
+-  isLazy?: boolean;
+ };
+ 
+-const createBinding = ({
++const getReactHookName = ({
+   operationDefinition: { verb, path, operation },
+-  overrides,
+-  isLazy = false,
+-}: CreateBindingParams) =>
+-  factory.createBindingElement(
++  operationDefinition,
++  endpointOverrides,
++}: GetReactHookNameParams) => {
++  const overrides = getOverrides(operationDefinition, endpointOverrides);
++
++  return factory.createBindingElement(
+     undefined,
+     undefined,
+     factory.createIdentifier(
+-      `use${isLazy ? 'Lazy' : ''}${capitalize(getOperationName(verb, path, operation.operationId))}${
++      `use${capitalize(getOperationName(verb, path, operation.operationId))}${
+         isQuery(verb, overrides) ? 'Query' : 'Mutation'
+       }`
+     ),
+     undefined
+   );
+-
+-const getReactHookName = ({ operationDefinition, endpointOverrides, config }: GetReactHookNameParams) => {
+-  const overrides = getOverrides(operationDefinition, endpointOverrides);
+-
+-  const baseParams = {
+-    operationDefinition,
+-    overrides,
+-  };
+-
+-  const _isQuery = isQuery(operationDefinition.verb, overrides);
+-
+-  // If `config` is true, just generate everything
+-  if (typeof config === 'boolean') {
+-    return createBinding(baseParams);
+-  }
+-
+-  // `config` is an object and we need to check for the configuration of each property
+-  if (_isQuery) {
+-    return [
+-      ...(config.queries ? [createBinding(baseParams)] : []),
+-      ...(config.lazyQueries ? [createBinding({ ...baseParams, isLazy: true })] : []),
+-    ];
+-  }
+-
+-  return config.mutations ? createBinding(baseParams) : [];
+ };
+ 
+ type GenerateReactHooksParams = {
+   exportName: string;
+   operationDefinitions: OperationDefinition[];
+   endpointOverrides: EndpointOverrides[] | undefined;
+-  config: HooksConfigOptions;
+ };
+-export const generateReactHooks = ({
+-  exportName,
+-  operationDefinitions,
+-  endpointOverrides,
+-  config,
+-}: GenerateReactHooksParams) =>
++export const generateReactHooks = ({ exportName, operationDefinitions, endpointOverrides }: GenerateReactHooksParams) =>
+   factory.createVariableStatement(
+     [factory.createModifier(ts.SyntaxKind.ExportKeyword)],
+     factory.createVariableDeclarationList(
+       [
+         factory.createVariableDeclaration(
+           factory.createObjectBindingPattern(
+-            operationDefinitions
+-              .map((operationDefinition) => getReactHookName({ operationDefinition, endpointOverrides, config }))
+-              .flat()
++            operationDefinitions.map((operationDefinition) =>
++              getReactHookName({ operationDefinition, endpointOverrides })
++            )
+           ),
+           undefined,
+           undefined,
+diff --git a/packages/rtk-query-codegen-openapi/src/index.ts b/packages/rtk-query-codegen-openapi/src/index.ts
+index 35d719f0..32b4f325 100644
+--- a/packages/rtk-query-codegen-openapi/src/index.ts
++++ b/packages/rtk-query-codegen-openapi/src/index.ts
+@@ -2,7 +2,7 @@ import path from 'path';
+ import fs from 'fs';
+ import type { CommonOptions, ConfigFile, GenerationOptions, OutputFileOptions } from './types';
+ import { isValidUrl, prettify } from './utils';
+-export type { ConfigFile } from './types';
++export { ConfigFile } from './types';
+ 
+ export async function generateEndpoints(options: GenerationOptions): Promise<string | void> {
+   const schemaLocation = options.schemaFile;
+diff --git a/packages/rtk-query-codegen-openapi/src/types.ts b/packages/rtk-query-codegen-openapi/src/types.ts
+index 88a8d91a..a318be3a 100644
+--- a/packages/rtk-query-codegen-openapi/src/types.ts
++++ b/packages/rtk-query-codegen-openapi/src/types.ts
+@@ -1,3 +1,4 @@
++import * as ts from 'typescript';
+ import type { OpenAPIV3 } from 'openapi-types';
+ 
+ export type OperationDefinition = {
+@@ -47,10 +48,9 @@ export interface CommonOptions {
+    */
+   responseSuffix?: string;
+   /**
+-   * defaults to `false`
+-   * `true` will generate hooks for queries and mutations, but no lazyQueries
++   * defaults to false
+    */
+-  hooks?: boolean | { queries: boolean; lazyQueries: boolean; mutations: boolean };
++  hooks?: boolean;
+ 
+   /**
+    * defaults to false
+diff --git a/packages/rtk-query-codegen-openapi/test/__snapshots__/generateEndpoints.test.ts.snap b/packages/rtk-query-codegen-openapi/test/__snapshots__/generateEndpoints.test.ts.snap
+index c61d6714..5453bf7e 100644
+--- a/packages/rtk-query-codegen-openapi/test/__snapshots__/generateEndpoints.test.ts.snap
++++ b/packages/rtk-query-codegen-openapi/test/__snapshots__/generateEndpoints.test.ts.snap
+@@ -263,54 +263,6 @@ export type User = {
+ 
+ `;
+ 
+-exports[`default hooks generation: should generate an \`useGetPetByIdQuery\` query hook and an \`useAddPetMutation\` mutation hook 1`] = `
+-import { api } from './fixtures/emptyApi';
+-const injectedRtkApi = api.injectEndpoints({
+-  endpoints: (build) => ({
+-    addPet: build.mutation<AddPetApiResponse, AddPetApiArg>({
+-      query: (queryArg) => ({
+-        url: \`/pet\`,
+-        method: 'POST',
+-        body: queryArg.pet,
+-      }),
+-    }),
+-    getPetById: build.query<GetPetByIdApiResponse, GetPetByIdApiArg>({
+-      query: (queryArg) => ({ url: \`/pet/\${queryArg.petId}\` }),
+-    }),
+-  }),
+-  overrideExisting: false,
+-});
+-export { injectedRtkApi as enhancedApi };
+-export type AddPetApiResponse = /** status 200 Successful operation */ Pet;
+-export type AddPetApiArg = {
+-  /** Create a new pet in the store */
+-  pet: Pet;
+-};
+-export type GetPetByIdApiResponse = /** status 200 successful operation */ Pet;
+-export type GetPetByIdApiArg = {
+-  /** ID of pet to return */
+-  petId: number;
+-};
+-export type Category = {
+-  id?: number | undefined;
+-  name?: string | undefined;
+-};
+-export type Tag = {
+-  id?: number | undefined;
+-  name?: string | undefined;
+-};
+-export type Pet = {
+-  id?: number | undefined;
+-  name: string;
+-  category?: Category | undefined;
+-  photoUrls: string[];
+-  tags?: Tag[] | undefined;
+-  status?: ('available' | 'pending' | 'sold') | undefined;
+-};
+-export const { useAddPetMutation, useGetPetByIdQuery } = injectedRtkApi;
+-
+-`;
+-
+ exports[`endpoint filtering: should only have endpoints loginUser, placeOrder, getOrderById, deleteOrder 1`] = `
+ import { api } from './fixtures/emptyApi';
+ const injectedRtkApi = api.injectEndpoints({
+@@ -424,124 +376,7 @@ export const { useLoginUserMutation } = injectedRtkApi;
+ 
+ `;
+ 
+-exports[`should use brackets in a querystring urls arg, when the arg contains full stops 1`] = `
+-import { api } from './fixtures/emptyApi';
+-const injectedRtkApi = api.injectEndpoints({
+-  endpoints: (build) => ({
+-    patchApiV1ListByItemId: build.mutation<PatchApiV1ListByItemIdApiResponse, PatchApiV1ListByItemIdApiArg>({
+-      query: (queryArg) => ({
+-        url: \`/api/v1/list/\${queryArg['item.id']}\`,
+-        method: 'PATCH',
+-      }),
+-    }),
+-  }),
+-  overrideExisting: false,
+-});
+-export { injectedRtkApi as enhancedApi };
+-export type PatchApiV1ListByItemIdApiResponse = /** status 200 A successful response. */ string;
+-export type PatchApiV1ListByItemIdApiArg = {
+-  'item.id': string;
+-};
+-
+-`;
+-
+-exports[`supports granular hooks generation that includes all query types 1`] = `
+-import { api } from './fixtures/emptyApi';
+-const injectedRtkApi = api.injectEndpoints({
+-  endpoints: (build) => ({
+-    addPet: build.mutation<AddPetApiResponse, AddPetApiArg>({
+-      query: (queryArg) => ({
+-        url: \`/pet\`,
+-        method: 'POST',
+-        body: queryArg.pet,
+-      }),
+-    }),
+-    getPetById: build.query<GetPetByIdApiResponse, GetPetByIdApiArg>({
+-      query: (queryArg) => ({ url: \`/pet/\${queryArg.petId}\` }),
+-    }),
+-  }),
+-  overrideExisting: false,
+-});
+-export { injectedRtkApi as enhancedApi };
+-export type AddPetApiResponse = /** status 200 Successful operation */ Pet;
+-export type AddPetApiArg = {
+-  /** Create a new pet in the store */
+-  pet: Pet;
+-};
+-export type GetPetByIdApiResponse = /** status 200 successful operation */ Pet;
+-export type GetPetByIdApiArg = {
+-  /** ID of pet to return */
+-  petId: number;
+-};
+-export type Category = {
+-  id?: number;
+-  name?: string;
+-};
+-export type Tag = {
+-  id?: number;
+-  name?: string;
+-};
+-export type Pet = {
+-  id?: number;
+-  name: string;
+-  category?: Category;
+-  photoUrls: string[];
+-  tags?: Tag[];
+-  status?: 'available' | 'pending' | 'sold';
+-};
+-export const { useAddPetMutation, useGetPetByIdQuery, useLazyGetPetByIdQuery } = injectedRtkApi;
+-
+-`;
+-
+-exports[`supports granular hooks generation with only lazy queries 1`] = `
+-import { api } from './fixtures/emptyApi';
+-const injectedRtkApi = api.injectEndpoints({
+-  endpoints: (build) => ({
+-    addPet: build.mutation<AddPetApiResponse, AddPetApiArg>({
+-      query: (queryArg) => ({
+-        url: \`/pet\`,
+-        method: 'POST',
+-        body: queryArg.pet,
+-      }),
+-    }),
+-    getPetById: build.query<GetPetByIdApiResponse, GetPetByIdApiArg>({
+-      query: (queryArg) => ({ url: \`/pet/\${queryArg.petId}\` }),
+-    }),
+-  }),
+-  overrideExisting: false,
+-});
+-export { injectedRtkApi as enhancedApi };
+-export type AddPetApiResponse = /** status 200 Successful operation */ Pet;
+-export type AddPetApiArg = {
+-  /** Create a new pet in the store */
+-  pet: Pet;
+-};
+-export type GetPetByIdApiResponse = /** status 200 successful operation */ Pet;
+-export type GetPetByIdApiArg = {
+-  /** ID of pet to return */
+-  petId: number;
+-};
+-export type Category = {
+-  id?: number;
+-  name?: string;
+-};
+-export type Tag = {
+-  id?: number;
+-  name?: string;
+-};
+-export type Pet = {
+-  id?: number;
+-  name: string;
+-  category?: Category;
+-  photoUrls: string[];
+-  tags?: Tag[];
+-  status?: 'available' | 'pending' | 'sold';
+-};
+-export const { useLazyGetPetByIdQuery } = injectedRtkApi;
+-
+-`;
+-
+-exports[`supports granular hooks generation with only mutations 1`] = `
++exports[`hooks generation: should generate an \`useGetPetByIdQuery\` query hook and an \`useAddPetMutation\` mutation hook 1`] = `
+ import { api } from './fixtures/emptyApi';
+ const injectedRtkApi = api.injectEndpoints({
+   endpoints: (build) => ({
+@@ -570,70 +405,43 @@ export type GetPetByIdApiArg = {
+   petId: number;
+ };
+ export type Category = {
+-  id?: number;
+-  name?: string;
++  id?: number | undefined;
++  name?: string | undefined;
+ };
+ export type Tag = {
+-  id?: number;
+-  name?: string;
++  id?: number | undefined;
++  name?: string | undefined;
+ };
+ export type Pet = {
+-  id?: number;
++  id?: number | undefined;
+   name: string;
+-  category?: Category;
++  category?: Category | undefined;
+   photoUrls: string[];
+-  tags?: Tag[];
+-  status?: 'available' | 'pending' | 'sold';
++  tags?: Tag[] | undefined;
++  status?: ('available' | 'pending' | 'sold') | undefined;
+ };
+-export const { useAddPetMutation } = injectedRtkApi;
++export const { useAddPetMutation, useGetPetByIdQuery } = injectedRtkApi;
+ 
+ `;
+ 
+-exports[`supports granular hooks generation with only queries 1`] = `
++exports[`should use brackets in a querystring urls arg, when the arg contains full stops 1`] = `
+ import { api } from './fixtures/emptyApi';
+ const injectedRtkApi = api.injectEndpoints({
+   endpoints: (build) => ({
+-    addPet: build.mutation<AddPetApiResponse, AddPetApiArg>({
++    patchApiV1ListByItemId: build.mutation<PatchApiV1ListByItemIdApiResponse, PatchApiV1ListByItemIdApiArg>({
+       query: (queryArg) => ({
+-        url: \`/pet\`,
+-        method: 'POST',
+-        body: queryArg.pet,
++        url: \`/api/v1/list/\${queryArg['item.id']}\`,
++        method: 'PATCH',
+       }),
+     }),
+-    getPetById: build.query<GetPetByIdApiResponse, GetPetByIdApiArg>({
+-      query: (queryArg) => ({ url: \`/pet/\${queryArg.petId}\` }),
+-    }),
+   }),
+   overrideExisting: false,
+ });
+ export { injectedRtkApi as enhancedApi };
+-export type AddPetApiResponse = /** status 200 Successful operation */ Pet;
+-export type AddPetApiArg = {
+-  /** Create a new pet in the store */
+-  pet: Pet;
+-};
+-export type GetPetByIdApiResponse = /** status 200 successful operation */ Pet;
+-export type GetPetByIdApiArg = {
+-  /** ID of pet to return */
+-  petId: number;
+-};
+-export type Category = {
+-  id?: number;
+-  name?: string;
+-};
+-export type Tag = {
+-  id?: number;
+-  name?: string;
+-};
+-export type Pet = {
+-  id?: number;
+-  name: string;
+-  category?: Category;
+-  photoUrls: string[];
+-  tags?: Tag[];
+-  status?: 'available' | 'pending' | 'sold';
++export type PatchApiV1ListByItemIdApiResponse = /** status 200 A successful response. */ string;
++export type PatchApiV1ListByItemIdApiArg = {
++  'item.id': string;
+ };
+-export const { useGetPetByIdQuery } = injectedRtkApi;
+ 
+ `;
+ 
+diff --git a/packages/rtk-query-codegen-openapi/test/generateEndpoints.test.ts b/packages/rtk-query-codegen-openapi/test/generateEndpoints.test.ts
+index 7ed85674..b2c7bf74 100644
+--- a/packages/rtk-query-codegen-openapi/test/generateEndpoints.test.ts
++++ b/packages/rtk-query-codegen-openapi/test/generateEndpoints.test.ts
+@@ -73,7 +73,7 @@ test('endpoint overrides', async () => {
+   expect(api).toMatchSnapshot('loginUser should be a mutation');
+ });
+ 
+-test('default hooks generation', async () => {
++test('hooks generation', async () => {
+   const api = await generateEndpoints({
+     unionUndefined: true,
+     apiFile: './fixtures/emptyApi.ts',
+@@ -88,74 +88,6 @@ test('default hooks generation', async () => {
+   );
+ });
+ 
+-it('supports granular hooks generation that includes all query types', async () => {
+-  const api = await generateEndpoints({
+-    apiFile: './fixtures/emptyApi.ts',
+-    schemaFile: resolve(__dirname, 'fixtures/petstore.json'),
+-    filterEndpoints: ['getPetById', 'addPet'],
+-    hooks: {
+-      queries: true,
+-      lazyQueries: true,
+-      mutations: true,
+-    },
+-  });
+-  expect(api).toContain('useGetPetByIdQuery');
+-  expect(api).toContain('useLazyGetPetByIdQuery');
+-  expect(api).toContain('useAddPetMutation');
+-  expect(api).toMatchSnapshot();
+-});
+-
+-it('supports granular hooks generation with only queries', async () => {
+-  const api = await generateEndpoints({
+-    apiFile: './fixtures/emptyApi.ts',
+-    schemaFile: resolve(__dirname, 'fixtures/petstore.json'),
+-    filterEndpoints: ['getPetById', 'addPet'],
+-    hooks: {
+-      queries: true,
+-      lazyQueries: false,
+-      mutations: false,
+-    },
+-  });
+-  expect(api).toContain('useGetPetByIdQuery');
+-  expect(api).not.toContain('useLazyGetPetByIdQuery');
+-  expect(api).not.toContain('useAddPetMutation');
+-  expect(api).toMatchSnapshot();
+-});
+-
+-it('supports granular hooks generation with only lazy queries', async () => {
+-  const api = await generateEndpoints({
+-    apiFile: './fixtures/emptyApi.ts',
+-    schemaFile: resolve(__dirname, 'fixtures/petstore.json'),
+-    filterEndpoints: ['getPetById', 'addPet'],
+-    hooks: {
+-      queries: false,
+-      lazyQueries: true,
+-      mutations: false,
+-    },
+-  });
+-  expect(api).not.toContain('useGetPetByIdQuery');
+-  expect(api).toContain('useLazyGetPetByIdQuery');
+-  expect(api).not.toContain('useAddPetMutation');
+-  expect(api).toMatchSnapshot();
+-});
+-
+-it('supports granular hooks generation with only mutations', async () => {
+-  const api = await generateEndpoints({
+-    apiFile: './fixtures/emptyApi.ts',
+-    schemaFile: resolve(__dirname, 'fixtures/petstore.json'),
+-    filterEndpoints: ['getPetById', 'addPet'],
+-    hooks: {
+-      queries: false,
+-      lazyQueries: false,
+-      mutations: true,
+-    },
+-  });
+-  expect(api).not.toContain('useGetPetByIdQuery');
+-  expect(api).not.toContain('useLazyGetPetByIdQuery');
+-  expect(api).toContain('useAddPetMutation');
+-  expect(api).toMatchSnapshot();
+-});
+-
+ test('hooks generation uses overrides', async () => {
+   const api = await generateEndpoints({
+     unionUndefined: true,

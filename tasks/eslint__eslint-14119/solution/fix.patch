@@ -1,0 +1,279 @@
+diff --git a/conf/default-cli-options.js b/conf/default-cli-options.js
+index e09a829d1..dad03d89e 100644
+--- a/conf/default-cli-options.js
++++ b/conf/default-cli-options.js
+@@ -24,6 +24,7 @@ module.exports = {
+      */
+     cacheLocation: "",
+     cacheFile: ".eslintcache",
++    cacheStrategy: "metadata",
+     fix: false,
+     allowInlineConfig: true,
+     reportUnusedDisableDirectives: void 0,
+diff --git a/docs/developer-guide/nodejs-api.md b/docs/developer-guide/nodejs-api.md
+index cfa037218..708d1fa82 100644
+--- a/docs/developer-guide/nodejs-api.md
++++ b/docs/developer-guide/nodejs-api.md
+@@ -156,6 +156,8 @@ The `ESLint` constructor takes an `options` object. If you omit the `options` ob
+   Default is `false`. If `true` is present, the [`eslint.lintFiles()`][eslint-lintfiles] method caches lint results and uses it if each target file is not changed. Please mind that ESLint doesn't clear the cache when you upgrade ESLint plugins. In that case, you have to remove the cache file manually. The [`eslint.lintText()`][eslint-linttext] method doesn't use caches even if you pass the `options.filePath` to the method.
+ * `options.cacheLocation` (`string`)<br>
+   Default is `.eslintcache`. The [`eslint.lintFiles()`][eslint-lintfiles] method writes caches into this file.
++* `options.cacheStrategy` (`string`)<br>
++  Default is `"metadata"`. Strategy for the cache to use for detecting changed files. Can be either `"metadata"` or `"content"`.
+ 
+ ### ◆ eslint.lintFiles(patterns)
+ 
+diff --git a/docs/user-guide/command-line-interface.md b/docs/user-guide/command-line-interface.md
+index 64afa0b01..99fd61eb9 100644
+--- a/docs/user-guide/command-line-interface.md
++++ b/docs/user-guide/command-line-interface.md
+@@ -75,6 +75,7 @@ Caching:
+   --cache                        Only check changed files - default: false
+   --cache-file path::String      Path to the cache file. Deprecated: use --cache-location - default: .eslintcache
+   --cache-location path::String  Path to the cache file or directory
++  --cache-strategy String        Strategy to use for detecting changed files - either: metadata or content - default: metadata
+ 
+ Miscellaneous:
+   --init                         Run config initialization wizard - default: false
+@@ -440,6 +441,16 @@ Example:
+ 
+     eslint "src/**/*.js" --cache --cache-location "/Users/user/.eslintcache/"
+ 
++#### `--cache-strategy`
++
++Strategy for the cache to use for detecting changed files. Can be either `metadata` or `content`. If no strategy is specified, `metadata` will be used.
++
++The `content` strategy can be useful in cases where the modification time of your files change even if their contents have not. For example, this can happen during git operations like git clone because git does not track file modification time.
++
++Example:
++
++    eslint "src/**/*.js" --cache --cache-strategy content
++
+ ### Miscellaneous
+ 
+ #### `--init`
+diff --git a/lib/cli-engine/cli-engine.js b/lib/cli-engine/cli-engine.js
+index 3fd4f5ee1..b1befaa04 100644
+--- a/lib/cli-engine/cli-engine.js
++++ b/lib/cli-engine/cli-engine.js
+@@ -589,7 +589,7 @@ class CLIEngine {
+             ignore: options.ignore
+         });
+         const lintResultCache =
+-            options.cache ? new LintResultCache(cacheFilePath) : null;
++            options.cache ? new LintResultCache(cacheFilePath, options.cacheStrategy) : null;
+         const linter = new Linter({ cwd: options.cwd });
+ 
+         /** @type {ConfigArray[]} */
+diff --git a/lib/cli-engine/lint-result-cache.js b/lib/cli-engine/lint-result-cache.js
+index 23a142097..25b856f2f 100644
+--- a/lib/cli-engine/lint-result-cache.js
++++ b/lib/cli-engine/lint-result-cache.js
+@@ -15,6 +15,8 @@ const stringify = require("json-stable-stringify-without-jsonify");
+ const pkg = require("../../package.json");
+ const hash = require("./hash");
+ 
++const debug = require("debug")("eslint:lint-result-cache");
++
+ //-----------------------------------------------------------------------------
+ // Helpers
+ //-----------------------------------------------------------------------------
+@@ -22,6 +24,22 @@ const hash = require("./hash");
+ const configHashCache = new WeakMap();
+ const nodeVersion = process && process.version;
+ 
++const validCacheStrategies = ["metadata", "content"];
++const invalidCacheStrategyErrorMessage = `Cache strategy must be one of: ${validCacheStrategies
++    .map(strategy => `"${strategy}"`)
++    .join(", ")}`;
++
++/**
++ * Tests whether a provided cacheStrategy is valid
++ * @param {string} cacheStrategy The cache strategy to use
++ * @returns {boolean} true if `cacheStrategy` is one of `validCacheStrategies`; false otherwise
++ */
++function isValidCacheStrategy(cacheStrategy) {
++    return (
++        validCacheStrategies.indexOf(cacheStrategy) !== -1
++    );
++}
++
+ /**
+  * Calculates the hash of the config
+  * @param {ConfigArray} config The config.
+@@ -50,11 +68,30 @@ class LintResultCache {
+      * Creates a new LintResultCache instance.
+      * @param {string} cacheFileLocation The cache file location.
+      *   configuration lookup by file path).
++     * @param {"metadata" | "content"} cacheStrategy The cache strategy to use.
+      */
+-    constructor(cacheFileLocation) {
++    constructor(cacheFileLocation, cacheStrategy) {
+         assert(cacheFileLocation, "Cache file location is required");
+-
+-        this.fileEntryCache = fileEntryCache.create(cacheFileLocation);
++        assert(cacheStrategy, "Cache strategy is required");
++        assert(
++            isValidCacheStrategy(cacheStrategy),
++            invalidCacheStrategyErrorMessage
++        );
++
++        debug(`Caching results to ${cacheFileLocation}`);
++
++        const useChecksum = cacheStrategy === "content";
++
++        debug(
++            `Using "${cacheStrategy}" strategy to detect changes`
++        );
++
++        this.fileEntryCache = fileEntryCache.create(
++            cacheFileLocation,
++            void 0,
++            useChecksum
++        );
++        this.cacheFileLocation = cacheFileLocation;
+     }
+ 
+     /**
+@@ -76,17 +113,28 @@ class LintResultCache {
+          *    was previously linted
+          * If any of these are not true, we will not reuse the lint results.
+          */
+-
+         const fileDescriptor = this.fileEntryCache.getFileDescriptor(filePath);
+         const hashOfConfig = hashOfConfigFor(config);
+-        const changed = fileDescriptor.changed || fileDescriptor.meta.hashOfConfig !== hashOfConfig;
++        const changed =
++            fileDescriptor.changed ||
++            fileDescriptor.meta.hashOfConfig !== hashOfConfig;
++
++        if (fileDescriptor.notFound) {
++            debug(`File not found on the file system: ${filePath}`);
++            return null;
++        }
+ 
+-        if (fileDescriptor.notFound || changed) {
++        if (changed) {
++            debug(`Cache entry not found or no longer valid: ${filePath}`);
+             return null;
+         }
+ 
+         // If source is present but null, need to reread the file from the filesystem.
+-        if (fileDescriptor.meta.results && fileDescriptor.meta.results.source === null) {
++        if (
++            fileDescriptor.meta.results &&
++            fileDescriptor.meta.results.source === null
++        ) {
++            debug(`Rereading cached result source from filesystem: ${filePath}`);
+             fileDescriptor.meta.results.source = fs.readFileSync(filePath, "utf-8");
+         }
+ 
+@@ -112,6 +160,7 @@ class LintResultCache {
+         const fileDescriptor = this.fileEntryCache.getFileDescriptor(filePath);
+ 
+         if (fileDescriptor && !fileDescriptor.notFound) {
++            debug(`Updating cached result: ${filePath}`);
+ 
+             // Serialize the result, except that we want to remove the file source if present.
+             const resultToSerialize = Object.assign({}, result);
+@@ -135,6 +184,7 @@ class LintResultCache {
+      * @returns {void}
+      */
+     reconcile() {
++        debug(`Persisting cached results: ${this.cacheFileLocation}`);
+         this.fileEntryCache.reconcile();
+     }
+ }
+diff --git a/lib/cli.js b/lib/cli.js
+index ce1187800..4216126b6 100644
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -62,6 +62,7 @@ function translateOptions({
+     cache,
+     cacheFile,
+     cacheLocation,
++    cacheStrategy,
+     config,
+     env,
+     errorOnUnmatchedPattern,
+@@ -88,6 +89,7 @@ function translateOptions({
+         allowInlineConfig: inlineConfig,
+         cache,
+         cacheLocation: cacheLocation || cacheFile,
++        cacheStrategy,
+         errorOnUnmatchedPattern,
+         extensions: ext,
+         fix: (fix || fixDryRun) && (quiet ? quietFixPredicate : true),
+diff --git a/lib/eslint/eslint.js b/lib/eslint/eslint.js
+index 0bd7a41c6..ae2d21008 100644
+--- a/lib/eslint/eslint.js
++++ b/lib/eslint/eslint.js
+@@ -43,6 +43,7 @@ const { version } = require("../../package.json");
+  * @property {ConfigData} [baseConfig] Base config object, extended by all configs used with this instance
+  * @property {boolean} [cache] Enable result caching.
+  * @property {string} [cacheLocation] The cache file to use instead of .eslintcache.
++ * @property {"metadata" | "content"} [cacheStrategy] The strategy used to detect changed files.
+  * @property {string} [cwd] The value to use for the current working directory.
+  * @property {boolean} [errorOnUnmatchedPattern] If `false` then `ESLint#lintFiles()` doesn't throw even if no target files found. Defaults to `true`.
+  * @property {string[]} [extensions] An array of file extensions to check.
+@@ -157,6 +158,7 @@ function processOptions({
+     baseConfig = null,
+     cache = false,
+     cacheLocation = ".eslintcache",
++    cacheStrategy = "metadata",
+     cwd = process.cwd(),
+     errorOnUnmatchedPattern = true,
+     extensions = null, // ← should be null by default because if it's an array then it suppresses RFC20 feature.
+@@ -216,6 +218,12 @@ function processOptions({
+     if (!isNonEmptyString(cacheLocation)) {
+         errors.push("'cacheLocation' must be a non-empty string.");
+     }
++    if (
++        cacheStrategy !== "metadata" &&
++        cacheStrategy !== "content"
++    ) {
++        errors.push("'cacheStrategy' must be any of \"metadata\", \"content\".");
++    }
+     if (!isNonEmptyString(cwd) || !path.isAbsolute(cwd)) {
+         errors.push("'cwd' must be an absolute path.");
+     }
+@@ -284,6 +292,7 @@ function processOptions({
+         baseConfig,
+         cache,
+         cacheLocation,
++        cacheStrategy,
+         configFile: overrideConfigFile,
+         cwd,
+         errorOnUnmatchedPattern,
+diff --git a/lib/options.js b/lib/options.js
+index 1681f1dbd..99a38a770 100644
+--- a/lib/options.js
++++ b/lib/options.js
+@@ -214,6 +214,14 @@ module.exports = optionator({
+             type: "path::String",
+             description: "Path to the cache file or directory"
+         },
++        {
++            option: "cache-strategy",
++            dependsOn: ["cache"],
++            type: "String",
++            default: "metadata",
++            enum: ["metadata", "content"],
++            description: "Strategy to use for detecting changed files in the cache"
++        },
+         {
+             heading: "Miscellaneous"
+         },
+diff --git a/package.json b/package.json
+index fe5a3ba47..941635389 100644
+--- a/package.json
++++ b/package.json
+@@ -60,7 +60,7 @@
+     "espree": "^7.3.1",
+     "esquery": "^1.4.0",
+     "esutils": "^2.0.2",
+-    "file-entry-cache": "^6.0.0",
++    "file-entry-cache": "^6.0.1",
+     "functional-red-black-tree": "^1.0.1",
+     "glob-parent": "^5.0.0",
+     "globals": "^12.1.0",

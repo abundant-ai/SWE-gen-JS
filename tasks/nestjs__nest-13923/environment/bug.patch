@@ -1,0 +1,208 @@
+diff --git a/integration/scopes/e2e/durable-providers.spec.ts b/integration/scopes/e2e/durable-providers.spec.ts
+index cb3871c2c..d7088d0e9 100644
+--- a/integration/scopes/e2e/durable-providers.spec.ts
++++ b/integration/scopes/e2e/durable-providers.spec.ts
+@@ -89,25 +89,6 @@ describe('Durable providers', () => {
+       expect(result.body).deep.equal({ tenantId: '3' });
+     });
+ 
+-    it(`should return the same tenantId both from durable request scoped service and non-durable request scoped service`, async () => {
+-      let result: request.Response;
+-      result = await new Promise<request.Response>(resolve =>
+-        performHttpCall(1, resolve, '/durable/request-context'),
+-      );
+-      expect(result.body).deep.equal({
+-        durableService: '1',
+-        nonDurableService: '1',
+-      });
+-
+-      result = await new Promise<request.Response>(resolve =>
+-        performHttpCall(2, resolve, '/durable/request-context'),
+-      );
+-      expect(result.body).deep.equal({
+-        durableService: '2',
+-        nonDurableService: '2',
+-      });
+-    });
+-    
+     it(`should not cache durable providers that throw errors`, async () => {
+       let result: request.Response;
+ 
+diff --git a/integration/scopes/src/durable/durable-context-id.strategy.ts b/integration/scopes/src/durable/durable-context-id.strategy.ts
+index b0bb6bee1..feea43a02 100644
+--- a/integration/scopes/src/durable/durable-context-id.strategy.ts
++++ b/integration/scopes/src/durable/durable-context-id.strategy.ts
+@@ -1,11 +1,6 @@
+ import { ContextId, ContextIdStrategy, HostComponentInfo } from '@nestjs/core';
+ import { Request } from 'express';
+ 
+-export type TenantContext = {
+-  tenantId: string;
+-  forceError?: boolean;
+-};
+-
+ const tenants = new Map<string, ContextId>();
+ 
+ export class DurableContextIdStrategy implements ContextIdStrategy {
+@@ -22,7 +17,10 @@ export class DurableContextIdStrategy implements ContextIdStrategy {
+       tenants.set(tenantId, tenantSubTreeId);
+     }
+ 
+-    const payload: TenantContext = { tenantId };
++    const payload: {
++      tenantId: string;
++      forceError?: boolean;
++    } = { tenantId };
+     if (forceError) {
+       payload.forceError = true;
+     }
+diff --git a/integration/scopes/src/durable/durable.controller.ts b/integration/scopes/src/durable/durable.controller.ts
+index fbc33c12c..be51ad2df 100644
+--- a/integration/scopes/src/durable/durable.controller.ts
++++ b/integration/scopes/src/durable/durable.controller.ts
+@@ -1,13 +1,9 @@
+ import { Controller, Get } from '@nestjs/common';
+ import { DurableService } from './durable.service';
+-import { NonDurableService } from './non-durable.service';
+ 
+ @Controller('durable')
+ export class DurableController {
+-  constructor(
+-    private readonly durableService: DurableService,
+-    private readonly nonDurableService: NonDurableService,
+-  ) {}
++  constructor(private readonly durableService: DurableService) {}
+ 
+   @Get()
+   greeting(): string {
+@@ -16,16 +12,6 @@ export class DurableController {
+ 
+   @Get('echo')
+   echo() {
+-    return {
+-      tenantId: this.durableService.getTenantId(),
+-    };
+-  }
+-
+-  @Get('request-context')
+-  getRequestContext() {
+-    return {
+-      durableService: this.durableService.getTenantId(),
+-      nonDurableService: this.nonDurableService.getTenantId(),
+-    };
++    return this.durableService.requestPayload;
+   }
+ }
+diff --git a/integration/scopes/src/durable/durable.module.ts b/integration/scopes/src/durable/durable.module.ts
+index dc91cded6..d749135bd 100644
+--- a/integration/scopes/src/durable/durable.module.ts
++++ b/integration/scopes/src/durable/durable.module.ts
+@@ -3,13 +3,11 @@ import { APP_GUARD } from '@nestjs/core';
+ import { DurableController } from './durable.controller';
+ import { DurableGuard } from './durable.guard';
+ import { DurableService } from './durable.service';
+-import { NonDurableService } from './non-durable.service';
+ 
+ @Module({
+   controllers: [DurableController],
+   providers: [
+     DurableService,
+-    NonDurableService,
+     {
+       provide: APP_GUARD,
+       useClass: DurableGuard,
+diff --git a/integration/scopes/src/durable/durable.service.ts b/integration/scopes/src/durable/durable.service.ts
+index 247501143..8f33692d8 100644
+--- a/integration/scopes/src/durable/durable.service.ts
++++ b/integration/scopes/src/durable/durable.service.ts
+@@ -5,14 +5,14 @@ import {
+   Scope,
+ } from '@nestjs/common';
+ import { REQUEST } from '@nestjs/core';
+-import { TenantContext } from './durable-context-id.strategy';
+ 
+ @Injectable({ scope: Scope.REQUEST, durable: true })
+ export class DurableService {
+   public instanceCounter = 0;
+ 
+   constructor(
+-    @Inject(REQUEST) private readonly requestPayload: TenantContext,
++    @Inject(REQUEST)
++    public readonly requestPayload: { tenantId: string; forceError: boolean },
+   ) {
+     if (requestPayload.forceError) {
+       throw new PreconditionFailedException('Forced error');
+@@ -23,8 +23,4 @@ export class DurableService {
+     ++this.instanceCounter;
+     return `Hello world! Counter: ${this.instanceCounter}`;
+   }
+-
+-  getTenantId() {
+-    return this.requestPayload.tenantId;
+-  }
+ }
+diff --git a/integration/scopes/src/durable/non-durable.service.ts b/integration/scopes/src/durable/non-durable.service.ts
+deleted file mode 100644
+index add062941..000000000
+--- a/integration/scopes/src/durable/non-durable.service.ts
++++ /dev/null
+@@ -1,14 +0,0 @@
+-import { Inject, Injectable, Scope } from '@nestjs/common';
+-import { REQUEST } from '@nestjs/core';
+-import { TenantContext } from './durable-context-id.strategy';
+-
+-@Injectable()
+-export class NonDurableService {
+-  constructor(
+-    @Inject(REQUEST) private readonly requestPayload: TenantContext,
+-  ) {}
+-
+-  getTenantId() {
+-    return this.requestPayload.tenantId;
+-  }
+-}
+diff --git a/packages/core/middleware/middleware-module.ts b/packages/core/middleware/middleware-module.ts
+index 68e4d197e..b956a2385 100644
+--- a/packages/core/middleware/middleware-module.ts
++++ b/packages/core/middleware/middleware-module.ts
+@@ -346,9 +346,7 @@ export class MiddlewareModule<
+         configurable: false,
+       });
+ 
+-      const requestProviderValue = isTreeDurable
+-        ? contextId.payload
+-        : Object.assign(request, contextId.payload);
++      const requestProviderValue = isTreeDurable ? contextId.payload : request;
+       this.container.registerRequestProvider(requestProviderValue, contextId);
+     }
+     return contextId;
+diff --git a/packages/core/router/router-explorer.ts b/packages/core/router/router-explorer.ts
+index 7c537ab12..411d86efb 100644
+--- a/packages/core/router/router-explorer.ts
++++ b/packages/core/router/router-explorer.ts
+@@ -418,9 +418,7 @@ export class RouterExplorer {
+         configurable: false,
+       });
+ 
+-      const requestProviderValue = isTreeDurable
+-        ? contextId.payload
+-        : Object.assign(request, contextId.payload);
++      const requestProviderValue = isTreeDurable ? contextId.payload : request;
+       this.container.registerRequestProvider(requestProviderValue, contextId);
+     }
+     return contextId;
+diff --git a/packages/microservices/listeners-controller.ts b/packages/microservices/listeners-controller.ts
+index 4a1c43935..cba398269 100644
+--- a/packages/microservices/listeners-controller.ts
++++ b/packages/microservices/listeners-controller.ts
+@@ -308,9 +308,7 @@ export class ListenersController {
+         configurable: false,
+       });
+ 
+-      const requestProviderValue = isTreeDurable
+-        ? contextId.payload
+-        : Object.assign(request, contextId.payload);
++      const requestProviderValue = isTreeDurable ? contextId.payload : request;
+       this.container.registerRequestProvider(requestProviderValue, contextId);
+     }
+     return contextId;

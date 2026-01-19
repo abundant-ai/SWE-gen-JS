@@ -1,0 +1,370 @@
+diff --git a/readme.md b/readme.md
+index 5e20aaf..a988c4d 100644
+--- a/readme.md
++++ b/readme.md
+@@ -188,7 +188,14 @@ Type: `number` `Object`
+ 
+ Milliseconds to wait for the server to end the response before aborting request with `ETIMEDOUT` error (a.k.a. `request` property). By default there's no timeout.
+ 
+-This also accepts an object with separate `connect`, `socket`, and `request` fields for connection, socket, and entire request timeouts.
++This also accepts an object with separate `lookup`, `connect`, `socket`, `response` and `request` fields to specify granular timeouts for each phase of the request.
++
++- `lookup` starts when a socket is assigned and ends when the hostname has been resolved. Does not apply when using a Unix domain socket.
++- `connect` starts when `lookup` completes (or when the socket is assigned if lookup does not apply to the request) and ends when the socket is connected.
++- `socket` starts when the socket is connected. See [request.setTimeout](https://nodejs.org/api/http.html#http_request_settimeout_timeout_callback).
++- `response` starts when the request has been written to the socket and ends when the response headers are received.
++- `send` starts when the socket is connected and ends with the request has been written to the socket.
++- `request` starts when the request is initiated and ends when the response's end event fires.
+ 
+ ###### retry
+ 
+diff --git a/source/as-promise.js b/source/as-promise.js
+index fcd261d..1b4ff00 100644
+--- a/source/as-promise.js
++++ b/source/as-promise.js
+@@ -24,17 +24,22 @@ module.exports = options => {
+ 
+ 			proxy.emit('request', req);
+ 
++			const uploadComplete = () => {
++				req.emit('upload-complete');
++			};
++
+ 			onCancel(() => {
+ 				req.abort();
+ 			});
+ 
+ 			if (is.nodeStream(options.body)) {
++				options.body.once('end', uploadComplete);
+ 				options.body.pipe(req);
+ 				options.body = undefined;
+ 				return;
+ 			}
+ 
+-			req.end(options.body);
++			req.end(options.body, uploadComplete);
+ 		});
+ 
+ 		emitter.on('response', async response => {
+diff --git a/source/as-stream.js b/source/as-stream.js
+index 35f14c5..501da2b 100644
+--- a/source/as-stream.js
++++ b/source/as-stream.js
+@@ -28,23 +28,28 @@ module.exports = options => {
+ 
+ 	emitter.on('request', req => {
+ 		proxy.emit('request', req);
++		const uploadComplete = () => {
++			req.emit('upload-complete');
++		};
+ 
+ 		if (is.nodeStream(options.body)) {
++			options.body.once('end', uploadComplete);
+ 			options.body.pipe(req);
+ 			return;
+ 		}
+ 
+ 		if (options.body) {
+-			req.end(options.body);
++			req.end(options.body, uploadComplete);
+ 			return;
+ 		}
+ 
+ 		if (options.method === 'POST' || options.method === 'PUT' || options.method === 'PATCH') {
++			input.once('end', uploadComplete);
+ 			input.pipe(req);
+ 			return;
+ 		}
+ 
+-		req.end();
++		req.end(uploadComplete);
+ 	});
+ 
+ 	emitter.on('response', response => {
+diff --git a/source/errors.js b/source/errors.js
+index ad83388..dff0576 100644
+--- a/source/errors.js
++++ b/source/errors.js
+@@ -19,6 +19,7 @@ class GotError extends Error {
+ 			hostname: opts.hostname,
+ 			method: opts.method,
+ 			path: opts.path,
++			socketPath: opts.socketPath,
+ 			protocol: opts.protocol,
+ 			url: opts.href
+ 		});
+@@ -89,4 +90,12 @@ module.exports.UnsupportedProtocolError = class extends GotError {
+ 	}
+ };
+ 
++module.exports.TimeoutError = class extends GotError {
++	constructor(threshold, event, opts) {
++		super(`Timeout awaiting '${event}' for ${threshold}ms`, {code: 'ETIMEDOUT'}, opts);
++		this.name = 'TimeoutError';
++		this.event = event;
++	}
++};
++
+ module.exports.CancelError = PCancelable.CancelError;
+diff --git a/source/request-as-event-emitter.js b/source/request-as-event-emitter.js
+index 0f9f3bc..7631b53 100644
+--- a/source/request-as-event-emitter.js
++++ b/source/request-as-event-emitter.js
+@@ -10,7 +10,7 @@ const timedOut = require('./timed-out');
+ const getBodySize = require('./get-body-size');
+ const getResponse = require('./get-response');
+ const progress = require('./progress');
+-const {CacheError, UnsupportedProtocolError, MaxRedirectsError, RequestError} = require('./errors');
++const {GotError, CacheError, UnsupportedProtocolError, MaxRedirectsError, RequestError} = require('./errors');
+ 
+ const getMethodRedirectCodes = new Set([300, 301, 302, 303, 304, 305, 307, 308]);
+ const allMethodRedirectCodes = new Set([300, 303, 307, 308]);
+@@ -91,13 +91,11 @@ module.exports = (options = {}) => {
+ 				return;
+ 			}
+ 
+-			setImmediate(() => {
+-				try {
+-					getResponse(response, options, emitter, redirects);
+-				} catch (error) {
+-					emitter.emit('error', error);
+-				}
+-			});
++			try {
++				getResponse(response, options, emitter, redirects);
++			} catch (error) {
++				emitter.emit('error', error);
++			}
+ 		});
+ 
+ 		cacheReq.on('error', error => {
+@@ -119,10 +117,12 @@ module.exports = (options = {}) => {
+ 					return;
+ 				}
+ 
+-				const err = new RequestError(error, options);
+-				emitter.emit('retry', err, retried => {
++				if (!(error instanceof GotError)) {
++					error = new RequestError(error, options);
++				}
++				emitter.emit('retry', error, retried => {
+ 					if (!retried) {
+-						emitter.emit('error', err);
++						emitter.emit('error', error);
+ 					}
+ 				});
+ 			});
+@@ -130,12 +130,10 @@ module.exports = (options = {}) => {
+ 			progress.upload(req, emitter, uploadBodySize);
+ 
+ 			if (options.gotTimeout) {
+-				timedOut(req, options.gotTimeout);
++				timedOut(req, options);
+ 			}
+ 
+-			setImmediate(() => {
+-				emitter.emit('request', req);
+-			});
++			emitter.emit('request', req);
+ 		});
+ 	};
+ 
+diff --git a/source/timed-out.js b/source/timed-out.js
+index 0c43bf1..aeb5134 100644
+--- a/source/timed-out.js
++++ b/source/timed-out.js
+@@ -1,79 +1,131 @@
+ 'use strict';
++const net = require('net');
++const {TimeoutError} = require('./errors');
+ 
+-// Forked from https://github.com/floatdrop/timed-out
++const reentry = Symbol('reentry');
+ 
+-module.exports = function (req, delays) {
+-	if (req.timeoutTimer) {
+-		return req;
++function addTimeout(delay, callback, ...args) {
++	// Event loop order is timers, poll, immediates.
++	// The timed event may emit during the current tick poll phase, so
++	// defer calling the handler until the poll phase completes.
++	let immediate;
++	const timeout = setTimeout(
++		() => {
++			immediate = setImmediate(callback, delay, ...args);
++			if (immediate.unref) {
++				// Added in node v9.7.0
++				immediate.unref();
++			}
++		},
++		delay
++	);
++	timeout.unref();
++	return () => {
++		clearTimeout(timeout);
++		clearImmediate(immediate);
++	};
++}
++
++module.exports = function (req, options) {
++	if (req[reentry]) {
++		return;
+ 	}
++	req[reentry] = true;
++	const {gotTimeout: delays, host, hostname} = options;
++	const timeoutHandler = (delay, event) => {
++		req.abort();
++		req.emit('error', new TimeoutError(delay, event, options));
++	};
++	const cancelers = [];
++	const cancelTimeouts = () => {
++		cancelers.forEach(cancelTimeout => cancelTimeout());
++	};
+ 
+-	const host = req._headers ? (' to ' + req._headers.host) : '';
++	req.on('error', cancelTimeouts);
++	req.once('response', response => {
++		response.once('end', cancelTimeouts);
++	});
+ 
+-	function throwESOCKETTIMEDOUT() {
+-		req.abort();
+-		const e = new Error('Socket timed out on request' + host);
+-		e.code = 'ESOCKETTIMEDOUT';
+-		req.emit('error', e);
++	if (delays.request !== undefined) {
++		const cancelTimeout = addTimeout(
++			delays.request,
++			timeoutHandler,
++			'request'
++		);
++		cancelers.push(cancelTimeout);
+ 	}
+-
+-	function throwETIMEDOUT() {
+-		req.abort();
+-		const e = new Error('Connection timed out on request' + host);
+-		e.code = 'ETIMEDOUT';
+-		req.emit('error', e);
++	if (delays.socket !== undefined) {
++		req.setTimeout(
++			delays.socket,
++			() => {
++				timeoutHandler(delays.socket, 'socket');
++			}
++		);
++	}
++	if (delays.lookup !== undefined && !req.socketPath && !net.isIP(hostname || host)) {
++		req.once('socket', socket => {
++			if (socket.connecting) {
++				const cancelTimeout = addTimeout(
++					delays.lookup,
++					timeoutHandler,
++					'lookup'
++				);
++				cancelers.push(cancelTimeout);
++				socket.once('lookup', cancelTimeout);
++			}
++		});
+ 	}
+-
+ 	if (delays.connect !== undefined) {
+-		req.timeoutTimer = setTimeout(throwETIMEDOUT, delays.connect);
++		req.once('socket', socket => {
++			if (socket.connecting) {
++				const timeConnect = () => {
++					const cancelTimeout = addTimeout(
++						delays.connect,
++						timeoutHandler,
++						'connect'
++					);
++					cancelers.push(cancelTimeout);
++					return cancelTimeout;
++				};
++				if (req.socketPath || net.isIP(hostname || host)) {
++					socket.once('connect', timeConnect());
++				} else {
++					socket.once('lookup', () => {
++						socket.once('connect', timeConnect());
++					});
++				}
++			}
++		});
+ 	}
+-
+-	if (delays.request !== undefined) {
+-		req.requestTimeoutTimer = setTimeout(() => {
+-			clear();
+-
+-			if (req.connection.connecting) {
+-				throwETIMEDOUT();
++	if (delays.send !== undefined) {
++		req.once('socket', socket => {
++			const timeRequest = () => {
++				const cancelTimeout = addTimeout(
++					delays.send,
++					timeoutHandler,
++					'send'
++				);
++				cancelers.push(cancelTimeout);
++				return cancelTimeout;
++			};
++			if (socket.connecting) {
++				socket.once('connect', () => {
++					req.once('upload-complete', timeRequest());
++				});
+ 			} else {
+-				throwESOCKETTIMEDOUT();
++				req.once('upload-complete', timeRequest());
+ 			}
+-		}, delays.request);
+-	}
+-
+-	// Clear the connection timeout timer once a socket is assigned to the
+-	// request and is connected.
+-	req.on('socket', socket => {
+-		// Socket may come from Agent pool and may be already connected.
+-		if (!socket.connecting) {
+-			connect();
+-			return;
+-		}
+-
+-		socket.once('connect', connect);
+-	});
+-
+-	function clear() {
+-		if (req.timeoutTimer) {
+-			clearTimeout(req.timeoutTimer);
+-			req.timeoutTimer = null;
+-		}
++		});
+ 	}
+-
+-	function connect() {
+-		clear();
+-
+-		if (delays.socket !== undefined) {
+-			// Abort the request if there is no activity on the socket for more
+-			// than `delays.socket` milliseconds.
+-			req.setTimeout(delays.socket, throwESOCKETTIMEDOUT);
+-		}
+-
+-		req.on('response', res => {
+-			res.on('end', () => {
+-				// The request is finished, cancel request timeout.
+-				clearTimeout(req.requestTimeoutTimer);
+-			});
++	if (delays.response !== undefined) {
++		req.once('upload-complete', () => {
++			const cancelTimeout = addTimeout(
++				delays.response,
++				timeoutHandler,
++				'response'
++			);
++			cancelers.push(cancelTimeout);
++			req.once('response', cancelTimeout);
+ 		});
+ 	}
+-
+-	return req.on('error', clear);
+ };

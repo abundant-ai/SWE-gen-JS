@@ -1,0 +1,225 @@
+diff --git a/changelog_unreleased/markdown/17965.md b/changelog_unreleased/markdown/17965.md
+new file mode 100644
+index 000000000..ff641fd6e
+--- /dev/null
++++ b/changelog_unreleased/markdown/17965.md
+@@ -0,0 +1,4 @@
++#### Infer TOML parser for Front Matter (#17965 by @kovsu)
++
++TOML Front Matter can be processed by the appropriate plugin if any.
++Works for HTML and CSS files too.
+diff --git a/src/language-css/embed.js b/src/language-css/embed.js
+index 09e2a6b0b..a18568980 100644
+--- a/src/language-css/embed.js
++++ b/src/language-css/embed.js
+@@ -1,17 +1,11 @@
+-import { hardline } from "../document/builders.js";
+ import {
+-  isFrontMatter,
+-  printFrontMatter,
++  isEmbedFrontMatter,
++  printEmbedFrontMatter,
+ } from "../utils/front-matter/index.js";
+ 
+ function embed(path) {
+-  const { node } = path;
+-
+-  if (isFrontMatter(node) && node.language === "yaml") {
+-    return async (textToDoc) => {
+-      const doc = await printFrontMatter(node, textToDoc);
+-      return doc ? [doc, hardline] : undefined;
+-    };
++  if (isEmbedFrontMatter(path)) {
++    return printEmbedFrontMatter;
+   }
+ }
+ 
+diff --git a/src/language-css/printer-postcss.js b/src/language-css/printer-postcss.js
+index 4e8f9eb85..3370db39c 100644
+--- a/src/language-css/printer-postcss.js
++++ b/src/language-css/printer-postcss.js
+@@ -54,7 +54,7 @@ function genericPrint(path, options, print) {
+ 
+   switch (node.type) {
+     case "front-matter":
+-      return [node.raw, hardline];
++      return node.raw;
+     case "css-root": {
+       const nodes = printSequence(path, options, print);
+       let after = node.raws.after.trim();
+@@ -63,7 +63,13 @@ function genericPrint(path, options, print) {
+       }
+ 
+       return [
+-        node.frontMatter ? [print("frontMatter"), hardline] : "",
++        node.frontMatter
++          ? [
++              print("frontMatter"),
++              hardline,
++              node.nodes.length > 0 ? hardline : "",
++            ]
++          : "",
+         nodes,
+         after ? ` ${after}` : "",
+         node.nodes.length > 0 ? hardline : "",
+diff --git a/src/language-html/embed.js b/src/language-html/embed.js
+index 1cab9851c..73c93e84a 100644
+--- a/src/language-html/embed.js
++++ b/src/language-html/embed.js
+@@ -5,7 +5,10 @@ import {
+   indent,
+   line,
+ } from "../document/builders.js";
+-import { printFrontMatter } from "../utils/front-matter/index.js";
++import {
++  isEmbedFrontMatter,
++  printEmbedFrontMatter,
++} from "../utils/front-matter/index.js";
+ import printAngularControlFlowBlockParameters from "./embed/angular-control-flow-block-parameters.js";
+ import printAttribute from "./embed/attribute.js";
+ import { formatAttributeValue } from "./embed/utils.js";
+@@ -37,6 +40,10 @@ const embeddedAngularControlFlowBlocks = new Set([
+ function embed(path, options) {
+   const { node } = path;
+ 
++  if (isEmbedFrontMatter(path)) {
++    return printEmbedFrontMatter;
++  }
++
+   switch (node.type) {
+     case "element":
+       if (isScriptLikeTag(node, options) || node.type === "interpolation") {
+@@ -141,12 +148,6 @@ function embed(path, options) {
+     case "attribute":
+       return printAttribute(path, options);
+ 
+-    case "front-matter":
+-      if (node.language === "yaml") {
+-        return (textToDoc) => printFrontMatter(node, textToDoc);
+-      }
+-      break;
+-
+     case "angularControlFlowBlockParameters":
+       if (!embeddedAngularControlFlowBlocks.has(path.parent.name)) {
+         return;
+diff --git a/src/language-markdown/embed.js b/src/language-markdown/embed.js
+index bfe8c3e53..5108091f4 100644
+--- a/src/language-markdown/embed.js
++++ b/src/language-markdown/embed.js
+@@ -1,6 +1,9 @@
+ import { hardline, markAsRoot } from "../document/builders.js";
+ import { replaceEndOfLine } from "../document/utils.js";
+-import { printFrontMatter } from "../utils/front-matter/index.js";
++import {
++  isEmbedFrontMatter,
++  printEmbedFrontMatter,
++} from "../utils/front-matter/index.js";
+ import getMaxContinuousCount from "../utils/get-max-continuous-count.js";
+ import inferParser from "../utils/infer-parser.js";
+ import { getFencedCodeBlockValue } from "./utils.js";
+@@ -46,10 +49,11 @@ function embed(path, options) {
+     }
+   }
+ 
+-  switch (node.type) {
+-    case "front-matter":
+-      return (textToDoc) => printFrontMatter(node, textToDoc);
++  if (isEmbedFrontMatter(path)) {
++    return printEmbedFrontMatter;
++  }
+ 
++  switch (node.type) {
+     // MDX
+     case "import":
+     case "export":
+diff --git a/src/utils/front-matter/clean.js b/src/utils/front-matter/clean.js
+index d286901ac..702556997 100644
+--- a/src/utils/front-matter/clean.js
++++ b/src/utils/front-matter/clean.js
+@@ -1,11 +1,13 @@
+-import isFrontMatter from "./is-front-matter.js";
++import { isEmbedFrontMatter } from "./embed.js";
+ 
+ function clean(original, cloned) {
+-  if (isFrontMatter(original) && original.language === "yaml") {
++  if (isEmbedFrontMatter({ node: original })) {
+     delete cloned.end;
+     delete cloned.raw;
+     delete cloned.value;
+   }
++
++  return cloned;
+ }
+ 
+ export default clean;
+diff --git a/src/utils/front-matter/embed.js b/src/utils/front-matter/embed.js
+new file mode 100644
+index 000000000..2c4063368
+--- /dev/null
++++ b/src/utils/front-matter/embed.js
+@@ -0,0 +1,31 @@
++import { hardline, markAsRoot } from "../../document/builders.js";
++import isFrontMatter from "./is-front-matter.js";
++
++const SUPPORTED_EMBED_LANGUAGES = new Set(["yaml", "toml"]);
++
++const isEmbedFrontMatter = ({ node } /* , options */) =>
++  isFrontMatter(node) && SUPPORTED_EMBED_LANGUAGES.has(node.language);
++
++async function printEmbedFrontMatter(textToDoc, print, path /* , options*/) {
++  const { node } = path;
++
++  if (!SUPPORTED_EMBED_LANGUAGES.has(node.language)) {
++    return;
++  }
++
++  const value = node.value.trim();
++
++  // TODO[@fisker]: Use inferParser instead of using `toml` directly
++  const doc = value ? await textToDoc(value, { parser: node.language }) : "";
++
++  return markAsRoot([
++    node.startDelimiter,
++    node.explicitLanguage ?? "",
++    hardline,
++    doc,
++    doc ? hardline : "",
++    node.endDelimiter,
++  ]);
++}
++
++export { isEmbedFrontMatter, printEmbedFrontMatter };
+diff --git a/src/utils/front-matter/index.js b/src/utils/front-matter/index.js
+index 320d0dc65..bb00e5832 100644
+--- a/src/utils/front-matter/index.js
++++ b/src/utils/front-matter/index.js
+@@ -1,4 +1,4 @@
+ export { default as cleanFrontMatter } from "./clean.js";
++export { isEmbedFrontMatter, printEmbedFrontMatter } from "./embed.js";
+ export { default as isFrontMatter } from "./is-front-matter.js";
+ export { default as parseFrontMatter } from "./parse.js";
+-export { default as printFrontMatter } from "./print.js";
+diff --git a/src/utils/front-matter/print.js b/src/utils/front-matter/print.js
+deleted file mode 100644
+index 218eb51f8..000000000
+--- a/src/utils/front-matter/print.js
++++ /dev/null
+@@ -1,18 +0,0 @@
+-import { hardline, markAsRoot } from "../../document/builders.js";
+-
+-async function print(node, textToDoc) {
+-  if (node.language === "yaml") {
+-    const value = node.value.trim();
+-    const doc = value ? await textToDoc(value, { parser: "yaml" }) : "";
+-    return markAsRoot([
+-      node.startDelimiter,
+-      node.explicitLanguage ?? "",
+-      hardline,
+-      doc,
+-      doc ? hardline : "",
+-      node.endDelimiter,
+-    ]);
+-  }
+-}
+-
+-export default print;

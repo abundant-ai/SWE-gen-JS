@@ -1,0 +1,203 @@
+diff --git a/src/commands/addJob-8.lua b/src/commands/addJob-8.lua
+index d043d88c9c..d99fa31fae 100644
+--- a/src/commands/addJob-8.lua
++++ b/src/commands/addJob-8.lua
+@@ -79,7 +79,6 @@ local jobCounter = rcall("INCR", KEYS[4])
+ trimEvents(KEYS[3], KEYS[8])
+ 
+ local parentDependenciesKey = args[7]
+-local timestamp = args[4]
+ if args[2] == "" then
+   jobId = jobCounter
+   jobIdKey = args[1] .. jobId
+@@ -91,7 +90,7 @@ else
+       if rcall("ZSCORE", KEYS[7], jobId) ~= false then
+         local returnvalue = rcall("HGET", jobIdKey, "returnvalue")
+         updateParentDepsIfNeeded(parentKey, parent['queueKey'], parentDependenciesKey,
+-          parent['id'], jobIdKey, returnvalue, timestamp)
++          parent['id'], jobIdKey, returnvalue)
+       else
+         if parentDependenciesKey ~= nil then
+           rcall("SADD", parentDependenciesKey, jobIdKey)
+@@ -107,6 +106,7 @@ end
+ local jsonOpts = cjson.encode(opts)
+ local delay = opts['delay'] or 0
+ local priority = opts['priority'] or 0
++local timestamp = args[4]
+ 
+ local optionalValues = {}
+ if parentKey ~= nil then
+diff --git a/src/commands/includes/updateParentDepsIfNeeded.lua b/src/commands/includes/updateParentDepsIfNeeded.lua
+index 5c30feee98..cf00677088 100644
+--- a/src/commands/includes/updateParentDepsIfNeeded.lua
++++ b/src/commands/includes/updateParentDepsIfNeeded.lua
+@@ -4,11 +4,10 @@
+ 
+ -- Includes
+ --- @include "addJobWithPriority"
+---- @include "getNextDelayedTimestamp"
+ --- @include "getTargetQueueList"
+ 
+ local function updateParentDepsIfNeeded(parentKey, parentQueueKey, parentDependenciesKey,
+-  parentId, jobIdKey, returnvalue, timestamp )
++  parentId, jobIdKey, returnvalue )
+   local processedSet = parentKey .. ":processed"
+   rcall("HSET", processedSet, jobIdKey, returnvalue)
+   local activeParent = rcall("ZSCORE", parentQueueKey .. ":waiting-children", parentId)
+@@ -16,23 +15,9 @@ local function updateParentDepsIfNeeded(parentKey, parentQueueKey, parentDepende
+     rcall("ZREM", parentQueueKey .. ":waiting-children", parentId)
+     local parentTarget = getTargetQueueList(parentQueueKey .. ":meta", parentQueueKey .. ":wait",
+       parentQueueKey .. ":paused")
+-    local jobAttributes = rcall("HMGET", parentKey, "priority", "delay")
+-    local priority = tonumber(jobAttributes[1]) or 0
+-    local delay = tonumber(jobAttributes[2]) or 0
+-    if delay > 0 then
+-      local delayedTimestamp = tonumber(timestamp) + delay 
+-      local score = delayedTimestamp * 0x1000
+-      local parentDelayedKey = parentQueueKey .. ":delayed" 
+-      rcall("ZADD", parentDelayedKey, score, parentId)
+-
+-      if rcall("LLEN", parentTarget) == 0 then
+-        local nextTimestamp = getNextDelayedTimestamp(parentDelayedKey)
+-        if not nextTimestamp or (delayedTimestamp <= nextTimestamp) then
+-          rcall("LPUSH", parentTarget, "0:" .. delayedTimestamp - tonumber(timestamp))
+-        end
+-      end
++    local priority = tonumber(rcall("HGET", parentKey, "priority"))
+     -- Standard or priority add
+-    elseif priority == 0 then
++    if priority == 0 then
+       rcall("RPUSH", parentTarget, parentId)
+     else
+       addJobWithPriority(parentQueueKey .. ":priority", priority, parentTarget, parentId)
+diff --git a/src/commands/moveToFinished-12.lua b/src/commands/moveToFinished-12.lua
+index ed566308b2..3aa08b15d3 100644
+--- a/src/commands/moveToFinished-12.lua
++++ b/src/commands/moveToFinished-12.lua
+@@ -128,7 +128,7 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+             if rcall("SREM", dependenciesSet, jobIdKey) == 1 then
+                 updateParentDepsIfNeeded(parentKey, parentQueueKey,
+                                          dependenciesSet, parentId, jobIdKey,
+-                                         ARGV[4], timestamp)
++                                         ARGV[4])
+             end
+         elseif opts['fpof'] then
+             moveParentFromWaitingChildrenToFailed(parentQueueKey, parentKey,
+diff --git a/tests/test_flow.ts b/tests/test_flow.ts
+index 985222c022..df9e49f793 100644
+--- a/tests/test_flow.ts
++++ b/tests/test_flow.ts
+@@ -1,3 +1,4 @@
++import { after, last } from 'lodash';
+ import { expect } from 'chai';
+ import { default as IORedis } from 'ioredis';
+ import { beforeEach, describe, it } from 'mocha';
+@@ -1731,7 +1732,7 @@ describe('flows', () => {
+       { idx: 2, qux: 'something' },
+     ];
+ 
+-    const topQueueName = `top-queue-${v4()}`;
++    const topQueueName = 'top-queue';
+ 
+     let childrenProcessor,
+       parentProcessor,
+@@ -1852,99 +1853,6 @@ describe('flows', () => {
+     await removeAllQueueData(new IORedis(), topQueueName);
+   });
+ 
+-  describe('when parent has delay', () => {
+-    it('moves process to delayed after children are processed', async () => {
+-      const name = 'child-job';
+-      const values = [{ idx: 0, bar: 'something' }];
+-
+-      const topQueueName = `top-queue-${v4()}`;
+-
+-      let parentProcessor;
+-      const childrenWorker = new Worker(
+-        queueName,
+-        async (job: Job) => {
+-          await delay(500);
+-          return values[job.data.idx];
+-        },
+-        {
+-          connection,
+-        },
+-      );
+-
+-      const completed = new Promise<void>((resolve, reject) => {
+-        childrenWorker.on('completed', async function () {
+-          resolve();
+-        });
+-      });
+-
+-      const processingTop = new Promise<void>((resolve, reject) => [
+-        (parentProcessor = async (job: Job) => {
+-          try {
+-            const { processed } = await job.getDependencies();
+-            expect(Object.keys(processed)).to.have.length(1);
+-
+-            const childrenValues = await job.getChildrenValues();
+-
+-            const jobKey = queue.toKey(tree.children[0].job.id);
+-            expect(childrenValues[jobKey]).to.be.deep.equal(values[0]);
+-            expect(processed[jobKey]).to.be.deep.equal(values[0]);
+-
+-            resolve();
+-          } catch (err) {
+-            console.error(err);
+-            reject(err);
+-          }
+-        }),
+-      ]);
+-
+-      const parentWorker = new Worker(topQueueName, parentProcessor, {
+-        connection,
+-      });
+-
+-      const flow = new FlowProducer({ connection });
+-      const tree = await flow.add({
+-        name: 'root-job',
+-        queueName: topQueueName,
+-        data: {},
+-        children: [
+-          {
+-            name,
+-            data: { idx: 0, foo: 'bar' },
+-            queueName,
+-          },
+-        ],
+-        opts: {
+-          delay: 3000,
+-        },
+-      });
+-
+-      expect(tree).to.have.property('job');
+-      expect(tree).to.have.property('children');
+-
+-      const { children, job } = tree;
+-      const isWaitingChildren = await job.isWaitingChildren();
+-
+-      expect(isWaitingChildren).to.be.true;
+-      expect(children).to.have.length(1);
+-
+-      expect(children[0].job.id).to.be.ok;
+-      expect(children[0].job.data.foo).to.be.eql('bar');
+-
+-      await completed;
+-      await childrenWorker.close();
+-
+-      const isDelayed = await job.isDelayed();
+-
+-      expect(isDelayed).to.be.true;
+-      await processingTop;
+-      await parentWorker.close();
+-
+-      await flow.close();
+-
+-      await removeAllQueueData(new IORedis(), topQueueName);
+-    });
+-  });
+-
+   it('should not process parent if child fails', async () => {
+     const name = 'child-job';
+ 

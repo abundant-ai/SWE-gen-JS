@@ -1,0 +1,357 @@
+diff --git a/index.d.ts b/index.d.ts
+index 54f2a1a..210299a 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -39,7 +39,7 @@ declare namespace execa {
+ 		readonly localDir?: string;
+ 
+ 		/**
+-		Buffer the output from the spawned process. When set to `false`, you must read the output of `stdout` and `stderr` (or `all` if the `all` option is `true`). Otherwise the returned promise will not be resolved/rejected.
++		Buffer the output from the spawned process. When buffering is disabled you must consume the output of the `stdout` and `stderr` streams because the promise will not be resolved/rejected until they have completed.
+ 
+ 		If the spawned process fails, `error.stdout`, `error.stderr`, and `error.all` will contain the buffered data.
+ 
+@@ -75,13 +75,6 @@ declare namespace execa {
+ 		*/
+ 		readonly reject?: boolean;
+ 
+-		/**
+-		Add an `.all` property on the promise and the resolved value. The property contains the output of the process with `stdout` and `stderr` interleaved.
+-
+-		@default false
+-		*/
+-		readonly all?: boolean;
+-
+ 		/**
+ 		Strip the final [newline character](https://en.wikipedia.org/wiki/Newline) from the output.
+ 
+@@ -272,12 +265,8 @@ declare namespace execa {
+ 		extends ExecaSyncReturnValue<StdoutErrorType> {
+ 		/**
+ 		The output of the process with `stdout` and `stderr` interleaved.
+-
+-		This is `undefined` if either:
+-		- the `all` option is `false` (default value)
+-		- `execa.sync()` was used
+ 		*/
+-		all?: StdoutErrorType;
++		all: StdoutErrorType;
+ 
+ 		/**
+ 		Whether the process was canceled.
+@@ -298,12 +287,8 @@ declare namespace execa {
+ 		extends ExecaSyncError<StdoutErrorType> {
+ 		/**
+ 		The output of the process with `stdout` and `stderr` interleaved.
+-
+-		This is `undefined` if either:
+-		- the `all` option is `false` (default value)
+-		- `execa.sync()` was used
+ 		*/
+-		all?: StdoutErrorType;
++		all: StdoutErrorType;
+ 
+ 		/**
+ 		Whether the process was canceled.
+@@ -340,9 +325,7 @@ declare namespace execa {
+ 		/**
+ 		Stream combining/interleaving [`stdout`](https://nodejs.org/api/child_process.html#child_process_subprocess_stdout) and [`stderr`](https://nodejs.org/api/child_process.html#child_process_subprocess_stderr).
+ 
+-		This is `undefined` if either:
+-			- the `all` option is `false` (the default value)
+-			- both `stdout` and `stderr` options are set to [`'inherit'`, `'ipc'`, `Stream` or `integer`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio)
++		This is `undefined` when both `stdout` and `stderr` options are set to [`'pipe'`, `'ipc'`, `Stream` or `integer`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 		*/
+ 		all?: ReadableStream;
+ 	}
+diff --git a/index.js b/index.js
+index 70466bb..8b9df5f 100644
+--- a/index.js
++++ b/index.js
+@@ -40,7 +40,6 @@ const handleArgs = (file, args, options = {}) => {
+ 		encoding: 'utf8',
+ 		reject: true,
+ 		cleanup: true,
+-		all: false,
+ 		...options,
+ 		windowsHide: true
+ 	};
+@@ -151,7 +150,7 @@ const execa = (file, args, options) => {
+ 
+ 	handleInput(spawned, parsed.options.input);
+ 
+-	spawned.all = makeAllStream(spawned, parsed.options);
++	spawned.all = makeAllStream(spawned);
+ 
+ 	return mergePromise(spawned, handlePromiseOnce);
+ };
+diff --git a/index.test-d.ts b/index.test-d.ts
+index f1261b3..0b3347c 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -20,7 +20,7 @@ try {
+ 	expectType<string>(unicornsResult.exitCodeName);
+ 	expectType<string>(unicornsResult.stdout);
+ 	expectType<string>(unicornsResult.stderr);
+-	expectType<string | undefined>(unicornsResult.all);
++	expectType<string>(unicornsResult.all);
+ 	expectType<boolean>(unicornsResult.failed);
+ 	expectType<boolean>(unicornsResult.timedOut);
+ 	expectType<boolean>(unicornsResult.isCanceled);
+@@ -34,7 +34,7 @@ try {
+ 	expectType<string>(execaError.exitCodeName);
+ 	expectType<string>(execaError.stdout);
+ 	expectType<string>(execaError.stderr);
+-	expectType<string | undefined>(execaError.all);
++	expectType<string>(execaError.all);
+ 	expectType<boolean>(execaError.failed);
+ 	expectType<boolean>(execaError.timedOut);
+ 	expectType<boolean>(execaError.isCanceled);
+@@ -99,7 +99,6 @@ execa('unicorns', {stderr: 'inherit'});
+ execa('unicorns', {stderr: process.stderr});
+ execa('unicorns', {stderr: 1});
+ execa('unicorns', {stderr: undefined});
+-execa('unicorns', {all: true});
+ execa('unicorns', {reject: false});
+ execa('unicorns', {stripFinalNewline: false});
+ execa('unicorns', {extendEnv: false});
+diff --git a/lib/stream.js b/lib/stream.js
+index 2a87068..827a73f 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -19,8 +19,8 @@ const handleInput = (spawned, input) => {
+ };
+ 
+ // `all` interleaves `stdout` and `stderr`
+-const makeAllStream = (spawned, {all}) => {
+-	if (!all || (!spawned.stdout && !spawned.stderr)) {
++const makeAllStream = spawned => {
++	if (!spawned.stdout && !spawned.stderr) {
+ 		return;
+ 	}
+ 
+@@ -53,10 +53,19 @@ const getBufferedData = async (stream, streamPromise) => {
+ };
+ 
+ const getStreamPromise = (stream, {encoding, buffer, maxBuffer}) => {
+-	if (!stream || !buffer) {
++	if (!stream) {
+ 		return;
+ 	}
+ 
++	if (!buffer) {
++		// TODO: Use `ret = util.promisify(stream.finished)(stream);` when targeting Node.js 10
++		return new Promise((resolve, reject) => {
++			stream
++				.once('end', resolve)
++				.once('error', reject);
++		});
++	}
++
+ 	if (encoding) {
+ 		return getStream(stream, {encoding, maxBuffer});
+ 	}
+diff --git a/readme.md b/readme.md
+index fa0e85d..b5633f2 100644
+--- a/readme.md
++++ b/readme.md
+@@ -168,9 +168,7 @@ Type: `ReadableStream | undefined`
+ 
+ Stream combining/interleaving [`stdout`](https://nodejs.org/api/child_process.html#child_process_subprocess_stdout) and [`stderr`](https://nodejs.org/api/child_process.html#child_process_subprocess_stderr).
+ 
+-This is `undefined` if either:
+-  - the [`all` option](#all-2) is `false` (the default value)
+-  - both [`stdout`](#stdout-1) and [`stderr`](#stderr-1) options are set to [`'inherit'`, `'ipc'`, `Stream` or `integer`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio)
++This is `undefined` when both [`stdout`](#stdout-1) and [`stderr`](#stderr-1) options are set to [`'pipe'`, `'ipc'`, `Stream` or `integer`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+ ### execa.sync(file, [arguments], [options])
+ 
+@@ -239,13 +237,9 @@ The output of the process on stderr.
+ 
+ #### all
+ 
+-Type: `string | Buffer | undefined`
+-
+-The output of the process with `stdout` and `stderr` interleaved.
++Type: `string | Buffer`
+ 
+-This is `undefined` if either:
+-  - the [`all` option](#all-2) is `false` (the default value)
+-  - `execa.sync()` was used
++The output of the process on both stdout and stderr. `undefined` if `execa.sync()` was used.
+ 
+ #### failed
+ 
+@@ -310,7 +304,7 @@ Preferred path to find locally installed binaries in (use with `preferLocal`).
+ Type: `boolean`<br>
+ Default: `true`
+ 
+-Buffer the output from the spawned process. When set to `false`, you must read the output of [`stdout`](#stdout-1) and [`stderr`](#stderr-1) (or [`all`](#all) if the [`all`](#all-2) option is `true`). Otherwise the returned promise will not be resolved/rejected.
++Buffer the output from the spawned process. When buffering is disabled you must consume the output of the `stdout` and `stderr` streams because the promise will not be resolved/rejected until they have completed.
+ 
+ If the spawned process fails, [`error.stdout`](#stdout), [`error.stderr`](#stderr), and [`error.all`](#all) will contain the buffered data.
+ 
+@@ -342,13 +336,6 @@ Default: `pipe`
+ 
+ Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+-#### all
+-
+-Type: `boolean`<br>
+-Default: `false`
+-
+-Add an `.all` property on the [promise](#all) and the [resolved value](#all-1). The property contains the output of the process with `stdout` and `stderr` interleaved.
+-
+ #### reject
+ 
+ Type: `boolean`<br>
+diff --git a/test/error.js b/test/error.js
+index a009b04..cb2caee 100644
+--- a/test/error.js
++++ b/test/error.js
+@@ -10,7 +10,7 @@ const TIMEOUT_REGEXP = /timed out after/;
+ const getExitRegExp = exitMessage => new RegExp(`failed with exit code ${exitMessage}`);
+ 
+ test('stdout/stderr/all available on errors', async t => {
+-	const {stdout, stderr, all} = await t.throwsAsync(execa('exit', ['2'], {all: true}), {message: getExitRegExp('2')});
++	const {stdout, stderr, all} = await t.throwsAsync(execa('exit', ['2']), {message: getExitRegExp('2')});
+ 	t.is(typeof stdout, 'string');
+ 	t.is(typeof stderr, 'string');
+ 	t.is(typeof all, 'string');
+@@ -21,7 +21,7 @@ const WRONG_COMMAND = process.platform === 'win32' ?
+ 	'';
+ 
+ test('stdout/stderr/all on process errors', async t => {
+-	const {stdout, stderr, all} = await t.throwsAsync(execa('wrong command', {all: true}));
++	const {stdout, stderr, all} = await t.throwsAsync(execa('wrong command'));
+ 	t.is(stdout, '');
+ 	t.is(stderr, WRONG_COMMAND);
+ 	t.is(all, WRONG_COMMAND);
+diff --git a/test/fixtures/max-buffer b/test/fixtures/max-buffer
+index d1cfea9..7385a83 100755
+--- a/test/fixtures/max-buffer
++++ b/test/fixtures/max-buffer
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env node
+ 'use strict';
+-const output = process.argv[2] || 'stdout';
+-const bytes = Number(process.argv[3] || 1e7);
++const output = process.argv[2];
++const bytes = Number(process.argv[3]);
+ 
+ process[output].write('.'.repeat(bytes - 1) + '\n');
+diff --git a/test/stream.js b/test/stream.js
+index fc388ad..6cbab5e 100644
+--- a/test/stream.js
++++ b/test/stream.js
+@@ -27,24 +27,19 @@ test('pass `stderr` to a file descriptor', async t => {
+ });
+ 
+ test.serial('result.all shows both `stdout` and `stderr` intermixed', async t => {
+-	const {all} = await execa('noop-132', {all: true});
++	const {all} = await execa('noop-132');
+ 	t.is(all, '132');
+ });
+ 
+-test('result.all is undefined unless opts.all is true', async t => {
+-	const {all} = await execa('noop');
+-	t.is(all, undefined);
+-});
+-
+ test('stdout/stderr/all are undefined if ignored', async t => {
+-	const {stdout, stderr, all} = await execa('noop', {stdio: 'ignore', all: true});
++	const {stdout, stderr, all} = await execa('noop', {stdio: 'ignore'});
+ 	t.is(stdout, undefined);
+ 	t.is(stderr, undefined);
+ 	t.is(all, undefined);
+ });
+ 
+ test('stdout/stderr/all are undefined if ignored in sync mode', t => {
+-	const {stdout, stderr, all} = execa.sync('noop', {stdio: 'ignore', all: true});
++	const {stdout, stderr, all} = execa.sync('noop', {stdio: 'ignore'});
+ 	t.is(stdout, undefined);
+ 	t.is(stderr, undefined);
+ 	t.is(all, undefined);
+@@ -103,14 +98,14 @@ test('helpful error trying to provide an input stream in sync mode', t => {
+ 
+ test('maxBuffer affects stdout', async t => {
+ 	await t.notThrowsAsync(execa('max-buffer', ['stdout', '10'], {maxBuffer: 10}));
+-	const {stdout, all} = await t.throwsAsync(execa('max-buffer', ['stdout', '11'], {maxBuffer: 10, all: true}), /max-buffer stdout/);
++	const {stdout, all} = await t.throwsAsync(execa('max-buffer', ['stdout', '11'], {maxBuffer: 10}), /max-buffer stdout/);
+ 	t.is(stdout, '.'.repeat(10));
+ 	t.is(all, '.'.repeat(10));
+ });
+ 
+ test('maxBuffer affects stderr', async t => {
+ 	await t.notThrowsAsync(execa('max-buffer', ['stderr', '10'], {maxBuffer: 10}));
+-	const {stderr, all} = await t.throwsAsync(execa('max-buffer', ['stderr', '11'], {maxBuffer: 10, all: true}), /max-buffer stderr/);
++	const {stderr, all} = await t.throwsAsync(execa('max-buffer', ['stderr', '11'], {maxBuffer: 10}), /max-buffer stderr/);
+ 	t.is(stderr, '.'.repeat(10));
+ 	t.is(all, '.'.repeat(10));
+ });
+@@ -119,7 +114,8 @@ test('do not buffer stdout when `buffer` set to `false`', async t => {
+ 	const promise = execa('max-buffer', ['stdout', '10'], {buffer: false});
+ 	const [result, stdout] = await Promise.all([
+ 		promise,
+-		getStream(promise.stdout)
++		getStream(promise.stdout),
++		getStream(promise.all)
+ 	]);
+ 
+ 	t.is(result.stdout, undefined);
+@@ -130,7 +126,8 @@ test('do not buffer stderr when `buffer` set to `false`', async t => {
+ 	const promise = execa('max-buffer', ['stderr', '10'], {buffer: false});
+ 	const [result, stderr] = await Promise.all([
+ 		promise,
+-		getStream(promise.stderr)
++		getStream(promise.stderr),
++		getStream(promise.all)
+ 	]);
+ 
+ 	t.is(result.stderr, undefined);
+@@ -142,45 +139,3 @@ test('do not buffer when streaming', async t => {
+ 	const result = await getStream(stdout);
+ 	t.is(result, '....................\n');
+ });
+-
+-test('buffer: false > promise resolves', async t => {
+-	await t.notThrowsAsync(execa('noop', {buffer: false}));
+-});
+-
+-test('buffer: false > promise resolves when output is big but is not pipable', async t => {
+-	await t.notThrowsAsync(execa('max-buffer', {buffer: false, stdout: 'ignore'}));
+-});
+-
+-test('buffer: false > promise resolves when output is big and is read', async t => {
+-	const cp = execa('max-buffer', {buffer: false});
+-	cp.stdout.resume();
+-	cp.stderr.resume();
+-	await t.notThrowsAsync(cp);
+-});
+-
+-test('buffer: false > promise resolves when output is big and "all" is used and is read', async t => {
+-	const cp = execa('max-buffer', {buffer: false, all: true});
+-	cp.all.resume();
+-	await t.notThrowsAsync(cp);
+-});
+-
+-test('buffer: false > promise rejects when process returns non-zero', async t => {
+-	const cp = execa('fail', {buffer: false});
+-	const {exitCode} = await t.throwsAsync(cp);
+-	t.is(exitCode, 2);
+-});
+-
+-const BUFFER_TIMEOUT = 1e3;
+-
+-test.serial('buffer: false > promise does not resolve when output is big and is not read', async t => {
+-	const {timedOut} = await t.throwsAsync(execa('max-buffer', {buffer: false, timeout: BUFFER_TIMEOUT}));
+-	t.true(timedOut);
+-});
+-
+-test.serial('buffer: false > promise does not resolve when output is big and "all" is used but not read', async t => {
+-	const cp = execa('max-buffer', {buffer: false, all: true, timeout: BUFFER_TIMEOUT});
+-	cp.stdout.resume();
+-	cp.stderr.resume();
+-	const {timedOut} = await t.throwsAsync(cp);
+-	t.true(timedOut);
+-});

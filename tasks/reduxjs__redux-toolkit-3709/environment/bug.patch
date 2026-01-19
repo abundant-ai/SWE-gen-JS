@@ -1,0 +1,1289 @@
+diff --git a/packages/toolkit/src/query/core/buildInitiate.ts b/packages/toolkit/src/query/core/buildInitiate.ts
+index 1b3a1e0a..2811f426 100644
+--- a/packages/toolkit/src/query/core/buildInitiate.ts
++++ b/packages/toolkit/src/query/core/buildInitiate.ts
+@@ -20,7 +20,6 @@ import type { BaseQueryError, QueryReturnValue } from '../baseQueryTypes'
+ import type { QueryResultSelectorResult } from './buildSelectors'
+ import type { Dispatch } from 'redux'
+ import { isNotNullish } from '../utils/isNotNullish'
+-import { countObjectKeys } from '../utils/countObjectKeys'
+ 
+ declare module './module' {
+   export interface ApiEndpointQuery<
+@@ -266,18 +265,19 @@ export function buildInitiate({
+   function middlewareWarning(dispatch: Dispatch) {
+     if (process.env.NODE_ENV !== 'production') {
+       if ((middlewareWarning as any).triggered) return
+-      const returnedValue = dispatch(
+-        api.internalActions.internal_getRTKQSubscriptions()
++      const registered:
++        | ReturnType<typeof api.internalActions.internal_probeSubscription>
++        | boolean = dispatch(
++        api.internalActions.internal_probeSubscription({
++          queryCacheKey: 'DOES_NOT_EXIST',
++          requestId: 'DUMMY_REQUEST_ID',
++        })
+       )
+ 
+       ;(middlewareWarning as any).triggered = true
+ 
+-      // The RTKQ middleware should return the internal state object,
+-      // but it should _not_ be the action object.
+-      if (
+-        typeof returnedValue !== 'object' ||
+-        typeof returnedValue?.type === 'string'
+-      ) {
++      // The RTKQ middleware _should_ always return a boolean for `probeSubscription`
++      if (typeof registered !== 'boolean') {
+         // Otherwise, must not have been added
+         throw new Error(
+           `Warning: Middleware for RTK-Query API at reducerPath "${api.reducerPath}" has not been added to the store.
+@@ -395,7 +395,7 @@ You must add the middleware for RTK-Query to function correctly!`
+ 
+           statePromise.then(() => {
+             delete running[queryCacheKey]
+-            if (!countObjectKeys(running)) {
++            if (!Object.keys(running).length) {
+               runningQueries.delete(dispatch)
+             }
+           })
+@@ -443,7 +443,7 @@ You must add the middleware for RTK-Query to function correctly!`
+         running[requestId] = ret
+         ret.then(() => {
+           delete running[requestId]
+-          if (!countObjectKeys(running)) {
++          if (!Object.keys(running).length) {
+             runningMutations.delete(dispatch)
+           }
+         })
+@@ -452,7 +452,7 @@ You must add the middleware for RTK-Query to function correctly!`
+           ret.then(() => {
+             if (running[fixedCacheKey] === ret) {
+               delete running[fixedCacheKey]
+-              if (!countObjectKeys(running)) {
++              if (!Object.keys(running).length) {
+                 runningMutations.delete(dispatch)
+               }
+             }
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts b/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
+index f941bcd5..0bd2a735 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
+@@ -1,18 +1,17 @@
+-import type { InternalHandlerBuilder, SubscriptionSelectors } from './types'
++import type { InternalHandlerBuilder } from './types'
+ import type { SubscriptionState } from '../apiState'
+ import { produceWithPatches } from 'immer'
+ import type { Action } from '@reduxjs/toolkit'
+-import { countObjectKeys } from '../../utils/countObjectKeys'
+ 
+ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+-  [actionShouldContinue: boolean, returnValue: SubscriptionSelectors | boolean]
++  [actionShouldContinue: boolean, subscriptionExists: boolean]
+ > = ({ api, queryThunk, internalState }) => {
+   const subscriptionsPrefix = `${api.reducerPath}/subscriptions`
+ 
+   let previousSubscriptions: SubscriptionState =
+     null as unknown as SubscriptionState
+ 
+-  let updateSyncTimer: ReturnType<typeof window.setTimeout> | null = null
++  let dispatchQueued = false
+ 
+   const { updateSubscriptionOptions, unsubscribeQueryResult } =
+     api.internalActions
+@@ -46,23 +45,13 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+       const {
+         meta: { arg, requestId },
+       } = action
+-      const substate = (mutableState[arg.queryCacheKey] ??= {})
+-      substate[`${requestId}_running`] = {}
+       if (arg.subscribe) {
++        const substate = (mutableState[arg.queryCacheKey] ??= {})
+         substate[requestId] =
+           arg.subscriptionOptions ?? substate[requestId] ?? {}
++
++        return true
+       }
+-      return true
+-    }
+-    let mutated = false
+-    if (
+-      queryThunk.fulfilled.match(action) ||
+-      queryThunk.rejected.match(action)
+-    ) {
+-      const state = mutableState[action.meta.arg.queryCacheKey] || {}
+-      const key = `${action.meta.requestId}_running`
+-      mutated ||= !!state[key]
+-      delete state[key]
+     }
+     if (queryThunk.rejected.match(action)) {
+       const {
+@@ -73,37 +62,17 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+         substate[requestId] =
+           arg.subscriptionOptions ?? substate[requestId] ?? {}
+ 
+-        mutated = true
++        return true
+       }
+     }
+ 
+-    return mutated
+-  }
+-
+-  const getSubscriptions = () => internalState.currentSubscriptions
+-  const getSubscriptionCount = (queryCacheKey: string) => {
+-    const subscriptions = getSubscriptions()
+-    const subscriptionsForQueryArg = subscriptions[queryCacheKey] ?? {}
+-    return countObjectKeys(subscriptionsForQueryArg)
+-  }
+-  const isRequestSubscribed = (queryCacheKey: string, requestId: string) => {
+-    const subscriptions = getSubscriptions()
+-    return !!subscriptions?.[queryCacheKey]?.[requestId]
+-  }
+-
+-  const subscriptionSelectors: SubscriptionSelectors = {
+-    getSubscriptions,
+-    getSubscriptionCount,
+-    isRequestSubscribed,
++    return false
+   }
+ 
+   return (
+     action,
+     mwApi
+-  ): [
+-    actionShouldContinue: boolean,
+-    result: SubscriptionSelectors | boolean
+-  ] => {
++  ): [actionShouldContinue: boolean, hasSubscription: boolean] => {
+     if (!previousSubscriptions) {
+       // Initialize it the first time this handler runs
+       previousSubscriptions = JSON.parse(
+@@ -113,16 +82,16 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+ 
+     if (api.util.resetApiState.match(action)) {
+       previousSubscriptions = internalState.currentSubscriptions = {}
+-      updateSyncTimer = null
+       return [true, false]
+     }
+ 
+     // Intercept requests by hooks to see if they're subscribed
+-    // We return the internal state reference so that hooks
+-    // can do their own checks to see if they're still active.
+-    // It's stupid and hacky, but it does cut down on some dispatch calls.
+-    if (api.internalActions.internal_getRTKQSubscriptions.match(action)) {
+-      return [false, subscriptionSelectors]
++    // Necessary because we delay updating store state to the end of the tick
++    if (api.internalActions.internal_probeSubscription.match(action)) {
++      const { queryCacheKey, requestId } = action.payload
++      const hasSubscription =
++        !!internalState.currentSubscriptions[queryCacheKey]?.[requestId]
++      return [false, hasSubscription]
+     }
+ 
+     // Update subscription data based on this action
+@@ -131,16 +100,9 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+       action
+     )
+ 
+-    let actionShouldContinue = true
+-
+     if (didMutate) {
+-      if (!updateSyncTimer) {
+-        // We only use the subscription state for the Redux DevTools at this point,
+-        // as the real data is kept here in the middleware.
+-        // Given that, we can throttle synchronizing this state significantly to
+-        // save on overall perf.
+-        // In 1.9, it was updated in a microtask, but now we do it at most every 500ms.
+-        updateSyncTimer = setTimeout(() => {
++      if (!dispatchQueued) {
++        queueMicrotask(() => {
+           // Deep clone the current subscription data
+           const newSubscriptions: SubscriptionState = JSON.parse(
+             JSON.stringify(internalState.currentSubscriptions)
+@@ -155,23 +117,25 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+           mwApi.next(api.internalActions.subscriptionsUpdated(patches))
+           // Save the cloned state for later reference
+           previousSubscriptions = newSubscriptions
+-          updateSyncTimer = null
+-        }, 500)
++          dispatchQueued = false
++        })
++        dispatchQueued = true
+       }
+ 
+       const isSubscriptionSliceAction =
+         typeof action.type == 'string' &&
+         !!action.type.startsWith(subscriptionsPrefix)
+-
+       const isAdditionalSubscriptionAction =
+         queryThunk.rejected.match(action) &&
+         action.meta.condition &&
+         !!action.meta.arg.subscribe
+ 
+-      actionShouldContinue =
++      const actionShouldContinue =
+         !isSubscriptionSliceAction && !isAdditionalSubscriptionAction
++
++      return [actionShouldContinue, false]
+     }
+ 
+-    return [actionShouldContinue, false]
++    return [true, false]
+   }
+ }
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/index.ts b/packages/toolkit/src/query/core/buildMiddleware/index.ts
+index eecd189e..aa58617d 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/index.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/index.ts
+@@ -71,7 +71,6 @@ export function buildMiddleware<
+       >),
+       internalState,
+       refetchQuery,
+-      isThisApiSliceAction,
+     }
+ 
+     const handlers = handlerBuilders.map((build) => build(builderArgs))
+@@ -94,15 +93,18 @@ export function buildMiddleware<
+ 
+         const stateBefore = mwApi.getState()
+ 
+-        const [actionShouldContinue, internalProbeResult] =
+-          batchedActionsHandler(action, mwApiWithNext, stateBefore)
++        const [actionShouldContinue, hasSubscription] = batchedActionsHandler(
++          action,
++          mwApiWithNext,
++          stateBefore
++        )
+ 
+         let res: any
+ 
+         if (actionShouldContinue) {
+           res = next(action)
+         } else {
+-          res = internalProbeResult
++          res = hasSubscription
+         }
+ 
+         if (!!mwApi.getState()[reducerPath]) {
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts b/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
+index e92c692d..181e50f5 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
+@@ -9,9 +9,7 @@ import type {
+   SubMiddlewareApi,
+   InternalHandlerBuilder,
+   ApiMiddlewareInternalHandler,
+-  InternalMiddlewareState,
+ } from './types'
+-import { countObjectKeys } from '../../utils/countObjectKeys'
+ 
+ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+   reducerPath,
+@@ -21,7 +19,6 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+   api,
+   assertTagType,
+   refetchQuery,
+-  internalState,
+ }) => {
+   const { removeQueryResult } = api.internalActions
+   const isThunkActionWithTags = isAnyOf(
+@@ -38,8 +35,7 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+           endpointDefinitions,
+           assertTagType
+         ),
+-        mwApi,
+-        internalState
++        mwApi
+       )
+     }
+ 
+@@ -53,19 +49,16 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+           undefined,
+           assertTagType
+         ),
+-        mwApi,
+-        internalState
++        mwApi
+       )
+     }
+   }
+ 
+   function invalidateTags(
+     tags: readonly FullTagDescription<string>[],
+-    mwApi: SubMiddlewareApi,
+-    internalState: InternalMiddlewareState
++    mwApi: SubMiddlewareApi
+   ) {
+     const rootState = mwApi.getState()
+-
+     const state = rootState[reducerPath]
+ 
+     const toInvalidate = api.util.selectInvalidatedBy(rootState, tags)
+@@ -74,11 +67,10 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+       const valuesArray = Array.from(toInvalidate.values())
+       for (const { queryCacheKey } of valuesArray) {
+         const querySubState = state.queries[queryCacheKey]
+-        const subscriptionSubState =
+-          internalState.currentSubscriptions[queryCacheKey] ?? {}
++        const subscriptionSubState = state.subscriptions[queryCacheKey] ?? {}
+ 
+         if (querySubState) {
+-          if (countObjectKeys(subscriptionSubState) === 0) {
++          if (Object.keys(subscriptionSubState).length === 0) {
+             mwApi.dispatch(
+               removeQueryResult({
+                 queryCacheKey: queryCacheKey as QueryCacheKey,
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/types.ts b/packages/toolkit/src/query/core/buildMiddleware/types.ts
+index 2e41e095..c7e4e52e 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/types.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/types.ts
+@@ -32,12 +32,6 @@ export interface InternalMiddlewareState {
+   currentSubscriptions: SubscriptionState
+ }
+ 
+-export interface SubscriptionSelectors {
+-  getSubscriptions: () => SubscriptionState
+-  getSubscriptionCount: (queryCacheKey: string) => number
+-  isRequestSubscribed: (queryCacheKey: string, requestId: string) => boolean
+-}
+-
+ export interface BuildMiddlewareInput<
+   Definitions extends EndpointDefinitions,
+   ReducerPath extends string,
+@@ -67,7 +61,6 @@ export interface BuildSubMiddlewareInput
+     queryCacheKey: string,
+     override?: Partial<QueryThunkArg>
+   ): AsyncThunkAction<ThunkResult, QueryThunkArg, {}>
+-  isThisApiSliceAction: (action: Action) => boolean
+ }
+ 
+ export type SubMiddlewareBuilder = (
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/windowEventHandling.ts b/packages/toolkit/src/query/core/buildMiddleware/windowEventHandling.ts
+index 409bc56e..4caa97c7 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/windowEventHandling.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/windowEventHandling.ts
+@@ -6,7 +6,6 @@ import type {
+   InternalHandlerBuilder,
+   SubMiddlewareApi,
+ } from './types'
+-import { countObjectKeys } from '../../utils/countObjectKeys'
+ 
+ export const buildWindowEventHandler: InternalHandlerBuilder = ({
+   reducerPath,
+@@ -51,7 +50,7 @@ export const buildWindowEventHandler: InternalHandlerBuilder = ({
+             state.config[type])
+ 
+         if (shouldRefetch) {
+-          if (countObjectKeys(subscriptionSubState) === 0) {
++          if (Object.keys(subscriptionSubState).length === 0) {
+             api.dispatch(
+               removeQueryResult({
+                 queryCacheKey: queryCacheKey as QueryCacheKey,
+diff --git a/packages/toolkit/src/query/core/buildSlice.ts b/packages/toolkit/src/query/core/buildSlice.ts
+index bb712281..dc107999 100644
+--- a/packages/toolkit/src/query/core/buildSlice.ts
++++ b/packages/toolkit/src/query/core/buildSlice.ts
+@@ -1,4 +1,4 @@
+-import type { Action, PayloadAction, UnknownAction } from '@reduxjs/toolkit'
++import type { PayloadAction, UnknownAction } from '@reduxjs/toolkit'
+ import {
+   combineReducers,
+   createAction,
+@@ -147,9 +147,12 @@ export function buildSlice({
+       builder
+         .addCase(queryThunk.pending, (draft, { meta, meta: { arg } }) => {
+           const upserting = isUpsertQuery(arg)
+-          draft[arg.queryCacheKey] ??= {
+-            status: QueryStatus.uninitialized,
+-            endpointName: arg.endpointName,
++          if (arg.subscribe || upserting) {
++            // only initialize substate if we want to subscribe to it
++            draft[arg.queryCacheKey] ??= {
++              status: QueryStatus.uninitialized,
++              endpointName: arg.endpointName,
++            }
+           }
+ 
+           updateQuerySubstateIfExists(draft, arg.queryCacheKey, (substate) => {
+@@ -443,7 +446,12 @@ export function buildSlice({
+       ) {
+         // Dummy
+       },
+-      internal_getRTKQSubscriptions() {},
++      internal_probeSubscription(
++        d,
++        a: PayloadAction<{ queryCacheKey: string; requestId: string }>
++      ) {
++        // dummy
++      },
+     },
+   })
+ 
+diff --git a/packages/toolkit/src/query/react/buildHooks.ts b/packages/toolkit/src/query/react/buildHooks.ts
+index ba86d843..4ab1f9db 100644
+--- a/packages/toolkit/src/query/react/buildHooks.ts
++++ b/packages/toolkit/src/query/react/buildHooks.ts
+@@ -53,10 +53,6 @@ import { UNINITIALIZED_VALUE } from './constants'
+ import { useShallowStableValue } from './useShallowStableValue'
+ import type { BaseQueryFn } from '../baseQueryTypes'
+ import { defaultSerializeQueryArgs } from '../defaultSerializeQueryArgs'
+-import {
+-  InternalMiddlewareState,
+-  SubscriptionSelectors,
+-} from '../core/buildMiddleware/types'
+ 
+ // Copy-pasted from React-Redux
+ export const useIsomorphicLayoutEffect =
+@@ -685,27 +681,6 @@ export function buildHooks<Definitions extends EndpointDefinitions>({
+         Definitions
+       >
+       const dispatch = useDispatch<ThunkDispatch<any, any, UnknownAction>>()
+-      const subscriptionSelectorsRef = useRef<SubscriptionSelectors>()
+-      if (!subscriptionSelectorsRef.current) {
+-        const returnedValue = dispatch(
+-          api.internalActions.internal_getRTKQSubscriptions()
+-        )
+-
+-        if (process.env.NODE_ENV !== 'production') {
+-          if (
+-            typeof returnedValue !== 'object' ||
+-            typeof returnedValue?.type === 'string'
+-          ) {
+-            throw new Error(
+-              `Warning: Middleware for RTK-Query API at reducerPath "${api.reducerPath}" has not been added to the store.
+-    You must add the middleware for RTK-Query to function correctly!`
+-            )
+-          }
+-        }
+-
+-        subscriptionSelectorsRef.current =
+-          returnedValue as unknown as SubscriptionSelectors
+-      }
+       const stableArg = useStableQueryArgs(
+         skip ? skipToken : arg,
+         // Even if the user provided a per-endpoint `serializeQueryArgs` with
+@@ -729,15 +704,28 @@ export function buildHooks<Definitions extends EndpointDefinitions>({
+ 
+       let { queryCacheKey, requestId } = promiseRef.current || {}
+ 
+-      // HACK We've saved the middleware subscription lookup callbacks into a ref,
+-      // so we can directly check here if the subscription exists for this query.
++      // HACK Because the latest state is in the middleware, we actually
++      // dispatch an action that will be intercepted and returned.
+       let currentRenderHasSubscription = false
+       if (queryCacheKey && requestId) {
+-        currentRenderHasSubscription =
+-          subscriptionSelectorsRef.current.isRequestSubscribed(
++        // This _should_ return a boolean, even if the types don't line up
++        const returnedValue = dispatch(
++          api.internalActions.internal_probeSubscription({
+             queryCacheKey,
+-            requestId
+-          )
++            requestId,
++          })
++        )
++
++        if (process.env.NODE_ENV !== 'production') {
++          if (typeof returnedValue !== 'boolean') {
++            throw new Error(
++              `Warning: Middleware for RTK-Query API at reducerPath "${api.reducerPath}" has not been added to the store.
++    You must add the middleware for RTK-Query to function correctly!`
++            )
++          }
++        }
++
++        currentRenderHasSubscription = !!returnedValue
+       }
+ 
+       const subscriptionRemoved =
+diff --git a/packages/toolkit/src/query/react/module.ts b/packages/toolkit/src/query/react/module.ts
+index 3ff9a021..c5d42619 100644
+--- a/packages/toolkit/src/query/react/module.ts
++++ b/packages/toolkit/src/query/react/module.ts
+@@ -22,7 +22,6 @@ import {
+ } from 'react-redux'
+ import type { QueryKeys } from '../core/apiState'
+ import type { PrefetchOptions } from '../core/module'
+-import { countObjectKeys } from '../utils/countObjectKeys'
+ 
+ export const reactHooksModuleName = /* @__PURE__ */ Symbol()
+ export type ReactHooksModule = typeof reactHooksModuleName
+@@ -148,7 +147,7 @@ export const reactHooksModule = ({
+     let warned = false
+     for (const hookName of hookNames) {
+       // warn for old hook options
+-      if (countObjectKeys(rest) > 0) {
++      if (Object.keys(rest).length > 0) {
+         if ((rest as Partial<typeof hooks>)[hookName]) {
+           if (!warned) {
+             console.warn(
+diff --git a/packages/toolkit/src/query/tests/buildHooks.test.tsx b/packages/toolkit/src/query/tests/buildHooks.test.tsx
+index d10d1565..39f93d14 100644
+--- a/packages/toolkit/src/query/tests/buildHooks.test.tsx
++++ b/packages/toolkit/src/query/tests/buildHooks.test.tsx
+@@ -37,8 +37,6 @@ import type { SubscriptionOptions } from '@reduxjs/toolkit/dist/query/core/apiSt
+ import type { SerializedError } from '@reduxjs/toolkit'
+ import { createListenerMiddleware, configureStore } from '@reduxjs/toolkit'
+ import { delay } from '../../utils'
+-import type { SubscriptionSelectors } from '../core/buildMiddleware/types'
+-import { countObjectKeys } from '../utils/countObjectKeys'
+ 
+ // Just setup a temporary in-memory counter for tests that `getIncrementedAmount`.
+ // This can be used to test how many renders happen due to data changes or
+@@ -140,9 +138,6 @@ const storeRef = setupApiStore(
+   }
+ )
+ 
+-let getSubscriptions: SubscriptionSelectors['getSubscriptions']
+-let getSubscriptionCount: SubscriptionSelectors['getSubscriptionCount']
+-
+ beforeEach(() => {
+   actions = []
+   listenerMiddleware.startListening({
+@@ -151,9 +146,6 @@ beforeEach(() => {
+       actions.push(action)
+     },
+   })
+-  ;({ getSubscriptions, getSubscriptionCount } = storeRef.store.dispatch(
+-    api.internalActions.internal_getRTKQSubscriptions()
+-  ) as unknown as SubscriptionSelectors)
+ })
+ 
+ afterEach(() => {
+@@ -746,13 +738,14 @@ describe('hooks tests', () => {
+         withoutTestLifecycles: true,
+       })
+ 
++      const getSubscriptions = () => storeRef.store.getState().api.subscriptions
++
+       const checkNumSubscriptions = (arg: string, count: number) => {
+         const subscriptions = getSubscriptions()
+         const cacheKeyEntry = subscriptions[arg]
+ 
+         if (cacheKeyEntry) {
+-          const subscriptionCount = Object.keys(cacheKeyEntry) //getSubscriptionCount(arg)
+-          expect(subscriptionCount).toBe(count)
++          expect(Object.values(cacheKeyEntry).length).toBe(count)
+         }
+       }
+ 
+@@ -1433,19 +1426,25 @@ describe('hooks tests', () => {
+ 
+       await screen.findByText(/isUninitialized/i)
+       expect(screen.queryByText('Yay')).toBeNull()
+-      expect(countObjectKeys(storeRef.store.getState().api.mutations)).toBe(0)
++      expect(Object.keys(storeRef.store.getState().api.mutations).length).toBe(
++        0
++      )
+ 
+       userEvent.click(screen.getByRole('button', { name: 'trigger' }))
+ 
+       await screen.findByText(/isSuccess/i)
+       expect(screen.queryByText('Yay')).not.toBeNull()
+-      expect(countObjectKeys(storeRef.store.getState().api.mutations)).toBe(1)
++      expect(Object.keys(storeRef.store.getState().api.mutations).length).toBe(
++        1
++      )
+ 
+       userEvent.click(screen.getByRole('button', { name: 'reset' }))
+ 
+       await screen.findByText(/isUninitialized/i)
+       expect(screen.queryByText('Yay')).toBeNull()
+-      expect(countObjectKeys(storeRef.store.getState().api.mutations)).toBe(0)
++      expect(Object.keys(storeRef.store.getState().api.mutations).length).toBe(
++        0
++      )
+     })
+   })
+ 
+@@ -1748,7 +1747,11 @@ describe('hooks tests', () => {
+       }),
+     })
+ 
+-    const storeRef = setupApiStore(api, { ...actionsReducer })
++    const storeRef = setupApiStore(api, {
++      actions(state: UnknownAction[] = [], action: UnknownAction) {
++        return [...state, action]
++      },
++    })
+     test('initially failed useQueries that provide an tag will refetch after a mutation invalidates it', async () => {
+       const checkSessionData = { name: 'matt' }
+       server.use(
+@@ -1815,6 +1818,7 @@ describe('hooks tests', () => {
+       expect(storeRef.store.getState().actions).toMatchSequence(
+         api.internalActions.middlewareRegistered.match,
+         checkSession.matchPending,
++        api.internalActions.subscriptionsUpdated.match,
+         checkSession.matchRejected,
+         login.matchPending,
+         login.matchFulfilled,
+@@ -2534,6 +2538,11 @@ describe('skip behaviour', () => {
+     isUninitialized: true,
+   }
+ 
++  function subscriptionCount(key: string) {
++    return Object.keys(storeRef.store.getState().api.subscriptions[key] || {})
++      .length
++  }
++
+   test('normal skip', async () => {
+     const { result, rerender } = renderHook(
+       ([arg, options]: Parameters<typeof api.endpoints.getUser.useQuery>) =>
+@@ -2546,14 +2555,14 @@ describe('skip behaviour', () => {
+ 
+     expect(result.current).toEqual(uninitialized)
+     await delay(1)
+-    expect(getSubscriptionCount('getUser(1)')).toBe(0)
++    expect(subscriptionCount('getUser(1)')).toBe(0)
+ 
+     await act(async () => {
+       rerender([1])
+     })
+     expect(result.current).toMatchObject({ status: QueryStatus.fulfilled })
+     await delay(1)
+-    expect(getSubscriptionCount('getUser(1)')).toBe(1)
++    expect(subscriptionCount('getUser(1)')).toBe(1)
+ 
+     await act(async () => {
+       rerender([1, { skip: true }])
+@@ -2564,7 +2573,7 @@ describe('skip behaviour', () => {
+       data: { name: 'Timmy' },
+     })
+     await delay(1)
+-    expect(getSubscriptionCount('getUser(1)')).toBe(0)
++    expect(subscriptionCount('getUser(1)')).toBe(0)
+   })
+ 
+   test('skipToken', async () => {
+@@ -2580,17 +2589,17 @@ describe('skip behaviour', () => {
+     expect(result.current).toEqual(uninitialized)
+     await delay(1)
+ 
+-    expect(getSubscriptionCount('getUser(1)')).toBe(0)
++    expect(subscriptionCount('getUser(1)')).toBe(0)
+     // also no subscription on `getUser(skipToken)` or similar:
+-    expect(getSubscriptions()).toEqual({})
++    expect(storeRef.store.getState().api.subscriptions).toEqual({})
+ 
+     await act(async () => {
+       rerender([1])
+     })
+     expect(result.current).toMatchObject({ status: QueryStatus.fulfilled })
+     await delay(1)
+-    expect(getSubscriptionCount('getUser(1)')).toBe(1)
+-    expect(getSubscriptions()).not.toEqual({})
++    expect(subscriptionCount('getUser(1)')).toBe(1)
++    expect(storeRef.store.getState().api.subscriptions).not.toEqual({})
+ 
+     await act(async () => {
+       rerender([skipToken])
+@@ -2601,7 +2610,7 @@ describe('skip behaviour', () => {
+       data: { name: 'Timmy' },
+     })
+     await delay(1)
+-    expect(getSubscriptionCount('getUser(1)')).toBe(0)
++    expect(subscriptionCount('getUser(1)')).toBe(0)
+   })
+ 
+   test('skipping a previously fetched query retains the existing value as `data`, but clears `currentData`', async () => {
+diff --git a/packages/toolkit/src/query/tests/buildInitiate.test.tsx b/packages/toolkit/src/query/tests/buildInitiate.test.tsx
+index 27925d14..b1618217 100644
+--- a/packages/toolkit/src/query/tests/buildInitiate.test.tsx
++++ b/packages/toolkit/src/query/tests/buildInitiate.test.tsx
+@@ -1,5 +1,4 @@
+ import { createApi } from '../core'
+-import type { SubscriptionSelectors } from '../core/buildMiddleware/types'
+ import { fakeBaseQuery } from '../fakeBaseQuery'
+ import { setupApiStore } from './helpers'
+ 
+@@ -14,26 +13,11 @@ const api = createApi({
+         return { data }
+       },
+     }),
+-    failing: build.query<void, void>({
+-      async queryFn() {
+-        await Promise.resolve()
+-        return { error: { status: 500, data: 'error' } }
+-      },
+-    }),
+   }),
+ })
+ 
+ const storeRef = setupApiStore(api)
+ 
+-let getSubscriptions: SubscriptionSelectors['getSubscriptions']
+-let isRequestSubscribed: SubscriptionSelectors['isRequestSubscribed']
+-
+-beforeEach(() => {
+-  ;({ getSubscriptions, isRequestSubscribed } = storeRef.store.dispatch(
+-    api.internalActions.internal_getRTKQSubscriptions()
+-  ) as unknown as SubscriptionSelectors)
+-})
+-
+ test('multiple synchonrous initiate calls with pre-existing cache entry', async () => {
+   const { store, api } = storeRef
+   // seed the store
+@@ -68,54 +52,3 @@ test('multiple synchonrous initiate calls with pre-existing cache entry', async
+     requestId: thirdValue.requestId,
+   })
+ })
+-
+-describe('calling initiate without a cache entry, with subscribe: false still returns correct values', () => {
+-  test('successful query', async () => {
+-    const { store, api } = storeRef
+-    calls = 0
+-    const promise = store.dispatch(
+-      api.endpoints.increment.initiate(undefined, { subscribe: false })
+-    )
+-    expect(isRequestSubscribed('increment(undefined)', promise.requestId)).toBe(
+-      false
+-    )
+-    expect(
+-      isRequestSubscribed(
+-        'increment(undefined)',
+-        `${promise.requestId}_running`
+-      )
+-    ).toBe(true)
+-
+-    await expect(promise).resolves.toMatchObject({
+-      data: 0,
+-      status: 'fulfilled',
+-    })
+-    expect(
+-      isRequestSubscribed(
+-        'increment(undefined)',
+-        `${promise.requestId}_running`
+-      )
+-    ).toBe(false)
+-  })
+-
+-  test('rejected query', async () => {
+-    const { store, api } = storeRef
+-    calls = 0
+-    const promise = store.dispatch(
+-      api.endpoints.failing.initiate(undefined, { subscribe: false })
+-    )
+-    expect(isRequestSubscribed('failing(undefined)', promise.requestId)).toBe(
+-      false
+-    )
+-    expect(
+-      isRequestSubscribed('failing(undefined)', `${promise.requestId}_running`)
+-    ).toBe(true)
+-
+-    await expect(promise).resolves.toMatchObject({
+-      status: 'rejected',
+-    })
+-    expect(
+-      isRequestSubscribed('failing(undefined)', `${promise.requestId}_running`)
+-    ).toBe(false)
+-  })
+-})
+diff --git a/packages/toolkit/src/query/tests/buildMiddleware.test.tsx b/packages/toolkit/src/query/tests/buildMiddleware.test.tsx
+index f6154ea8..cd7ac0fb 100644
+--- a/packages/toolkit/src/query/tests/buildMiddleware.test.tsx
++++ b/packages/toolkit/src/query/tests/buildMiddleware.test.tsx
+@@ -37,6 +37,7 @@ it('invalidates the specified tags', async () => {
+   expect(storeRef.store.getState().actions).toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     getBanana.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     getBanana.matchFulfilled
+   )
+ 
+@@ -48,6 +49,7 @@ it('invalidates the specified tags', async () => {
+   const firstSequence = [
+     api.internalActions.middlewareRegistered.match,
+     getBanana.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     getBanana.matchFulfilled,
+     api.util.invalidateTags.match,
+     getBanana.matchPending,
+@@ -63,6 +65,7 @@ it('invalidates the specified tags', async () => {
+   expect(storeRef.store.getState().actions).toMatchSequence(
+     ...firstSequence,
+     getBread.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     getBread.matchFulfilled,
+     api.util.invalidateTags.match,
+     getBread.matchPending,
+diff --git a/packages/toolkit/src/query/tests/buildSlice.test.ts b/packages/toolkit/src/query/tests/buildSlice.test.ts
+index 6ca643b2..71d16def 100644
+--- a/packages/toolkit/src/query/tests/buildSlice.test.ts
++++ b/packages/toolkit/src/query/tests/buildSlice.test.ts
+@@ -75,8 +75,8 @@ describe('buildSlice', () => {
+             status: 'fulfilled',
+           },
+         },
+-        // Filled some time later
+-        subscriptions: {},
++        // Filled in a tick later
++        subscriptions: expect.any(Object),
+       },
+       auth: {
+         token: '1234',
+@@ -85,6 +85,18 @@ describe('buildSlice', () => {
+ 
+     expect(storeRef.store.getState()).toEqual(initialQueryState)
+ 
++    await delay(1)
++
++    expect(storeRef.store.getState()).toEqual({
++      ...initialQueryState,
++      api: {
++        ...initialQueryState.api,
++        subscriptions: {
++          'getUser(1)': expect.any(Object),
++        },
++      },
++    })
++
+     storeRef.store.dispatch(api.util.resetApiState())
+ 
+     expect(storeRef.store.getState()).toEqual(initialState)
+diff --git a/packages/toolkit/src/query/tests/cacheCollection.test.ts b/packages/toolkit/src/query/tests/cacheCollection.test.ts
+index 28e090a4..68500c9d 100644
+--- a/packages/toolkit/src/query/tests/cacheCollection.test.ts
++++ b/packages/toolkit/src/query/tests/cacheCollection.test.ts
+@@ -6,7 +6,6 @@ import {
+   THIRTY_TWO_BIT_MAX_INT,
+   THIRTY_TWO_BIT_MAX_TIMER_SECONDS,
+ } from '../core/buildMiddleware/cacheCollection'
+-import { countObjectKeys } from '../utils/countObjectKeys'
+ 
+ beforeAll(() => {
+   vi.useFakeTimers()
+@@ -30,9 +29,7 @@ test(`query: await cleanup, defaults`, async () => {
+     })
+   )
+ 
+-  const promise = store.dispatch(api.endpoints.query.initiate('arg'))
+-  await promise
+-  promise.unsubscribe()
++  store.dispatch(api.endpoints.query.initiate('arg')).unsubscribe()
+   vi.advanceTimersByTime(59000)
+   expect(onCleanup).not.toHaveBeenCalled()
+   vi.advanceTimersByTime(2000)
+@@ -52,9 +49,7 @@ test(`query: await cleanup, keepUnusedDataFor set`, async () => {
+     })
+   )
+ 
+-  const promise = store.dispatch(api.endpoints.query.initiate('arg'))
+-  await promise
+-  promise.unsubscribe()
++  store.dispatch(api.endpoints.query.initiate('arg')).unsubscribe()
+   vi.advanceTimersByTime(28000)
+   expect(onCleanup).not.toHaveBeenCalled()
+   vi.advanceTimersByTime(2000)
+@@ -74,9 +69,7 @@ test(`query: handles large keepUnuseDataFor values over 32-bit ms`, async () =>
+     })
+   )
+ 
+-  const promise = store.dispatch(api.endpoints.query.initiate('arg'))
+-  await promise
+-  promise.unsubscribe()
++  store.dispatch(api.endpoints.query.initiate('arg')).unsubscribe()
+ 
+   // Shouldn't have been called right away
+   vi.advanceTimersByTime(1000)
+@@ -117,9 +110,7 @@ describe(`query: await cleanup, keepUnusedDataFor set`, () => {
+   )
+ 
+   test('global keepUnusedDataFor', async () => {
+-    const promise = store.dispatch(api.endpoints.query.initiate('arg'))
+-    await promise
+-    promise.unsubscribe()
++    store.dispatch(api.endpoints.query.initiate('arg')).unsubscribe()
+     vi.advanceTimersByTime(28000)
+     expect(onCleanup).not.toHaveBeenCalled()
+     vi.advanceTimersByTime(2000)
+@@ -127,10 +118,7 @@ describe(`query: await cleanup, keepUnusedDataFor set`, () => {
+   })
+ 
+   test('endpoint keepUnusedDataFor', async () => {
+-    const promise = store.dispatch(api.endpoints.query2.initiate('arg'))
+-    await promise
+-    promise.unsubscribe()
+-
++    store.dispatch(api.endpoints.query2.initiate('arg')).unsubscribe()
+     vi.advanceTimersByTime(34000)
+     expect(onCleanup).not.toHaveBeenCalled()
+     vi.advanceTimersByTime(2000)
+@@ -139,9 +127,7 @@ describe(`query: await cleanup, keepUnusedDataFor set`, () => {
+ 
+   test('endpoint keepUnusedDataFor: 0 ', async () => {
+     expect(onCleanup).not.toHaveBeenCalled()
+-    const promise = store.dispatch(api.endpoints.query3.initiate('arg'))
+-    await promise
+-    promise.unsubscribe()
++    store.dispatch(api.endpoints.query3.initiate('arg')).unsubscribe()
+     expect(onCleanup).not.toHaveBeenCalled()
+     vi.advanceTimersByTime(1)
+     expect(onCleanup).toHaveBeenCalled()
+@@ -178,10 +164,10 @@ function storeForApi<
+   let hadQueries = false
+   store.subscribe(() => {
+     const queryState = store.getState().api.queries
+-    if (hadQueries && countObjectKeys(queryState) === 0) {
++    if (hadQueries && Object.keys(queryState).length === 0) {
+       onCleanup()
+     }
+-    hadQueries = hadQueries || countObjectKeys(queryState) > 0
++    hadQueries = hadQueries || Object.keys(queryState).length > 0
+   })
+   return { api, store }
+ }
+diff --git a/packages/toolkit/src/query/tests/cacheLifecycle.test.ts b/packages/toolkit/src/query/tests/cacheLifecycle.test.ts
+index fa505f89..778000ce 100644
+--- a/packages/toolkit/src/query/tests/cacheLifecycle.test.ts
++++ b/packages/toolkit/src/query/tests/cacheLifecycle.test.ts
+@@ -76,7 +76,6 @@ describe.each([['query'], ['mutation']] as const)(
+       expect(onNewCacheEntry).toHaveBeenCalledWith('arg')
+       expect(onCleanup).not.toHaveBeenCalled()
+ 
+-      await promise
+       if (type === 'mutation') {
+         promise.reset()
+       } else {
+@@ -220,7 +219,6 @@ describe.each([['query'], ['mutation']] as const)(
+       )
+ 
+       expect(onNewCacheEntry).toHaveBeenCalledWith('arg')
+-      await promise
+       if (type === 'mutation') {
+         promise.reset()
+       } else {
+@@ -272,7 +270,6 @@ describe.each([['query'], ['mutation']] as const)(
+       )
+ 
+       expect(onNewCacheEntry).toHaveBeenCalledWith('arg')
+-      await promise
+ 
+       if (type === 'mutation') {
+         promise.reset()
+@@ -324,7 +321,6 @@ describe.each([['query'], ['mutation']] as const)(
+ 
+       expect(onNewCacheEntry).toHaveBeenCalledWith('arg')
+ 
+-      await promise
+       if (type === 'mutation') {
+         promise.reset()
+       } else {
+@@ -374,7 +370,6 @@ test(`query: getCacheEntry`, async () => {
+   const promise = storeRef.store.dispatch(
+     extended.endpoints.injected.initiate('arg')
+   )
+-  await promise
+   promise.unsubscribe()
+ 
+   await fakeTimerWaitFor(() => {
+@@ -544,7 +539,6 @@ test('updateCachedData', async () => {
+   const promise = storeRef.store.dispatch(
+     extended.endpoints.injected.initiate('arg')
+   )
+-  await promise
+   promise.unsubscribe()
+ 
+   await fakeTimerWaitFor(() => {
+@@ -582,7 +576,7 @@ test('dispatching further actions does not trigger another lifecycle', async ()
+   expect(onNewCacheEntry).toHaveBeenCalledTimes(1)
+ })
+ 
+-test('dispatching a query initializer with `subscribe: false` does also start a lifecycle', async () => {
++test('dispatching a query initializer with `subscribe: false` does not start a lifecycle', async () => {
+   const extended = api.injectEndpoints({
+     overrideExisting: true,
+     endpoints: (build) => ({
+@@ -597,9 +591,8 @@ test('dispatching a query initializer with `subscribe: false` does also start a
+   await storeRef.store.dispatch(
+     extended.endpoints.injected.initiate(undefined, { subscribe: false })
+   )
+-  expect(onNewCacheEntry).toHaveBeenCalledTimes(1)
++  expect(onNewCacheEntry).toHaveBeenCalledTimes(0)
+ 
+-  // will not be called a second time though
+   await storeRef.store.dispatch(extended.endpoints.injected.initiate(undefined))
+   expect(onNewCacheEntry).toHaveBeenCalledTimes(1)
+ })
+diff --git a/packages/toolkit/src/query/tests/cleanup.test.tsx b/packages/toolkit/src/query/tests/cleanup.test.tsx
+index cb1ff750..36870e11 100644
+--- a/packages/toolkit/src/query/tests/cleanup.test.tsx
++++ b/packages/toolkit/src/query/tests/cleanup.test.tsx
+@@ -1,12 +1,11 @@
+ // tests for "cleanup-after-unsubscribe" behaviour
+ import { vi } from 'vitest'
+-import React from 'react'
++import React, { Profiler, ProfilerOnRenderCallback } from 'react'
+ 
+ import { createListenerMiddleware } from '@reduxjs/toolkit'
+ import { createApi, QueryStatus } from '@reduxjs/toolkit/query/react'
+ import { render, waitFor, act, screen } from '@testing-library/react'
+ import { setupApiStore } from './helpers'
+-import { SubscriptionSelectors } from '../core/buildMiddleware/types'
+ 
+ const tick = () => new Promise((res) => setImmediate(res))
+ 
+@@ -160,26 +159,18 @@ test('Minimizes the number of subscription dispatches when multiple components a
+     withoutTestLifecycles: true,
+   })
+ 
++  let getSubscriptionsA = () =>
++    storeRef.store.getState().api.subscriptions['a(undefined)']
++
+   let actionTypes: unknown[] = []
+ 
+   listenerMiddleware.startListening({
+     predicate: () => true,
+     effect: (action) => {
+-      if (
+-        action.type.includes('subscriptionsUpdated') ||
+-        action.type.includes('internal_')
+-      ) {
+-        return
+-      }
+-
+       actionTypes.push(action.type)
+     },
+   })
+ 
+-  const { getSubscriptionCount } = storeRef.store.dispatch(
+-    api.internalActions.internal_getRTKQSubscriptions()
+-  ) as unknown as SubscriptionSelectors
+-
+   const NUM_LIST_ITEMS = 1000
+ 
+   function ParentComponent() {
+@@ -203,11 +194,14 @@ test('Minimizes the number of subscription dispatches when multiple components a
+     return screen.getAllByText(/42/).length > 0
+   })
+ 
+-  expect(getSubscriptionCount('a(undefined)')).toBe(NUM_LIST_ITEMS)
++  const subscriptions = getSubscriptionsA()
++
++  expect(Object.keys(subscriptions!).length).toBe(NUM_LIST_ITEMS)
+ 
+   expect(actionTypes).toEqual([
+     'api/config/middlewareRegistered',
+     'api/executeQuery/pending',
++    'api/internalSubscriptions/subscriptionsUpdated',
+     'api/executeQuery/fulfilled',
+   ])
+ }, 25000)
+diff --git a/packages/toolkit/src/query/tests/fetchBaseQuery.test.tsx b/packages/toolkit/src/query/tests/fetchBaseQuery.test.tsx
+index 6ab089f2..e2f9334f 100644
+--- a/packages/toolkit/src/query/tests/fetchBaseQuery.test.tsx
++++ b/packages/toolkit/src/query/tests/fetchBaseQuery.test.tsx
+@@ -176,7 +176,7 @@ describe('fetchBaseQuery', () => {
+       expect(res.meta?.response).toBeInstanceOf(Object)
+       expect(res.error).toEqual({
+         status: 'PARSING_ERROR',
+-        error: expect.stringMatching(/SyntaxError: Unexpected token/),
++        error: 'SyntaxError: Unexpected token h in JSON at position 1',
+         originalStatus: 200,
+         data: `this is not json!`,
+       })
+@@ -334,7 +334,7 @@ describe('fetchBaseQuery', () => {
+       expect(res.meta?.response).toBeInstanceOf(Object)
+       expect(res.error).toEqual({
+         status: 'PARSING_ERROR',
+-        error: expect.stringMatching(/SyntaxError: Unexpected token/),
++        error: 'SyntaxError: Unexpected token h in JSON at position 1',
+         originalStatus: 500,
+         data: `this is not json!`,
+       })
+@@ -435,7 +435,7 @@ describe('fetchBaseQuery', () => {
+ 
+     it('supports a custom jsonReplacer', async () => {
+       const body = {
+-        items: new Set(['A', 'B', 'C']),
++        items: new Set(["A", "B", "C"])
+       }
+ 
+       let request: any
+@@ -456,8 +456,7 @@ describe('fetchBaseQuery', () => {
+       const baseQueryWithReplacer = fetchBaseQuery({
+         baseUrl,
+         fetchFn: fetchFn as any,
+-        jsonReplacer: (key, value) =>
+-          value instanceof Set ? [...value] : value,
++        jsonReplacer: (key, value) => value instanceof Set ? [...value] : value
+       })
+ 
+       ;({ data: request } = await baseQueryWithReplacer(
+@@ -471,7 +470,8 @@ describe('fetchBaseQuery', () => {
+       ))
+ 
+       expect(request.headers['content-type']).toBe('application/json')
+-      expect(request.body).toEqual({ items: ['A', 'B', 'C'] }) // Set is marshalled correctly by jsonReplacer
++      expect(request.body).toEqual({ items: ["A", "B", "C"] }) // Set is marshalled correctly by jsonReplacer
++      
+     })
+   })
+ 
+diff --git a/packages/toolkit/src/query/tests/helpers.tsx b/packages/toolkit/src/query/tests/helpers.tsx
+index acf2bf09..01c2a226 100644
+--- a/packages/toolkit/src/query/tests/helpers.tsx
++++ b/packages/toolkit/src/query/tests/helpers.tsx
+@@ -118,9 +118,7 @@ expect.extend({
+       if (!matchers[i](actions[i])) {
+         return {
+           message: () =>
+-            `Action ${actions[i].type} does not match sequence at position ${i}.
+-All actions:
+-${actions.map((a) => a.type).join('\n')}`,
++            `Action ${actions[i].type} does not match sequence at position ${i}.`,
+           pass: false,
+         }
+       }
+@@ -182,11 +180,6 @@ ${expectedOutput}
+ 
+ export const actionsReducer = {
+   actions: (state: UnknownAction[] = [], action: UnknownAction) => {
+-    // As of 2.0-beta.4, we are going to ignore all `subscriptionsUpdated` actions in tests
+-    if (action.type.includes('subscriptionsUpdated')) {
+-      return state
+-    }
+-
+     return [...state, action]
+   },
+ }
+diff --git a/packages/toolkit/src/query/tests/matchers.test.tsx b/packages/toolkit/src/query/tests/matchers.test.tsx
+index 37c1dfe5..1a7f5847 100644
+--- a/packages/toolkit/src/query/tests/matchers.test.tsx
++++ b/packages/toolkit/src/query/tests/matchers.test.tsx
+@@ -65,22 +65,25 @@ test('matches query pending & fulfilled actions for the given endpoint', async (
+   expect(storeRef.store.getState().actions).toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     endpoint.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     endpoint.matchFulfilled
+   )
+   expect(storeRef.store.getState().actions).not.toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     otherEndpoint.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     otherEndpoint.matchFulfilled
+   )
+   expect(storeRef.store.getState().actions).not.toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     endpoint.matchFulfilled,
+-    api.endpoints.mutationSuccess.matchFulfilled,
++    api.internalActions.subscriptionsUpdated.match,
+     endpoint.matchRejected
+   )
+   expect(storeRef.store.getState().actions).not.toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     endpoint.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     endpoint.matchRejected
+   )
+ })
+@@ -93,6 +96,7 @@ test('matches query pending & rejected actions for the given endpoint', async ()
+   expect(storeRef.store.getState().actions).toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     endpoint.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     endpoint.matchRejected
+   )
+   expect(storeRef.store.getState().actions).not.toMatchSequence(
+@@ -118,17 +122,20 @@ test('matches lazy query pending & fulfilled actions for given endpoint', async
+   expect(storeRef.store.getState().actions).toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     endpoint.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     endpoint.matchFulfilled
+   )
+   expect(storeRef.store.getState().actions).not.toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     endpoint.matchFulfilled,
++    api.internalActions.subscriptionsUpdated.match,
+     endpoint.matchRejected
+   )
+ 
+   expect(storeRef.store.getState().actions).not.toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     endpoint.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     endpoint.matchRejected
+   )
+ })
+@@ -144,6 +151,7 @@ test('matches lazy query pending & rejected actions for given endpoint', async (
+   expect(storeRef.store.getState().actions).toMatchSequence(
+     api.internalActions.middlewareRegistered.match,
+     endpoint.matchPending,
++    api.internalActions.subscriptionsUpdated.match,
+     endpoint.matchRejected
+   )
+   expect(storeRef.store.getState().actions).not.toMatchSequence(
+diff --git a/packages/toolkit/src/query/tests/polling.test.tsx b/packages/toolkit/src/query/tests/polling.test.tsx
+index d5d3cd20..7443d940 100644
+--- a/packages/toolkit/src/query/tests/polling.test.tsx
++++ b/packages/toolkit/src/query/tests/polling.test.tsx
+@@ -2,7 +2,6 @@ import { vi } from 'vitest'
+ import { createApi } from '@reduxjs/toolkit/query'
+ import { setupApiStore, waitMs } from './helpers'
+ import { delay } from '../../utils'
+-import type { SubscriptionSelectors } from '../core/buildMiddleware/types'
+ 
+ const mockBaseQuery = vi
+   .fn()
+@@ -24,16 +23,8 @@ const { getPosts } = api.endpoints
+ 
+ const storeRef = setupApiStore(api)
+ 
+-let getSubscriptions: SubscriptionSelectors['getSubscriptions']
+-
+-beforeEach(() => {
+-  ;({ getSubscriptions } = storeRef.store.dispatch(
+-    api.internalActions.internal_getRTKQSubscriptions()
+-  ) as unknown as SubscriptionSelectors)
+-})
+-
+ const getSubscribersForQueryCacheKey = (queryCacheKey: string) =>
+-  getSubscriptions()[queryCacheKey] || {}
++  storeRef.store.getState()[api.reducerPath].subscriptions[queryCacheKey] || {}
+ const createSubscriptionGetter = (queryCacheKey: string) => () =>
+   getSubscribersForQueryCacheKey(queryCacheKey)
+ 
+diff --git a/packages/toolkit/src/query/tests/refetchingBehaviors.test.tsx b/packages/toolkit/src/query/tests/refetchingBehaviors.test.tsx
+index f2703e5b..cd2dd45c 100644
+--- a/packages/toolkit/src/query/tests/refetchingBehaviors.test.tsx
++++ b/packages/toolkit/src/query/tests/refetchingBehaviors.test.tsx
+@@ -432,12 +432,10 @@ describe('customListenersHandler', () => {
+     })
+     expect(dispatchSpy).toHaveBeenCalled()
+ 
+-    // Ignore RTKQ middleware internal data calls
+-    const mockCallsWithoutInternals = dispatchSpy.mock.calls.filter((call) => {
+-      const type = (call[0] as any)?.type ?? ''
+-      const reIsInternal = /internal/i
+-      return !reIsInternal.test(type)
+-    })
++    // Ignore RTKQ middleware `internal_probeSubscription` calls
++    const mockCallsWithoutInternals = dispatchSpy.mock.calls.filter(
++      (call) => !(call[0] as any)?.type?.includes('internal')
++    )
+ 
+     expect(
+       defaultApi.internalActions.onOnline.match(
+diff --git a/packages/toolkit/src/query/utils/countObjectKeys.ts b/packages/toolkit/src/query/utils/countObjectKeys.ts
+deleted file mode 100644
+index b0de9834..00000000
+--- a/packages/toolkit/src/query/utils/countObjectKeys.ts
++++ /dev/null
+@@ -1,14 +0,0 @@
+-// Fast method for counting an object's keys
+-// without resorting to `Object.keys(obj).length
+-// Will this make a big difference in perf? Probably not
+-// But we can save a few allocations.
+-
+-export function countObjectKeys(obj: Record<any, any>) {
+-  let count = 0
+-
+-  for (const _key in obj) {
+-    count++
+-  }
+-
+-  return count
+-}

@@ -1,0 +1,165 @@
+diff --git a/.gitignore b/.gitignore
+index 16202c352..ccd52cd34 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -39,6 +39,7 @@ stats.html
+ .pnpm-store
+ .svelte-kit
+ .tsup
++.vinxi
+ 
+ vite.config.js.timestamp-*
+ vite.config.ts.timestamp-*
+diff --git a/docs/framework/angular/guides/optimistic-updates.md b/docs/framework/angular/guides/optimistic-updates.md
+index 0f148e76b..478675912 100644
+--- a/docs/framework/angular/guides/optimistic-updates.md
++++ b/docs/framework/angular/guides/optimistic-updates.md
+@@ -72,7 +72,6 @@ addTodo = injectMutation(() => ({
+ 
+ // access variables somewhere else
+ 
+-// Note: injectMutationState is not available yet in Angular Query
+ mutationState = injectMutationState<string>(() => ({
+   filters: { mutationKey: ['addTodo'], status: 'pending' },
+   select: (mutation) => mutation.state.variables,
+diff --git a/packages/angular-query-experimental/src/create-base-query.ts b/packages/angular-query-experimental/src/create-base-query.ts
+index c5a0e1183..3fbde300f 100644
+--- a/packages/angular-query-experimental/src/create-base-query.ts
++++ b/packages/angular-query-experimental/src/create-base-query.ts
+@@ -5,6 +5,7 @@ import {
+   effect,
+   inject,
+   signal,
++  untracked,
+ } from '@angular/core'
+ import { notifyManager } from '@tanstack/query-core'
+ import { signalProxy } from './signal-proxy'
+@@ -62,18 +63,19 @@ export function createBaseQuery<
+     observer.getOptimisticResult(defaultedOptionsSignal()),
+   )
+ 
+-  effect(
+-    () => {
++  effect(() => {
++    const defaultedOptions = defaultedOptionsSignal()
++    observer.setOptions(defaultedOptions, {
+       // Do not notify on updates because of changes in the options because
+       // these changes should already be reflected in the optimistic result.
+-      const defaultedOptions = defaultedOptionsSignal()
+-      observer.setOptions(defaultedOptions, {
+-        listeners: false,
+-      })
+-      resultSignal.set(observer.getOptimisticResult(defaultedOptions))
+-    },
+-    { allowSignalWrites: true },
+-  )
++      listeners: false,
++    })
++    untracked(() =>
++      // Set the signal in effect because it's both 'computed' from options()
++      // and needs to be set imperatively in the query observer listener.
++      resultSignal.set(observer.getOptimisticResult(defaultedOptions)),
++    )
++  })
+ 
+   // observer.trackResult is not used as this optimization is not needed for Angular
+   const unsubscribe = observer.subscribe(
+diff --git a/packages/angular-query-experimental/src/index.ts b/packages/angular-query-experimental/src/index.ts
+index 89587b496..d56be2adb 100644
+--- a/packages/angular-query-experimental/src/index.ts
++++ b/packages/angular-query-experimental/src/index.ts
+@@ -17,6 +17,7 @@ export * from './inject-infinite-query'
+ export * from './inject-is-fetching'
+ export * from './inject-is-mutating'
+ export * from './inject-mutation'
++export * from './inject-mutation-state'
+ export * from './inject-queries'
+ export * from './inject-query'
+ export {
+diff --git a/packages/angular-query-experimental/src/inject-mutation-state.ts b/packages/angular-query-experimental/src/inject-mutation-state.ts
+new file mode 100644
+index 000000000..94fd80458
+--- /dev/null
++++ b/packages/angular-query-experimental/src/inject-mutation-state.ts
+@@ -0,0 +1,81 @@
++import { DestroyRef, effect, inject, signal, untracked } from '@angular/core'
++import {
++  type DefaultError,
++  type Mutation,
++  type MutationCache,
++  type MutationFilters,
++  type MutationState,
++  notifyManager,
++  replaceEqualDeep,
++} from '@tanstack/query-core'
++import { assertInjector } from './util/assert-injector/assert-injector'
++import { injectQueryClient } from './inject-query-client'
++import type { Injector, Signal } from '@angular/core'
++
++type MutationStateOptions<TResult = MutationState> = {
++  filters?: MutationFilters
++  select?: (
++    mutation: Mutation<unknown, DefaultError, unknown, unknown>,
++  ) => TResult
++}
++
++function getResult<TResult = MutationState>(
++  mutationCache: MutationCache,
++  options: MutationStateOptions<TResult>,
++): Array<TResult> {
++  return mutationCache
++    .findAll(options.filters)
++    .map(
++      (mutation): TResult =>
++        (options.select
++          ? options.select(
++              mutation as Mutation<unknown, DefaultError, unknown, unknown>,
++            )
++          : mutation.state) as TResult,
++    )
++}
++
++export interface InjectMutationStateOptions {
++  injector?: Injector
++}
++
++export function injectMutationState<TResult = MutationState>(
++  mutationStateOptionsFn: () => MutationStateOptions<TResult> = () => ({}),
++  options?: InjectMutationStateOptions,
++): Signal<Array<TResult>> {
++  return assertInjector(injectMutationState, options?.injector, () => {
++    const destroyRef = inject(DestroyRef)
++    const queryClient = injectQueryClient()
++
++    const mutationCache = queryClient.getMutationCache()
++
++    const result = signal<Array<TResult>>(
++      getResult(mutationCache, mutationStateOptionsFn()),
++    )
++
++    effect(() => {
++      const mutationStateOptions = mutationStateOptionsFn()
++      untracked(() => {
++        // Setting the signal from an effect because it's both 'computed' from options()
++        // and needs to be set imperatively in the mutationCache listener.
++        result.set(getResult(mutationCache, mutationStateOptions))
++      })
++    })
++
++    const unsubscribe = mutationCache.subscribe(
++      notifyManager.batchCalls(() => {
++        const nextResult = replaceEqualDeep(
++          result(),
++          getResult(mutationCache, mutationStateOptionsFn()),
++        )
++        if (result() !== nextResult) {
++          result.set(nextResult)
++        }
++      }),
++    )
++
++    destroyRef.onDestroy(unsubscribe)
++
++    return result
++  })
++}

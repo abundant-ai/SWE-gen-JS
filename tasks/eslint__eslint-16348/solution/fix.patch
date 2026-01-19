@@ -1,0 +1,230 @@
+diff --git a/docs/src/developer-guide/nodejs-api.md b/docs/src/developer-guide/nodejs-api.md
+index 0b8d84226..eb286c7bf 100644
+--- a/docs/src/developer-guide/nodejs-api.md
++++ b/docs/src/developer-guide/nodejs-api.md
+@@ -410,8 +410,8 @@ This edit information means replacing the range of the `range` property by the `
+ 
+ The `LoadedFormatter` value is the object to convert the [LintResult] objects to text. The [eslint.loadFormatter()][eslint-loadformatter] method returns it. It has the following method:
+ 
+-* `format` (`(results: LintResult[]) => string | Promise<string>`)<br>
+-  The method to convert the [LintResult] objects to text.
++* `format` (`(results: LintResult[], resultsMeta: ResultsMeta) => string | Promise<string>`)<br>
++  The method to convert the [LintResult] objects to text. `resultsMeta` is an object that will contain a `maxWarningsExceeded` object if `--max-warnings` was set and the number of warnings exceeded the limit. The `maxWarningsExceeded` object will contain two properties: `maxWarnings`, the value of the `--max-warnings` option, and `foundWarnings`, the number of lint warnings.
+ 
+ ---
+ 
+diff --git a/docs/src/developer-guide/working-with-custom-formatters.md b/docs/src/developer-guide/working-with-custom-formatters.md
+index 1d970ea5e..3fff816b5 100644
+--- a/docs/src/developer-guide/working-with-custom-formatters.md
++++ b/docs/src/developer-guide/working-with-custom-formatters.md
+@@ -129,9 +129,10 @@ Each `message` object contains information about the ESLint rule that was trigge
+ 
+ ## The `context` Argument
+ 
+-The formatter function receives an object as the second argument. The object has two properties:
++The formatter function receives an object as the second argument. The object has the following properties:
+ 
+ * `cwd` ... The current working directory. This value comes from the `cwd` constructor option of the [ESLint](nodejs-api#-new-eslintoptions) class.
++* `maxWarningsExceeded` (optional): If `--max-warnings` was set and the number of warnings exceeded the limit, this property's value will be an object containing two properties: `maxWarnings`, the value of the `--max-warnings` option, and `foundWarnings`, the number of lint warnings.
+ * `rulesMeta` ... The `meta` property values of rules. See the [Working with Rules](working-with-rules) page for more information about rules.
+ 
+ For example, here's what the object would look like if one rule, `no-extra-semi`, had been run:
+@@ -139,6 +140,10 @@ For example, here's what the object would look like if one rule, `no-extra-semi`
+ ```js
+ {
+     cwd: "/path/to/cwd",
++    maxWarningsExceeded: {
++        maxWarnings: 5,
++        foundWarnings: 6
++    },
+     rulesMeta: {
+         "no-extra-semi": {
+             type: "suggestion",
+@@ -153,7 +158,7 @@ For example, here's what the object would look like if one rule, `no-extra-semi`
+                 unexpected: "Unnecessary semicolon."
+             }
+         }
+-    }
++    },
+ }
+ ```
+ 
+diff --git a/lib/cli.js b/lib/cli.js
+index 2fca65c19..58c50f7c2 100644
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -38,6 +38,7 @@ const debug = require("debug")("eslint:cli");
+ /** @typedef {import("./eslint/eslint").LintMessage} LintMessage */
+ /** @typedef {import("./eslint/eslint").LintResult} LintResult */
+ /** @typedef {import("./options").ParsedCLIOptions} ParsedCLIOptions */
++/** @typedef {import("./shared/types").ResultsMeta} ResultsMeta */
+ 
+ //------------------------------------------------------------------------------
+ // Helpers
+@@ -201,7 +202,7 @@ async function translateOptions({
+ /**
+  * Count error messages.
+  * @param {LintResult[]} results The lint results.
+- * @returns {{errorCount:number;warningCount:number}} The number of error messages.
++ * @returns {{errorCount:number;fatalErrorCount:number,warningCount:number}} The number of error messages.
+  */
+ function countErrors(results) {
+     let errorCount = 0;
+@@ -239,10 +240,11 @@ async function isDirectory(filePath) {
+  * @param {LintResult[]} results The results to print.
+  * @param {string} format The name of the formatter to use or the path to the formatter.
+  * @param {string} outputFile The path for the output file.
++ * @param {ResultsMeta} resultsMeta Warning count and max threshold.
+  * @returns {Promise<boolean>} True if the printing succeeds, false if not.
+  * @private
+  */
+-async function printResults(engine, results, format, outputFile) {
++async function printResults(engine, results, format, outputFile, resultsMeta) {
+     let formatter;
+ 
+     try {
+@@ -252,7 +254,7 @@ async function printResults(engine, results, format, outputFile) {
+         return false;
+     }
+ 
+-    const output = await formatter.format(results);
++    const output = await formatter.format(results, resultsMeta);
+ 
+     if (output) {
+         if (outputFile) {
+@@ -407,17 +409,24 @@ const cli = {
+             resultsToPrint = ActiveESLint.getErrorResults(resultsToPrint);
+         }
+ 
+-        if (await printResults(engine, resultsToPrint, options.format, options.outputFile)) {
++        const resultCounts = countErrors(results);
++        const tooManyWarnings = options.maxWarnings >= 0 && resultCounts.warningCount > options.maxWarnings;
++        const resultsMeta = tooManyWarnings
++            ? {
++                maxWarningsExceeded: {
++                    maxWarnings: options.maxWarnings,
++                    foundWarnings: resultCounts.warningCount
++                }
++            }
++            : {};
+ 
+-            // Errors and warnings from the original unfiltered results should determine the exit code
+-            const { errorCount, fatalErrorCount, warningCount } = countErrors(results);
++        if (await printResults(engine, resultsToPrint, options.format, options.outputFile, resultsMeta)) {
+ 
+-            const tooManyWarnings =
+-                options.maxWarnings >= 0 && warningCount > options.maxWarnings;
++            // Errors and warnings from the original unfiltered results should determine the exit code
+             const shouldExitForFatalErrors =
+-                options.exitOnFatalError && fatalErrorCount > 0;
++                options.exitOnFatalError && resultCounts.fatalErrorCount > 0;
+ 
+-            if (!errorCount && tooManyWarnings) {
++            if (!resultCounts.errorCount && tooManyWarnings) {
+                 log.error(
+                     "ESLint found too many warnings (maximum: %s).",
+                     options.maxWarnings
+@@ -428,7 +437,7 @@ const cli = {
+                 return 2;
+             }
+ 
+-            return (errorCount || tooManyWarnings) ? 1 : 0;
++            return (resultCounts.errorCount || tooManyWarnings) ? 1 : 0;
+         }
+ 
+         return 2;
+diff --git a/lib/eslint/eslint.js b/lib/eslint/eslint.js
+index 9a3bd66e4..e1d211694 100644
+--- a/lib/eslint/eslint.js
++++ b/lib/eslint/eslint.js
+@@ -36,11 +36,12 @@ const { version } = require("../../package.json");
+ /** @typedef {import("../shared/types").Plugin} Plugin */
+ /** @typedef {import("../shared/types").Rule} Rule */
+ /** @typedef {import("../shared/types").LintResult} LintResult */
++/** @typedef {import("../shared/types").ResultsMeta} ResultsMeta */
+ 
+ /**
+  * The main formatter object.
+  * @typedef LoadedFormatter
+- * @property {function(LintResult[]): string | Promise<string>} format format function.
++ * @property {(results: LintResult[], resultsMeta: ResultsMeta) => string | Promise<string>} format format function.
+  */
+ 
+ /**
+@@ -625,14 +626,16 @@ class ESLint {
+             /**
+              * The main formatter method.
+              * @param {LintResult[]} results The lint results to format.
++             * @param {ResultsMeta} resultsMeta Warning count and max threshold.
+              * @returns {string | Promise<string>} The formatted lint results.
+              */
+-            format(results) {
++            format(results, resultsMeta) {
+                 let rulesMeta = null;
+ 
+                 results.sort(compareResultsByFilePath);
+ 
+                 return formatter(results, {
++                    ...resultsMeta,
+                     get cwd() {
+                         return options.cwd;
+                     },
+diff --git a/lib/eslint/flat-eslint.js b/lib/eslint/flat-eslint.js
+index e436c4640..5cec98071 100644
+--- a/lib/eslint/flat-eslint.js
++++ b/lib/eslint/flat-eslint.js
+@@ -59,6 +59,7 @@ const LintResultCache = require("../cli-engine/lint-result-cache");
+ /** @typedef {import("../shared/types").LintMessage} LintMessage */
+ /** @typedef {import("../shared/types").ParserOptions} ParserOptions */
+ /** @typedef {import("../shared/types").Plugin} Plugin */
++/** @typedef {import("../shared/types").ResultsMeta} ResultsMeta */
+ /** @typedef {import("../shared/types").RuleConf} RuleConf */
+ /** @typedef {import("../shared/types").Rule} Rule */
+ /** @typedef {ReturnType<ConfigArray.extractConfig>} ExtractedConfig */
+@@ -1114,14 +1115,16 @@ class FlatESLint {
+             /**
+              * The main formatter method.
+              * @param {LintResults[]} results The lint results to format.
++             * @param {ResultsMeta} resultsMeta Warning count and max threshold.
+              * @returns {string} The formatted lint results.
+              */
+-            format(results) {
++            format(results, resultsMeta) {
+                 let rulesMeta = null;
+ 
+                 results.sort(compareResultsByFilePath);
+ 
+                 return formatter(results, {
++                    ...resultsMeta,
+                     cwd,
+                     get rulesMeta() {
+                         if (!rulesMeta) {
+diff --git a/lib/shared/types.js b/lib/shared/types.js
+index 60f9f1d6a..20335f68a 100644
+--- a/lib/shared/types.js
++++ b/lib/shared/types.js
+@@ -190,10 +190,23 @@ module.exports = {};
+  * @property {DeprecatedRuleInfo[]} usedDeprecatedRules The list of used deprecated rules.
+  */
+ 
++/**
++ * Information provided when the maximum warning threshold is exceeded.
++ * @typedef {Object} MaxWarningsExceeded
++ * @property {number} maxWarnings Number of warnings to trigger nonzero exit code.
++ * @property {number} foundWarnings Number of warnings found while linting.
++ */
++
++/**
++ * Metadata about results for formatters.
++ * @typedef {Object} ResultsMeta
++ * @property {MaxWarningsExceeded} [maxWarningsExceeded] Present if the maxWarnings threshold was exceeded.
++ */
++
+ /**
+  * A formatter function.
+  * @callback FormatterFunction
+  * @param {LintResult[]} results The list of linting results.
+- * @param {{cwd: string, rulesMeta: Record<string, RuleMeta>}} [context] A context object.
++ * @param {{cwd: string, maxWarningsExceeded?: MaxWarningsExceeded, rulesMeta: Record<string, RuleMeta>}} [context] A context object.
+  * @returns {string | Promise<string>} Formatted text.
+  */

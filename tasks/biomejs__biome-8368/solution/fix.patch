@@ -1,0 +1,639 @@
+diff --git a/.changeset/rare-maps-read.md b/.changeset/rare-maps-read.md
+new file mode 100644
+index 0000000000..d2756c6d35
+--- /dev/null
++++ b/.changeset/rare-maps-read.md
+@@ -0,0 +1,25 @@
++---
++"@biomejs/biome": minor
++---
++
++Added 2 options from `typescript-eslint` (`ignoreDifferentlyNamedParameters` and `ignoreDifferentJsDoc`) to [`useUnifiedTypeSignatures`](https://biomejs.dev/linter/rules/use-unified-type-signatures/).
++
++Each option makes the rule ignore overload signatures whose parameter names or JSDoc comments differ.
++
++#### Examples
++
++Valid code with `ignoreDifferentlyNamedParameters` set to `true`:
++
++```ts
++function cook(scoops: IceCreamScoop[]): void;
++function cook(cakeType: string): void;
++```
++
++Valid code with `ignoreDifferentJsDoc` set to `true`:
++
++```ts
++/** Does objs have "cow" inside it? */
++function hasCow(objs: string[]): boolean;
++/** @deprecated - convert to array */
++function hasCow(objs: string): boolean;
++```
+diff --git a/Cargo.lock b/Cargo.lock
+index 2a2dcde37d..96e5012c4f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1077,6 +1077,7 @@ name = "biome_jsdoc_comment"
+ version = "0.0.1"
+ dependencies = [
+  "biome_formatter",
++ "biome_js_parser",
+  "biome_js_syntax",
+  "biome_js_type_info",
+  "biome_rowan",
+diff --git a/crates/biome_js_analyze/src/lint/style/use_unified_type_signatures.rs b/crates/biome_js_analyze/src/lint/style/use_unified_type_signatures.rs
+index b996c7709b..681e5d1fc5 100644
+--- a/crates/biome_js_analyze/src/lint/style/use_unified_type_signatures.rs
++++ b/crates/biome_js_analyze/src/lint/style/use_unified_type_signatures.rs
+@@ -17,6 +17,7 @@ use biome_js_syntax::{
+     TsDeclareFunctionDeclaration, TsDeclareFunctionExportDefaultDeclaration, TsDeclareStatement,
+     TsMethodSignatureClassMember, TsMethodSignatureTypeMember, TsTypeParameters,
+ };
++use biome_jsdoc_comment::JsdocComment;
+ use biome_rowan::{
+     AstNode, AstSeparatedList, BatchMutation, BatchMutationExt, SyntaxResult, TextRange,
+     TriviaPieceKind, chain_trivia_pieces, declare_node_union,
+@@ -40,12 +41,31 @@ declare_lint_rule! {
+     /// ```
+     ///
+     /// ```ts,expect_diagnostic
+-    /// interface I {
++    /// function f({ a }: Record<"a", string>): void;
++    /// function f({ a }: Record<"a", boolean>): void;
++    /// function f(obj: any): void {};
++    /// ```
++    ///
++    /// ```ts,expect_diagnostic
++    /// type T = {
+     ///     a(): void;
+     ///     a(x: number): void;
+     /// }
+     /// ```
+     ///
++    /// ```ts,expect_diagnostic
++    /// interface I {
++    ///     (): void;
++    ///     (x: number): void;
++    /// }
++    /// ```
++    ///
++    /// ```ts,expect_diagnostic
++    /// export function fizzbuzz([fizz, buzz]: [number, number]): void;
++    /// export function fizzbuzz([fizz, buzz]: [string, string]): void;
++    /// export default function fizzbuzz([fizz, buzz]: [string | number, string | number]): void {}
++    /// ```
++    ///
+     /// ### Valid
+     ///
+     /// ```ts
+@@ -53,11 +73,20 @@ declare_lint_rule! {
+     /// ```
+     ///
+     /// ```ts
++    /// function f({ a }: Record<"a", string | boolean>): void;
++    /// ```
++    ///
++    /// ```ts
+     /// interface I {
+     ///     a(x?: number): void;
+     /// }
+     /// ```
+     ///
++    /// ```ts
++    /// export function fizzbuzz([fizz, buzz]: [number, number] | [string, string]): void;
++    /// export default function fizzbuzz([fizz, buzz]: [string | number, string | number]): void {}
++    /// ```
++    ///
+     /// Different return types cannot be merged:
+     /// ```ts
+     /// interface I {
+@@ -73,6 +102,63 @@ declare_lint_rule! {
+     /// function f(x: unknown): void {}
+     /// ```
+     ///
++    /// Different rest signatures cannot be merged:
++    /// (cf https://github.com/microsoft/TypeScript/issues/5077)
++    /// ```ts
++    /// function foo(...x: string[]): void;
++    /// function foo(...x: number[]): void;
++    /// function foo(...x: any[]): void {}
++    /// ```
++    ///
++    /// ## Options
++    ///
++    /// ### `ignoreDifferentlyNamedParameters`
++    ///
++    /// If set to `true`, overloads with differently named parameters will be ignored,
++    /// even if said parameters would be of otherwise mergeable types.
++    ///
++    /// Parameter declarations that lack specified "names" (such as array spread and destructuring literals)
++    /// will be ignored for this check.
++    ///
++    /// Default: `false`
++    ///
++    /// ```json,options
++    /// {
++    ///   "options": {
++    ///     "ignoreDifferentlyNamedParameters": true
++    ///   }
++    /// }
++    /// ```
++    ///
++    /// ```ts,use_options
++    /// function bake(numApples: number): void;
++    /// function bake(cakeType: string): void;
++    /// ```
++    ///
++    /// ### `ignoreDifferentJsDoc`
++    ///
++    /// If set to `true`, overloads with different JSDoc comments from one another will be ignored.
++    /// Ones with identical comments will be merged as normal.
++    ///
++    /// Default: `false`
++    ///
++    /// ```json,options
++    /// {
++    ///   "options": {
++    ///     "ignoreDifferentJsDoc": true
++    ///   }
++    /// }
++    /// ```
++    ///
++    /// ```ts,use_options
++    /// /** Print foo + 1 */
++    /// function doThing(foo: number): void;
++    /// /** Print foo concatenated with 3 */
++    /// function doThing(foo: string): void;
++    /// /** @deprecated - don't use this, it crashes the program */
++    /// function doThing(foo: boolean): void;
++    /// ```
++    ///
+     pub UseUnifiedTypeSignatures {
+         version: "2.1.0",
+         name: "useUnifiedTypeSignatures",
+@@ -94,50 +180,16 @@ impl Rule for UseUnifiedTypeSignatures {
+ 
+         let overload_info = OverloadInfo::from_overload_signature(node)?;
+ 
++        let opts = ctx.options();
++
+         // Yes, this is a O(n^2) algorithm, but we need to compare all overload signatures
+         // with each other. This shouldn't be a problem in practice,
+         // since the number of overloads is usually relatively small.
+         for (i, overload1) in overload_info.overload_signatures.iter().enumerate() {
+             for overload2 in &overload_info.overload_signatures[i + 1..] {
+-                if !overload1
+-                    .type_parameters()
+-                    .is_type_equal(&overload2.type_parameters())
+-                {
+-                    // We can only combine signatures if their type parameters are equal.
+-                    continue;
+-                }
+-
+-                if !overload1
+-                    .return_type_annotation()
+-                    .is_type_equal(&overload2.return_type_annotation())
+-                {
+-                    // We can only combine signatures if their return types are equal.
+-                    continue;
++                if let Some(info) = try_merge_overloads(overload1, overload2, opts) {
++                    return Some(info);
+                 }
+-
+-                let (Some(parameters1), Some(parameters2)) =
+-                    (overload1.parameters(), overload2.parameters())
+-                else {
+-                    continue;
+-                };
+-
+-                let Some((signature_to_remove, signature_to_keep, instructions)) = parameters2
+-                    .try_merge(&parameters1)
+-                    .map(|instr| (overload1.clone(), overload2.clone(), instr))
+-                    .or_else(|| {
+-                        parameters1
+-                            .try_merge(&parameters2)
+-                            .map(|instr| (overload2.clone(), overload1.clone(), instr))
+-                    })
+-                else {
+-                    continue;
+-                };
+-
+-                return Some(MergeOverloadSignaturesInfo {
+-                    signature_to_remove,
+-                    signature_to_extend: signature_to_keep,
+-                    parameters_to_merge: instructions.into_boxed_slice(),
+-                });
+             }
+         }
+ 
+@@ -175,7 +227,6 @@ impl Rule for UseUnifiedTypeSignatures {
+                 signature_to_extend_wrapper,
+             );
+         } else {
+-            // Nothing important to transfer, just remove the signature.
+             mutation.remove_node(signature_to_remove_wrapper);
+         }
+ 
+@@ -242,6 +293,65 @@ impl Rule for UseUnifiedTypeSignatures {
+     }
+ }
+ 
++/// Attempt to merge a pair of function overloads, returning information for the range to delete.
++fn try_merge_overloads(
++    overload1: &AnyPotentialTsOverloadSignature,
++    overload2: &AnyPotentialTsOverloadSignature,
++    opts: &UseUnifiedTypeSignaturesOptions,
++) -> Option<MergeOverloadSignaturesInfo> {
++    if !overload1
++        .type_parameters()
++        .is_type_equal(&overload2.type_parameters())
++    {
++        // We can only combine signatures if their type parameters are equal.
++        return None;
++    }
++
++    if !overload1
++        .return_type_annotation()
++        .is_type_equal(&overload2.return_type_annotation())
++    {
++        // We can only combine signatures if their return types are equal.
++        return None;
++    }
++
++    // TODO: Should we drop duplicate JSDocs from the output?
++    // TODO: Should we consider functions without JSDocs as mergeable with documented ones
++    if opts.ignore_different_js_doc()
++        && let (docs1, docs2) = (
++            JsdocComment::get_jsdocs(&overload1.wrapper_syntax()),
++            JsdocComment::get_jsdocs(&overload2.wrapper_syntax()),
++        )
++        && docs1.ne(docs2)
++    {
++        return None;
++    }
++
++    let parameters1 = overload1.parameters()?;
++    let parameters2 = overload2.parameters()?;
++
++    if opts.ignore_differently_named_parameters() && !parameters1.same_param_names(&parameters2) {
++        return None;
++    }
++
++    // TODO: Should try_merge be made to return a tuple itself?
++    parameters2
++        .try_merge(&parameters1)
++        .map(|instr| (overload1.clone(), overload2.clone(), instr))
++        .or_else(|| {
++            parameters1
++                .try_merge(&parameters2)
++                .map(|instr| (overload2.clone(), overload1.clone(), instr))
++        })
++        .map(
++            |(signature_to_remove, signature_to_keep, instructions)| MergeOverloadSignaturesInfo {
++                signature_to_remove,
++                signature_to_extend: signature_to_keep,
++                parameters_to_merge: instructions.into_boxed_slice(),
++            },
++        )
++}
++
+ /// Represents the information needed to merge overload signatures.
+ #[derive(Debug)]
+ pub struct MergeOverloadSignaturesInfo {
+@@ -307,6 +417,12 @@ trait AnyJsParameterListExt {
+     /// Checks if the parameters in this list are assignable to the parameters in the other list.
+     /// Returns a list of parameters that needs to be made optional.
+     fn try_merge(&self, other: &Self) -> Option<Vec<MergeParameterInfo>>;
++
++    /// Checks if all the parameters in this list have identical names to those from another list.
++    ///
++    /// Notably, will only progress to the smaller of the 2 lists before stopping, and will consider any parameters
++    /// without name tokens (like array spread or destructuring literals) as "matching" any other parameter.
++    fn same_param_names(&self, other: &Self) -> bool;
+ }
+ 
+ impl AnyJsParameterListExt for AnyJsParameterList {
+@@ -405,6 +521,26 @@ impl AnyJsParameterListExt for AnyJsParameterList {
+ 
+         Some(result)
+     }
++
++    fn same_param_names(&self, other: &Self) -> bool {
++        self.iter()
++            .zip(other.iter())
++            .all(|(self_param, other_param)| {
++                // nodes without parameter names (destructuring, etc.) should count as matching anything else
++                // for lack of names.
++                // NB: While this could (in theory) produce type errors by merging a destructuring literal with a non-object parameter,
++                // any such code would be nonsensical and arguably deserve to break.
++                // Put another way, if merging the overloads produces new type errors for you, you're probably doing something wrong.
++                let (Some(self_name), Some(other_name)) = (
++                    self_param.ok().and_then(|param| param.name_token()),
++                    other_param.ok().and_then(|param| param.name_token()),
++                ) else {
++                    return true;
++                };
++
++                self_name.text_trimmed() == other_name.text_trimmed()
++            })
++    }
+ }
+ 
+ declare_node_union! {
+@@ -465,8 +601,10 @@ impl AnyFunctionOrMethodName {
+     }
+ }
+ 
++// TODO: Consolidate this with the `IsNameEqual` trait from `use_grouped_accessor_pair.rs`
++// (and maybe anywhere else these kinds of checks are performed).
+ trait NameEquals {
+-    /// Checks if the name of the current node is equal to the name of another node.
++    /// Checks if the name of the current type is equal to the name of another type.
+     fn is_name_equal(&self, other: &Self) -> bool;
+ }
+ 
+diff --git a/crates/biome_js_syntax/src/parameter_ext.rs b/crates/biome_js_syntax/src/parameter_ext.rs
+index 796a9ba409..9d6519e859 100644
+--- a/crates/biome_js_syntax/src/parameter_ext.rs
++++ b/crates/biome_js_syntax/src/parameter_ext.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     AnyJsBindingPattern, AnyJsConstructorParameter, AnyJsFormalParameter, AnyJsParameter,
+     JsConstructorParameterList, JsConstructorParameters, JsDecoratorList, JsLanguage,
+-    JsParameterList, JsParameters, TsTypeAnnotation,
++    JsParameterList, JsParameters, JsSyntaxToken, TsTypeAnnotation,
+ };
+ use biome_rowan::{
+     AstNodeList, AstSeparatedList, AstSeparatedListNodesIterator, SyntaxResult, declare_node_union,
+@@ -470,6 +470,16 @@ impl AnyParameter {
+         }
+     }
+ 
++    /// Obtain the name syntax token for this parameter, if it has one.
++    /// TODO: move this method into AnyJsBindingPattern and then remove it from everywhere else
++    pub fn name_token(&self) -> Option<JsSyntaxToken> {
++        self.binding()?
++            .as_any_js_binding()?
++            .as_js_identifier_binding()?
++            .name_token()
++            .ok()
++    }
++
+     /// Returns type annotation of the parameter if any.
+     pub fn type_annotation(&self) -> Option<TsTypeAnnotation> {
+         match self {
+diff --git a/crates/biome_jsdoc_comment/Cargo.toml b/crates/biome_jsdoc_comment/Cargo.toml
+index c02c54204a..6456fcf7e7 100644
+--- a/crates/biome_jsdoc_comment/Cargo.toml
++++ b/crates/biome_jsdoc_comment/Cargo.toml
+@@ -16,6 +16,7 @@ workspace = true
+ 
+ [dependencies]
+ biome_formatter    = { workspace = true }
++biome_js_parser    = { workspace = true }
+ biome_js_syntax    = { workspace = true }
+ biome_js_type_info = { workspace = true }
+ biome_rowan        = { workspace = true }
+diff --git a/crates/biome_jsdoc_comment/src/jsdoc_comment.rs b/crates/biome_jsdoc_comment/src/jsdoc_comment.rs
+index 07b1527d39..ecba2e9c61 100644
+--- a/crates/biome_jsdoc_comment/src/jsdoc_comment.rs
++++ b/crates/biome_jsdoc_comment/src/jsdoc_comment.rs
+@@ -1,7 +1,6 @@
+-use std::ops::Deref;
+-
+ use biome_js_syntax::{JsSyntaxNode, JsSyntaxToken};
+ use biome_rowan::TriviaPieceKind;
++use std::ops::Deref;
+ 
+ /// Represents a normalised JSDoc comment.
+ ///
+@@ -22,7 +21,7 @@ use biome_rowan::TriviaPieceKind;
+ ///
+ /// The normalised representation will become:
+ /// `"Magic constant of fooness.\n\nFor if you want more ways to write 1."`.
+-///    
++///
+ /// See https://jsdoc.app/ for the JSDoc reference.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct JsdocComment(String);
+@@ -65,24 +64,31 @@ impl JsdocComment {
+             && text.ends_with("*/")
+     }
+ 
+-    /// Iterates all JSDoc comments preceding the node.
++    /// Execute a callback on all JSDoc comments preceding the given node.
++    // TODO: Remove this and replace it since we now expose the raw iterator
+     pub fn for_each<F>(node: &JsSyntaxNode, mut func: F)
+     where
+         F: FnMut(&str),
+     {
+-        if let Some(token) = node.first_token() {
+-            for trivia in token.leading_trivia().pieces() {
+-                match trivia.kind() {
+-                    TriviaPieceKind::MultiLineComment | TriviaPieceKind::SingleLineComment => {
+-                        let text = trivia.text();
+-                        if Self::text_is_jsdoc_comment(text) {
+-                            func(text)
+-                        }
+-                    }
+-                    _ => {}
+-                }
+-            }
+-        }
++        Self::get_jsdocs(node).for_each(|str: String| func(str.as_str()))
++    }
++
++    /// Returns an iterator over the given node's serialized JSDoc comments.
++    /// Nodes lacking a first token will return an empty iterator.
++    pub fn get_jsdocs(node: &JsSyntaxNode) -> impl Iterator<Item = String> {
++        node.first_token()
++            .into_iter()
++            .flat_map(|token| token.leading_trivia().pieces())
++            .filter_map(|trivia| {
++                let text = trivia.text();
++                matches!(
++                    trivia.kind(),
++                    TriviaPieceKind::SingleLineComment | TriviaPieceKind::MultiLineComment
++                )
++                .then(|| text)
++                .filter(|text: &&str| Self::text_is_jsdoc_comment(text))
++                .map(|text| text.to_owned())
++            })
+     }
+ }
+ 
+@@ -137,6 +143,8 @@ impl TryFrom<JsSyntaxToken> for JsdocComment {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use biome_js_parser::{JsParserOptions, parse};
++    use biome_js_syntax::JsFileSource;
+ 
+     #[test]
+     fn test_text_is_jsdoc_comment() {
+@@ -151,4 +159,77 @@ mod tests {
+         assert!(!JsdocComment::text_is_jsdoc_comment("/***/"));
+         assert!(!JsdocComment::text_is_jsdoc_comment("/**/"));
+     }
++
++    fn assert_jsdoc_comments(text: &str, jsdocs: Vec<&str>) {
++        let source = parse(text, JsFileSource::tsx(), JsParserOptions::default()).syntax();
++        assert!(JsdocComment::get_jsdocs(&source).eq(jsdocs));
++    }
++
++    #[test]
++    fn test_get_jsdocs() {
++        assert_jsdoc_comments(
++            r"
++            /** blubber */
++            const a = 5;
++            ",
++            vec!["/** blubber */"],
++        );
++        assert_jsdoc_comments(
++            r"
++            /** j1 */
++            /** j2 */
++            const a = 5;
++            ",
++            vec!["/** j1 */", "/** j2 */"],
++        );
++        assert_jsdoc_comments(
++            r"
++            /** 
++             * multiline
++             * yay
++             * @param foo - the fooness of great
++             */
++            export function fizzbuzz(foo: any) {};
++            ",
++            vec![
++                r"/** 
++             * multiline
++             * yay
++             * @param foo - the fooness of great
++             */",
++            ],
++        );
++        assert_jsdoc_comments(
++            r"
++            /** j1 */
++            // foo bar baz qux quux
++            /** j2 */
++            const rgb = 555;
++            ",
++            vec!["/** j1 */", "/** j2 */"],
++        );
++
++        assert_jsdoc_comments("const a = 5;", vec![]);
++        assert_jsdoc_comments(
++            r"
++            // not jsdoc
++            const a = () => 5;
++            ",
++            vec![],
++        );
++        assert_jsdoc_comments(
++            r"
++            /* also not jsdoc */
++            class a {};
++            ",
++            vec![],
++        );
++        assert_jsdoc_comments(
++            r"
++            /*** too many asterisks */
++            var l = 345678;
++            ",
++            vec![],
++        );
++    }
+ }
+diff --git a/crates/biome_rowan/src/tree_builder.rs b/crates/biome_rowan/src/tree_builder.rs
+index 2d88a32685..b12ea927bf 100644
+--- a/crates/biome_rowan/src/tree_builder.rs
++++ b/crates/biome_rowan/src/tree_builder.rs
+@@ -85,6 +85,7 @@ impl<L: Language, S: SyntaxFactory<Kind = L::Kind>> TreeBuilder<'_, L, S> {
+     }
+ 
+     /// Adds new token to the current branch.
++    // TODO: This should return &mut Self for consistency with `token`
+     #[inline]
+     pub fn token_with_trivia(
+         &mut self,
+diff --git a/crates/biome_rule_options/src/use_unified_type_signatures.rs b/crates/biome_rule_options/src/use_unified_type_signatures.rs
+index c25a7462ec..cd2f19a79e 100644
+--- a/crates/biome_rule_options/src/use_unified_type_signatures.rs
++++ b/crates/biome_rule_options/src/use_unified_type_signatures.rs
+@@ -1,6 +1,26 @@
+ use biome_deserialize_macros::{Deserializable, Merge};
+ use serde::{Deserialize, Serialize};
+-#[derive(Default, Clone, Debug, Deserialize, Deserializable, Merge, Eq, PartialEq, Serialize)]
++
++#[derive(
++    Clone, Copy, Debug, Default, Deserialize, Deserializable, Merge, Eq, PartialEq, Serialize,
++)]
+ #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+ #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+-pub struct UseUnifiedTypeSignaturesOptions {}
++pub struct UseUnifiedTypeSignaturesOptions {
++    /// Whether to ignore overloads with differently named parameters.
++    #[serde(skip_serializing_if = "Option::<_>::is_none")]
++    pub ignore_differently_named_parameters: Option<bool>,
++
++    /// Whether to ignore overloads with different JSDoc comments.
++    #[serde(skip_serializing_if = "Option::<_>::is_none")]
++    pub ignore_different_js_doc: Option<bool>,
++}
++
++impl UseUnifiedTypeSignaturesOptions {
++    pub fn ignore_differently_named_parameters(&self) -> bool {
++        self.ignore_differently_named_parameters.unwrap_or(false)
++    }
++    pub fn ignore_different_js_doc(&self) -> bool {
++        self.ignore_different_js_doc.unwrap_or(false)
++    }
++}
+diff --git a/packages/@biomejs/backend-jsonrpc/src/workspace.ts b/packages/@biomejs/backend-jsonrpc/src/workspace.ts
+index d43f2e59a6..4ccadb2e5e 100644
+--- a/packages/@biomejs/backend-jsonrpc/src/workspace.ts
++++ b/packages/@biomejs/backend-jsonrpc/src/workspace.ts
+@@ -6745,7 +6745,16 @@ export type UseTemplateOptions = {};
+ export type UseThrowNewErrorOptions = {};
+ export type UseThrowOnlyErrorOptions = {};
+ export type UseTrimStartEndOptions = {};
+-export type UseUnifiedTypeSignaturesOptions = {};
++export interface UseUnifiedTypeSignaturesOptions {
++	/**
++	 * Whether to ignore overloads with different JSDoc comments.
++	 */
++	ignoreDifferentJsDoc?: boolean;
++	/**
++	 * Whether to ignore overloads with differently named parameters.
++	 */
++	ignoreDifferentlyNamedParameters?: boolean;
++}
+ export type NoAlertOptions = {};
+ export type NoApproximativeNumericConstantOptions = {};
+ export type NoArrayIndexKeyOptions = {};
+diff --git a/packages/@biomejs/biome/configuration_schema.json b/packages/@biomejs/biome/configuration_schema.json
+index 84a0494f8f..5d6eab9eac 100644
+--- a/packages/@biomejs/biome/configuration_schema.json
++++ b/packages/@biomejs/biome/configuration_schema.json
+@@ -12648,6 +12648,16 @@
+ 		},
+ 		"UseUnifiedTypeSignaturesOptions": {
+ 			"type": "object",
++			"properties": {
++				"ignoreDifferentJsDoc": {
++					"description": "Whether to ignore overloads with different JSDoc comments.",
++					"type": ["boolean", "null"]
++				},
++				"ignoreDifferentlyNamedParameters": {
++					"description": "Whether to ignore overloads with differently named parameters.",
++					"type": ["boolean", "null"]
++				}
++			},
+ 			"additionalProperties": false
+ 		},
+ 		"UseUniqueElementIdsConfiguration": {

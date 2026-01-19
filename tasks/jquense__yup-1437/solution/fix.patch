@@ -1,0 +1,147 @@
+diff --git a/README.md b/README.md
+index 5976c7a..44d8d4b 100644
+--- a/README.md
++++ b/README.md
+@@ -142,7 +142,6 @@ schema.validate({ name: 'jimmy', age: 11 }).catch(function (err) {
+ <!-- START doctoc generated TOC please keep comment here to allow auto update -->
+ <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+ 
+-
+ - [`yup`](#yup)
+   - [`yup.reach(schema: Schema, path: string, value?: object, context?: object): Schema`](#yupreachschema-schema-path-string-value-object-context-object-schema)
+   - [`yup.addMethod(schemaType: Schema, name: string, method: ()=> Schema): void`](#yupaddmethodschematype-schema-name-string-method--schema-void)
+@@ -606,7 +605,9 @@ be used in the `message` argument.
+ #### `mixed.oneOf(arrayOfValues: Array<any>, message?: string | function): Schema` Alias: `equals`
+ 
+ Whitelist a set of values. Values added are automatically removed from any blacklist if they are in it.
+-The `${values}` interpolation can be used in the `message` argument.
++The `${values}` interpolation can be used in the `message` argument. If a ref or refs are provided,
++the `${resolved}` interpolation can be used in the message argument to get the resolved values that were checked
++at validation time.
+ 
+ Note that `undefined` does not fail this validator, even when `undefined` is not included in `arrayOfValues`.
+ If you don't want `undefined` to be a valid value, you can use `mixed.required`.
+@@ -622,7 +623,9 @@ await schema.isValid(new Date()); // => false
+ #### `mixed.notOneOf(arrayOfValues: Array<any>, message?: string | function)`
+ 
+ Blacklist a set of values. Values added are automatically removed from any whitelist if they are in it.
+-The `${values}` interpolation can be used in the `message` argument.
++The `${values}` interpolation can be used in the `message` argument. If a ref or refs are provided,
++the `${resolved}` interpolation can be used in the message argument to get the resolved values that were checked
++at validation time.
+ 
+ ```js
+ let schema = yup.mixed().notOneOf(['jimmy', 42]);
+@@ -729,7 +732,7 @@ await schema.isValid('john'); // => false
+ ```
+ 
+ Test functions are called with a special context value, as the second argument, that exposes some useful metadata
+-and functions. For non arrow functions, the test context is also set as the function `this`. Watch out, if you access 
++and functions. For non arrow functions, the test context is also set as the function `this`. Watch out, if you access
+ it via `this` it won't work in an arrow function.
+ 
+ - `testContext.path`: the string path of the current validation
+diff --git a/src/schema.ts b/src/schema.ts
+index 89b783a..4842af4 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -12,7 +12,6 @@ import createValidation, {
+ import printValue from './util/printValue';
+ import Ref from './Reference';
+ import { getIn } from './util/reach';
+-import toArray from './util/toArray';
+ import {
+   ValidateOptions,
+   TransformFunction,
+@@ -28,6 +27,7 @@ import ValidationError from './ValidationError';
+ import type { Asserts, Thunk } from './util/types';
+ import ReferenceSet from './util/ReferenceSet';
+ import Reference from './Reference';
++import toArray from './util/toArray';
+ 
+ // const UNSET = 'unset' as const;
+ 
+@@ -381,10 +381,8 @@ export default abstract class BaseSchema<
+     let initialTests = [];
+ 
+     if (this._typeError) initialTests.push(this._typeError);
+-
+-    let finalTests = [];
+-    if (this._whitelistError) finalTests.push(this._whitelistError);
+-    if (this._blacklistError) finalTests.push(this._blacklistError);    
++    if (this._whitelistError) initialTests.push(this._whitelistError);
++    if (this._blacklistError) initialTests.push(this._blacklistError);
+ 
+     runTests(
+       {
+@@ -400,7 +398,7 @@ export default abstract class BaseSchema<
+ 
+         runTests(
+           {
+-            tests: this.tests.concat(finalTests),
++            tests: this.tests,
+             args,
+             path,
+             sync,
+@@ -684,12 +682,14 @@ export default abstract class BaseSchema<
+       test(value) {
+         if (value === undefined) return true;
+         let valids = this.schema._whitelist;
++        let resolved = valids.resolveAll(this.resolve);
+ 
+-        return valids.has(value, this.resolve)
++        return resolved.includes(value)
+           ? true
+           : this.createError({
+               params: {
+                 values: valids.toArray().join(', '),
++                resolved
+               },
+             });
+       },
+@@ -713,10 +713,12 @@ export default abstract class BaseSchema<
+       name: 'notOneOf',
+       test(value) {
+         let invalids = this.schema._blacklist;
+-        if (invalids.has(value, this.resolve))
++        let resolved = invalids.resolveAll(this.resolve);
++        if (resolved.includes(value))
+           return this.createError({
+             params: {
+               values: invalids.toArray().join(', '),
++              resolved
+             },
+           });
+         return true;
+diff --git a/src/util/ReferenceSet.ts b/src/util/ReferenceSet.ts
+index a6ac2a1..f9974af 100644
+--- a/src/util/ReferenceSet.ts
++++ b/src/util/ReferenceSet.ts
+@@ -26,6 +26,10 @@ export default class ReferenceSet {
+     return Array.from(this.list).concat(Array.from(this.refs.values()));
+   }
+ 
++  resolveAll(resolve: (v: unknown) => unknown) {
++    return this.toArray().reduce((acc: unknown[],e) => acc.concat(Reference.isRef(e) ? resolve(e) : e),[]);
++  }
++
+   add(value: unknown) {
+     Reference.isRef(value)
+       ? this.refs.set(value.key, value)
+@@ -36,16 +40,6 @@ export default class ReferenceSet {
+       ? this.refs.delete(value.key)
+       : this.list.delete(value);
+   }
+-  has(value: unknown, resolve: (v: unknown) => unknown) {
+-    if (this.list.has(value)) return true;
+-
+-    let item,
+-      values = this.refs.values();
+-    while (((item = values.next()), !item.done))
+-      if (resolve(item.value) === value) return true;
+-
+-    return false;
+-  }
+ 
+   clone() {
+     const next = new ReferenceSet();

@@ -1,0 +1,270 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a34fc57b..597597c2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,9 @@
+ # Changelog
+ 
++## Next
++
++- [] Add `experimentalApplySyntactic`, an experimental built-in rule to allow application of a syntactic rule from a lexical context (see #136 for details).
++
+ ## v16.0.0 - Oct 1, 2021
+ 
+ Ohm v16 is primarily about improving the experience of [using Ohm with TypeScript][using-ohm-with-typescript]. In order to do that, we needed to make some minor breaking changes. With the major version change, we also took the opportunity to clean up and simplify some parts of the API.
+diff --git a/doc/releases/ohm-js-16.0.md b/doc/releases/ohm-js-16.0.md
+index 4252f281..ea60cb46 100644
+--- a/doc/releases/ohm-js-16.0.md
++++ b/doc/releases/ohm-js-16.0.md
+@@ -3,11 +3,13 @@
+ ## Upgrading
+ 
+ ### Args to _\_iter_ and _\_nonterminal_ actions
++
+ <!-- https://git.io/Jz4CI -->
+ 
+ The [`_iter` and `_nonterminal` actions](../api-reference.md#special-actions) now take a variable number of arguments, rather than a single `Node[]` argument containing the child nodes. To make existing code work with Ohm v16, you should change the parameter to a [rest parameter](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Functions/rest_parameters) — e.g., `_iter(children) { ... }` should be changed to `_iter(...children) { ... }`. You can easily find code that needs to change because `addOperation` and friends will now throw an exception if your actions have a single parameter which is _not_ a rest parameter. See [#324](https://github.com/harc/ohm/issues/324) for the reasons behind this change.
+ 
+ ### Default semantic actions
++
+ <!-- https://git.io/JRwtG -->
+ 
+ In operations and attributes, if you haven't defined a semantic action for a particular rule application node, a default action will be used in some cases. For example, your grammar has an _AddExp_ rule but your action dictionary doesn't contain a semantic action named 'AddExp'. **In Ohm v16.0, there is no longer a default action for iteration nodes** — it is _only_ defined for non-terminal nodes with exactly one child. See [#309](https://github.com/harc/ohm/issues/309) for context on this change.
+@@ -23,6 +25,7 @@ _iter(...children) {
+ ```
+ 
+ ### grammarFromScriptElement / grammarsFromScriptElements
++
+ <!-- https://git.io/Jwow5 -->
+ 
+ The functions `grammarFromScriptElement` and `grammarsFromScriptElements` have been removed. When using Ohm in the browser, it's now recommended to put your grammar in a [template literal with String.raw](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/raw):
+diff --git a/doc/syntax-reference.md b/doc/syntax-reference.md
+index 228d15bf..da675aa1 100644
+--- a/doc/syntax-reference.md
++++ b/doc/syntax-reference.md
+@@ -241,6 +241,8 @@ AddExp_plus = AddExp "+" MulExp
+ 
+ <h3 id="syntactic-lexical">Syntactic vs. Lexical Rules</h3>
+ 
++<!-- https://git.io/JiYgP -->
++
+ A _syntactic rule_ is a rule whose name begins with an uppercase letter, and _lexical rule_ is one whose name begins with a lowercase letter. The difference between lexical and syntactic rules is that syntactic rules implicitly skip whitespace characters.
+ 
+ For the purposes of a syntactic rule, a "whitespace character" is anything that matches its enclosing grammar's "space" rule. The default implementation of "space" matches ' ', '\t', '\n', '\r', and any other character that is considered whitespace in the [ES5 spec](http://ecma-international.org/ecma-262/5.1/#sec-7.2).
+diff --git a/packages/ohm-js/index.d.ts b/packages/ohm-js/index.d.ts
+index 2dfdeccf..015d9802 100644
+--- a/packages/ohm-js/index.d.ts
++++ b/packages/ohm-js/index.d.ts
+@@ -248,6 +248,7 @@ declare namespace ohm {
+       arg2: IterationNode
+     ) => T;
+     emptyListOf?: (this: NonterminalNode) => T;
++    experimentalApplySyntactic?: (this: NonterminalNode, arg0: Node) => T;
+   }
+ 
+   /**
+diff --git a/packages/ohm-js/src/MatchState.js b/packages/ohm-js/src/MatchState.js
+index e7219403..1903337c 100644
+--- a/packages/ohm-js/src/MatchState.js
++++ b/packages/ohm-js/src/MatchState.js
+@@ -9,11 +9,18 @@ const MatchResult = require('./MatchResult');
+ const PosInfo = require('./PosInfo');
+ const Trace = require('./Trace');
+ const pexprs = require('./pexprs');
++const util = require('./util');
+ 
+ // --------------------------------------------------------------------
+ // Private stuff
+ // --------------------------------------------------------------------
+ 
++let builtInApplySyntacticBody;
++
++util.awaitBuiltInRules(builtInRules => {
++  builtInApplySyntacticBody = builtInRules.rules.experimentalApplySyntactic.body;
++});
++
+ const applySpaces = new pexprs.Apply('spaces');
+ 
+ function MatchState(matcher, startExpr, optPositionToRecordFailures) {
+@@ -84,9 +91,6 @@ MatchState.prototype = {
+   },
+ 
+   inSyntacticContext() {
+-    if (typeof this.inputStream.source !== 'string') {
+-      return false;
+-    }
+     const currentApplication = this.currentApplication();
+     if (currentApplication) {
+       return currentApplication.isSyntactic() && !this.inLexifiedContext();
+@@ -139,6 +143,7 @@ MatchState.prototype = {
+   truncateBindings(newLength) {
+     // Yes, this is this really faster than setting the `length` property (tested with
+     // bin/es5bench on Node v6.1.0).
++    // Update 2021-10-25: still true on v14.15.5 — it's ~20% speedup on es5bench.
+     while (this._bindings.length > newLength) {
+       this.popBinding();
+     }
+@@ -341,6 +346,12 @@ MatchState.prototype = {
+       this.recordFailures(origRecordedFailures, false);
+     }
+ 
++    // The built-in experimentalApplySyntactic rule needs special handling: we want to skip
++    // trailing spaces, just as with the top-level application of a syntactic rule.
++    if (expr === builtInApplySyntacticBody) {
++      this.skipSpaces();
++    }
++
+     return ans;
+   },
+ 
+diff --git a/packages/ohm-js/src/built-in-rules.ohm b/packages/ohm-js/src/built-in-rules.ohm
+index 5df09d6c..76150930 100644
+--- a/packages/ohm-js/src/built-in-rules.ohm
++++ b/packages/ohm-js/src/built-in-rules.ohm
+@@ -37,4 +37,6 @@ BuiltInRules {
+   emptyListOf<elem, sep>
+     = /* nothing */
+ 
++  // Allows a syntactic rule application within a lexical context.
++  experimentalApplySyntactic<app> = app
+ }
+diff --git a/packages/ohm-js/src/errors.js b/packages/ohm-js/src/errors.js
+index 5f5ce6b0..d5e78f06 100644
+--- a/packages/ohm-js/src/errors.js
++++ b/packages/ohm-js/src/errors.js
+@@ -166,6 +166,10 @@ function invalidParameter(ruleName, expr) {
+ 
+ // Application of syntactic rule from lexical rule
+ 
++const syntacticVsLexicalNote =
++  'NOTE: A _syntactic rule_ is a rule whose name begins with a capital letter. ' +
++  'See https://git.io/JiYgP for more details.';
++
+ function applicationOfSyntacticRuleFromLexicalContext(ruleName, applyExpr) {
+   return createError(
+       'Cannot apply syntactic rule ' + ruleName + ' from here (inside a lexical context)',
+@@ -173,6 +177,17 @@ function applicationOfSyntacticRuleFromLexicalContext(ruleName, applyExpr) {
+   );
+ }
+ 
++// Lexical rule application used with experimentalApplySyntactic
++
++function experimentalApplySyntacticWithLexicalRuleApplication(applyExpr) {
++  const {ruleName} = applyExpr;
++  return createError(
++      `experimentalApplySyntactic is for syntactic rules, but '${ruleName}' is a lexical rule. ` +
++      syntacticVsLexicalNote,
++      applyExpr.source
++  );
++}
++
+ // Incorrect argument type
+ 
+ function incorrectArgumentType(expectedType, expr) {
+@@ -280,6 +295,7 @@ function missingSemanticAction(ctorName, name, type, stack) {
+ 
+ module.exports = {
+   applicationOfSyntacticRuleFromLexicalContext,
++  experimentalApplySyntacticWithLexicalRuleApplication,
+   cannotExtendUndeclaredRule,
+   cannotOverrideUndeclaredRule,
+   duplicateGrammarDeclaration,
+diff --git a/packages/ohm-js/src/pexprs-assertAllApplicationsAreValid.js b/packages/ohm-js/src/pexprs-assertAllApplicationsAreValid.js
+index 9f584bbd..ac697eac 100644
+--- a/packages/ohm-js/src/pexprs-assertAllApplicationsAreValid.js
++++ b/packages/ohm-js/src/pexprs-assertAllApplicationsAreValid.js
+@@ -4,7 +4,7 @@
+ // Imports
+ // --------------------------------------------------------------------
+ 
+-const common = require('./common');
++const {abstract, isSyntactic} = require('./common');
+ const errors = require('./errors');
+ const pexprs = require('./pexprs');
+ const util = require('./util');
+@@ -26,7 +26,7 @@ pexprs.PExpr.prototype.assertAllApplicationsAreValid = function(ruleName, gramma
+   this._assertAllApplicationsAreValid(ruleName, grammar);
+ };
+ 
+-pexprs.PExpr.prototype._assertAllApplicationsAreValid = common.abstract(
++pexprs.PExpr.prototype._assertAllApplicationsAreValid = abstract(
+     '_assertAllApplicationsAreValid'
+ );
+ 
+@@ -65,7 +65,11 @@ pexprs.Iter.prototype._assertAllApplicationsAreValid =
+       this.expr._assertAllApplicationsAreValid(ruleName, grammar);
+     };
+ 
+-pexprs.Apply.prototype._assertAllApplicationsAreValid = function(ruleName, grammar) {
++pexprs.Apply.prototype._assertAllApplicationsAreValid = function(
++    ruleName,
++    grammar,
++    skipSyntacticCheck = false
++) {
+   const ruleInfo = grammar.rules[this.ruleName];
+ 
+   // Make sure that the rule exists...
+@@ -75,8 +79,9 @@ pexprs.Apply.prototype._assertAllApplicationsAreValid = function(ruleName, gramm
+ 
+   // ...and that this application is allowed
+   if (
+-    common.isSyntactic(this.ruleName) &&
+-    (!common.isSyntactic(ruleName) || lexifyCount > 0)
++    !skipSyntacticCheck &&
++    isSyntactic(this.ruleName) &&
++    (!isSyntactic(ruleName) || lexifyCount > 0)
+   ) {
+     throw errors.applicationOfSyntacticRuleFromLexicalContext(this.ruleName, this);
+   }
+@@ -88,9 +93,16 @@ pexprs.Apply.prototype._assertAllApplicationsAreValid = function(ruleName, gramm
+     throw errors.wrongNumberOfArguments(this.ruleName, expected, actual, this.source);
+   }
+ 
++  const isBuiltInApplySyntactic =
++    BuiltInRules && ruleInfo === BuiltInRules.rules.experimentalApplySyntactic;
++  const isBuiltInCaseInsensitive =
++    BuiltInRules && ruleInfo === BuiltInRules.rules.caseInsensitive;
++
+   // ...and that all of the argument expressions only have valid applications and have arity 1.
++  // If `this` is an application of the built-in experimentalApplySyntactic rule, then its arg is
++  // allowed (and expected) to be a syntactic rule, even if we're in a lexical context.
+   this.args.forEach(arg => {
+-    arg._assertAllApplicationsAreValid(ruleName, grammar);
++    arg._assertAllApplicationsAreValid(ruleName, grammar, isBuiltInApplySyntactic);
+     if (arg.getArity() !== 1) {
+       throw errors.invalidParameter(this.ruleName, arg);
+     }
+@@ -99,9 +111,19 @@ pexprs.Apply.prototype._assertAllApplicationsAreValid = function(ruleName, gramm
+   // Extra checks for "special" applications
+ 
+   // If it's an application of 'caseInsensitive', ensure that the argument is a Terminal.
+-  if (BuiltInRules && ruleInfo === BuiltInRules.rules.caseInsensitive) {
++  if (isBuiltInCaseInsensitive) {
+     if (!(this.args[0] instanceof pexprs.Terminal)) {
+       throw errors.incorrectArgumentType('a Terminal (e.g. "abc")', this.args[0]);
+     }
+   }
++
++  if (isBuiltInApplySyntactic) {
++    const arg = this.args[0];
++    if (!(arg instanceof pexprs.Apply)) {
++      throw errors.incorrectArgumentType('a syntactic rule application', arg);
++    }
++    if (!isSyntactic(arg.ruleName)) {
++      throw errors.experimentalApplySyntacticWithLexicalRuleApplication(arg);
++    }
++  }
+ };
+diff --git a/packages/ohm-js/dist/built-in-rules.js b/packages/ohm-js/dist/built-in-rules.js
+index 71ac9c66..004c1de9 100644
+--- a/packages/ohm-js/dist/built-in-rules.js
++++ b/packages/ohm-js/dist/built-in-rules.js
+@@ -1,2 +1,2 @@
+ var ohm = require('..');
+-module.exports = ohm.makeRecipe(["grammar",{"source":"BuiltInRules {\n\n  alnum  (an alpha-numeric character)\n    = letter\n    | digit\n\n  letter  (a letter)\n    = lower\n    | upper\n    | unicodeLtmo\n\n  digit  (a digit)\n    = \"0\"..\"9\"\n\n  hexDigit  (a hexadecimal digit)\n    = digit\n    | \"a\"..\"f\"\n    | \"A\"..\"F\"\n\n  ListOf<elem, sep>\n    = NonemptyListOf<elem, sep>\n    | EmptyListOf<elem, sep>\n\n  NonemptyListOf<elem, sep>\n    = elem (sep elem)*\n\n  EmptyListOf<elem, sep>\n    = /* nothing */\n\n  listOf<elem, sep>\n    = nonemptyListOf<elem, sep>\n    | emptyListOf<elem, sep>\n\n  nonemptyListOf<elem, sep>\n    = elem (sep elem)*\n\n  emptyListOf<elem, sep>\n    = /* nothing */\n\n}"},"BuiltInRules",null,null,{"alnum":["define",{"sourceInterval":[18,78]},"an alpha-numeric character",[],["alt",{"sourceInterval":[60,78]},["app",{"sourceInterval":[60,66]},"letter",[]],["app",{"sourceInterval":[73,78]},"digit",[]]]],"letter":["define",{"sourceInterval":[82,142]},"a letter",[],["alt",{"sourceInterval":[107,142]},["app",{"sourceInterval":[107,112]},"lower",[]],["app",{"sourceInterval":[119,124]},"upper",[]],["app",{"sourceInterval":[131,142]},"unicodeLtmo",[]]]],"digit":["define",{"sourceInterval":[146,177]},"a digit",[],["range",{"sourceInterval":[169,177]},"0","9"]],"hexDigit":["define",{"sourceInterval":[181,254]},"a hexadecimal digit",[],["alt",{"sourceInterval":[219,254]},["app",{"sourceInterval":[219,224]},"digit",[]],["range",{"sourceInterval":[231,239]},"a","f"],["range",{"sourceInterval":[246,254]},"A","F"]]],"ListOf":["define",{"sourceInterval":[258,336]},null,["elem","sep"],["alt",{"sourceInterval":[282,336]},["app",{"sourceInterval":[282,307]},"NonemptyListOf",[["param",{"sourceInterval":[297,301]},0],["param",{"sourceInterval":[303,306]},1]]],["app",{"sourceInterval":[314,336]},"EmptyListOf",[["param",{"sourceInterval":[326,330]},0],["param",{"sourceInterval":[332,335]},1]]]]],"NonemptyListOf":["define",{"sourceInterval":[340,388]},null,["elem","sep"],["seq",{"sourceInterval":[372,388]},["param",{"sourceInterval":[372,376]},0],["star",{"sourceInterval":[377,388]},["seq",{"sourceInterval":[378,386]},["param",{"sourceInterval":[378,381]},1],["param",{"sourceInterval":[382,386]},0]]]]],"EmptyListOf":["define",{"sourceInterval":[392,434]},null,["elem","sep"],["seq",{"sourceInterval":[438,438]}]],"listOf":["define",{"sourceInterval":[438,516]},null,["elem","sep"],["alt",{"sourceInterval":[462,516]},["app",{"sourceInterval":[462,487]},"nonemptyListOf",[["param",{"sourceInterval":[477,481]},0],["param",{"sourceInterval":[483,486]},1]]],["app",{"sourceInterval":[494,516]},"emptyListOf",[["param",{"sourceInterval":[506,510]},0],["param",{"sourceInterval":[512,515]},1]]]]],"nonemptyListOf":["define",{"sourceInterval":[520,568]},null,["elem","sep"],["seq",{"sourceInterval":[552,568]},["param",{"sourceInterval":[552,556]},0],["star",{"sourceInterval":[557,568]},["seq",{"sourceInterval":[558,566]},["param",{"sourceInterval":[558,561]},1],["param",{"sourceInterval":[562,566]},0]]]]],"emptyListOf":["define",{"sourceInterval":[572,614]},null,["elem","sep"],["seq",{"sourceInterval":[616,616]}]]}]);
++module.exports = ohm.makeRecipe(["grammar",{"source":"BuiltInRules {\n\n  alnum  (an alpha-numeric character)\n    = letter\n    | digit\n\n  letter  (a letter)\n    = lower\n    | upper\n    | unicodeLtmo\n\n  digit  (a digit)\n    = \"0\"..\"9\"\n\n  hexDigit  (a hexadecimal digit)\n    = digit\n    | \"a\"..\"f\"\n    | \"A\"..\"F\"\n\n  ListOf<elem, sep>\n    = NonemptyListOf<elem, sep>\n    | EmptyListOf<elem, sep>\n\n  NonemptyListOf<elem, sep>\n    = elem (sep elem)*\n\n  EmptyListOf<elem, sep>\n    = /* nothing */\n\n  listOf<elem, sep>\n    = nonemptyListOf<elem, sep>\n    | emptyListOf<elem, sep>\n\n  nonemptyListOf<elem, sep>\n    = elem (sep elem)*\n\n  emptyListOf<elem, sep>\n    = /* nothing */\n\n  // Allows a syntactic rule application within a lexical context.\n  experimentalApplySyntactic<app> = app\n}"},"BuiltInRules",null,null,{"alnum":["define",{"sourceInterval":[18,78]},"an alpha-numeric character",[],["alt",{"sourceInterval":[60,78]},["app",{"sourceInterval":[60,66]},"letter",[]],["app",{"sourceInterval":[73,78]},"digit",[]]]],"letter":["define",{"sourceInterval":[82,142]},"a letter",[],["alt",{"sourceInterval":[107,142]},["app",{"sourceInterval":[107,112]},"lower",[]],["app",{"sourceInterval":[119,124]},"upper",[]],["app",{"sourceInterval":[131,142]},"unicodeLtmo",[]]]],"digit":["define",{"sourceInterval":[146,177]},"a digit",[],["range",{"sourceInterval":[169,177]},"0","9"]],"hexDigit":["define",{"sourceInterval":[181,254]},"a hexadecimal digit",[],["alt",{"sourceInterval":[219,254]},["app",{"sourceInterval":[219,224]},"digit",[]],["range",{"sourceInterval":[231,239]},"a","f"],["range",{"sourceInterval":[246,254]},"A","F"]]],"ListOf":["define",{"sourceInterval":[258,336]},null,["elem","sep"],["alt",{"sourceInterval":[282,336]},["app",{"sourceInterval":[282,307]},"NonemptyListOf",[["param",{"sourceInterval":[297,301]},0],["param",{"sourceInterval":[303,306]},1]]],["app",{"sourceInterval":[314,336]},"EmptyListOf",[["param",{"sourceInterval":[326,330]},0],["param",{"sourceInterval":[332,335]},1]]]]],"NonemptyListOf":["define",{"sourceInterval":[340,388]},null,["elem","sep"],["seq",{"sourceInterval":[372,388]},["param",{"sourceInterval":[372,376]},0],["star",{"sourceInterval":[377,388]},["seq",{"sourceInterval":[378,386]},["param",{"sourceInterval":[378,381]},1],["param",{"sourceInterval":[382,386]},0]]]]],"EmptyListOf":["define",{"sourceInterval":[392,434]},null,["elem","sep"],["seq",{"sourceInterval":[438,438]}]],"listOf":["define",{"sourceInterval":[438,516]},null,["elem","sep"],["alt",{"sourceInterval":[462,516]},["app",{"sourceInterval":[462,487]},"nonemptyListOf",[["param",{"sourceInterval":[477,481]},0],["param",{"sourceInterval":[483,486]},1]]],["app",{"sourceInterval":[494,516]},"emptyListOf",[["param",{"sourceInterval":[506,510]},0],["param",{"sourceInterval":[512,515]},1]]]]],"nonemptyListOf":["define",{"sourceInterval":[520,568]},null,["elem","sep"],["seq",{"sourceInterval":[552,568]},["param",{"sourceInterval":[552,556]},0],["star",{"sourceInterval":[557,568]},["seq",{"sourceInterval":[558,566]},["param",{"sourceInterval":[558,561]},1],["param",{"sourceInterval":[562,566]},0]]]]],"emptyListOf":["define",{"sourceInterval":[572,682]},null,["elem","sep"],["seq",{"sourceInterval":[685,685]}]],"experimentalApplySyntactic":["define",{"sourceInterval":[685,722]},null,["app"],["param",{"sourceInterval":[719,722]},0]]}]);
+commit 1ba582aae4234c7b618d5c265f0ee0d3a8c45372
+Author: Patrick Dubroy <pdubroy@gmail.com>
+Date:   Tue Oct 26 13:15:49 2021 +0200
+
+    feat: Add built-in `experimentalApplySyntactic` rule (#334)

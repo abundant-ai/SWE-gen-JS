@@ -1,0 +1,174 @@
+diff --git a/packages/common/decorators/http/header.decorator.ts b/packages/common/decorators/http/header.decorator.ts
+index 3aad45cc3..875ce8472 100644
+--- a/packages/common/decorators/http/header.decorator.ts
++++ b/packages/common/decorators/http/header.decorator.ts
+@@ -15,7 +15,10 @@ import { extendArrayMetadata } from '../../utils/extend-metadata.util';
+  *
+  * @publicApi
+  */
+-export function Header(name: string, value: string | (() => string)): MethodDecorator {
++export function Header(
++  name: string,
++  value: string | (() => string),
++): MethodDecorator {
+   return (
+     target: object,
+     key: string | symbol,
+diff --git a/packages/core/middleware/builder.ts b/packages/core/middleware/builder.ts
+index aa1b3675a..40301577a 100644
+--- a/packages/core/middleware/builder.ts
++++ b/packages/core/middleware/builder.ts
+@@ -58,10 +58,22 @@ export class MiddlewareBuilder implements MiddlewareConsumer {
+     public exclude(
+       ...routes: Array<string | RouteInfo>
+     ): MiddlewareConfigProxy {
+-      this.excludedRoutes = this.getRoutesFlatList(routes).map(route => ({
+-        ...route,
+-        path: this.routeInfoPathExtractor.extractPathFrom(route),
+-      }));
++      this.excludedRoutes = this.getRoutesFlatList(routes).reduce(
++        (excludedRoutes, route) => {
++          for (const routePath of this.routeInfoPathExtractor.extractPathFrom(
++            route,
++          )) {
++            excludedRoutes.push({
++              ...route,
++              path: routePath,
++            });
++          }
++
++          return excludedRoutes;
++        },
++        [] as RouteInfo[],
++      );
++
+       return this;
+     }
+ 
+diff --git a/packages/core/middleware/route-info-path-extractor.ts b/packages/core/middleware/route-info-path-extractor.ts
+index c3d2bf8bf..d8f17f5d9 100644
+--- a/packages/core/middleware/route-info-path-extractor.ts
++++ b/packages/core/middleware/route-info-path-extractor.ts
+@@ -14,7 +14,7 @@ import { isRouteExcluded } from '../router/utils';
+ import { RoutePathFactory } from './../router/route-path-factory';
+ 
+ export class RouteInfoPathExtractor {
+-  private routePathFactory: RoutePathFactory;
++  private readonly routePathFactory: RoutePathFactory;
+   private readonly prefixPath: string;
+   private readonly excludedGlobalPrefixRoutes: ExcludeRouteMetadata[];
+   private readonly versioningConfig?: VersioningOptions;
+@@ -30,58 +30,83 @@ export class RouteInfoPathExtractor {
+   }
+ 
+   public extractPathsFrom({ path, method, version }: RouteInfo): string[] {
+-    const versionPath = this.extractVersionPathFrom(version);
++    const versionPaths = this.extractVersionPathFrom(version);
+ 
+     if (this.isAWildcard(path)) {
++      const entries =
++        versionPaths.length > 0
++          ? versionPaths.map(
++              versionPath =>
++                this.prefixPath + versionPath + addLeadingSlash(path),
++            )
++          : [this.prefixPath + addLeadingSlash(path)];
++
+       return Array.isArray(this.excludedGlobalPrefixRoutes)
+         ? [
+-            this.prefixPath + versionPath + addLeadingSlash(path),
++            ...entries,
+             ...this.excludedGlobalPrefixRoutes.map(
+-              route => versionPath + addLeadingSlash(route.path),
++              route => versionPaths + addLeadingSlash(route.path),
+             ),
+           ]
+-        : [this.prefixPath + versionPath + addLeadingSlash(path)];
++        : entries;
+     }
+ 
+-    return [this.extractNonWildcardPathFrom({ path, method, version })];
++    return this.extractNonWildcardPathsFrom({ path, method, version });
+   }
+ 
+-  public extractPathFrom(route: RouteInfo): string {
++  public extractPathFrom(route: RouteInfo): string[] {
+     if (this.isAWildcard(route.path) && !route.version) {
+-      return addLeadingSlash(route.path);
++      return [addLeadingSlash(route.path)];
+     }
+ 
+-    return this.extractNonWildcardPathFrom(route);
++    return this.extractNonWildcardPathsFrom(route);
+   }
+ 
+   private isAWildcard(path: string): boolean {
+     return ['*', '/*', '/*/', '(.*)', '/(.*)'].includes(path);
+   }
+ 
+-  private extractNonWildcardPathFrom({
++  private extractNonWildcardPathsFrom({
+     path,
+     method,
+     version,
+-  }: RouteInfo): string {
+-    const versionPath = this.extractVersionPathFrom(version);
++  }: RouteInfo): string[] {
++    const versionPaths = this.extractVersionPathFrom(version);
+ 
+     if (
+       Array.isArray(this.excludedGlobalPrefixRoutes) &&
+       isRouteExcluded(this.excludedGlobalPrefixRoutes, path, method)
+     ) {
+-      return versionPath + addLeadingSlash(path);
++      if (!versionPaths.length) {
++        return [addLeadingSlash(path)];
++      }
++
++      return versionPaths.map(
++        versionPath => versionPath + addLeadingSlash(path),
++      );
+     }
+ 
+-    return this.prefixPath + versionPath + addLeadingSlash(path);
++    if (!versionPaths.length) {
++      return [this.prefixPath + addLeadingSlash(path)];
++    }
++    return versionPaths.map(
++      versionPath => this.prefixPath + versionPath + addLeadingSlash(path),
++    );
+   }
+ 
+-  private extractVersionPathFrom(version?: VersionValue): string {
+-    if (!version || this.versioningConfig?.type !== VersioningType.URI)
+-      return '';
++  private extractVersionPathFrom(versionValue?: VersionValue): string[] {
++    if (!versionValue || this.versioningConfig?.type !== VersioningType.URI)
++      return [];
+ 
+     const versionPrefix = this.routePathFactory.getVersionPrefix(
+       this.versioningConfig,
+     );
+-    return addLeadingSlash(versionPrefix + version.toString());
++
++    if (Array.isArray(versionValue)) {
++      return versionValue.map(version =>
++        addLeadingSlash(versionPrefix + version.toString()),
++      );
++    }
++    return [addLeadingSlash(versionPrefix + versionValue.toString())];
+   }
+ }
+diff --git a/packages/core/router/router-response-controller.ts b/packages/core/router/router-response-controller.ts
+index a647afbe5..96bd06b94 100644
+--- a/packages/core/router/router-response-controller.ts
++++ b/packages/core/router/router-response-controller.ts
+@@ -87,7 +87,7 @@ export class RouterResponseController {
+       this.applicationRef.setHeader(
+         response,
+         name,
+-        typeof value === 'function' ? value() : value
++        typeof value === 'function' ? value() : value,
+       ),
+     );
+   }

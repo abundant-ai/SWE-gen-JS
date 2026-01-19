@@ -1,0 +1,133 @@
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index caebbdd128..ffd155aa63 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -323,10 +323,13 @@ export class Job<
+    * @param data - the data that will replace the current jobs data.
+    */
+   async update(data: DataType): Promise<void> {
+-    const client = await this.queue.client;
+-
+     this.data = data;
+-    await client.hset(this.toKey(this.id), 'data', JSON.stringify(data));
++
++    return Scripts.updateData<DataType, ReturnType, NameType>(
++      this.queue,
++      this,
++      data,
++    );
+   }
+ 
+   /**
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index d11f7e16ad..aca2dc0964 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -203,6 +203,23 @@ export class Scripts {
+     return (<any>client).extendLock(args);
+   }
+ 
++  static async updateData<T = any, R = any, N extends string = string>(
++    queue: MinimalQueue,
++    job: Job<T, R, N>,
++    data: T,
++  ): Promise<void> {
++    const client = await queue.client;
++
++    const keys = [queue.toKey(job.id)];
++    const dataJson = JSON.stringify(data);
++
++    const result = await (<any>client).updateData(keys.concat([dataJson]));
++
++    if (result < 0) {
++      throw this.finishedErrors(result, job.id, 'updateData');
++    }
++  }
++
+   static async updateProgress<T = any, R = any, N extends string = string>(
+     queue: MinimalQueue,
+     job: Job<T, R, N>,
+@@ -213,10 +230,9 @@ export class Scripts {
+     const keys = [queue.toKey(job.id), queue.keys.events];
+     const progressJson = JSON.stringify(progress);
+ 
+-    const result = await (<any>client).updateProgress(keys, [
+-      job.id,
+-      progressJson,
+-    ]);
++    const result = await (<any>client).updateProgress(
++      keys.concat([job.id, progressJson]),
++    );
+ 
+     if (result < 0) {
+       throw this.finishedErrors(result, job.id, 'updateProgress');
+diff --git a/src/commands/includes/batches.lua b/src/commands/includes/batches.lua
+index 479a832300..b8e6d48065 100644
+--- a/src/commands/includes/batches.lua
++++ b/src/commands/includes/batches.lua
+@@ -1,3 +1,9 @@
++--[[
++  Function to loop in batches.
++  Just a bit of warning, some commands as ZREM
++  could receive a maximum of 7000 parameters per call.
++]]
++
+ local function batches(n, batchSize)
+   local i = 0
+ 
+diff --git a/src/commands/updateData-1.lua b/src/commands/updateData-1.lua
+new file mode 100644
+index 0000000000..130b6e565b
+--- /dev/null
++++ b/src/commands/updateData-1.lua
+@@ -0,0 +1,16 @@
++--[[
++  Update job data
++
++  Input:
++    KEYS[1] Job id key
++  
++    ARGV[1] data        
++]]
++local rcall = redis.call
++
++if rcall("EXISTS",KEYS[1]) == 1 then -- // Make sure job exists
++  rcall("HSET", KEYS[1], "data", ARGV[1])
++  return 0
++else
++  return -1
++end
+diff --git a/src/commands/updateProgress-2.lua b/src/commands/updateProgress-2.lua
+index d5a252a2a0..7c5f136e2d 100644
+--- a/src/commands/updateProgress-2.lua
++++ b/src/commands/updateProgress-2.lua
+@@ -1,15 +1,15 @@
+ --[[
+   Update job progress
+ 
+-     Input:
+-        KEYS[1] Job id key
+-        KEYS[2] event stream key
+-      
+-        ARGV[1] id
+-        ARGV[2] progress
+-        
+-      Event:
+-        progress(jobId, progress)
++  Input:
++    KEYS[1] Job id key
++    KEYS[2] event stream key
++  
++    ARGV[1] id
++    ARGV[2] progress
++    
++  Event:
++    progress(jobId, progress)
+ ]]
+ local rcall = redis.call
+ 
+@@ -20,4 +20,3 @@ if rcall("EXISTS",KEYS[1]) == 1 then -- // Make sure job exists
+ else
+   return -1
+ end
+-

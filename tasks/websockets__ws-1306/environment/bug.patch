@@ -1,0 +1,219 @@
+diff --git a/README.md b/README.md
+index 423ed6a3..83d21dad 100644
+--- a/README.md
++++ b/README.md
+@@ -81,47 +81,6 @@ The extension is disabled by default on the server and enabled by default on
+ the client. It adds a significant overhead in terms of performance and memory
+ consumption so we suggest to enable it only if it is really needed.
+ 
+-Note that Node.js has a variety of issues with high-performance compression,
+-where increased concurrency, especially on Linux, can lead to
+-[catastrophic memory fragmentation][node-zlib-bug] and slow performance.
+-If you intend to use `permessage-deflate` in production, it is worthwhile
+-to set up a test representative of your workload and ensure Node.js/zlib will
+-handle it with acceptable performance and memory usage.
+-
+-Tuning of `permessage-deflate` can be done via the options defined below.
+-You can also use `zlibDeflateOptions` and `zlibInflateOptions`, which is passed
+-directly into the creation of
+-[raw deflate/inflate streams][node-zlib-deflaterawdocs].
+-
+-See [the docs][ws-server-options] for more options.
+-
+-```js
+-const WebSocket = require('ws');
+-
+-const wss = new WebSocket.Server({
+-  port: 8080,
+-  perMessageDeflate: {
+-    zlibDeflateOptions: { // See zlib defaults
+-      chunkSize: 1024,
+-      memLevel: 7,
+-      level: 3,
+-    },
+-    zlibInflateOptions: {
+-      chunkSize: 10 * 1024
+-    },
+-    // Other options settable:
+-    clientNoContextTakeover: true, // defaults to negotiated value
+-    serverNoContextTakeover: true, // defaults to negotiated value
+-    clientMaxWindowBits: 10,       // defaults to negotiated value
+-    serverMaxWindowBits: 10,       // defaults to negotiated value
+-    // Below options specified as default values
+-    concurrencyLimit: 10,          // limits zlib concurrency for perf
+-    threshold: 1024,               // Size (in bytes) below which messages
+-                                   // should not be compressed
+-  }
+-});
+-```
+-
+ The client will only use the extension if it is supported and enabled on the
+ server. To always disable the extension on the client set the
+ `perMessageDeflate` option to `false`.
+@@ -385,6 +344,3 @@ We're using the GitHub [releases][changelog] for changelog entries.
+ [server-report]: http://websockets.github.io/ws/autobahn/servers/
+ [permessage-deflate]: https://tools.ietf.org/html/rfc7692
+ [changelog]: https://github.com/websockets/ws/releases
+-[node-zlib-bug]: https://github.com/nodejs/node/issues/8871
+-[node-zlib-deflaterawdocs]: https://nodejs.org/api/zlib.html#zlib_zlib_createdeflateraw_options
+-[ws-server-options]: https://github.com/websockets/ws/blob/master/doc/ws.md#new-websocketserveroptions-callback
+diff --git a/doc/ws.md b/doc/ws.md
+index 213af006..da0f285f 100644
+--- a/doc/ws.md
++++ b/doc/ws.md
+@@ -71,8 +71,8 @@ provided then that is extension parameters:
+   takeover.
+ - `serverMaxWindowBits` {Number} The value of `windowBits`.
+ - `clientMaxWindowBits` {Number} Request a custom client window size.
+-- `zlibOptions` {Object} [Additional options][zlib-options] to pass to zlib
+-  on deflate.
++- `level` {Number} The value of zlib's `level` param (0-9, default 8).
++- `memLevel` {Number} The value of zlib's `memLevel` param (1-9, default 8).
+ - `threshold` {Number} Payloads smaller than this will not be compressed.
+   Defaults to 1024 bytes.
+ - `concurrencyLimit` {Number} The number of concurrent calls to zlib.
+@@ -420,4 +420,3 @@ The URL of the WebSocket server. Server clients don't have this attribute.
+ 
+ [concurrency-limit]: https://github.com/websockets/ws/issues/1202
+ [permessage-deflate]: https://tools.ietf.org/html/draft-ietf-hybi-permessage-compression-19
+-[zlib-options]: https://nodejs.org/api/zlib.html#zlib_class_options
+diff --git a/lib/permessage-deflate.js b/lib/permessage-deflate.js
+index cabab971..63182200 100644
+--- a/lib/permessage-deflate.js
++++ b/lib/permessage-deflate.js
+@@ -44,8 +44,8 @@ class PerMessageDeflate {
+    *     use of a custom server window size
+    * @param {(Boolean|Number)} options.clientMaxWindowBits Advertise support
+    *     for, or request, a custom client window size
+-   * @param {Object} options.zlibDeflateOptions Options to pass to zlib on deflate
+-   * @param {Object} options.zlibInflateOptions Options to pass to zlib on inflate
++   * @param {Number} options.level The value of zlib's `level` param
++   * @param {Number} options.memLevel The value of zlib's `memLevel` param
+    * @param {Number} options.threshold Size (in bytes) below which messages
+    *     should not be compressed
+    * @param {Number} options.concurrencyLimit The number of concurrent calls to
+@@ -345,13 +345,7 @@ class PerMessageDeflate {
+         ? zlib.Z_DEFAULT_WINDOWBITS
+         : this.params[key];
+ 
+-      this._inflate = zlib.createInflateRaw(
+-        Object.assign(
+-          {},
+-          this._options.zlibInflateOptions,
+-          { windowBits }
+-        )
+-      );
++      this._inflate = zlib.createInflateRaw({ windowBits });
+       this._inflate[kTotalLength] = 0;
+       this._inflate[kBuffers] = [];
+       this._inflate[kOwner] = this;
+@@ -418,17 +412,12 @@ class PerMessageDeflate {
+         ? zlib.Z_DEFAULT_WINDOWBITS
+         : this.params[key];
+ 
+-      this._deflate = zlib.createDeflateRaw(
+-        Object.assign(
+-          // TODO deprecate memLevel/level and recommend zlibDeflateOptions instead
+-          {
+-            memLevel: this._options.memLevel,
+-            level: this._options.level
+-          },
+-          this._options.zlibDeflateOptions,
+-          { windowBits }
+-        )
+-      );
++      this._deflate = zlib.createDeflateRaw({
++        memLevel: this._options.memLevel,
++        level: this._options.level,
++        flush: zlib.Z_SYNC_FLUSH,
++        windowBits
++      });
+ 
+       this._deflate[kTotalLength] = 0;
+       this._deflate[kBuffers] = [];
+diff --git a/test/permessage-deflate.test.js b/test/permessage-deflate.test.js
+index 038af2df..92931598 100644
+--- a/test/permessage-deflate.test.js
++++ b/test/permessage-deflate.test.js
+@@ -352,8 +352,8 @@ describe('PerMessageDeflate', function () {
+     });
+ 
+     it('honors the `level` option', function (done) {
+-      const lev0 = new PerMessageDeflate({ threshold: 0, level: 0 });
+       const lev9 = new PerMessageDeflate({ threshold: 0, level: 9 });
++      const lev0 = new PerMessageDeflate({ threshold: 0, level: 0 });
+       const extensionStr = (
+         'permessage-deflate; server_no_context_takeover; ' +
+         'client_no_context_takeover; server_max_window_bits=10; ' +
+@@ -390,71 +390,6 @@ describe('PerMessageDeflate', function () {
+       });
+     });
+ 
+-    it('honors the `zlib{Deflate,Inflate}Options` option', function (done) {
+-      const lev0 = new PerMessageDeflate({
+-        threshold: 0,
+-        zlibDeflateOptions: {
+-          level: 0,
+-          chunkSize: 256
+-        },
+-        zlibInflateOptions: {
+-          chunkSize: 2048
+-        }
+-      });
+-      const lev9 = new PerMessageDeflate({
+-        threshold: 0,
+-        zlibDeflateOptions: {
+-          level: 9,
+-          chunkSize: 128
+-        },
+-        zlibInflateOptions: {
+-          chunkSize: 1024
+-        }
+-      });
+-
+-      // Note no context takeover so we can get a hold of the raw streams after we do the dance
+-      const extensionStr = (
+-        'permessage-deflate; server_max_window_bits=10; ' +
+-        'client_max_window_bits=11'
+-      );
+-      const buf = Buffer.from("Some compressible data, it's compressible.");
+-
+-      lev0.accept(extension.parse(extensionStr)['permessage-deflate']);
+-      lev9.accept(extension.parse(extensionStr)['permessage-deflate']);
+-
+-      lev0.compress(buf, true, (err, compressed1) => {
+-        if (err) return done(err);
+-
+-        lev0.decompress(compressed1, true, (err, decompressed1) => {
+-          if (err) return done(err);
+-
+-          lev9.compress(buf, true, (err, compressed2) => {
+-            if (err) return done(err);
+-
+-            lev9.decompress(compressed2, true, (err, decompressed2) => {
+-              if (err) return done(err);
+-              // Level 0 compression actually adds a few bytes due to headers.
+-              assert.ok(compressed1.length > buf.length);
+-              // Level 9 should not, of course.
+-              assert.ok(compressed2.length < buf.length);
+-              // Ensure they both decompress back properly.
+-              assert.ok(decompressed1.equals(buf));
+-              assert.ok(decompressed2.equals(buf));
+-
+-              // Assert options were set.
+-              assert.ok(lev0._deflate._level === 0);
+-              assert.ok(lev9._deflate._level === 9);
+-              assert.ok(lev0._deflate._chunkSize === 256);
+-              assert.ok(lev9._deflate._chunkSize === 128);
+-              assert.ok(lev0._inflate._chunkSize === 2048);
+-              assert.ok(lev9._inflate._chunkSize === 1024);
+-              done();
+-            });
+-          });
+-        });
+-      });
+-    });
+-
+     it("doesn't use contex takeover if not allowed", function (done) {
+       const perMessageDeflate = new PerMessageDeflate({ threshold: 0 }, true);
+       const extensions = extension.parse(

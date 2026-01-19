@@ -1,0 +1,224 @@
+diff --git a/.changeset/grumpy-planes-protect.md b/.changeset/grumpy-planes-protect.md
+new file mode 100644
+index 0000000000..6ae97f2c29
+--- /dev/null
++++ b/.changeset/grumpy-planes-protect.md
+@@ -0,0 +1,20 @@
++---
++'@xstate/graph': major
++---
++
++Remove `getMachineShortestPaths` and `getMachineSimplePaths`
++
++```diff
++import {
++- getMachineShortestPaths,
+++ getShortestPaths,
++- getMachineSimplePaths,
+++ getSimplePaths
++} from '@xstate/graph';
++
++-const paths = getMachineShortestPaths(machine);
+++const paths = getShortestPaths(machine);
++
++-const paths = getMachineSimplePaths(machine);
+++const paths = getSimplePaths(machine);
++```
+diff --git a/packages/xstate-graph/src/adjacency.ts b/packages/xstate-graph/src/adjacency.ts
+index 93744f46b5..0c9df7e5d6 100644
+--- a/packages/xstate-graph/src/adjacency.ts
++++ b/packages/xstate-graph/src/adjacency.ts
+@@ -20,7 +20,7 @@ export function getAdjacencyMap<
+     traversalLimit: limit,
+     fromState: customFromState,
+     stopCondition
+-  } = resolveTraversalOptions(options);
++  } = resolveTraversalOptions(logic, options);
+   const actorContext = { self: {} } as any; // TODO: figure out the simulation API
+   const fromState =
+     customFromState ?? logic.getInitialState(actorContext, undefined);
+diff --git a/packages/xstate-graph/src/graph.ts b/packages/xstate-graph/src/graph.ts
+index 304b89880e..7cf5e4cc99 100644
+--- a/packages/xstate-graph/src/graph.ts
++++ b/packages/xstate-graph/src/graph.ts
+@@ -5,7 +5,9 @@ import {
+   StateFrom,
+   EventFrom,
+   StateMachine,
+-  AnyActorLogic
++  AnyActorLogic,
++  SnapshotFrom,
++  EventFromLogic
+ } from 'xstate';
+ import type {
+   SerializedEvent,
+@@ -169,13 +171,30 @@ export interface AdjacencyMap<TState, TEvent> {
+   [key: SerializedState]: AdjacencyValue<TState, TEvent>;
+ }
+ 
+-export function resolveTraversalOptions<TState, TEvent extends EventObject>(
++function isMachineLogic(logic: AnyActorLogic): logic is AnyStateMachine {
++  return 'getStateNodeById' in logic;
++}
++
++export function resolveTraversalOptions<
++  TLogic extends AnyActorLogic,
++  TState extends SnapshotFrom<TLogic>,
++  TEvent extends EventFromLogic<TLogic>
++>(
++  logic: AnyActorLogic,
+   traversalOptions?: TraversalOptions<TState, TEvent>,
+   defaultOptions?: TraversalOptions<TState, TEvent>
+ ): TraversalConfig<TState, TEvent> {
++  const resolvedDefaultOptions =
++    defaultOptions ??
++    (isMachineLogic(logic)
++      ? (createDefaultMachineOptions(
++          logic,
++          traversalOptions as any
++        ) as TraversalOptions<TState, TEvent>)
++      : undefined);
+   const serializeState =
+     traversalOptions?.serializeState ??
+-    defaultOptions?.serializeState ??
++    resolvedDefaultOptions?.serializeState ??
+     ((state) => JSON.stringify(state));
+   const traversalConfig: TraversalConfig<TState, TEvent> = {
+     serializeState,
+@@ -188,7 +207,7 @@ export function resolveTraversalOptions<TState, TEvent extends EventObject>(
+     // Traversal should not continue past the `toState` predicate
+     // since the target state has already been reached at that point
+     stopCondition: traversalOptions?.toState,
+-    ...defaultOptions,
++    ...resolvedDefaultOptions,
+     ...traversalOptions
+   };
+ 
+diff --git a/packages/xstate-graph/src/index.ts b/packages/xstate-graph/src/index.ts
+index be3e353603..f5d387004d 100644
+--- a/packages/xstate-graph/src/index.ts
++++ b/packages/xstate-graph/src/index.ts
+@@ -6,8 +6,8 @@ export {
+   toDirectedGraph,
+   joinPaths
+ } from './graph.ts';
+-export { getMachineSimplePaths, getSimplePaths } from './simplePaths.ts';
+-export { getShortestPaths, getMachineShortestPaths } from './shortestPaths.ts';
++export { getSimplePaths } from './simplePaths.ts';
++export { getShortestPaths } from './shortestPaths.ts';
+ export { getPathsFromEvents } from './pathFromEvents.ts';
+ export { getAdjacencyMap } from './adjacency.ts';
+ 
+diff --git a/packages/xstate-graph/src/pathFromEvents.ts b/packages/xstate-graph/src/pathFromEvents.ts
+index 5cb37f1995..f81117f300 100644
+--- a/packages/xstate-graph/src/pathFromEvents.ts
++++ b/packages/xstate-graph/src/pathFromEvents.ts
+@@ -28,7 +28,8 @@ export function getPathsFromEvents<
+   events: TEvent[],
+   options?: TraversalOptions<TInternalState, TEvent>
+ ): Array<StatePath<TInternalState, TEvent>> {
+-  const resolvedOptions = resolveTraversalOptions<TInternalState, TEvent>(
++  const resolvedOptions = resolveTraversalOptions(
++    logic,
+     {
+       events,
+       ...options
+diff --git a/packages/xstate-graph/src/shortestPaths.ts b/packages/xstate-graph/src/shortestPaths.ts
+index 6264878e6f..ee671ebf52 100644
+--- a/packages/xstate-graph/src/shortestPaths.ts
++++ b/packages/xstate-graph/src/shortestPaths.ts
+@@ -3,7 +3,10 @@ import {
+   AnyStateMachine,
+   StateFrom,
+   EventFrom,
+-  ActorLogic
++  ActorLogic,
++  AnyActorLogic,
++  SnapshotFrom,
++  EventFromLogic
+ } from 'xstate';
+ import {
+   SerializedEvent,
+@@ -15,11 +18,15 @@ import {
+ import { resolveTraversalOptions, createDefaultMachineOptions } from './graph';
+ import { getAdjacencyMap } from './adjacency';
+ 
+-export function getShortestPaths<TState, TEvent extends EventObject>(
+-  logic: ActorLogic<TEvent, TState>,
++export function getShortestPaths<
++  TLogic extends AnyActorLogic,
++  TState extends SnapshotFrom<TLogic>,
++  TEvent extends EventFromLogic<TLogic>
++>(
++  logic: TLogic,
+   options?: TraversalOptions<TState, TEvent>
+ ): Array<StatePath<TState, TEvent>> {
+-  const resolvedOptions = resolveTraversalOptions(options);
++  const resolvedOptions = resolveTraversalOptions(logic, options);
+   const serializeState = resolvedOptions.serializeState as (
+     ...args: Parameters<typeof resolvedOptions.serializeState>
+   ) => SerializedState;
+@@ -131,15 +138,3 @@ export function getShortestPaths<TState, TEvent extends EventObject>(
+ 
+   return paths;
+ }
+-
+-export function getMachineShortestPaths<TMachine extends AnyStateMachine>(
+-  machine: TMachine,
+-  options?: TraversalOptions<StateFrom<TMachine>, EventFrom<TMachine>>
+-): Array<StatePath<StateFrom<TMachine>, EventFrom<TMachine>>> {
+-  const resolvedOptions = resolveTraversalOptions(
+-    options,
+-    createDefaultMachineOptions(machine, options)
+-  );
+-
+-  return getShortestPaths(machine as any, resolvedOptions);
+-}
+diff --git a/packages/xstate-graph/src/simplePaths.ts b/packages/xstate-graph/src/simplePaths.ts
+index d9155f7b4e..8f1f6fa815 100644
+--- a/packages/xstate-graph/src/simplePaths.ts
++++ b/packages/xstate-graph/src/simplePaths.ts
+@@ -3,7 +3,10 @@ import {
+   AnyStateMachine,
+   StateFrom,
+   EventFrom,
+-  ActorLogic
++  ActorLogic,
++  AnyActorLogic,
++  EventFromLogic,
++  SnapshotFrom
+ } from 'xstate';
+ import {
+   SerializedEvent,
+@@ -15,23 +18,15 @@ import {
+ import { resolveTraversalOptions, createDefaultMachineOptions } from './graph';
+ import { getAdjacencyMap } from './adjacency';
+ 
+-export function getMachineSimplePaths<TMachine extends AnyStateMachine>(
+-  machine: TMachine,
+-  options?: TraversalOptions<StateFrom<TMachine>, EventFrom<TMachine>>
+-): Array<StatePath<StateFrom<TMachine>, EventFrom<TMachine>>> {
+-  const resolvedOptions = resolveTraversalOptions(
+-    options,
+-    createDefaultMachineOptions(machine)
+-  );
+-
+-  return getSimplePaths(machine as any, resolvedOptions);
+-}
+-
+-export function getSimplePaths<TState, TEvent extends EventObject>(
+-  logic: ActorLogic<TEvent, TState>,
+-  options: TraversalOptions<TState, TEvent>
++export function getSimplePaths<
++  TLogic extends AnyActorLogic,
++  TState extends SnapshotFrom<TLogic>,
++  TEvent extends EventFromLogic<TLogic>
++>(
++  logic: TLogic,
++  options?: TraversalOptions<TState, TEvent>
+ ): Array<StatePath<TState, TEvent>> {
+-  const resolvedOptions = resolveTraversalOptions(options);
++  const resolvedOptions = resolveTraversalOptions(logic, options);
+   const actorContext = { self: {} } as any; // TODO: figure out the simulation API
+   const fromState =
+     resolvedOptions.fromState ?? logic.getInitialState(actorContext, undefined);

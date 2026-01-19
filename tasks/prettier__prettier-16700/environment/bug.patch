@@ -1,0 +1,550 @@
+diff --git a/changelog_unreleased/javascript/16700.md b/changelog_unreleased/javascript/16700.md
+deleted file mode 100644
+index f4a1ec81f..000000000
+--- a/changelog_unreleased/javascript/16700.md
++++ /dev/null
+@@ -1,28 +0,0 @@
+-#### Improve word wrapping edge cases in JSX (#16700 by @seiyab)
+-
+-<!-- prettier-ignore -->
+-```jsx
+-// Input
+-br_triggers_expression_break =
+-  <div><br />
+-  text text text text text text text text text text text {this.props.type} </div>
+-
+-// Prettier stable
+-br_triggers_expression_break = (
+-  <div>
+-    <br />
+-    text text text text text text text text text text text {
+-      this.props.type
+-    }{" "}
+-  </div>
+-);
+-
+-// Prettier main
+-br_triggers_expression_break = (
+-  <div>
+-    <br />
+-    text text text text text text text text text text text{" "}
+-    {this.props.type}{" "}
+-  </div>
+-);
+-```
+diff --git a/src/document/builders.js b/src/document/builders.js
+index 460478e87..a0c150e26 100644
+--- a/src/document/builders.js
++++ b/src/document/builders.js
+@@ -13,11 +13,7 @@ import {
+   DOC_TYPE_LINE_SUFFIX_BOUNDARY,
+   DOC_TYPE_TRIM,
+ } from "./constants.js";
+-import {
+-  assertDoc,
+-  assertDocArray,
+-  assertDocFillParts,
+-} from "./utils/assert-doc.js";
++import { assertDoc, assertDocArray } from "./utils/assert-doc.js";
+ 
+ /**
+  * TBD properly tagged union for Doc object type is needed here.
+@@ -110,7 +106,7 @@ function conditionalGroup(states, opts) {
+  * @returns Doc
+  */
+ function fill(parts) {
+-  assertDocFillParts(parts);
++  assertDocArray(parts);
+ 
+   return { type: DOC_TYPE_FILL, parts };
+ }
+diff --git a/src/document/utils.js b/src/document/utils.js
+index 9e9d7be0a..98da38327 100644
+--- a/src/document/utils.js
++++ b/src/document/utils.js
+@@ -370,38 +370,12 @@ function inheritLabel(doc, fn) {
+     : fn(doc);
+ }
+ 
+-/**
+- * returns true iff cleanDoc(doc) === ""
+- * @param {import("./builders.js").Doc} doc
+- * @returns {boolean}
+- */
+-function isEmptyDoc(doc) {
+-  let isEmpty = true;
+-  traverseDoc(doc, (doc) => {
+-    switch (getDocType(doc)) {
+-      case DOC_TYPE_STRING:
+-        if (doc === "") {
+-          break;
+-        }
+-      // fallthrough
+-      case DOC_TYPE_TRIM:
+-      case DOC_TYPE_LINE_SUFFIX_BOUNDARY:
+-      case DOC_TYPE_LINE:
+-      case DOC_TYPE_BREAK_PARENT:
+-        isEmpty = false;
+-        return false;
+-    }
+-  });
+-  return isEmpty;
+-}
+-
+ export {
+   canBreak,
+   cleanDoc,
+   findInDoc,
+   getDocType,
+   inheritLabel,
+-  isEmptyDoc,
+   mapDoc,
+   propagateBreaks,
+   removeLines,
+diff --git a/src/document/utils/assert-doc.js b/src/document/utils/assert-doc.js
+index 2c148e329..adb34d4d9 100644
+--- a/src/document/utils/assert-doc.js
++++ b/src/document/utils/assert-doc.js
+@@ -1,16 +1,5 @@
+-import {
+-  DOC_TYPE_IF_BREAK,
+-  DOC_TYPE_LINE,
+-  DOC_TYPE_STRING,
+-} from "../constants.js";
+-import { isEmptyDoc } from "../utils.js";
+-import getDocType from "./get-doc-type.js";
+ import traverseDoc from "./traverse-doc.js";
+ 
+-/**
+- * @typedef {import("../builders.js").Doc} Doc
+- */
+-
+ const checked = process.env.NODE_ENV !== "production" && new WeakSet();
+ const noop = () => {};
+ const assertDoc =
+@@ -45,58 +34,4 @@ const assertDocArray =
+         }
+       };
+ 
+-const assertDocFillParts =
+-  process.env.NODE_ENV === "production"
+-    ? noop
+-    : /**
+-       * @param {Doc[]} parts
+-       */
+-      function (parts) {
+-        assertDocArray(parts);
+-        if (parts.length > 1 && isEmptyDoc(parts.at(-1))) {
+-          // stripTrailingHardline can transform trailing hardline into empty string.
+-          // The trailing empty string is not a problem even if it's a line element.
+-          parts = parts.slice(0, -1);
+-        }
+-        for (const [i, doc] of parts.entries()) {
+-          if (i % 2 === 1 && !isValidSeparator(doc)) {
+-            const type = getDocType(doc);
+-            throw new Error(
+-              `Unexpected non-line-break doc at ${i}. Doc type is ${type}.`,
+-            );
+-          }
+-        }
+-      };
+-
+-/**
+- * @param {Doc} doc
+- * @returns {boolean}
+- */
+-function isValidSeparator(doc) {
+-  let hasLine = false;
+-  let hasUnexpectedString = false;
+-  function rec(doc) {
+-    switch (getDocType(doc)) {
+-      case DOC_TYPE_LINE:
+-        hasLine = true;
+-        return;
+-      case DOC_TYPE_STRING:
+-        if (doc === "{' '}" || doc === '{" "}' || doc === " ") {
+-          // As of now, we can include `{' '}` in line part of `fill()`.
+-          // This sometimes causes overflows https://github.com/prettier/prettier/issues/2553
+-          // We don't have a good way to handle this case.
+-          return;
+-        }
+-        hasUnexpectedString = true;
+-        return;
+-      case DOC_TYPE_IF_BREAK:
+-        traverseDoc(doc.breakContents, rec);
+-        return false;
+-      default:
+-    }
+-  }
+-  traverseDoc(doc, rec);
+-  return hasLine && !hasUnexpectedString;
+-}
+-
+-export { assertDoc, assertDocArray, assertDocFillParts };
++export { assertDoc, assertDocArray };
+diff --git a/src/language-js/print/jsx.js b/src/language-js/print/jsx.js
+index 6cd4961fb..eaf544c76 100644
+--- a/src/language-js/print/jsx.js
++++ b/src/language-js/print/jsx.js
+@@ -11,11 +11,7 @@ import {
+   lineSuffixBoundary,
+   softline,
+ } from "../../document/builders.js";
+-import {
+-  isEmptyDoc,
+-  replaceEndOfLine,
+-  willBreak,
+-} from "../../document/utils.js";
++import { replaceEndOfLine, willBreak } from "../../document/utils.js";
+ import {
+   printComments,
+   printDanglingComments,
+@@ -129,7 +125,7 @@ function printJsxElementInternal(path, options, print) {
+ 
+   const rawJsxWhitespace = options.singleQuote ? "{' '}" : '{" "}';
+   const jsxWhitespace = isMdxBlock
+-    ? line
++    ? " "
+     : ifBreak([rawJsxWhitespace, softline], " ");
+ 
+   const isFacebookTranslationTag = node.openingElement?.name?.name === "fbt";
+@@ -204,51 +200,34 @@ function printJsxElementInternal(path, options, print) {
+     children.shift();
+   }
+ 
+-  /*
+-   * Tweak how we format children if outputting this element over multiple lines.
+-   * Also detect whether we will force this element to output over multiple lines.
+-   *
+-   * Moreover, we need to ensure that we always have line-like doc at odd index, that is rule of fill().
+-   * Assuming that parts.length is always odd, satisfying the above can be straightforwardly done by:
+-   * - if we push line-like doc, we push empty string after it
+-   * - if we push non-line-like doc, push [parts.pop(), doc] instead
+-   */
+-  /** @type {Doc[]} */
+-  const multilineChildren = [""];
++  // Tweak how we format children if outputting this element over multiple lines.
++  // Also detect whether we will force this element to output over multiple lines.
++  const multilineChildren = [];
+   for (const [i, child] of children.entries()) {
+     // There are a number of situations where we need to ensure we display
+     // whitespace as `{" "}` when outputting this element over multiple lines.
+     if (child === jsxWhitespace) {
+-      if (i === 1 && isEmptyDoc(children[i - 1])) {
++      if (i === 1 && children[i - 1] === "") {
+         if (children.length === 2) {
+           // Solitary whitespace
+-          multilineChildren.push([multilineChildren.pop(), rawJsxWhitespace]);
++          multilineChildren.push(rawJsxWhitespace);
+           continue;
+         }
+         // Leading whitespace
+-        multilineChildren.push([rawJsxWhitespace, hardline], "");
++        multilineChildren.push([rawJsxWhitespace, hardline]);
+         continue;
+       } else if (i === children.length - 1) {
+         // Trailing whitespace
+-        multilineChildren.push([multilineChildren.pop(), rawJsxWhitespace]);
++        multilineChildren.push(rawJsxWhitespace);
+         continue;
+       } else if (children[i - 1] === "" && children[i - 2] === hardline) {
+         // Whitespace after line break
+-        multilineChildren.push([multilineChildren.pop(), rawJsxWhitespace]);
++        multilineChildren.push(rawJsxWhitespace);
+         continue;
+       }
+     }
+ 
+-    // Note that children always satisfy the rule of fill() content.
+-    // - printJsxChildren always returns valid fill() content
+-    // - we always remove even number (containing zero) of leading items from children.
+-    if (i % 2 === 0) {
+-      // non-line-like
+-      multilineChildren.push([multilineChildren.pop(), child]);
+-    } else {
+-      // line-like
+-      multilineChildren.push(child, "");
+-    }
++    multilineChildren.push(child);
+ 
+     if (willBreak(child)) {
+       forcedBreak = true;
+@@ -314,7 +293,10 @@ function printJsxElementInternal(path, options, print) {
+ // Leading, trailing, and lone whitespace all need to
+ // turn themselves into the rather ugly `{' '}` when breaking.
+ //
+-// This function returns Doc array that satisfies rule of `fill()`.
++// We print JSX using the `fill` doc primitive.
++// This requires that we give it an array of alternating
++// content and whitespace elements.
++// To ensure this we add dummy `""` content elements as needed.
+ function printJsxChildren(
+   path,
+   options,
+@@ -322,22 +304,7 @@ function printJsxChildren(
+   jsxWhitespace,
+   isFacebookTranslationTag,
+ ) {
+-  /** @type {Doc} */
+-  let prevPart = "";
+-  /** @type {Doc[]} */
+-  const parts = [prevPart];
+-  // To ensure rule of `fill()`, we use `push()` and `pushLine()` instead of `parts.push()`.
+-  function push(doc) {
+-    prevPart = doc;
+-    parts.push([parts.pop(), doc]);
+-  }
+-  function pushLine(doc) {
+-    if (doc === "") {
+-      return;
+-    }
+-    prevPart = doc;
+-    parts.push(doc, "");
+-  }
++  const parts = [];
+   path.each(({ node, next }) => {
+     if (node.type === "JSXText") {
+       const text = rawText(node);
+@@ -351,9 +318,10 @@ function printJsxChildren(
+ 
+         // Starts with whitespace
+         if (words[0] === "") {
++          parts.push("");
+           words.shift();
+           if (/\n/u.test(words[0])) {
+-            pushLine(
++            parts.push(
+               separatorWithWhitespace(
+                 isFacebookTranslationTag,
+                 words[1],
+@@ -362,7 +330,7 @@ function printJsxChildren(
+               ),
+             );
+           } else {
+-            pushLine(jsxWhitespace);
++            parts.push(jsxWhitespace);
+           }
+           words.shift();
+         }
+@@ -381,30 +349,30 @@ function printJsxChildren(
+ 
+         for (const [i, word] of words.entries()) {
+           if (i % 2 === 1) {
+-            pushLine(line);
++            parts.push(line);
+           } else {
+-            push(word);
++            parts.push(word);
+           }
+         }
+ 
+         if (endWhitespace !== undefined) {
+           if (/\n/u.test(endWhitespace)) {
+-            pushLine(
++            parts.push(
+               separatorWithWhitespace(
+                 isFacebookTranslationTag,
+-                prevPart,
++                parts.at(-1),
+                 node,
+                 next,
+               ),
+             );
+           } else {
+-            pushLine(jsxWhitespace);
++            parts.push(jsxWhitespace);
+           }
+         } else {
+-          pushLine(
++          parts.push(
+             separatorNoWhitespace(
+               isFacebookTranslationTag,
+-              prevPart,
++              parts.at(-1),
+               node,
+               next,
+             ),
+@@ -414,21 +382,21 @@ function printJsxChildren(
+         // Keep (up to one) blank line between tags/expressions/text.
+         // Note: We don't keep blank lines between text elements.
+         if (text.match(/\n/gu).length > 1) {
+-          pushLine(hardline);
++          parts.push("", hardline);
+         }
+       } else {
+-        pushLine(jsxWhitespace);
++        parts.push("", jsxWhitespace);
+       }
+     } else {
+       const printedChild = print();
+-      push(printedChild);
++      parts.push(printedChild);
+ 
+       const directlyFollowedByMeaningfulText =
+         next && isMeaningfulJsxText(next);
+       if (directlyFollowedByMeaningfulText) {
+         const trimmed = jsxWhitespaceUtils.trim(rawText(next));
+         const [firstWord] = jsxWhitespaceUtils.split(trimmed);
+-        pushLine(
++        parts.push(
+           separatorNoWhitespace(
+             isFacebookTranslationTag,
+             firstWord,
+@@ -437,7 +405,7 @@ function printJsxChildren(
+           ),
+         );
+       } else {
+-        pushLine(hardline);
++        parts.push(hardline);
+       }
+     }
+   }, "children");
+diff --git a/tests/format/jsx/text-wrap/__snapshots__/format.test.js.snap b/tests/format/jsx/text-wrap/__snapshots__/format.test.js.snap
+index 778c12f96..fd8dec060 100644
+--- a/tests/format/jsx/text-wrap/__snapshots__/format.test.js.snap
++++ b/tests/format/jsx/text-wrap/__snapshots__/format.test.js.snap
+@@ -320,6 +320,7 @@ single_expression_child_tags =
+ expression_does_not_break =
+   <div>texty text text text text text text text text text text text {this.props.type} </div>
+ 
++// FIXME
+ br_triggers_expression_break =
+   <div><br />
+   text text text text text text text text text text text {this.props.type} </div>
+@@ -862,11 +863,13 @@ expression_does_not_break = (
+   </div>
+ );
+ 
++// FIXME
+ br_triggers_expression_break = (
+   <div>
+     <br />
+-    text text text text text text text text text text text{" "}
+-    {this.props.type}{" "}
++    text text text text text text text text text text text {
++      this.props.type
++    }{" "}
+   </div>
+ );
+ 
+diff --git a/tests/format/jsx/text-wrap/test.js b/tests/format/jsx/text-wrap/test.js
+index 80d2ac97b..f8cb62554 100644
+--- a/tests/format/jsx/text-wrap/test.js
++++ b/tests/format/jsx/text-wrap/test.js
+@@ -273,6 +273,7 @@ single_expression_child_tags =
+ expression_does_not_break =
+   <div>texty text text text text text text text text text text text {this.props.type} </div>
+ 
++// FIXME
+ br_triggers_expression_break =
+   <div><br />
+   text text text text text text text text text text text {this.props.type} </div>
+diff --git a/tests/format/mdx/mdx/__snapshots__/format.test.js.snap b/tests/format/mdx/mdx/__snapshots__/format.test.js.snap
+index ab5e0316a..688694083 100644
+--- a/tests/format/mdx/mdx/__snapshots__/format.test.js.snap
++++ b/tests/format/mdx/mdx/__snapshots__/format.test.js.snap
+@@ -454,19 +454,16 @@ A {/* JS-style comment */} comment.
+ 
+ <Hello>
+   test <World /> test
+-</Hello>
+-123
++</Hello> 123
+ <Hello>
+   test <World /> test
+-</Hello>
+-234
++</Hello> 234
+ 
+ ---
+ 
+ <>
+   test <World /> test
+-</>
+-123
++</> 123
+ 
+ ---
+ 
+@@ -560,19 +557,16 @@ A {/* JS-style comment */} comment.
+ 
+ <Hello>
+   test <World /> test
+-</Hello>
+-123
++</Hello> 123
+ <Hello>
+   test <World /> test
+-</Hello>
+-234
++</Hello> 234
+ 
+ ---
+ 
+ <>
+   test <World /> test
+-</>
+-123
++</> 123
+ 
+ ---
+ 
+diff --git a/tests/unit/doc-builders.js b/tests/unit/doc-builders.js
+index da5e14c66..400ea4c4f 100644
+--- a/tests/unit/doc-builders.js
++++ b/tests/unit/doc-builders.js
+@@ -11,7 +11,6 @@ import {
+   indentIfBreak,
+   join,
+   label,
+-  line,
+   lineSuffix,
+   markAsRoot,
+ } from "../../src/document/builders.js";
+@@ -50,10 +49,6 @@ describe("doc builders", () => {
+     [() => fill(), TypeError],
+     [() => fill(notArray), TypeError],
+     () => fill([invalidDoc]),
+-    [() => fill(["abc", "abc"]), Error],
+-    [() => fill(["abc", line, "def", "ghi"]), Error],
+-    [() => fill(["abc", [line, "def"], "ghi"]), Error],
+-    [() => fill(["abc", "", "def"]), Error],
+ 
+     () => ifBreak(),
+     () => ifBreak(invalidDoc),
+diff --git a/tests/unit/is-empty-doc.js b/tests/unit/is-empty-doc.js
+deleted file mode 100644
+index d7cb5ff43..000000000
+--- a/tests/unit/is-empty-doc.js
++++ /dev/null
+@@ -1,30 +0,0 @@
+-import {
+-  breakParent,
+-  fill,
+-  group,
+-  line,
+-  lineSuffix,
+-} from "../../src/document/builders.js";
+-import { cleanDoc, isEmptyDoc } from "../../src/document/utils.js";
+-
+-it.each([
+-  { name: "empty string", doc: "" },
+-  { name: "non-empty string", doc: "a" },
+-  { name: "empty array", doc: [] },
+-  { name: "nested empty array", doc: [[[]]] },
+-  { name: "array with empty string", doc: [""] },
+-  { name: "non-empty array", doc: ["", "a", ""] },
+-  { name: "empty group", doc: group([]) },
+-  { name: "nested empty group", doc: group([group([])]) },
+-  { name: "group with empty string", doc: group([""]) },
+-  { name: "non-empty group", doc: group(["a"]) },
+-  { name: "empty fill", doc: fill([]) },
+-  { name: "fill with empty content", doc: fill([["", ""]]) },
+-  { name: "non-empty fill", doc: fill(["", line]) },
+-  { name: "empty line", doc: line },
+-  { name: "empty lineSuffix", doc: lineSuffix([]) },
+-  { name: "breakParent", doc: breakParent },
+-])("isEmptyDoc: $name", ({ doc }) => {
+-  const expected = cleanDoc(doc) === "";
+-  expect(isEmptyDoc(doc)).toBe(expected);
+-});

@@ -1,0 +1,200 @@
+diff --git a/.changeset/neat-plants-shake.md b/.changeset/neat-plants-shake.md
+new file mode 100644
+index 000000000..9d50111ad
+--- /dev/null
++++ b/.changeset/neat-plants-shake.md
+@@ -0,0 +1,5 @@
++---
++'@keystone-6/core': patch
++---
++
++Improves performance of querying to-one relationships
+diff --git a/docs/pages/docs/config/access-control.md b/docs/pages/docs/config/access-control.md
+index b8efa812c..2d206eea6 100644
+--- a/docs/pages/docs/config/access-control.md
++++ b/docs/pages/docs/config/access-control.md
+@@ -193,10 +193,6 @@ Filter based access control cannot be used for `create` operations.
+ If you want to limit `create` operations, use either `access.operation.create` or `access.item.create`.
+ {% /hint %}
+ 
+-{% hint kind="warn" %}
+-Filter based access control can impact the performance of your database queries.
+-{% /hint %}
+-
+ ### Item (mutations only)
+ 
+ Item-level access control lets you control which mutative operations can be applied to a list item.
+diff --git a/packages/core/package.json b/packages/core/package.json
+index a371f09da..9af21334c 100644
+--- a/packages/core/package.json
++++ b/packages/core/package.json
+@@ -81,6 +81,7 @@
+     "cookie": "^0.5.0",
+     "cors": "^2.8.5",
+     "cuid": "^2.1.8",
++    "dataloader": "^2.1.0",
+     "date-fns": "^2.26.0",
+     "decimal.js": "^10.4.1",
+     "dumb-passwords": "^0.2.1",
+diff --git a/packages/core/src/lib/core/queries/output-field.ts b/packages/core/src/lib/core/queries/output-field.ts
+index 4ca3806f1..997a3dae1 100644
+--- a/packages/core/src/lib/core/queries/output-field.ts
++++ b/packages/core/src/lib/core/queries/output-field.ts
+@@ -1,5 +1,6 @@
+ import { CacheHint } from 'apollo-server-types';
+ import { GraphQLResolveInfo } from 'graphql';
++import DataLoader from 'dataloader';
+ import {
+   NextFieldType,
+   IndividualFieldAccessControl,
+@@ -25,7 +26,7 @@ function getRelationVal(
+   foreignList: InitialisedList,
+   context: KeystoneContext,
+   info: GraphQLResolveInfo,
+-  fk?: IdType
++  fk: IdType | null | undefined
+ ) {
+   const oppositeDbField = foreignList.resolvedDbFields[dbField.field];
+   if (oppositeDbField.kind !== 'relation') throw new Error('failed assert');
+@@ -47,52 +48,86 @@ function getRelationVal(
+         // since we know the related item doesn't exist.
+         return null;
+       }
+-      // Check operation permission to pass into single operation
+-      const operationAccess = await getOperationAccess(foreignList, context, 'query');
+-      if (!operationAccess) {
+-        return null;
+-      }
+-      const accessFilters = await getAccessFilters(foreignList, context, 'query');
+-      if (accessFilters === false) {
+-        return null;
+-      }
+-
+-      if (accessFilters === true && fk !== undefined) {
+-        // We know the exact item we're looking for, and there are no other filters to apply,
+-        // so we can use findUnique to get the item. This allows Prisma to group multiple
+-        // findUnique operations into a single database query, which solves the N+1 problem
+-        // in this specific case.
+-        return runWithPrisma(context, foreignList, model =>
+-          model.findUnique({ where: { id: fk } })
+-        );
+-      } else {
+-        // Either we have access filters to apply, or we don't have a foreign key to use.
+-        // If we have a foreign key, we'll search directly on this ID, and merge in the access filters.
+-        // If we don't have a foreign key, we'll use the general solution, which is a filter based
+-        // on the original item's ID, merged with any access control filters.
+-        const relationFilter =
+-          fk !== undefined
+-            ? { id: fk }
+-            : { [dbField.field]: oppositeDbField.mode === 'many' ? { some: { id } } : { id } };
+-
+-        // There's no need to check isFilterable access here (c.f. `findOne()`), as
+-        // the filter has been constructed internally, not as part of user input.
+-
+-        // Apply access control
+-        const resolvedWhere = await accessControlledFilter(
+-          foreignList,
+-          context,
+-          relationFilter,
+-          accessFilters
+-        );
+-        return runWithPrisma(context, foreignList, model =>
+-          model.findFirst({ where: resolvedWhere })
+-        );
+-      }
++      // for one-to-many relationships, the one side always owns the foreign key
++      // so that means we have the id for the related item and we're fetching it by _its_ id.
++      // for the a one-to-one relationship though, the id might be on the related item
++      // so we need to fetch the related item by the id of the current item on the foreign key field
++      const currentItemOwnsForeignKey = fk !== undefined;
++      return fetchRelatedItem(context)(foreignList)(
++        currentItemOwnsForeignKey ? 'id' : `${dbField.field}Id`
++      )(currentItemOwnsForeignKey ? fk : id);
+     };
+   }
+ }
+ 
++function weakMemoize<Arg extends object, Return>(cb: (arg: Arg) => Return) {
++  const cache = new WeakMap<Arg, Return>();
++  return (arg: Arg) => {
++    if (!cache.has(arg)) {
++      const result = cb(arg);
++      cache.set(arg, result);
++    }
++    return cache.get(arg)!;
++  };
++}
++
++function memoize<Arg, Return>(cb: (arg: Arg) => Return) {
++  const cache = new Map<Arg, Return>();
++  return (arg: Arg) => {
++    if (!cache.has(arg)) {
++      const result = cb(arg);
++      cache.set(arg, result);
++    }
++    return cache.get(arg)!;
++  };
++}
++
++const fetchRelatedItem = weakMemoize((context: KeystoneContext) =>
++  weakMemoize((foreignList: InitialisedList) =>
++    memoize((idFieldKey: string) => {
++      const relatedItemLoader = new DataLoader(
++        (keys: readonly IdType[]) => fetchRelatedItems(context, foreignList, idFieldKey, keys),
++        { cache: false }
++      );
++      return (id: IdType) => relatedItemLoader.load(id);
++    })
++  )
++);
++
++async function fetchRelatedItems(
++  context: KeystoneContext,
++  foreignList: InitialisedList,
++  idFieldKey: string,
++  toFetch: readonly IdType[]
++) {
++  const operationAccess = await getOperationAccess(foreignList, context, 'query');
++  if (!operationAccess) {
++    return [];
++  }
++
++  const accessFilters = await getAccessFilters(foreignList, context, 'query');
++  if (accessFilters === false) {
++    return [];
++  }
++
++  const resolvedWhere = await accessControlledFilter(
++    foreignList,
++    context,
++    { [idFieldKey]: { in: toFetch } },
++    accessFilters
++  );
++
++  const results = await runWithPrisma(context, foreignList, model =>
++    model.findMany({
++      where: resolvedWhere,
++    })
++  );
++
++  const resultsById = new Map(results.map(x => [x[idFieldKey], x]));
++
++  return toFetch.map(id => resultsById.get(id));
++}
++
+ function getValueForDBField(
+   rootVal: BaseItem,
+   dbField: ResolvedDBField,
+diff --git a/yarn.lock b/yarn.lock
+index 34981b6eb..d9649675c 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -6264,7 +6264,7 @@ dataloader@^1.4.0:
+   resolved "https://registry.yarnpkg.com/dataloader/-/dataloader-1.4.0.tgz#bca11d867f5d3f1b9ed9f737bd15970c65dff5c8"
+   integrity sha512-68s5jYdlvasItOJnCuI2Q9s4q98g0pCyL3HrcKJu8KNugUl8ahgmZYg38ysLTgQjjXX3H8CJLkAvWrclWfcalw==
+ 
+-dataloader@^2.0.0:
++dataloader@^2.0.0, dataloader@^2.1.0:
+   version "2.1.0"
+   resolved "https://registry.yarnpkg.com/dataloader/-/dataloader-2.1.0.tgz#c69c538235e85e7ac6c6c444bae8ecabf5de9df7"
+   integrity sha512-qTcEYLen3r7ojZNgVUaRggOI+KM7jrKxXeSHhogh/TWxYMeONEMqY+hmkobiYQozsGIyg9OYVzO4ZIfoB4I0pQ==

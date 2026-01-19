@@ -1,0 +1,219 @@
+diff --git a/packages/query-core/src/mutation.ts b/packages/query-core/src/mutation.ts
+index 30f426dcf..7d3ee1bfb 100644
+--- a/packages/query-core/src/mutation.ts
++++ b/packages/query-core/src/mutation.ts
+@@ -159,8 +159,12 @@ export class Mutation<
+     }
+   }
+ 
+-  continue(): Promise<unknown> {
+-    return this.retryer?.continue() ?? this.execute()
++  continue(): Promise<TData> {
++    if (this.retryer) {
++      this.retryer.continue()
++      return this.retryer.promise
++    }
++    return this.execute()
+   }
+ 
+   async execute(): Promise<TData> {
+diff --git a/packages/query-core/src/mutationCache.ts b/packages/query-core/src/mutationCache.ts
+index 66764c589..acf87caf7 100644
+--- a/packages/query-core/src/mutationCache.ts
++++ b/packages/query-core/src/mutationCache.ts
+@@ -79,7 +79,6 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
+ 
+   private mutations: Mutation<any, any, any, any>[]
+   private mutationId: number
+-  private resuming: Promise<unknown> | undefined
+ 
+   constructor(config?: MutationCacheConfig) {
+     super()
+@@ -153,22 +152,14 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
+     })
+   }
+ 
+-  resumePausedMutations(): Promise<unknown> {
+-    this.resuming = (this.resuming ?? Promise.resolve())
+-      .then(() => {
+-        const pausedMutations = this.mutations.filter((x) => x.state.isPaused)
+-        return notifyManager.batch(() =>
+-          pausedMutations.reduce(
+-            (promise, mutation) =>
+-              promise.then(() => mutation.continue().catch(noop)),
+-            Promise.resolve() as Promise<unknown>,
+-          ),
+-        )
+-      })
+-      .then(() => {
+-        this.resuming = undefined
+-      })
+-
+-    return this.resuming
++  resumePausedMutations(): Promise<void> {
++    const pausedMutations = this.mutations.filter((x) => x.state.isPaused)
++    return notifyManager.batch(() =>
++      pausedMutations.reduce(
++        (promise, mutation) =>
++          promise.then(() => mutation.continue().catch(noop)),
++        Promise.resolve(),
++      ),
++    )
+   }
+ }
+diff --git a/packages/query-core/src/queryClient.ts b/packages/query-core/src/queryClient.ts
+index 1df365a4e..15df26391 100644
+--- a/packages/query-core/src/queryClient.ts
++++ b/packages/query-core/src/queryClient.ts
+@@ -594,7 +594,7 @@ export class QueryClient {
+       .catch(noop)
+   }
+ 
+-  resumePausedMutations(): Promise<unknown> {
++  resumePausedMutations(): Promise<void> {
+     return this.mutationCache.resumePausedMutations()
+   }
+ 
+diff --git a/packages/query-core/src/retryer.ts b/packages/query-core/src/retryer.ts
+index c25ff4429..f54c53f12 100644
+--- a/packages/query-core/src/retryer.ts
++++ b/packages/query-core/src/retryer.ts
+@@ -21,7 +21,7 @@ interface RetryerConfig<TData = unknown, TError = unknown> {
+ export interface Retryer<TData = unknown> {
+   promise: Promise<TData>
+   cancel: (cancelOptions?: CancelOptions) => void
+-  continue: () => Promise<unknown>
++  continue: () => void
+   cancelRetry: () => void
+   continueRetry: () => void
+ }
+@@ -69,7 +69,7 @@ export function createRetryer<TData = unknown, TError = unknown>(
+   let isRetryCancelled = false
+   let failureCount = 0
+   let isResolved = false
+-  let continueFn: ((value?: unknown) => boolean) | undefined
++  let continueFn: ((value?: unknown) => void) | undefined
+   let promiseResolve: (data: TData) => void
+   let promiseReject: (error: TError) => void
+ 
+@@ -118,11 +118,9 @@ export function createRetryer<TData = unknown, TError = unknown>(
+   const pause = () => {
+     return new Promise((continueResolve) => {
+       continueFn = (value) => {
+-        const canContinue = isResolved || !shouldPause()
+-        if (canContinue) {
+-          continueResolve(value)
++        if (isResolved || !shouldPause()) {
++          return continueResolve(value)
+         }
+-        return canContinue
+       }
+       config.onPause?.()
+     }).then(() => {
+@@ -210,8 +208,7 @@ export function createRetryer<TData = unknown, TError = unknown>(
+     promise,
+     cancel,
+     continue: () => {
+-      const didContinue = continueFn?.()
+-      return didContinue ? promise : Promise.resolve()
++      continueFn?.()
+     },
+     cancelRetry,
+     continueRetry,
+diff --git a/packages/query-core/src/tests/queryClient.test.tsx b/packages/query-core/src/tests/queryClient.test.tsx
+index a92702009..a8b5533b0 100644
+--- a/packages/query-core/src/tests/queryClient.test.tsx
++++ b/packages/query-core/src/tests/queryClient.test.tsx
+@@ -8,9 +8,8 @@ import type {
+   QueryFunction,
+   QueryObserverOptions,
+ } from '..'
+-import { InfiniteQueryObserver, MutationObserver, QueryObserver } from '..'
++import { InfiniteQueryObserver, QueryObserver } from '..'
+ import { focusManager, onlineManager } from '..'
+-import { noop } from '../utils'
+ 
+ describe('queryClient', () => {
+   let queryClient: QueryClient
+@@ -1469,81 +1468,6 @@ describe('queryClient', () => {
+       onlineManager.setOnline(undefined)
+     })
+ 
+-    test('should resume paused mutations when coming online', async () => {
+-      const consoleMock = jest.spyOn(console, 'error')
+-      consoleMock.mockImplementation(() => undefined)
+-      onlineManager.setOnline(false)
+-
+-      const observer1 = new MutationObserver(queryClient, {
+-        mutationFn: async () => 1,
+-      })
+-
+-      const observer2 = new MutationObserver(queryClient, {
+-        mutationFn: async () => 2,
+-      })
+-      void observer1.mutate().catch(noop)
+-      void observer2.mutate().catch(noop)
+-
+-      await waitFor(() => {
+-        expect(observer1.getCurrentResult().isPaused).toBeTruthy()
+-        expect(observer2.getCurrentResult().isPaused).toBeTruthy()
+-      })
+-
+-      onlineManager.setOnline(true)
+-
+-      await waitFor(() => {
+-        expect(observer1.getCurrentResult().status).toBe('success')
+-        expect(observer1.getCurrentResult().status).toBe('success')
+-      })
+-
+-      onlineManager.setOnline(undefined)
+-    })
+-
+-    test('should resume paused mutations one after the other when invoked manually at the same time', async () => {
+-      const consoleMock = jest.spyOn(console, 'error')
+-      consoleMock.mockImplementation(() => undefined)
+-      onlineManager.setOnline(false)
+-
+-      const orders: Array<string> = []
+-
+-      const observer1 = new MutationObserver(queryClient, {
+-        mutationFn: async () => {
+-          orders.push('1start')
+-          await sleep(50)
+-          orders.push('1end')
+-          return 1
+-        },
+-      })
+-
+-      const observer2 = new MutationObserver(queryClient, {
+-        mutationFn: async () => {
+-          orders.push('2start')
+-          await sleep(20)
+-          orders.push('2end')
+-          return 2
+-        },
+-      })
+-      void observer1.mutate().catch(noop)
+-      void observer2.mutate().catch(noop)
+-
+-      await waitFor(() => {
+-        expect(observer1.getCurrentResult().isPaused).toBeTruthy()
+-        expect(observer2.getCurrentResult().isPaused).toBeTruthy()
+-      })
+-
+-      onlineManager.setOnline(undefined)
+-      void queryClient.resumePausedMutations()
+-      await sleep(5)
+-      await queryClient.resumePausedMutations()
+-
+-      await waitFor(() => {
+-        expect(observer1.getCurrentResult().status).toBe('success')
+-        expect(observer2.getCurrentResult().status).toBe('success')
+-      })
+-
+-      expect(orders).toEqual(['1start', '1end', '2start', '2end'])
+-    })
+-
+     test('should notify queryCache and mutationCache after multiple mounts and single unmount', async () => {
+       const testClient = createQueryClient()
+       testClient.mount()

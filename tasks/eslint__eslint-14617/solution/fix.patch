@@ -1,0 +1,405 @@
+diff --git a/docs/developer-guide/nodejs-api.md b/docs/developer-guide/nodejs-api.md
+index 6aab5b566..edaf7fc15 100644
+--- a/docs/developer-guide/nodejs-api.md
++++ b/docs/developer-guide/nodejs-api.md
+@@ -148,7 +148,7 @@ The `ESLint` constructor takes an `options` object. If you omit the `options` ob
+ 
+ * `options.fix` (`boolean | (message: LintMessage) => boolean`)<br>
+   Default is `false`. If `true` is present, the [`eslint.lintFiles()`][eslint-lintfiles] and [`eslint.lintText()`][eslint-linttext] methods work in autofix mode. If a predicate function is present, the methods pass each lint message to the function, then use only the lint messages for which the function returned `true`.
+-* `options.fixTypes` (`("problem" | "suggestion" | "layout")[] | null`)<br>
++* `options.fixTypes` (`("directive" | "problem" | "suggestion" | "layout")[] | null`)<br>
+   Default is `null`. The types of the rules that the [`eslint.lintFiles()`][eslint-lintfiles] and [`eslint.lintText()`][eslint-linttext] methods use for autofix.
+ 
+ ##### Cache-related
+diff --git a/docs/user-guide/command-line-interface.md b/docs/user-guide/command-line-interface.md
+index 4500e6ff6..9ff8cbc3d 100644
+--- a/docs/user-guide/command-line-interface.md
++++ b/docs/user-guide/command-line-interface.md
+@@ -47,7 +47,7 @@ Specifying rules and plugins:
+ Fixing problems:
+   --fix                          Automatically fix problems
+   --fix-dry-run                  Automatically fix problems without saving the changes to the file system
+-  --fix-type Array               Specify the types of fixes to apply (problem, suggestion, layout)
++  --fix-type Array               Specify the types of fixes to apply (directive, problem, suggestion, layout)
+ 
+ Ignoring files:
+   --ignore-path path::String     Specify path of ignore file
+@@ -240,11 +240,12 @@ This flag can be useful for integrations (e.g. editor plugins) which need to aut
+ 
+ #### `--fix-type`
+ 
+-This option allows you to specify the type of fixes to apply when using either `--fix` or `--fix-dry-run`. The three types of fixes are:
++This option allows you to specify the type of fixes to apply when using either `--fix` or `--fix-dry-run`. The four types of fixes are:
+ 
+ 1. `problem` - fix potential errors in the code
+ 1. `suggestion` - apply fixes to the code that improve it
+ 1. `layout` - apply fixes that do not change the program structure (AST)
++1. `directive` - apply fixes to inline directives such as `// eslint-disable`
+ 
+ You can specify one or more fix type on the command line. Here are some examples:
+ 
+diff --git a/lib/cli-engine/cli-engine.js b/lib/cli-engine/cli-engine.js
+index 24f6a10d1..97ab38f68 100644
+--- a/lib/cli-engine/cli-engine.js
++++ b/lib/cli-engine/cli-engine.js
+@@ -41,7 +41,7 @@ const hash = require("./hash");
+ const LintResultCache = require("./lint-result-cache");
+ 
+ const debug = require("debug")("eslint:cli-engine");
+-const validFixTypes = new Set(["problem", "suggestion", "layout"]);
++const validFixTypes = new Set(["directive", "problem", "suggestion", "layout"]);
+ 
+ //------------------------------------------------------------------------------
+ // Typedefs
+@@ -331,6 +331,23 @@ function getRule(ruleId, configArrays) {
+     return builtInRules.get(ruleId) || null;
+ }
+ 
++/**
++ * Checks whether a message's rule type should be fixed.
++ * @param {LintMessage} message The message to check.
++ * @param {ConfigArray[]} lastConfigArrays The list of config arrays that the last `executeOnFiles` or `executeOnText` used.
++ * @param {string[]} fixTypes An array of fix types to check.
++ * @returns {boolean} Whether the message should be fixed.
++ */
++function shouldMessageBeFixed(message, lastConfigArrays, fixTypes) {
++    if (!message.ruleId) {
++        return fixTypes.has("directive");
++    }
++
++    const rule = message.ruleId && getRule(message.ruleId, lastConfigArrays);
++
++    return Boolean(rule && rule.meta && fixTypes.has(rule.meta.type));
++}
++
+ /**
+  * Collect used deprecated rules.
+  * @param {ConfigArray[]} usedConfigArrays The config arrays which were used.
+@@ -623,12 +640,7 @@ class CLIEngine {
+             const originalFix = (typeof options.fix === "function")
+                 ? options.fix : () => true;
+ 
+-            options.fix = message => {
+-                const rule = message.ruleId && getRule(message.ruleId, lastConfigArrays);
+-                const matches = rule && rule.meta && fixTypes.has(rule.meta.type);
+-
+-                return matches && originalFix(message);
+-            };
++            options.fix = message => shouldMessageBeFixed(message, lastConfigArrays, fixTypes) && originalFix(message);
+         }
+     }
+ 
+diff --git a/lib/eslint/eslint.js b/lib/eslint/eslint.js
+index 056e04b59..62229be80 100644
+--- a/lib/eslint/eslint.js
++++ b/lib/eslint/eslint.js
+@@ -125,7 +125,7 @@ function isArrayOfNonEmptyString(x) {
+  * @returns {boolean} `true` if `x` is valid fix type.
+  */
+ function isFixType(x) {
+-    return x === "problem" || x === "suggestion" || x === "layout";
++    return x === "directive" || x === "problem" || x === "suggestion" || x === "layout";
+ }
+ 
+ /**
+@@ -237,7 +237,7 @@ function processOptions({
+         errors.push("'fix' must be a boolean or a function.");
+     }
+     if (fixTypes !== null && !isFixTypeArray(fixTypes)) {
+-        errors.push("'fixTypes' must be an array of any of \"problem\", \"suggestion\", and \"layout\".");
++        errors.push("'fixTypes' must be an array of any of \"directive\", \"problem\", \"suggestion\", and \"layout\".");
+     }
+     if (typeof globInputPaths !== "boolean") {
+         errors.push("'globInputPaths' must be a boolean.");
+diff --git a/lib/linter/apply-disable-directives.js b/lib/linter/apply-disable-directives.js
+index 0ba69ca9c..de81c2444 100644
+--- a/lib/linter/apply-disable-directives.js
++++ b/lib/linter/apply-disable-directives.js
+@@ -5,6 +5,8 @@
+ 
+ "use strict";
+ 
++const escapeRegExp = require("escape-string-regexp");
++
+ /**
+  * Compares the locations of two objects in a source file
+  * @param {{line: number, column: number}} itemA The first object
+@@ -16,6 +18,123 @@ function compareLocations(itemA, itemB) {
+     return itemA.line - itemB.line || itemA.column - itemB.column;
+ }
+ 
++/**
++ * Groups a set of directives into sub-arrays by their parent comment.
++ * @param {Directive[]} directives Unused directives to be removed.
++ * @returns {Directive[][]} Directives grouped by their parent comment.
++ */
++function groupByParentComment(directives) {
++    const groups = new Map();
++
++    for (const directive of directives) {
++        const { unprocessedDirective: { parentComment } } = directive;
++
++        if (groups.has(parentComment)) {
++            groups.get(parentComment).push(directive);
++        } else {
++            groups.set(parentComment, [directive]);
++        }
++    }
++
++    return [...groups.values()];
++}
++
++/**
++ * Creates removal details for a set of directives within the same comment.
++ * @param {Directive[]} directives Unused directives to be removed.
++ * @param {Token} commentToken The backing Comment token.
++ * @returns {{ description, fix, position }[]} Details for later creation of output Problems.
++ */
++function createIndividualDirectivesRemoval(directives, commentToken) {
++    const listOffset = /^\s*\S+\s+/u.exec(commentToken.value)[0].length;
++    const listText = commentToken.value
++        .slice(listOffset) // remove eslint-*
++        .split(/\s-{2,}\s/u)[0] // remove -- directive comment
++        .trimRight();
++    const listStart = commentToken.range[0] + 2 + listOffset;
++
++    return directives.map(directive => {
++        const { ruleId } = directive;
++        const match = new RegExp(String.raw`(?:^|,)\s*${escapeRegExp(ruleId)}\s*(?:$|,)`, "u").exec(listText);
++        const ruleOffset = match.index;
++        const ruleEndOffset = ruleOffset + match[0].length;
++        const ruleText = listText.slice(ruleOffset, ruleEndOffset);
++
++        return {
++            description: `'${ruleId}'`,
++            fix: {
++                range: [
++                    listStart + ruleOffset + (ruleText.startsWith(",") && ruleText.endsWith(",") ? 1 : 0),
++                    listStart + ruleEndOffset
++                ],
++                text: ""
++            },
++            position: directive.unprocessedDirective
++        };
++    });
++}
++
++/**
++ * Creates a description of deleting an entire unused disable comment.
++ * @param {Directive[]} directives Unused directives to be removed.
++ * @param {Token} commentToken The backing Comment token.
++ * @returns {{ description, fix, position }} Details for later creation of an output Problem.
++ */
++function createCommentRemoval(directives, commentToken) {
++    const { range } = commentToken;
++    const ruleIds = directives.filter(directive => directive.ruleId).map(directive => `'${directive.ruleId}'`);
++
++    return {
++        description: ruleIds.length <= 2
++            ? ruleIds.join(" or ")
++            : `${ruleIds.slice(0, ruleIds.length - 1).join(", ")}, or ${ruleIds[ruleIds.length - 1]}`,
++        fix: {
++            range,
++            text: " "
++        },
++        position: directives[0].unprocessedDirective
++    };
++}
++
++/**
++ * Returns a new array formed by applying a given callback function to each element of the array, and then flattening the result by one level.
++ * TODO(stephenwade): Replace this with array.flatMap when we drop support for Node v10
++ * @param {any[]} array The array to process
++ * @param {Function} fn The function to use
++ * @returns {any[]} The result array
++ */
++function flatMap(array, fn) {
++    const mapped = array.map(fn);
++    const flattened = [].concat(...mapped);
++
++    return flattened;
++}
++
++/**
++ * Parses details from directives to create output Problems.
++ * @param {Directive[]} allDirectives Unused directives to be removed.
++ * @returns {{ description, fix, position }[]} Details for later creation of output Problems.
++ */
++function processUnusedDisableDirectives(allDirectives) {
++    const directiveGroups = groupByParentComment(allDirectives);
++
++    return flatMap(
++        directiveGroups,
++        directives => {
++            const { parentComment } = directives[0].unprocessedDirective;
++            const remainingRuleIds = new Set(parentComment.ruleIds);
++
++            for (const directive of directives) {
++                remainingRuleIds.delete(directive.ruleId);
++            }
++
++            return remainingRuleIds.size
++                ? createIndividualDirectivesRemoval(directives, parentComment.commentToken)
++                : [createCommentRemoval(directives, parentComment.commentToken)];
++        }
++    );
++}
++
+ /**
+  * This is the same as the exported function, except that it
+  * doesn't handle disable-line and disable-next-line directives, and it always reports unused
+@@ -82,17 +201,22 @@ function applyDirectives(options) {
+         }
+     }
+ 
+-    const unusedDisableDirectives = options.directives
+-        .filter(directive => directive.type === "disable" && !usedDisableDirectives.has(directive))
+-        .map(directive => ({
++    const unusedDisableDirectivesToReport = options.directives
++        .filter(directive => directive.type === "disable" && !usedDisableDirectives.has(directive));
++
++    const processed = processUnusedDisableDirectives(unusedDisableDirectivesToReport);
++
++    const unusedDisableDirectives = processed
++        .map(({ description, fix, position }) => ({
+             ruleId: null,
+-            message: directive.ruleId
+-                ? `Unused eslint-disable directive (no problems were reported from '${directive.ruleId}').`
++            message: description
++                ? `Unused eslint-disable directive (no problems were reported from ${description}).`
+                 : "Unused eslint-disable directive (no problems were reported).",
+-            line: directive.unprocessedDirective.line,
+-            column: directive.unprocessedDirective.column,
++            line: position.line,
++            column: position.column,
+             severity: options.reportUnusedDisableDirectives === "warn" ? 1 : 2,
+-            nodeType: null
++            nodeType: null,
++            ...options.disableFixes ? {} : { fix }
+         }));
+ 
+     return { problems, unusedDisableDirectives };
+@@ -113,29 +237,16 @@ function applyDirectives(options) {
+  * @param {{ruleId: (string|null), line: number, column: number}[]} options.problems
+  * A list of problems reported by rules, sorted by increasing location in the file, with one-based columns.
+  * @param {"off" | "warn" | "error"} options.reportUnusedDisableDirectives If `"warn"` or `"error"`, adds additional problems for unused directives
++ * @param {boolean} options.disableFixes If true, it doesn't make `fix` properties.
+  * @returns {{ruleId: (string|null), line: number, column: number}[]}
+  * A list of reported problems that were not disabled by the directive comments.
+  */
+-module.exports = ({ directives, problems, reportUnusedDisableDirectives = "off" }) => {
++module.exports = ({ directives, disableFixes, problems, reportUnusedDisableDirectives = "off" }) => {
+     const blockDirectives = directives
+         .filter(directive => directive.type === "disable" || directive.type === "enable")
+         .map(directive => Object.assign({}, directive, { unprocessedDirective: directive }))
+         .sort(compareLocations);
+ 
+-    /**
+-     * Returns a new array formed by applying a given callback function to each element of the array, and then flattening the result by one level.
+-     * TODO(stephenwade): Replace this with array.flatMap when we drop support for Node v10
+-     * @param {any[]} array The array to process
+-     * @param {Function} fn The function to use
+-     * @returns {any[]} The result array
+-     */
+-    function flatMap(array, fn) {
+-        const mapped = array.map(fn);
+-        const flattened = [].concat(...mapped);
+-
+-        return flattened;
+-    }
+-
+     const lineDirectives = flatMap(directives, directive => {
+         switch (directive.type) {
+             case "disable":
+@@ -162,11 +273,13 @@ module.exports = ({ directives, problems, reportUnusedDisableDirectives = "off"
+     const blockDirectivesResult = applyDirectives({
+         problems,
+         directives: blockDirectives,
++        disableFixes,
+         reportUnusedDisableDirectives
+     });
+     const lineDirectivesResult = applyDirectives({
+         problems: blockDirectivesResult.problems,
+         directives: lineDirectives,
++        disableFixes,
+         reportUnusedDisableDirectives
+     });
+ 
+diff --git a/lib/linter/linter.js b/lib/linter/linter.js
+index 4e80926a8..65a158895 100644
+--- a/lib/linter/linter.js
++++ b/lib/linter/linter.js
+@@ -242,14 +242,14 @@ function createLintingProblem(options) {
+  * Creates a collection of disable directives from a comment
+  * @param {Object} options to create disable directives
+  * @param {("disable"|"enable"|"disable-line"|"disable-next-line")} options.type The type of directive comment
+- * @param {{line: number, column: number}} options.loc The 0-based location of the comment token
++ * @param {token} options.commentToken The Comment token
+  * @param {string} options.value The value after the directive in the comment
+  * comment specified no specific rules, so it applies to all rules (e.g. `eslint-disable`)
+  * @param {function(string): {create: Function}} options.ruleMapper A map from rule IDs to defined rules
+  * @returns {Object} Directives and problems from the comment
+  */
+ function createDisableDirectives(options) {
+-    const { type, loc, value, ruleMapper } = options;
++    const { commentToken, type, value, ruleMapper } = options;
+     const ruleIds = Object.keys(commentParser.parseListConfig(value));
+     const directiveRules = ruleIds.length ? ruleIds : [null];
+     const result = {
+@@ -257,13 +257,15 @@ function createDisableDirectives(options) {
+         directiveProblems: [] // problems in directives
+     };
+ 
++    const parentComment = { commentToken, ruleIds };
++
+     for (const ruleId of directiveRules) {
+ 
+         // push to directives, if the rule is defined(including null, e.g. /*eslint enable*/)
+         if (ruleId === null || ruleMapper(ruleId) !== null) {
+-            result.directives.push({ type, line: loc.start.line, column: loc.start.column + 1, ruleId });
++            result.directives.push({ parentComment, type, line: commentToken.loc.start.line, column: commentToken.loc.start.column + 1, ruleId });
+         } else {
+-            result.directiveProblems.push(createLintingProblem({ ruleId, loc }));
++            result.directiveProblems.push(createLintingProblem({ ruleId, loc: commentToken.loc }));
+         }
+     }
+     return result;
+@@ -344,7 +346,7 @@ function getDirectiveComments(filename, ast, ruleMapper, warnInlineConfig) {
+             case "eslint-disable-next-line":
+             case "eslint-disable-line": {
+                 const directiveType = directiveText.slice("eslint-".length);
+-                const options = { type: directiveType, loc: comment.loc, value: directiveValue, ruleMapper };
++                const options = { commentToken: comment, type: directiveType, value: directiveValue, ruleMapper };
+                 const { directives, directiveProblems } = createDisableDirectives(options);
+ 
+                 disableDirectives.push(...directives);
+@@ -1208,6 +1210,7 @@ class Linter {
+ 
+         return applyDisableDirectives({
+             directives: commentDirectives.disableDirectives,
++            disableFixes: options.disableFixes,
+             problems: lintingProblems
+                 .concat(commentDirectives.problems)
+                 .sort((problemA, problemB) => problemA.line - problemB.line || problemA.column - problemB.column),
+diff --git a/lib/options.js b/lib/options.js
+index e3661ec81..2dd186de3 100644
+--- a/lib/options.js
++++ b/lib/options.js
+@@ -32,7 +32,7 @@ const optionator = require("optionator");
+  * @property {string[]} [ext] Specify JavaScript file extensions
+  * @property {boolean} fix Automatically fix problems
+  * @property {boolean} fixDryRun Automatically fix problems without saving the changes to the file system
+- * @property {("problem" | "suggestion" | "layout")[]} [fixType] Specify the types of fixes to apply (problem, suggestion, layout)
++ * @property {("directive" | "problem" | "suggestion" | "layout")[]} [fixType] Specify the types of fixes to apply (directive, problem, suggestion, layout)
+  * @property {string} format Use a specific output format
+  * @property {string[]} [global] Define global variables
+  * @property {boolean} [help] Show help
+@@ -151,7 +151,7 @@ module.exports = optionator({
+         {
+             option: "fix-type",
+             type: "Array",
+-            description: "Specify the types of fixes to apply (problem, suggestion, layout)"
++            description: "Specify the types of fixes to apply (directive, problem, suggestion, layout)"
+         },
+         {
+             heading: "Ignoring files"

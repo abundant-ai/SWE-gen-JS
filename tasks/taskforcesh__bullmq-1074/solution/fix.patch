@@ -1,0 +1,197 @@
+diff --git a/docs/gitbook/guide/retrying-failing-jobs.md b/docs/gitbook/guide/retrying-failing-jobs.md
+index 99db481c9b..b58085dd37 100644
+--- a/docs/gitbook/guide/retrying-failing-jobs.md
++++ b/docs/gitbook/guide/retrying-failing-jobs.md
+@@ -2,7 +2,7 @@
+ 
+ When a processor throws an exception, the worker will catch it and move the job to the failed set. But sometimes it may be desirable to retry a failed job.
+ 
+-BullMQ support retries of failed jobs using backoff functions. It is possible to use the built in backoff functions or provide custom ones.
++BullMQ supports retries of failed jobs using backoff functions. It is possible to use the built in backoff functions or provide custom ones.
+ 
+ For BullMQ to reschedule failed jobs, make sure you create a `QueueScheduler` for your queue.
+ 
+@@ -30,24 +30,21 @@ await queue.add(
+ You can also define it in the queue's `defaultJobOptions`, and it will apply to all jobs added to the queue, unless overridden. For example:
+ 
+ ```typescript
+-import { Queue, QueueScheduler } from "bullmq";
++import { Queue, QueueScheduler } from 'bullmq';
+ 
+-const myQueue = new Queue("foo", {
++const myQueue = new Queue('foo', {
+   defaultJobOptions: {
+     attempts: 3,
+     backoff: {
+-      type: "exponential",
+-      delay: 1000
+-    }
+-  }
++      type: 'exponential',
++      delay: 1000,
++    },
++  },
+ });
+ 
+ const myQueueScheduler = new QueueScheduler('foo');
+ 
+-await queue.add(
+-  "test-retry",
+-  { foo: "bar" }
+-);
++await queue.add('test-retry', { foo: 'bar' });
+ ```
+ 
+ The current built-in backoff functions are "exponential" and "fixed".
+@@ -59,19 +56,15 @@ If you want to define your custom backoff you need to define it at the worker:
+ ```typescript
+ import { Worker } from 'bullmq';
+ 
+-const worker = new Worker(
+-  'foo',
+-  async job => doSomeProcessing(),
+-  {
+-    settings: {
+-      backoffStrategies: {
+-        custom(attemptsMade: number) {
+-          return attemptsMade * 1000;
+-        },
++const worker = new Worker('foo', async job => doSomeProcessing(), {
++  settings: {
++    backoffStrategies: {
++      custom(attemptsMade: number) {
++        return attemptsMade * 1000;
+       },
+     },
+   },
+-);
++});
+ ```
+ 
+ You can then use your "custom" strategy when adding jobs:
+@@ -93,3 +86,28 @@ await queue.add(
+ );
+ ```
+ 
++# Stop retrying jobs
++
++When a processor throws an exception that is considered as unrecoverable, you should use the `UnrecoverableError` class.
++
++BullMQ supports moving jobs to failed when this error is thrown without retrying to process it.
++
++```typescript
++import { Worker, UnrecoverableError } from 'bullmq';
++
++const worker = new Worker('foo', async job => {doSomeProcessing();
++throw new UnrecoverableError('Unrecoverable');
++}, {
++  connection
++  },
++});
++
++await queue.add(
++  'test-retry',
++  { foo: 'bar' },
++  {
++    attempts: 3,
++    backoff: 1000,
++  },
++);
++```
+diff --git a/src/classes/index.ts b/src/classes/index.ts
+index 89ddd17750..ed8ff00698 100644
+--- a/src/classes/index.ts
++++ b/src/classes/index.ts
+@@ -1,14 +1,15 @@
+-export * from './backoffs';
+-export * from './job';
+-export * from './queue-base';
+-export * from './queue-events';
+-export * from './queue-getters';
+-export * from './queue-scheduler';
+-export * from './queue';
+-export * from './redis-connection';
+-export * from './repeat';
+-export * from './scripts';
+-export * from './worker';
+-export * from './child-pool';
+-export * from './sandbox';
+-export * from './flow-producer';
++export * from './backoffs';
++export * from './job';
++export * from './queue-base';
++export * from './queue-events';
++export * from './queue-getters';
++export * from './queue-scheduler';
++export * from './queue';
++export * from './redis-connection';
++export * from './repeat';
++export * from './scripts';
++export * from './worker';
++export * from './child-pool';
++export * from './sandbox';
++export * from './flow-producer';
++export * from './unrecoverable-error';
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index dc6d61b7e6..186d8bbb98 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -1,4 +1,5 @@
+ import { Pipeline } from 'ioredis';
++import { fromPairs } from 'lodash';
+ import { debuglog } from 'util';
+ import {
+   BackoffOptions,
+@@ -20,7 +21,7 @@ import {
+ import { QueueEvents } from './queue-events';
+ import { Backoffs } from './backoffs';
+ import { MinimalQueue, ParentOpts, Scripts, JobData } from './scripts';
+-import { fromPairs } from 'lodash';
++import { UnrecoverableError } from './unrecoverable-error';
+ 
+ const logger = debuglog('bull');
+ 
+@@ -442,8 +443,8 @@ export class Job<
+    * @param fetchNext - true when wanting to fetch the next job
+    * @returns void
+    */
+-  async moveToFailed(
+-    err: Error,
++  async moveToFailed<E extends Error>(
++    err: E,
+     token: string,
+     fetchNext = false,
+   ): Promise<void> {
+@@ -461,7 +462,11 @@ export class Job<
+     // Check if an automatic retry should be performed
+     //
+     let moveToFailed = false;
+-    if (this.attemptsMade < this.opts.attempts && !this.discarded) {
++    if (
++      this.attemptsMade < this.opts.attempts &&
++      !this.discarded &&
++      !(err instanceof UnrecoverableError)
++    ) {
+       const opts = queue.opts as WorkerOptions;
+ 
+       // Check if backoff is needed
+diff --git a/src/classes/unrecoverable-error.ts b/src/classes/unrecoverable-error.ts
+new file mode 100644
+index 0000000000..6a48e04902
+--- /dev/null
++++ b/src/classes/unrecoverable-error.ts
+@@ -0,0 +1,14 @@
++/**
++ * UnrecoverableError
++ *
++ * Error to move a job to failed even if the attemptsMade
++ * are lower than the expected limit.
++ *
++ */
++export class UnrecoverableError extends Error {
++  constructor(message?: string) {
++    super(message);
++    this.name = this.constructor.name;
++    Object.setPrototypeOf(this, new.target.prototype);
++  }
++}

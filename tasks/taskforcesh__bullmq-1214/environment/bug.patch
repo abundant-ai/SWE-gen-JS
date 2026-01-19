@@ -1,0 +1,345 @@
+diff --git a/src/classes/compat.ts b/src/classes/compat.ts
+index 26575a7e56..fa4ee0a53d 100644
+--- a/src/classes/compat.ts
++++ b/src/classes/compat.ts
+@@ -28,12 +28,12 @@ import { Worker } from './worker';
+ import { QueueEvents } from './queue-events';
+ import {
+   JobsOptions,
+-  Processor,
+   QueueOptions,
++  RepeatOptions,
+   QueueEventsOptions,
+   QueueSchedulerOptions,
+-  RepeatOptions,
+   WorkerOptions,
++  Processor,
+ } from '../interfaces';
+ 
+ type CommonOptions = QueueSchedulerOptions &
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index 332a83c81b..05d679fa81 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -114,11 +114,6 @@ export class Job<
+    */
+   parent?: ParentKeys;
+ 
+-  /**
+-   * Base repeat job key.
+-   */
+-  repeatJobKey?: string;
+-
+   protected toKey: (type: string) => string;
+ 
+   private discarded: boolean;
+@@ -143,18 +138,14 @@ export class Job<
+     public opts: JobsOptions = {},
+     public id?: string,
+   ) {
+-    const { repeatJobKey, ...restOpts } = this.opts;
+-
+     this.opts = Object.assign(
+       {
+         attempts: 0,
+         delay: 0,
+       },
+-      restOpts,
++      opts,
+     );
+ 
+-    this.repeatJobKey = repeatJobKey;
+-
+     this.timestamp = opts.timestamp ? opts.timestamp : Date.now();
+ 
+     this.opts.backoff = Backoffs.normalize(opts.backoff);
+@@ -281,10 +272,6 @@ export class Job<
+       job.processedOn = parseInt(json.processedOn);
+     }
+ 
+-    if (json.rjk) {
+-      job.repeatJobKey = json.rjk;
+-    }
+-
+     job.failedReason = json.failedReason;
+     job.attemptsMade = parseInt(json.attemptsMade || '0');
+ 
+@@ -352,7 +339,6 @@ export class Job<
+       timestamp: this.timestamp,
+       failedReason: JSON.stringify(this.failedReason),
+       stacktrace: JSON.stringify(this.stacktrace),
+-      repeatJobKey: this.repeatJobKey,
+       returnvalue: JSON.stringify(this.returnvalue),
+     };
+   }
+@@ -967,7 +953,7 @@ export class Job<
+     return this.scripts.addJob(client, jobData, this.opts, this.id, parentOpts);
+   }
+ 
+-  protected saveStacktrace(multi: Pipeline, err: Error) {
++  private saveStacktrace(multi: Pipeline, err: Error) {
+     this.stacktrace = this.stacktrace || [];
+ 
+     if (err?.stack) {
+diff --git a/src/classes/queue-base.ts b/src/classes/queue-base.ts
+index 08326e11c9..69ec612909 100644
+--- a/src/classes/queue-base.ts
++++ b/src/classes/queue-base.ts
+@@ -24,9 +24,9 @@ export class QueueBase extends EventEmitter {
+ 
+   /**
+    *
+-   * @param name - The name of the queue.
+-   * @param opts - Options for the queue.
+-   * @param Connection - An optional "Connection" class used to instantiate a Connection. This is useful for
++   * @param name The name of the queue.
++   * @param opts Options for the queue.
++   * @param Connection An optional "Connection" class used to instantiate a Connection. This is useful for
+    * testing with mockups and/or extending the Connection class and passing an alternate implementation.
+    */
+   constructor(
+@@ -78,7 +78,7 @@ export class QueueBase extends EventEmitter {
+   }
+ 
+   /**
+-   * Returns the version of the Redis instance the client is connected to,
++   * Returns thedis version of the Redis instance the client is connected to,
+    */
+   get redisVersion(): string {
+     return this.connection.redisVersion;
+@@ -94,8 +94,8 @@ export class QueueBase extends EventEmitter {
+   /**
+    * Emits an event. Normally used by subclasses to emit events.
+    *
+-   * @param event - The emitted event.
+-   * @param args -
++   * @param event The emitted event.
++   * @param args
+    * @returns
+    */
+   emit(event: string | symbol, ...args: any[]): boolean {
+diff --git a/src/classes/repeat.ts b/src/classes/repeat.ts
+index d6cd95cc4c..f547a56c54 100644
+--- a/src/classes/repeat.ts
++++ b/src/classes/repeat.ts
+@@ -1,6 +1,5 @@
+ import { createHash } from 'crypto';
+ import { JobsOptions, RepeatOptions } from '../interfaces';
+-import { Job } from './job';
+ import { QueueBase } from './queue-base';
+ import { parseExpression } from 'cron-parser';
+ 
+@@ -10,7 +9,7 @@ export class Repeat extends QueueBase {
+     data: T,
+     opts: JobsOptions,
+     skipCheckExists?: boolean,
+-  ): Promise<Job<T, R, N>> {
++  ) {
+     const repeatOpts = { ...opts.repeat };
+     const prevMillis = opts.prevMillis || 0;
+     const currentCount = repeatOpts.count ? repeatOpts.count + 1 : 1;
+@@ -104,7 +103,6 @@ export class Repeat extends QueueBase {
+       delay: delay < 0 || hasImmediately ? 0 : delay,
+       timestamp: now,
+       prevMillis: nextMillis,
+-      repeatJobKey,
+     };
+ 
+     mergedOpts.repeat = { ...opts.repeat, count: currentCount };
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 533027d80a..09f64aeac4 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -97,7 +97,6 @@ export class Scripts {
+       parentOpts.parentKey || null,
+       parentOpts.waitChildrenKey || null,
+       parentOpts.parentDependenciesKey || null,
+-      job.repeatJobKey,
+     ];
+ 
+     let encodedOpts;
+diff --git a/src/commands/addJob-9.lua b/src/commands/addJob-9.lua
+index 1db3d1c25f..3f7a1714d2 100644
+--- a/src/commands/addJob-9.lua
++++ b/src/commands/addJob-9.lua
+@@ -31,9 +31,8 @@
+             [3]  name
+             [4]  timestamp
+             [5]  parentKey?
+-            [6]  waitChildrenKey key.
+-            [7]  parent dependencies key.
+-            [8]  repeat job key
++            [6] waitChildrenKey key.
++            [7] parent dependencies key.
+ 
+       ARGV[2] Json stringified job data
+       ARGV[3] msgpacked options
+@@ -52,7 +51,6 @@ local data = ARGV[2]
+ local opts = cmsgpack.unpack(ARGV[3])
+ 
+ local parentKey = args[5]
+-local repeatJobKey = args[8]
+ local parentId
+ local parentQueueKey
+ local parentData
+@@ -111,22 +109,14 @@ local delay = opts['delay'] or 0
+ local priority = opts['priority'] or 0
+ local timestamp = args[4]
+ 
+-local optionalValues = {}
+ if parentKey ~= nil then
+-  table.insert(optionalValues, "parentKey")
+-  table.insert(optionalValues, parentKey)
+-  table.insert(optionalValues, "parent")
+-  table.insert(optionalValues, parentData)
+-end
+-
+-if repeatJobKey ~= nil then
+-  table.insert(optionalValues, "rjk")
+-  table.insert(optionalValues, repeatJobKey)
++  rcall("HMSET", jobIdKey, "name", args[3], "data", ARGV[2], "opts", jsonOpts,
++    "timestamp", timestamp, "delay", delay, "priority", priority, "parentKey", parentKey, "parent", parentData)
++else
++  rcall("HMSET", jobIdKey, "name", args[3], "data", ARGV[2], "opts", jsonOpts,
++    "timestamp", timestamp, "delay", delay, "priority", priority )
+ end
+ 
+-rcall("HMSET", jobIdKey, "name", args[3], "data", ARGV[2], "opts", jsonOpts,
+-  "timestamp", timestamp, "delay", delay, "priority", priority, unpack(optionalValues))
+-
+ -- TODO: do not send data and opts to the event added (for performance reasons).
+ rcall("XADD", KEYS[8], "*", "event", "added", "jobId", jobId, "name", args[3], "data", ARGV[2], "opts", jsonOpts)
+ 
+diff --git a/src/interfaces/job-json.ts b/src/interfaces/job-json.ts
+index 85f4188db4..31bb289c79 100644
+--- a/src/interfaces/job-json.ts
++++ b/src/interfaces/job-json.ts
+@@ -14,7 +14,6 @@ export interface JobJson {
+   stacktrace: string;
+   returnvalue: string;
+   parentKey?: string;
+-  repeatJobKey?: string;
+ }
+ 
+ export interface JobJsonRaw {
+@@ -32,5 +31,4 @@ export interface JobJsonRaw {
+   returnvalue: string;
+   parentKey?: string;
+   parent?: string;
+-  rjk?: string;
+ }
+diff --git a/src/interfaces/jobs-options.ts b/src/interfaces/jobs-options.ts
+index 464e3b75f1..425732618d 100644
+--- a/src/interfaces/jobs-options.ts
++++ b/src/interfaces/jobs-options.ts
+@@ -33,11 +33,6 @@ export interface JobsOptions {
+    */
+   repeat?: RepeatOptions;
+ 
+-  /**
+-   * Base repeat job key.
+-   */
+-  repeatJobKey?: string;
+-
+   /**
+    * Rate limiter key to use if rate limiter enabled.
+    *
+diff --git a/src/utils.ts b/src/utils.ts
+index 9adc2208f0..3dc2ebc7df 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -6,11 +6,11 @@ import { v4 } from 'uuid';
+ import { get } from 'lodash';
+ import * as semver from 'semver';
+ import {
+-  ChildMessage,
++  RedisClient,
+   JobsOptions,
+-  ParentMessage,
+   QueueOptions,
+-  RedisClient,
++  ChildMessage,
++  ParentMessage,
+ } from './interfaces';
+ import { ChildProcess } from 'child_process';
+ 
+diff --git a/tests/test_flow.ts b/tests/test_flow.ts
+index a008a371d6..b4b3bf9f46 100644
+--- a/tests/test_flow.ts
++++ b/tests/test_flow.ts
+@@ -1258,7 +1258,6 @@ describe('flows', () => {
+         (childrenProcessor = async (job: Job) => {
+           processedChildren++;
+ 
+-          await delay(50);
+           if (processedChildren == values.length) {
+             resolve();
+           }
+diff --git a/tests/test_repeat.ts b/tests/test_repeat.ts
+index f2611ebccf..9a234cb575 100644
+--- a/tests/test_repeat.ts
++++ b/tests/test_repeat.ts
+@@ -78,7 +78,7 @@ describe('repeat', function () {
+       });
+     });
+ 
+-    const job = await queue.add(
++    await queue.add(
+       'test',
+       { foo: 'bar' },
+       {
+@@ -89,8 +89,6 @@ describe('repeat', function () {
+       },
+     );
+ 
+-    expect(job.repeatJobKey).to.not.be.undefined;
+-
+     this.clock.tick(every + 1);
+ 
+     await completing;
+@@ -793,12 +791,10 @@ describe('repeat', function () {
+   it('should be able to remove repeatable jobs by key', async () => {
+     const repeat = { cron: '*/2 * * * * *' };
+ 
+-    const createdJob = await queue.add('remove', { foo: 'bar' }, { repeat });
+-    const job = await queue.getJob(createdJob.id);
++    await queue.add('remove', { foo: 'bar' }, { repeat });
+     const repeatableJobs = await queue.getRepeatableJobs();
+     expect(repeatableJobs).to.have.length(1);
+-    const removed = await queue.removeRepeatableByKey(createdJob.repeatJobKey);
+-    expect(job.repeatJobKey).to.not.be.undefined;
++    const removed = await queue.removeRepeatableByKey(repeatableJobs[0].key);
+     expect(removed).to.be.true;
+     const repeatableJobsAfterRemove = await queue.getRepeatableJobs();
+     expect(repeatableJobsAfterRemove).to.have.length(0);
+@@ -839,7 +835,7 @@ describe('repeat', function () {
+     this.clock.tick(nextTick);
+ 
+     const processing = new Promise<void>((resolve, reject) => {
+-      processor = async () => {
++      processor = async (job: Job) => {
+         counter++;
+         if (counter == numJobs) {
+           try {
+@@ -1072,7 +1068,7 @@ describe('repeat', function () {
+     await queue.add('repeat s', { type: 's' }, { repeat: { every: interval } });
+     this.clock.tick(nextTick);
+ 
+-    const worker = new Worker(queueName, async () => {}, { connection });
++    const worker = new Worker(queueName, async job => {}, { connection });
+     const delayStub = sinon.stub(worker, 'delay').callsFake(async () => {});
+     await worker.waitUntilReady();
+ 
+diff --git a/tests/test_worker.ts b/tests/test_worker.ts
+index 652d48bdfc..c1280f46c8 100644
+--- a/tests/test_worker.ts
++++ b/tests/test_worker.ts
+@@ -12,7 +12,7 @@ import {
+   UnrecoverableError,
+   Worker,
+ } from '../src/classes';
+-import { JobsOptions, KeepJobs } from '../src/interfaces';
++import { KeepJobs, JobsOptions } from '../src/interfaces';
+ import { delay, removeAllQueueData } from '../src/utils';
+ 
+ describe('workers', function () {

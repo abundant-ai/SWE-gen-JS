@@ -1,0 +1,182 @@
+diff --git a/crates/biome_html_parser/src/lexer/mod.rs b/crates/biome_html_parser/src/lexer/mod.rs
+index fb77546c0c..1543690b21 100644
+--- a/crates/biome_html_parser/src/lexer/mod.rs
++++ b/crates/biome_html_parser/src/lexer/mod.rs
+@@ -339,36 +339,38 @@ impl<'src> HtmlLexer<'src> {
+     /// Consumes a restricted single text expression that stops at specific keywords
+     /// (e.g., 'as' in Svelte #each blocks). Tracks nested brackets and stops when
+     /// encountering a keyword at the top level.
++    ///
++    /// Finding a `{` at the top level will emit an error token.
+     fn consume_restricted_single_text_expression(
+         &mut self,
+         kind: RestrictedExpressionStopAt,
+     ) -> HtmlSyntaxKind {
+         let start_pos = self.position;
+         let mut brackets_stack = 0;
++
++        let is_opening_paren = |byte: u8| byte == b'(' || byte == b'[' || byte == b'{';
++        let is_closing_paren = |byte: u8| byte == b')' || byte == b']' || byte == b'}';
++
+         while let Some(current) = self.current_byte() {
+             match current {
+-                b'}' => {
++                // That's usually the case where we find a tag
++                _ if current == b'<' && brackets_stack == 0 => break,
++                _ if is_opening_paren(current) && !kind.matches_punct(current) => {
++                    brackets_stack += 1;
++                    self.advance(1)
++                }
++                _ if is_closing_paren(current) && !kind.matches_punct(current) => {
+                     if brackets_stack == 0 {
+                         // Reached the closing brace
+                         break;
+                     } else {
+                         brackets_stack -= 1;
+-                        self.advance(1);
++                        self.advance(1)
+                     }
+                 }
+-                b'{' => {
+-                    brackets_stack += 1;
+-                    self.advance(1);
+-                }
++
+                 _ if brackets_stack == 0 && !is_at_start_identifier(current) => {
+-                    let should_stop = match kind {
+-                        RestrictedExpressionStopAt::AsOrComma => current == b',',
+-                        RestrictedExpressionStopAt::OpeningParenOrComma => {
+-                            current == b'(' || current == b','
+-                        }
+-                        RestrictedExpressionStopAt::ClosingParen => current == b')',
+-                        RestrictedExpressionStopAt::ThenOrCatch => false,
+-                    };
++                    let should_stop = kind.matches_punct(current);
+                     if should_stop {
+                         break;
+                     }
+@@ -380,17 +382,8 @@ impl<'src> HtmlLexer<'src> {
+                     let prev_byte = self.prev_byte();
+                     if let Some(keyword_kind) = self.consume_language_identifier(current) {
+                         // Check if this keyword is in our stop list
+-                        let should_stop = match kind {
+-                            RestrictedExpressionStopAt::AsOrComma => {
+-                                keyword_kind == AS_KW && prev_byte == Some(b' ')
+-                            }
+-                            RestrictedExpressionStopAt::ThenOrCatch => {
+-                                (keyword_kind == THEN_KW || keyword_kind == CATCH_KW)
+-                                    && prev_byte == Some(b' ')
+-                            }
+-                            RestrictedExpressionStopAt::OpeningParenOrComma => false,
+-                            RestrictedExpressionStopAt::ClosingParen => false,
+-                        };
++                        let should_stop =
++                            kind.matches_keyword(keyword_kind) && prev_byte == Some(b' ');
+ 
+                         if should_stop {
+                             // Rewind - don't consume the keyword
+diff --git a/crates/biome_html_parser/src/syntax/svelte.rs b/crates/biome_html_parser/src/syntax/svelte.rs
+index 2f10ecaf63..7e598a08af 100644
+--- a/crates/biome_html_parser/src/syntax/svelte.rs
++++ b/crates/biome_html_parser/src/syntax/svelte.rs
+@@ -151,6 +151,8 @@ pub(crate) fn parse_else_clause(p: &mut HtmlParser) -> ParsedSyntax {
+     Present(m.complete(p, SVELTE_ELSE_CLAUSE))
+ }
+ 
++// #region parse `{#each}` functions
++
+ fn parse_each_block(p: &mut HtmlParser, parent_marker: Marker) -> ParsedSyntax {
+     if !p.at(T![each]) {
+         parent_marker.abandon(p);
+@@ -282,11 +284,6 @@ fn parse_svelte_block_item(p: &mut HtmlParser) -> ParsedSyntax {
+     } else if p.at(T![,]) {
+         parse_each_keyed_item(p)
+     } else {
+-        // Error: missing 'as' or ','
+-        p.error(p.err_builder(
+-            "Expected 'as' keyword for item binding or ',' for index-only syntax",
+-            p.cur_range(),
+-        ));
+         Absent
+     }
+ }
+@@ -343,6 +340,7 @@ fn parse_each_opening_block(p: &mut HtmlParser, parent_marker: Marker) -> (Parse
+         has_errors,
+     )
+ }
++// #endregion
+ 
+ // #region await parse functions
+ 
+@@ -488,13 +486,6 @@ impl ParseNodeList for AwaitClausesList {
+             .and_then(|parsed| {
+                 let range = parsed.range(p);
+ 
+-                if self.seen_then_block.is_none() && block_parsed == BlockParsed::Catch {
+-                    p.error(
+-                        p.err_builder("{:catch} cannot appear before the {:then} block.", range)
+-                            .with_detail(p.cur_range(), "This is where the {:then} block starts."),
+-                    )
+-                }
+-
+                 if let Some(seen_catch_block) = self.seen_catch_block
+                     && block_parsed == BlockParsed::Catch
+                 {
+@@ -523,6 +514,19 @@ impl ParseNodeList for AwaitClausesList {
+                     self.seen_then_block = Some(range);
+                 }
+ 
++                if let Some(catch_range) = self.seen_catch_block
++                    && let Some(then_range) = self.seen_then_block
++                    && catch_range < then_range
++                {
++                    p.error(
++                        p.err_builder(
++                            "{:catch} cannot appear before the {:then} block.",
++                            catch_range,
++                        )
++                        .with_detail(then_range, "This is where the {:then} block starts."),
++                    )
++                }
++
+                 Present(parsed)
+             })
+             .or_else(|| Absent)
+diff --git a/crates/biome_html_parser/src/token_source.rs b/crates/biome_html_parser/src/token_source.rs
+index 4e1ecad298..049ac3391f 100644
+--- a/crates/biome_html_parser/src/token_source.rs
++++ b/crates/biome_html_parser/src/token_source.rs
+@@ -1,5 +1,5 @@
+ use crate::lexer::HtmlLexer;
+-use biome_html_syntax::HtmlSyntaxKind::EOF;
++use biome_html_syntax::HtmlSyntaxKind::{AS_KW, CATCH_KW, EOF, THEN_KW};
+ use biome_html_syntax::{HtmlSyntaxKind, TextRange};
+ use biome_parser::diagnostic::ParseDiagnostic;
+ use biome_parser::lexer::{BufferedLexer, LexContext};
+@@ -94,6 +94,26 @@ pub(crate) enum RestrictedExpressionStopAt {
+     ThenOrCatch,
+ }
+ 
++impl RestrictedExpressionStopAt {
++    pub(crate) fn matches_punct(&self, byte: u8) -> bool {
++        match self {
++            Self::AsOrComma => byte == b',',
++            Self::OpeningParenOrComma => byte == b'(' || byte == b',',
++            Self::ClosingParen => byte == b')',
++            Self::ThenOrCatch => false,
++        }
++    }
++
++    pub(crate) fn matches_keyword(&self, keyword: HtmlSyntaxKind) -> bool {
++        match self {
++            Self::AsOrComma => keyword == AS_KW,
++            Self::OpeningParenOrComma => false,
++            Self::ClosingParen => false,
++            Self::ThenOrCatch => keyword == THEN_KW || keyword == CATCH_KW,
++        }
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum HtmlEmbeddedLanguage {
+     Script,

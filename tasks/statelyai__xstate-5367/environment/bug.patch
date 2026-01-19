@@ -1,0 +1,551 @@
+diff --git a/.changeset/dry-cows-stare.md b/.changeset/dry-cows-stare.md
+deleted file mode 100644
+index 13453efa83..0000000000
+--- a/.changeset/dry-cows-stare.md
++++ /dev/null
+@@ -1,44 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-Add type-bound action helpers to `setup()`:
+-
+-- `createAction(fn)` – create type-safe custom actions
+-- `setup().assign(...)`, `setup().sendTo(...)`, `setup().raise(...)`, `setup().log(...)`, `setup().cancel(...)`, `setup().stopChild(...)`, `setup().enqueueActions(...)`, `setup().emit(...)`, `setup().spawnChild(...)` – setup-scoped helpers that are fully typed to the setup's context/events/actors/guards/delays/emitted.
+-
+-These helpers return actions that are bound to the specific `setup()` they were created from and can be used directly in the machine produced by that setup.
+-
+-```ts
+-const machineSetup = setup({
+-  types: {} as {
+-    context: {
+-      count: number;
+-    };
+-    events: { type: 'inc'; value: number } | { type: 'TEST' };
+-    emitted: { type: 'PING' };
+-  }
+-});
+-
+-// Custom action
+-const action = machineSetup.createAction(({ context, event }) => {
+-  console.log(context.count, event.value);
+-});
+-
+-// Type-bound built-ins (no wrapper needed)
+-const increment = machineSetup.assign({
+-  count: ({ context }) => context.count + 1
+-});
+-const raiseTest = machineSetup.raise({ type: 'TEST' });
+-const ping = machineSetup.emit({ type: 'PING' });
+-const batch = machineSetup.enqueueActions(({ enqueue, check }) => {
+-  if (check(() => true)) {
+-    enqueue(increment);
+-  }
+-});
+-
+-const machine = machineSetup.createMachine({
+-  context: { count: 0 },
+-  entry: [action, increment, raiseTest, ping, batch]
+-});
+-```
+diff --git a/README.md b/README.md
+index cf02a98ad6..1b8afacce4 100644
+--- a/README.md
++++ b/README.md
+@@ -31,6 +31,29 @@ It uses event-driven programming, state machines, statecharts, and the actor mod
+ 
+ ✍️ Browse through the many [XState examples](https://github.com/statelyai/xstate/tree/main/examples)
+ 
++## Sponsors
++
++Special thanks to the sponsors who support this open-source project:
++
++<img src="https://opencollective.com/xstate/tiers/backer/badge.svg?label=sponsors&color=brightgreen" />
++
++ <a href="https://go.warp.dev/xstate">
++    <img alt="Warp sponsorship" width="400" src="https://github.com/warpdotdev/brand-assets/blob/main/Github/Sponsor/Warp-Github-LG-04.png?raw=true](https://github.com/warpdotdev/brand-assets/blob/main/Github/Sponsor/Warp-Github-LG-03.png?raw=true)">
++ </a>
++
++### [Warp, the intelligent terminal for developers](https://go.warp.dev/xstate)
++
++<small><a href="https://go.warp.dev/xstate">Warp is built for coding with multiple AI agents</a></small>
++
++<a href="https://transloadit.com/?utm_source=xstate&utm_medium=referral&utm_campaign=sponsorship&utm_content=github">
++  <picture>
++    <source media="(prefers-color-scheme: dark)" srcset="https://assets.transloadit.com/assets/images/sponsorships/logo-dark.svg">
++    <source media="(prefers-color-scheme: light)" srcset="https://assets.transloadit.com/assets/images/sponsorships/logo-default.svg">
++    <img src="https://assets.transloadit.com/assets/images/sponsorships/logo-default.svg" alt="Transloadit Logo">
++  </picture>
++</a>
++
++
+ ## Templates
+ 
+ Get started by forking one of these templates on CodeSandbox:
+@@ -542,19 +565,6 @@ actor.send({ type: 'PREVIOUS' });
+ </tbody>
+ </table>
+ 
+-## Sponsors
+-
+-Special thanks to the sponsors who support this open-source project:
+-
+-<img src="https://opencollective.com/xstate/tiers/backer/badge.svg?label=sponsors&color=brightgreen" />
+-
+-<a href="https://transloadit.com/?utm_source=xstate&utm_medium=referral&utm_campaign=sponsorship&utm_content=github">
+-  <picture>
+-    <source media="(prefers-color-scheme: dark)" srcset="https://assets.transloadit.com/assets/images/sponsorships/logo-dark.svg">
+-    <source media="(prefers-color-scheme: light)" srcset="https://assets.transloadit.com/assets/images/sponsorships/logo-default.svg">
+-    <img src="https://assets.transloadit.com/assets/images/sponsorships/logo-default.svg" alt="Transloadit Logo">
+-  </picture>
+-</a>
+ 
+ ## SemVer Policy
+ 
+diff --git a/packages/core/src/actions/send.ts b/packages/core/src/actions/send.ts
+index 35b2aa4f02..3d5c3917a7 100644
+--- a/packages/core/src/actions/send.ts
++++ b/packages/core/src/actions/send.ts
+@@ -214,13 +214,13 @@ export function sendTo<
+   TDelay extends string = never,
+   TUsedDelay extends TDelay = never
+ >(
+-  to: SendToActionTarget<
+-    TContext,
+-    TExpressionEvent,
+-    TParams,
+-    TTargetActor,
+-    TEvent
+-  >,
++  to:
++    | TTargetActor
++    | string
++    | ((
++        args: ActionArgs<TContext, TExpressionEvent, TEvent>,
++        params: TParams
++      ) => TTargetActor | string),
+   eventOrExpr:
+     | EventFrom<TTargetActor>
+     | SendExpr<
+@@ -313,19 +313,18 @@ export function sendParent<
+   >(SpecialTargets.Parent, event, options as any);
+ }
+ 
+-type SendToActionTarget<
++type Target<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject,
+   TParams extends ParameterizedObject['params'] | undefined,
+-  TTargetActor extends AnyActorRef,
+   TEvent extends EventObject
+ > =
+   | string
+-  | TTargetActor
++  | AnyActorRef
+   | ((
+       args: ActionArgs<TContext, TExpressionEvent, TEvent>,
+       params: TParams
+-    ) => string | TTargetActor);
++    ) => string | AnyActorRef);
+ 
+ /**
+  * Forwards (sends) an event to the `target` actor.
+@@ -341,13 +340,7 @@ export function forwardTo<
+   TDelay extends string = never,
+   TUsedDelay extends TDelay = never
+ >(
+-  target: SendToActionTarget<
+-    TContext,
+-    TExpressionEvent,
+-    TParams,
+-    AnyActorRef,
+-    TEvent
+-  >,
++  target: Target<TContext, TExpressionEvent, TParams, TEvent>,
+   options?: SendToActionOptions<
+     TContext,
+     TExpressionEvent,
+diff --git a/packages/core/src/setup.ts b/packages/core/src/setup.ts
+index 0d45d721ef..1af397f266 100644
+--- a/packages/core/src/setup.ts
++++ b/packages/core/src/setup.ts
+@@ -1,13 +1,4 @@
+ import { StateMachine } from './StateMachine';
+-import { assign } from './actions/assign';
+-import { cancel } from './actions/cancel';
+-import { emit } from './actions/emit';
+-import { enqueueActions } from './actions/enqueueActions';
+-import { log } from './actions/log';
+-import { raise } from './actions/raise';
+-import { sendTo } from './actions/send';
+-import { spawnChild } from './actions/spawnChild';
+-import { stopChild } from './actions/stopChild';
+ import { createMachine } from './createMachine';
+ import { GuardPredicate } from './guards';
+ 
+@@ -200,44 +191,6 @@ export function setup<
+   >(
+     config: TStateConfig
+   ) => TStateConfig;
+-  /**
+-   * Creates a type-safe action.
+-   *
+-   * @example
+-   *
+-   * ```ts
+-   * const machineSetup = setup({
+-   *   // ...
+-   * });
+-   *
+-   * const action = machineSetup.createAction(({ context, event }) => {
+-   *   console.log(context.count, event.value);
+-   * });
+-   *
+-   * const incrementAction = machineSetup.createAction(
+-   *   assign({ count: ({ context }) => context.count + 1 })
+-   * );
+-   *
+-   * const machine = machineSetup.createMachine({
+-   *   context: { count: 0 },
+-   *   entry: [action, incrementAction]
+-   * });
+-   * ```
+-   */
+-  createAction: (
+-    action: ActionFunction<
+-      TContext,
+-      TEvent,
+-      TEvent,
+-      unknown,
+-      ToProvidedActor<TChildrenMap, TActors>,
+-      ToParameterizedObject<TActions>,
+-      ToParameterizedObject<TGuards>,
+-      TDelay,
+-      TEmitted
+-    >
+-  ) => typeof action;
+-
+   createMachine: <
+     const TConfig extends MachineConfig<
+       TContext,
+@@ -273,73 +226,9 @@ export function setup<
+     TMeta,
+     TConfig
+   >;
+-
+-  assign: typeof assign<
+-    TContext,
+-    TEvent,
+-    undefined,
+-    TEvent,
+-    ToProvidedActor<TChildrenMap, TActors>
+-  >;
+-  sendTo: <TTargetActor extends AnyActorRef>(
+-    ...args: Parameters<
+-      typeof sendTo<
+-        TContext,
+-        TEvent,
+-        undefined,
+-        TTargetActor,
+-        TEvent,
+-        TDelay,
+-        TDelay
+-      >
+-    >
+-  ) => ReturnType<
+-    typeof sendTo<
+-      TContext,
+-      TEvent,
+-      undefined,
+-      TTargetActor,
+-      TEvent,
+-      TDelay,
+-      TDelay
+-    >
+-  >;
+-  raise: typeof raise<TContext, TEvent, TEvent, undefined, TDelay, TDelay>;
+-  log: typeof log<TContext, TEvent, undefined, TEvent>;
+-  cancel: typeof cancel<TContext, TEvent, undefined, TEvent>;
+-  stopChild: typeof stopChild<TContext, TEvent, undefined, TEvent>;
+-  enqueueActions: typeof enqueueActions<
+-    TContext,
+-    TEvent,
+-    undefined,
+-    TEvent,
+-    ToProvidedActor<TChildrenMap, TActors>,
+-    ToParameterizedObject<TActions>,
+-    ToParameterizedObject<TGuards>,
+-    TDelay,
+-    TEmitted
+-  >;
+-  emit: typeof emit<TContext, TEvent, undefined, TEvent, TEmitted>;
+-  spawnChild: typeof spawnChild<
+-    TContext,
+-    TEvent,
+-    undefined,
+-    TEvent,
+-    ToProvidedActor<TChildrenMap, TActors>
+-  >;
+ } {
+   return {
+-    assign,
+-    sendTo,
+-    raise,
+-    log,
+-    cancel,
+-    stopChild,
+-    enqueueActions,
+-    emit,
+-    spawnChild,
+     createStateConfig: (config) => config,
+-    createAction: (fn) => fn,
+     createMachine: (config) =>
+       (createMachine as any)(
+         { ...config, schemas },
+diff --git a/packages/core/test/setup.types.test.ts b/packages/core/test/setup.types.test.ts
+index b09c89f44a..d7ae068b51 100644
+--- a/packages/core/test/setup.types.test.ts
++++ b/packages/core/test/setup.types.test.ts
+@@ -2648,242 +2648,3 @@ describe('createStateConfig', () => {
+     });
+   });
+ });
+-
+-describe('type-bound actions', () => {
+-  it('should be able to create a type-safe action action', () => {
+-    const machineSetup = setup({
+-      types: {} as {
+-        context: {
+-          count: number;
+-        };
+-        events: {
+-          type: 'inc';
+-          value: number;
+-        };
+-      }
+-    });
+-
+-    const action = machineSetup.createAction((args) => {
+-      args.context.count satisfies number;
+-      // @ts-expect-error
+-      args.context.text satisfies string;
+-
+-      args.event.type satisfies 'inc';
+-      args.event.value satisfies number;
+-      // @ts-expect-error
+-      args.event.value satisfies string;
+-    });
+-
+-    machineSetup.createMachine({
+-      context: {
+-        count: 0
+-      },
+-      entry: action
+-    });
+-
+-    setup({}).createMachine({
+-      // @ts-expect-error
+-      entry: action
+-    });
+-  });
+-
+-  it('should be able to create a type-safe assign action', () => {
+-    const machineSetup = setup({
+-      types: {} as {
+-        context: {
+-          count: number;
+-        };
+-      }
+-    });
+-    const assignAction = machineSetup.assign({
+-      count: ({ context }) => {
+-        context.count satisfies number;
+-        // @ts-expect-error
+-        context.text satisfies string;
+-
+-        return context.count + 1;
+-      }
+-    });
+-
+-    machineSetup.createMachine({
+-      context: {
+-        count: 0
+-      },
+-      entry: assignAction
+-    });
+-
+-    setup({}).createMachine({
+-      // @ts-expect-error
+-      entry: assignAction
+-    });
+-  });
+-
+-  it('should be able to create a type-safe raise action', () => {
+-    const machineSetup = setup({
+-      types: {} as {
+-        context: {
+-          count: number;
+-        };
+-        events: {
+-          type: 'TEST';
+-        };
+-      }
+-    });
+-    const raiseAction = machineSetup.raise(({ event }) => {
+-      event.type satisfies 'TEST';
+-      // @ts-expect-error
+-      event.type satisfies 'INVALID';
+-
+-      return event;
+-    });
+-
+-    machineSetup.createMachine({
+-      context: {
+-        count: 0
+-      },
+-      entry: raiseAction
+-    });
+-
+-    setup({}).createMachine({
+-      // @ts-expect-error
+-      entry: raiseAction
+-    });
+-  });
+-
+-  it('should be able to create a type-safe sendTo action', () => {
+-    const machineSetup = setup({
+-      types: {} as {
+-        events: { type: 'TEST' };
+-      }
+-    });
+-    const sendToAction = machineSetup.sendTo(
+-      ({ self }) => self,
+-      ({ event }) => {
+-        event.type satisfies 'TEST';
+-        // @ts-expect-error
+-        event.type satisfies 'INVALID';
+-
+-        return event;
+-      }
+-    );
+-
+-    machineSetup.createMachine({
+-      context: {
+-        count: 0
+-      },
+-      entry: sendToAction
+-    });
+-
+-    setup({}).createMachine({
+-      // @ts-expect-error
+-      entry: sendToAction
+-    });
+-  });
+-
+-  it('should be able to create a type-safe log action', () => {
+-    const machineSetup = setup({
+-      types: {} as {
+-        context: { count: number };
+-        events: { type: 'TEST' };
+-      }
+-    });
+-    const logAction = machineSetup.log(({ context, event }) => {
+-      context.count satisfies number;
+-      event.type satisfies 'TEST';
+-      return { context, event };
+-    }, 'label');
+-
+-    machineSetup.createMachine({
+-      context: { count: 0 },
+-      entry: logAction
+-    });
+-  });
+-
+-  it('should be able to create a type-safe cancel action', () => {
+-    const machineSetup = setup({});
+-    const cancelAction = machineSetup.cancel('some-id');
+-    machineSetup.createMachine({ entry: cancelAction });
+-  });
+-
+-  it('should be able to create a type-safe stopChild action', () => {
+-    const machineSetup = setup({});
+-    const stopAction = machineSetup.stopChild('child');
+-    machineSetup.createMachine({ entry: stopAction });
+-  });
+-
+-  it('should be able to create a type-safe enqueueActions action', () => {
+-    const machineSetup = setup({
+-      types: {} as {
+-        context: { count: number };
+-        events: { type: 'INC'; value: number };
+-      },
+-      actions: {
+-        doing: () => {}
+-      },
+-      guards: {
+-        isOk: () => true
+-      }
+-    });
+-
+-    const enq = machineSetup.enqueueActions(
+-      ({ context, event, check, enqueue }) => {
+-        context.count satisfies number;
+-        event.type satisfies 'INC';
+-
+-        if (check('isOk')) {
+-          enqueue('doing');
+-        }
+-
+-        enqueue.assign({
+-          count: ({ context }) => context.count + 1
+-        });
+-      }
+-    );
+-
+-    machineSetup.createMachine({
+-      context: { count: 0 },
+-      entry: enq
+-    });
+-
+-    setup({}).createMachine({
+-      // @ts-expect-error
+-      entry: enq
+-    });
+-  });
+-
+-  it('should be able to create a type-safe emit action', () => {
+-    const machineSetup = setup({
+-      types: {} as {
+-        emitted: { type: 'PING' };
+-        events: { type: 'TEST' };
+-      }
+-    });
+-
+-    const emitAction = machineSetup.emit({ type: 'PING' });
+-
+-    machineSetup.createMachine({ entry: emitAction });
+-
+-    setup({}).createMachine({
+-      // @ts-expect-error
+-      entry: emitAction
+-    });
+-  });
+-
+-  it('should be able to create a type-safe spawnChild action', () => {
+-    const child = createMachine({});
+-    const machineSetup = setup({
+-      actors: {
+-        child
+-      }
+-    });
+-
+-    const spawn = machineSetup.spawnChild('child');
+-
+-    machineSetup.createMachine({ entry: spawn });
+-
+-    setup({}).createMachine({
+-      // @ts-expect-error
+-      entry: spawn
+-    });
+-  });
+-});

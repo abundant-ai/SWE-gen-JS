@@ -1,0 +1,167 @@
+diff --git a/.changeset/six-foxes-deny.md b/.changeset/six-foxes-deny.md
+new file mode 100644
+index 0000000000..bc17ee5bd4
+--- /dev/null
++++ b/.changeset/six-foxes-deny.md
+@@ -0,0 +1,40 @@
++---
++'@xstate/store': minor
++---
++
++Added selectors to @xstate/store that enable efficient state selection and subscription:
++
++- `store.select(selector)` function to create a "selector" entity where you can:
++  - Get current value with `.get()`
++  - Subscribe to changes with `.subscribe(callback)`
++  - Only notify subscribers when selected value actually changes
++  - Support custom equality functions for fine-grained control over updates via `store.select(selector, equalityFn)`
++
++```ts
++const store = createStore({
++  context: {
++    position: { x: 0, y: 0 },
++    user: { name: 'John', age: 30 }
++  },
++  on: {
++    positionUpdated: (
++      context,
++      event: { position: { x: number; y: number } }
++    ) => ({
++      ...context,
++      position: event.position
++    })
++  }
++});
++
++const position = store.select((state) => state.context.position);
++
++position.get(); // { x: 0, y: 0 }
++
++position.subscribe((position) => {
++  console.log(position);
++});
++
++store.trigger.positionUpdated({ x: 100, y: 200 });
++// Logs: { x: 100, y: 200 }
++```
+diff --git a/packages/xstate-store/src/store.ts b/packages/xstate-store/src/store.ts
+index 5ae50c7003..a2e3e75307 100644
+--- a/packages/xstate-store/src/store.ts
++++ b/packages/xstate-store/src/store.ts
+@@ -1,3 +1,4 @@
++import { toObserver } from './toObserver';
+ import {
+   EnqueueObject,
+   EventObject,
+@@ -12,30 +13,15 @@ import {
+   StoreEffect,
+   StoreInspectionEvent,
+   StoreProducerAssigner,
+-  StoreSnapshot
++  StoreSnapshot,
++  Selector,
++  Selection
+ } from './types';
+ 
+ const symbolObservable: typeof Symbol.observable = (() =>
+   (typeof Symbol === 'function' && Symbol.observable) ||
+   '@@observable')() as any;
+ 
+-function toObserver<T>(
+-  nextHandler?: Observer<T> | ((value: T) => void),
+-  errorHandler?: (error: any) => void,
+-  completionHandler?: () => void
+-): Observer<T> {
+-  const isObserver = typeof nextHandler === 'object';
+-  const self = isObserver ? nextHandler : undefined;
+-
+-  return {
+-    next: (isObserver ? nextHandler.next : nextHandler)?.bind(self),
+-    error: (isObserver ? nextHandler.error : errorHandler)?.bind(self),
+-    complete: (isObserver ? nextHandler.complete : completionHandler)?.bind(
+-      self
+-    )
+-  };
+-}
+-
+ /**
+  * Updates a context object using a recipe function.
+  *
+@@ -211,7 +197,27 @@ function createStoreCore<
+           });
+         };
+       }
+-    })
++    }),
++    select<TSelected>(
++      selector: Selector<TContext, TSelected>,
++      equalityFn: (a: TSelected, b: TSelected) => boolean = Object.is
++    ): Selection<TSelected> {
++      return {
++        subscribe: (observerOrFn) => {
++          const observer = toObserver(observerOrFn);
++          let previousSelected = selector(this.getSnapshot().context);
++
++          return this.subscribe((snapshot) => {
++            const nextSelected = selector(snapshot.context);
++            if (!equalityFn(previousSelected, nextSelected)) {
++              previousSelected = nextSelected;
++              observer.next?.(nextSelected);
++            }
++          });
++        },
++        get: () => selector(this.getSnapshot().context)
++      };
++    }
+   };
+ 
+   return store;
+diff --git a/packages/xstate-store/src/toObserver.ts b/packages/xstate-store/src/toObserver.ts
+new file mode 100644
+index 0000000000..8467d50801
+--- /dev/null
++++ b/packages/xstate-store/src/toObserver.ts
+@@ -0,0 +1,18 @@
++import { Observer } from './types';
++
++export function toObserver<T>(
++  nextHandler?: Observer<T> | ((value: T) => void),
++  errorHandler?: (error: any) => void,
++  completionHandler?: () => void
++): Observer<T> {
++  const isObserver = typeof nextHandler === 'object';
++  const self = isObserver ? nextHandler : undefined;
++
++  return {
++    next: (isObserver ? nextHandler.next : nextHandler)?.bind(self),
++    error: (isObserver ? nextHandler.error : errorHandler)?.bind(self),
++    complete: (isObserver ? nextHandler.complete : completionHandler)?.bind(
++      self
++    )
++  };
++}
+diff --git a/packages/xstate-store/src/types.ts b/packages/xstate-store/src/types.ts
+index edff42361e..87b250193c 100644
+--- a/packages/xstate-store/src/types.ts
++++ b/packages/xstate-store/src/types.ts
+@@ -111,6 +111,10 @@ export interface Store<
+       ? () => Omit<E, 'type'>
+       : (eventPayload: Omit<E, 'type'>) => void;
+   };
++  select<TSelected>(
++    selector: Selector<TContext, TSelected>,
++    equalityFn?: (a: TSelected, b: TSelected) => boolean
++  ): Selection<TSelected>;
+ }
+ 
+ export type IsEmptyObject<T> = T extends Record<string, never> ? true : false;
+@@ -312,3 +316,9 @@ export type Cast<A, B> = A extends B ? A : B;
+ export type EventMap<TEvent extends EventObject> = {
+   [E in TEvent as E['type']]: E;
+ };
++
++export type Selector<TContext, TSelected> = (context: TContext) => TSelected;
++
++export interface Selection<TSelected> extends Subscribable<TSelected> {
++  get: () => TSelected;
++}

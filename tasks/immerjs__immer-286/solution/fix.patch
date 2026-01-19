@@ -1,0 +1,434 @@
+diff --git a/src/common.js b/src/common.js
+index a78e5b0..ddcf7dc 100644
+--- a/src/common.js
++++ b/src/common.js
+@@ -3,6 +3,11 @@ export const NOTHING =
+         ? Symbol("immer-nothing")
+         : {["immer-nothing"]: true}
+ 
++export const DRAFTABLE =
++    typeof Symbol !== "undefined"
++        ? Symbol("immer-draftable")
++        : "__$immer_draftable"
++
+ export const DRAFT_STATE =
+     typeof Symbol !== "undefined" ? Symbol("immer-state") : "__$immer_state"
+ 
+@@ -11,11 +16,11 @@ export function isDraft(value) {
+ }
+ 
+ export function isDraftable(value) {
+-    if (!value) return false
+-    if (typeof value !== "object") return false
++    if (!value || typeof value !== "object") return false
+     if (Array.isArray(value)) return true
+     const proto = Object.getPrototypeOf(value)
+-    return proto === null || proto === Object.prototype
++    if (!proto || proto === Object.prototype) return true
++    return !!value[DRAFTABLE] || !!value.constructor[DRAFTABLE]
+ }
+ 
+ export function original(value) {
+@@ -36,20 +41,53 @@ export const assign =
+         return target
+     }
+ 
+-export function shallowCopy(value) {
+-    if (Array.isArray(value)) return value.slice()
+-    const target = value.__proto__ === undefined ? Object.create(null) : {}
+-    return assign(target, value)
++export const ownKeys =
++    typeof Reflect !== "undefined" && Reflect.ownKeys
++        ? Reflect.ownKeys
++        : obj =>
++              Object.getOwnPropertyNames(obj).concat(
++                  Object.getOwnPropertySymbols(obj)
++              )
++
++export function shallowCopy(base, invokeGetters = false) {
++    if (Array.isArray(base)) return base.slice()
++    const clone = Object.create(Object.getPrototypeOf(base))
++    ownKeys(base).forEach(key => {
++        if (key === DRAFT_STATE) {
++            return // Never copy over draft state.
++        }
++        const desc = Object.getOwnPropertyDescriptor(base, key)
++        if (desc.get) {
++            if (!invokeGetters) {
++                throw new Error("Immer drafts cannot have computed properties")
++            }
++            desc.value = desc.get.call(base)
++        }
++        if (desc.enumerable) {
++            clone[key] = desc.value
++        } else {
++            Object.defineProperty(clone, key, {
++                value: desc.value,
++                writable: true,
++                configurable: true
++            })
++        }
++    })
++    return clone
+ }
+ 
+ export function each(value, cb) {
+     if (Array.isArray(value)) {
+         for (let i = 0; i < value.length; i++) cb(i, value[i], value)
+     } else {
+-        for (let key in value) cb(key, value[key], value)
++        ownKeys(value).forEach(key => cb(key, value[key], value))
+     }
+ }
+ 
++export function isEnumerable(base, prop) {
++    return Object.getOwnPropertyDescriptor(base, prop).enumerable
++}
++
+ export function has(thing, prop) {
+     return Object.prototype.hasOwnProperty.call(thing, prop)
+ }
+diff --git a/src/es5.js b/src/es5.js
+index 3262790..05414f4 100644
+--- a/src/es5.js
++++ b/src/es5.js
+@@ -7,6 +7,7 @@ import {
+     is,
+     isDraft,
+     isDraftable,
++    isEnumerable,
+     shallowCopy,
+     DRAFT_STATE
+ } from "./common"
+@@ -28,18 +29,10 @@ export function willFinalize(result, baseDraft, needPatches) {
+ }
+ 
+ export function createDraft(base, parent) {
+-    let draft
+-    if (isDraft(base)) {
+-        const state = base[DRAFT_STATE]
+-        // Avoid creating new drafts when copying.
+-        state.finalizing = true
+-        draft = shallowCopy(state.draft)
+-        state.finalizing = false
+-    } else {
+-        draft = shallowCopy(base)
+-    }
+-    each(base, prop => {
+-        Object.defineProperty(draft, "" + prop, createPropertyProxy("" + prop))
++    const isArray = Array.isArray(base)
++    const draft = clonePotentialDraft(base)
++    each(draft, prop => {
++        proxyProperty(draft, prop, isArray || isEnumerable(base, prop))
+     })
+ 
+     // See "proxy.js" for property documentation.
+@@ -100,30 +93,44 @@ function markChanged(state) {
+ }
+ 
+ function prepareCopy(state) {
+-    if (!state.copy) state.copy = shallowCopy(state.base)
++    if (!state.copy) state.copy = clonePotentialDraft(state.base)
+ }
+ 
+-function createPropertyProxy(prop) {
+-    return (
+-        descriptors[prop] ||
+-        (descriptors[prop] = {
++function clonePotentialDraft(base) {
++    const state = base && base[DRAFT_STATE]
++    if (state) {
++        state.finalizing = true
++        const draft = shallowCopy(state.draft, true)
++        state.finalizing = false
++        return draft
++    }
++    return shallowCopy(base)
++}
++
++function proxyProperty(draft, prop, enumerable) {
++    let desc = descriptors[prop]
++    if (desc) {
++        desc.enumerable = enumerable
++    } else {
++        descriptors[prop] = desc = {
+             configurable: true,
+-            enumerable: true,
++            enumerable,
+             get() {
+                 return get(this[DRAFT_STATE], prop)
+             },
+             set(value) {
+                 set(this[DRAFT_STATE], prop, value)
+             }
+-        })
+-    )
++        }
++    }
++    Object.defineProperty(draft, prop, desc)
+ }
+ 
+ function assertUnrevoked(state) {
+     if (state.revoked === true)
+         throw new Error(
+             "Cannot use a proxy that has been revoked. Did you pass an object from inside an immer function to an async process? " +
+-                JSON.stringify(state.copy || state.base)
++                JSON.stringify(source(state))
+         )
+ }
+ 
+diff --git a/src/immer.d.ts b/src/immer.d.ts
+index c1b9e78..44bbf09 100644
+--- a/src/immer.d.ts
++++ b/src/immer.d.ts
+@@ -122,6 +122,16 @@ declare class Nothing {
+  */
+ export const nothing: Nothing
+ 
++/**
++ * To let Immer treat your class instances as plain immutable objects
++ * (albeit with a custom prototype), you must define either an instance property
++ * or a static property on each of your custom classes.
++ *
++ * Otherwise, your class instance will never be drafted, which means it won't be
++ * safe to mutate in a produce callback.
++ */
++export const immerable: unique symbol
++
+ /**
+  * Pass true to automatically freeze all copies created by Immer.
+  *
+@@ -144,16 +154,22 @@ export function setUseProxies(useProxies: boolean): void
+  */
+ export function applyPatches<S>(base: S, patches: Patch[]): S
+ 
++/** Get the underlying object that is represented by the given draft */
+ export function original<T>(value: T): T | void
+ 
++/** For detecting an Immer draft */
+ export function isDraft(value: any): boolean
+ 
+ export class Immer {
+     constructor(config: {
+         useProxies?: boolean
+         autoFreeze?: boolean
+-        onAssign?: (state: ImmerState, prop: keyof any, value: any) => void
+-        onDelete?: (state: ImmerState, prop: keyof any) => void
++        onAssign?: (
++            state: ImmerState,
++            prop: string | number,
++            value: unknown
++        ) => void
++        onDelete?: (state: ImmerState, prop: string | number) => void
+         onCopy?: (state: ImmerState) => void
+     })
+     /**
+@@ -203,5 +219,5 @@ export interface ImmerState<T = any> {
+     parent?: ImmerState
+     base: T
+     copy: T
+-    assigned: {[prop: string]: boolean}
++    assigned: {[prop: string]: boolean; [index: number]: boolean}
+ }
+diff --git a/src/immer.js b/src/immer.js
+index ac50ec2..b713fb0 100644
+--- a/src/immer.js
++++ b/src/immer.js
+@@ -4,9 +4,11 @@ import {generatePatches} from "./patches"
+ import {
+     assign,
+     each,
++    has,
+     is,
+     isDraft,
+     isDraftable,
++    isEnumerable,
+     shallowCopy,
+     DRAFT_STATE,
+     NOTHING
+@@ -54,11 +56,6 @@ export class Immer {
+             result = recipe(base)
+             if (result === undefined) return base
+         }
+-        // See #100, don't nest producers
+-        else if (isDraft(base)) {
+-            result = recipe.call(base, base)
+-            if (result === undefined) return base
+-        }
+         // The given value must be proxied.
+         else {
+             this.scopes.push([])
+@@ -138,9 +135,18 @@ export class Immer {
+             state.finalized = true
+             this.finalizeTree(state.draft, path, patches, inversePatches)
+             if (this.onDelete) {
+-                const {assigned} = state
+-                for (const prop in assigned)
+-                    assigned[prop] || this.onDelete(state, prop)
++                // The `assigned` object is unreliable with ES5 drafts.
++                if (this.useProxies) {
++                    const {assigned} = state
++                    for (const prop in assigned) {
++                        if (!assigned[prop]) this.onDelete(state, prop)
++                    }
++                } else {
++                    const {base, copy} = state
++                    each(base, prop => {
++                        if (!has(copy, prop)) this.onDelete(state, prop)
++                    })
++                }
+             }
+             if (this.onCopy) this.onCopy(state)
+ 
+@@ -161,25 +167,38 @@ export class Immer {
+     finalizeTree(root, path, patches, inversePatches) {
+         const state = root[DRAFT_STATE]
+         if (state) {
+-            root = this.useProxies
+-                ? state.copy
+-                : (state.copy = shallowCopy(state.draft))
++            if (!this.useProxies) {
++                state.finalizing = true
++                state.copy = shallowCopy(state.draft, true)
++                state.finalizing = false
++            }
++            root = state.copy
+         }
+ 
+         const {onAssign} = this
+         const finalizeProperty = (prop, value, parent) => {
+-            // Only `root` can be a draft in here.
++            if (value === parent) {
++                throw Error("Immer forbids circular references")
++            }
++
++            // The only possible draft (in the scope of a `finalizeTree` call) is the `root` object.
+             const inDraft = !!state && parent === root
+ 
+             if (isDraft(value)) {
+-                // prettier-ignore
+-                parent[prop] = value =
++                value =
+                     // Patches are never generated for assigned properties.
+                     patches && inDraft && !state.assigned[prop]
+-                        ? this.finalize(value, path.concat(prop), patches, inversePatches)
++                        ? this.finalize(value, path.concat(prop), patches, inversePatches) // prettier-ignore
+                         : this.finalize(value)
+ 
+-                // Unchanged drafts are ignored.
++                // Preserve non-enumerable properties.
++                if (Array.isArray(parent) || isEnumerable(parent, prop)) {
++                    parent[prop] = value
++                } else {
++                    Object.defineProperty(parent, prop, {value})
++                }
++
++                // Unchanged drafts are never passed to the `onAssign` hook.
+                 if (inDraft && value === state.base[prop]) return
+             }
+             // Unchanged draft properties are ignored.
+diff --git a/src/index.js b/src/index.js
+index d7cf54c..990c0a9 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -47,6 +47,11 @@ export const setUseProxies = value => immer.setUseProxies(value)
+  */
+ export const applyPatches = produce(applyPatchesImpl)
+ 
+-export {original, isDraft, NOTHING as nothing} from "./common"
++export {
++    original,
++    isDraft,
++    NOTHING as nothing,
++    DRAFTABLE as immerable
++} from "./common"
+ 
+ export {Immer}
+diff --git a/src/patches.js b/src/patches.js
+index 6833fd9..5ce7bb2 100644
+--- a/src/patches.js
++++ b/src/patches.js
+@@ -58,7 +58,7 @@ function generateObjectPatches(state, basePath, patches, inversePatches) {
+         const origValue = base[key]
+         const value = copy[key]
+         const op = !assignedValue ? "remove" : key in base ? "replace" : "add"
+-        if (origValue === base && op === "replace") return
++        if (origValue === value && op === "replace") return
+         const path = basePath.concat(key)
+         patches.push(op === "remove" ? {op, path} : {op, path, value})
+         inversePatches.push(
+diff --git a/src/proxy.js b/src/proxy.js
+index bc5b92d..6aee2a6 100644
+--- a/src/proxy.js
++++ b/src/proxy.js
+@@ -65,9 +65,14 @@ const objectTraps = {
+     set,
+     deleteProperty,
+     getOwnPropertyDescriptor,
+-    defineProperty,
++    defineProperty() {
++        throw new Error("Object.defineProperty() cannot be used on an Immer draft") // prettier-ignore
++    },
++    getPrototypeOf(target) {
++        return Object.getPrototypeOf(target.base)
++    },
+     setPrototypeOf() {
+-        throw new Error("Immer does not support `setPrototypeOf()`.")
++        throw new Error("Object.setPrototypeOf() cannot be used on an Immer draft") // prettier-ignore
+     }
+ }
+ 
+@@ -79,18 +84,15 @@ each(objectTraps, (key, fn) => {
+     }
+ })
+ arrayTraps.deleteProperty = function(state, prop) {
+-    if (isNaN(parseInt(prop)))
+-        throw new Error(
+-            "Immer does not support deleting properties from arrays: " + prop
+-        )
++    if (isNaN(parseInt(prop))) {
++        throw new Error("Immer only supports deleting array indices") // prettier-ignore
++    }
+     return objectTraps.deleteProperty.call(this, state[0], prop)
+ }
+ arrayTraps.set = function(state, prop, value) {
+-    if (prop !== "length" && isNaN(parseInt(prop)))
+-        throw new Error(
+-            "Immer does not support setting non-numeric properties on arrays: " +
+-                prop
+-        )
++    if (prop !== "length" && isNaN(parseInt(prop))) {
++        throw new Error("Immer only supports setting array indices and the 'length' property") // prettier-ignore
++    }
+     return objectTraps.set.call(this, state[0], prop, value)
+ }
+ 
+@@ -148,21 +150,13 @@ function deleteProperty(state, prop) {
+ }
+ 
+ function getOwnPropertyDescriptor(state, prop) {
+-    const owner = state.modified
+-        ? state.copy
+-        : has(state.drafts, prop)
+-        ? state.drafts
+-        : state.base
+-    const descriptor = Reflect.getOwnPropertyDescriptor(owner, prop)
+-    if (descriptor && !(Array.isArray(owner) && prop === "length"))
+-        descriptor.configurable = true
+-    return descriptor
+-}
+-
+-function defineProperty() {
+-    throw new Error(
+-        "Immer does not support defining properties on draft objects."
+-    )
++    const owner = source(state)
++    const desc = Reflect.getOwnPropertyDescriptor(owner, prop)
++    if (desc) {
++        desc.writable = true
++        desc.configurable = !Array.isArray(owner) || prop !== "length"
++    }
++    return desc
+ }
+ 
+ function markChanged(state) {

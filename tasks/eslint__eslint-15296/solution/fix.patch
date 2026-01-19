@@ -1,0 +1,1075 @@
+diff --git a/docs/src/rules/no-constant-binary-expression.md b/docs/src/rules/no-constant-binary-expression.md
+new file mode 100644
+index 000000000..18ff15c08
+--- /dev/null
++++ b/docs/src/rules/no-constant-binary-expression.md
+@@ -0,0 +1,70 @@
++# no-constant-binary-expression
++
++Disallows expressions where the operation doesn't affect the value.
++
++Comparisons which will always evaluate to true or false and logical expressions (`||`, `&&`, `??`) which either always short-circuit or never short-circuit are both likely indications of programmer error.
++
++These errors are especially common in complex expressions where operator precedence is easy to misjudge. For example:
++
++```js
++// One might think this would evaluate as `x + (b ?? c)`:
++const x = a + b ?? c;
++
++// But it actually evaluates as `(a + b) ?? c`. Since `a + b` can never be null,
++// the `?? c` has no effect.
++```
++
++Additionally, this rule detects comparisons to newly constructed objects/arrays/functions/etc. In JavaScript, where objects are compared by reference, a newly constructed object can _never_ `===` any other value. This can be surprising for programmers coming from languages where objects are compared by value.
++
++```js
++// Programmers coming from a language where objects are compared by value might expect this to work:
++const isEmpty = x === [];
++
++// However, this will always result in `isEmpty` being `false`.
++```
++
++## Rule Details
++
++This rule identifies `==` and `===` comparisons which, based on the semantics of the JavaScript language, will always evaluate to `true` or `false`.
++
++It also identifies `||`, `&&` and `??` logical expressions which will either always or never short-circuit.
++
++Examples of **incorrect** code for this rule:
++
++```js
++/*eslint no-constant-binary-expression: "error"*/
++
++const value1 = +x == null;
++
++const value2 = condition ? x : {} || DEFAULT;
++
++const value3 = !foo == null;
++
++const value4 = new Boolean(foo) === true;
++
++const objIsEmpty = someObj === {};
++
++const arrIsEmpty = someArr === [];
++```
++
++Examples of **correct** code for this rule:
++
++```js
++/*eslint no-constant-binary-expression: "error"*/
++
++const value1 = x == null;
++
++const value2 = (condition ? x : {}) || DEFAULT;
++
++const value3 = !(foo == null);
++
++const value4 = Boolean(foo) === true;
++
++const objIsEmpty = Object.keys(someObj).length === 0;
++
++const arrIsEmpty = someArr.length === 0;
++```
++
++Related Rules:
++
++* [no-constant-condition](no-constant-condition.md)
+diff --git a/docs/src/rules/no-constant-condition.md b/docs/src/rules/no-constant-condition.md
+index 810c17bea..03af67a46 100644
+--- a/docs/src/rules/no-constant-condition.md
++++ b/docs/src/rules/no-constant-condition.md
+@@ -125,3 +125,7 @@ do {
+     }
+ } while (true)
+ ```
++
++## Related Rules
++
++* [no-constant-binary-expression](no-constant-binary-expression.md)
+diff --git a/lib/rules/index.js b/lib/rules/index.js
+index 130b635c9..aef47f5ca 100644
+--- a/lib/rules/index.js
++++ b/lib/rules/index.js
+@@ -103,6 +103,7 @@ module.exports = new LazyLoadingRuleMap(Object.entries({
+     "no-confusing-arrow": () => require("./no-confusing-arrow"),
+     "no-console": () => require("./no-console"),
+     "no-const-assign": () => require("./no-const-assign"),
++    "no-constant-binary-expression": () => require("./no-constant-binary-expression"),
+     "no-constant-condition": () => require("./no-constant-condition"),
+     "no-constructor-return": () => require("./no-constructor-return"),
+     "no-continue": () => require("./no-continue"),
+diff --git a/lib/rules/no-constant-binary-expression.js b/lib/rules/no-constant-binary-expression.js
+new file mode 100644
+index 000000000..d550bcf1d
+--- /dev/null
++++ b/lib/rules/no-constant-binary-expression.js
+@@ -0,0 +1,500 @@
++/**
++ * @fileoverview Rule to flag constant comparisons and logical expressions that always/never short circuit
++ * @author Jordan Eldredge <https://jordaneldredge.com>
++ */
++
++"use strict";
++
++const globals = require("globals");
++const { isNullLiteral, isConstant, isReferenceToGlobalVariable, isLogicalAssignmentOperator } = require("./utils/ast-utils");
++
++const NUMERIC_OR_STRING_BINARY_OPERATORS = new Set(["+", "-", "*", "/", "%", "|", "^", "&", "**", "<<", ">>", ">>>"]);
++
++//------------------------------------------------------------------------------
++// Helpers
++//------------------------------------------------------------------------------
++
++/**
++ * Test if an AST node has a statically knowable constant nullishness. Meaning,
++ * it will always resolve to a constant value of either: `null`, `undefined`
++ * or not `null` _or_ `undefined`. An expression that can vary between those
++ * three states at runtime would return `false`.
++ * @param {Scope} scope The scope in which the node was found.
++ * @param {ASTNode} node The AST node being tested.
++ * @returns {boolean} Does `node` have constant nullishness?
++ */
++function hasConstantNullishness(scope, node) {
++    switch (node.type) {
++        case "ObjectExpression": // Objects are never nullish
++        case "ArrayExpression": // Arrays are never nullish
++        case "ArrowFunctionExpression": // Functions never nullish
++        case "FunctionExpression": // Functions are never nullish
++        case "ClassExpression": // Classes are never nullish
++        case "NewExpression": // Objects are never nullish
++        case "Literal": // Nullish, or non-nullish, literals never change
++        case "TemplateLiteral": // A string is never nullish
++        case "UpdateExpression": // Numbers are never nullish
++        case "BinaryExpression": // Numbers, strings, or booleans are never nullish
++            return true;
++        case "CallExpression": {
++            if (node.callee.type !== "Identifier") {
++                return false;
++            }
++            const functionName = node.callee.name;
++
++            return (functionName === "Boolean" || functionName === "String" || functionName === "Number") &&
++                isReferenceToGlobalVariable(scope, node.callee);
++        }
++        case "AssignmentExpression":
++            if (node.operator === "=") {
++                return hasConstantNullishness(scope, node.right);
++            }
++
++            /*
++             * Handling short-circuiting assignment operators would require
++             * walking the scope. We won't attempt that (for now...) /
++             */
++            if (isLogicalAssignmentOperator(node.operator)) {
++                return false;
++            }
++
++            /*
++             * The remaining assignment expressions all result in a numeric or
++             * string (non-nullish) value:
++             *   "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", ">>>=", "|=", "^=", "&="
++             */
++
++            return true;
++        case "UnaryExpression":
++
++            /*
++             * "void" Always returns `undefined`
++             * "typeof" All types are strings, and thus non-nullish
++             * "!" Boolean is never nullish
++             * "delete" Returns a boolean, which is never nullish
++             * Math operators always return numbers or strings, neither of which
++             * are non-nullish "+", "-", "~"
++             */
++
++            return true;
++        case "SequenceExpression": {
++            const last = node.expressions[node.expressions.length - 1];
++
++            return hasConstantNullishness(scope, last);
++        }
++        case "Identifier":
++            return node.name === "undefined" && isReferenceToGlobalVariable(scope, node);
++        case "JSXElement": // ESLint has a policy of not assuming any specific JSX behavior.
++        case "JSXFragment":
++            return false;
++        default:
++            return false;
++    }
++}
++
++/**
++ * Test if an AST node is a boolean value that never changes. Specifically we
++ * test for:
++ * 1. Literal booleans (`true` or `false`)
++ * 2. Unary `!` expressions with a constant value
++ * 3. Constant booleans created via the `Boolean` global function
++ * @param {Scope} scope The scope in which the node was found.
++ * @param {ASTNode} node The node to test
++ * @returns {boolean} Is `node` guaranteed to be a boolean?
++ */
++function isStaticBoolean(scope, node) {
++    switch (node.type) {
++        case "Literal":
++            return typeof node.value === "boolean";
++        case "CallExpression":
++            return node.callee.type === "Identifier" && node.callee.name === "Boolean" &&
++              isReferenceToGlobalVariable(scope, node.callee) &&
++              (node.arguments.length === 0 || isConstant(scope, node.arguments[0], true));
++        case "UnaryExpression":
++            return node.operator === "!" && isConstant(scope, node.argument, true);
++        default:
++            return false;
++    }
++}
++
++
++/**
++ * Test if an AST node will always give the same result when compared to a
++ * bolean value. Note that comparison to boolean values is different than
++ * truthiness.
++ * https://262.ecma-international.org/5.1/#sec-11.9.3
++ *
++ * Javascript `==` operator works by converting the boolean to `1` (true) or
++ * `+0` (false) and then checks the values `==` equality to that number.
++ * @param {Scope} scope The scope in which node was found.
++ * @param {ASTNode} node The node to test.
++ * @returns {boolean} Will `node` always coerce to the same boolean value?
++ */
++function hasConstantLooseBooleanComparison(scope, node) {
++    switch (node.type) {
++        case "ObjectExpression":
++        case "ClassExpression":
++
++            /**
++             * In theory objects like:
++             *
++             * `{toString: () => a}`
++             * `{valueOf: () => a}`
++             *
++             * Or a classes like:
++             *
++             * `class { static toString() { return a } }`
++             * `class { static valueOf() { return a } }`
++             *
++             * Are not constant verifiably when `inBooleanPosition` is
++             * false, but it's an edge case we've opted not to handle.
++             */
++            return true;
++        case "ArrayExpression": {
++            const nonSpreadElements = node.elements.filter(e =>
++
++                // Elements can be `null` in sparse arrays: `[,,]`;
++                e !== null && e.type !== "SpreadElement");
++
++
++            /*
++             * Possible future direction if needed: We could check if the
++             * single value would result in variable boolean comparison.
++             * For now we will err on the side of caution since `[x]` could
++             * evaluate to `[0]` or `[1]`.
++             */
++            return node.elements.length === 0 || nonSpreadElements.length > 1;
++        }
++        case "ArrowFunctionExpression":
++        case "FunctionExpression":
++            return true;
++        case "UnaryExpression":
++            if (node.operator === "void" || // Always returns `undefined`
++                node.operator === "typeof" // All `typeof` strings, when coerced to number, are not 0 or 1.
++            ) {
++                return true;
++            }
++            if (node.operator === "!") {
++                return isConstant(scope, node.argument, true);
++            }
++
++            /*
++             * We won't try to reason about +, -, ~, or delete
++             * In theory, for the mathematical operators, we could look at the
++             * argument and try to determine if it coerces to a constant numeric
++             * value.
++             */
++            return false;
++        case "NewExpression": // Objects might have custom `.valueOf` or `.toString`.
++            return false;
++        case "CallExpression": {
++            if (node.callee.type === "Identifier" &&
++                node.callee.name === "Boolean" &&
++                isReferenceToGlobalVariable(scope, node.callee)
++            ) {
++                return node.arguments.length === 0 || isConstant(scope, node.arguments[0], true);
++            }
++            return false;
++        }
++        case "Literal": // True or false, literals never change
++            return true;
++        case "Identifier":
++            return node.name === "undefined" && isReferenceToGlobalVariable(scope, node);
++        case "TemplateLiteral":
++
++            /*
++             * In theory we could try to check if the quasi are sufficient to
++             * prove that the expression will always be true, but it would be
++             * tricky to get right. For example: `000.${foo}000`
++             */
++            return node.expressions.length === 0;
++        case "AssignmentExpression":
++            if (node.operator === "=") {
++                return hasConstantLooseBooleanComparison(scope, node.right);
++            }
++
++            /*
++             * Handling short-circuiting assignment operators would require
++             * walking the scope. We won't attempt that (for now...)
++             *
++             * The remaining assignment expressions all result in a numeric or
++             * string (non-nullish) values which could be truthy or falsy:
++             *   "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", ">>>=", "|=", "^=", "&="
++             */
++            return false;
++        case "SequenceExpression": {
++            const last = node.expressions[node.expressions.length - 1];
++
++            return hasConstantLooseBooleanComparison(scope, last);
++        }
++        case "JSXElement": // ESLint has a policy of not assuming any specific JSX behavior.
++        case "JSXFragment":
++            return false;
++        default:
++            return false;
++    }
++}
++
++
++/**
++ * Test if an AST node will always give the same result when _strictly_ compared
++ * to a bolean value. This can happen if the expression can never be boolean, or
++ * if it is always the same boolean value.
++ * @param {Scope} scope The scope in which the node was found.
++ * @param {ASTNode} node The node to test
++ * @returns {boolean} Will `node` always give the same result when compared to a
++ * static boolean value?
++ */
++function hasConstantStrictBooleanComparison(scope, node) {
++    switch (node.type) {
++        case "ObjectExpression": // Objects are not booleans
++        case "ArrayExpression": // Arrays are not booleans
++        case "ArrowFunctionExpression": // Functions are not booleans
++        case "FunctionExpression":
++        case "ClassExpression": // Classes are not booleans
++        case "NewExpression": // Objects are not booleans
++        case "TemplateLiteral": // Strings are not booleans
++        case "Literal": // True, false, or not boolean, literals never change.
++        case "UpdateExpression": // Numbers are not booleans
++            return true;
++        case "BinaryExpression":
++            return NUMERIC_OR_STRING_BINARY_OPERATORS.has(node.operator);
++        case "UnaryExpression": {
++            if (node.operator === "delete") {
++                return false;
++            }
++            if (node.operator === "!") {
++                return isConstant(scope, node.argument, true);
++            }
++
++            /*
++             * The remaining operators return either strings or numbers, neither
++             * of which are boolean.
++             */
++            return true;
++        }
++        case "SequenceExpression": {
++            const last = node.expressions[node.expressions.length - 1];
++
++            return hasConstantStrictBooleanComparison(scope, last);
++        }
++        case "Identifier":
++            return node.name === "undefined" && isReferenceToGlobalVariable(scope, node);
++        case "AssignmentExpression":
++            if (node.operator === "=") {
++                return hasConstantStrictBooleanComparison(scope, node.right);
++            }
++
++            /*
++             * Handling short-circuiting assignment operators would require
++             * walking the scope. We won't attempt that (for now...)
++             */
++            if (isLogicalAssignmentOperator(node.operator)) {
++                return false;
++            }
++
++            /*
++             * The remaining assignment expressions all result in either a number
++             * or a string, neither of which can ever be boolean.
++             */
++            return true;
++        case "CallExpression": {
++            if (node.callee.type !== "Identifier") {
++                return false;
++            }
++            const functionName = node.callee.name;
++
++            if (
++                (functionName === "String" || functionName === "Number") &&
++                isReferenceToGlobalVariable(scope, node.callee)
++            ) {
++                return true;
++            }
++            if (functionName === "Boolean" && isReferenceToGlobalVariable(scope, node.callee)) {
++                return (
++                    node.arguments.length === 0 || isConstant(scope, node.arguments[0], true));
++            }
++            return false;
++        }
++        case "JSXElement": // ESLint has a policy of not assuming any specific JSX behavior.
++        case "JSXFragment":
++            return false;
++        default:
++            return false;
++    }
++}
++
++/**
++ * Test if an AST node will always result in a newly constructed object
++ * @param {Scope} scope The scope in which the node was found.
++ * @param {ASTNode} node The node to test
++ * @returns {boolean} Will `node` always be new?
++ */
++function isAlwaysNew(scope, node) {
++    switch (node.type) {
++        case "ObjectExpression":
++        case "ArrayExpression":
++        case "ArrowFunctionExpression":
++        case "FunctionExpression":
++        case "ClassExpression":
++            return true;
++        case "NewExpression": {
++            if (node.callee.type !== "Identifier") {
++                return false;
++            }
++
++            /*
++             * All the built-in constructors are always new, but
++             * user-defined constructors could return a sentinel
++             * object.
++             *
++             * Catching these is especially useful for primitive constructures
++             * which return boxed values, a surprising gotcha' in JavaScript.
++             */
++            return Object.hasOwnProperty.call(globals.builtin, node.callee.name) &&
++              isReferenceToGlobalVariable(scope, node.callee);
++        }
++        case "Literal":
++
++            // Regular expressions are objects, and thus always new
++            return typeof node.regex === "object";
++        case "SequenceExpression": {
++            const last = node.expressions[node.expressions.length - 1];
++
++            return isAlwaysNew(scope, last);
++        }
++        case "AssignmentExpression":
++            if (node.operator === "=") {
++                return isAlwaysNew(scope, node.right);
++            }
++            return false;
++        case "ConditionalExpression":
++            return isAlwaysNew(scope, node.consequent) && isAlwaysNew(scope, node.alternate);
++        case "JSXElement": // ESLint has a policy of not assuming any specific JSX behavior.
++        case "JSXFragment":
++            return false;
++        default:
++            return false;
++    }
++}
++
++/**
++ * Checks whether or not a node is `null` or `undefined`. Similar to the one
++ * found in ast-utils.js, but this one correctly handles the edge case that
++ * `undefined` has been redefined.
++ * @param {Scope} scope Scope in which the expression was found.
++ * @param {ASTNode} node A node to check.
++ * @returns {boolean} Whether or not the node is a `null` or `undefined`.
++ * @public
++ */
++function isNullOrUndefined(scope, node) {
++    return (
++        isNullLiteral(node) ||
++        (node.type === "Identifier" && node.name === "undefined" && isReferenceToGlobalVariable(scope, node)) ||
++        (node.type === "UnaryExpression" && node.operator === "void")
++    );
++}
++
++
++/**
++ * Checks if one operand will cause the result to be constant.
++ * @param {Scope} scope Scope in which the expression was found.
++ * @param {ASTNode} a One side of the expression
++ * @param {ASTNode} b The other side of the expression
++ * @param {string} operator The binary expression operator
++ * @returns {ASTNode | null} The node which will cause the expression to have a constant result.
++ */
++function findBinaryExpressionConstantOperand(scope, a, b, operator) {
++    if (operator === "==" || operator === "!=") {
++        if (
++            (isNullOrUndefined(scope, a) && hasConstantNullishness(scope, b)) ||
++            (isStaticBoolean(scope, a) && hasConstantLooseBooleanComparison(scope, b))
++        ) {
++            return b;
++        }
++    } else if (operator === "===" || operator === "!==") {
++        if (
++            (isNullOrUndefined(scope, a) && hasConstantNullishness(scope, b)) ||
++            (isStaticBoolean(scope, a) && hasConstantStrictBooleanComparison(scope, b))
++        ) {
++            return b;
++        }
++    }
++    return null;
++}
++
++//------------------------------------------------------------------------------
++// Rule Definition
++//------------------------------------------------------------------------------
++
++/** @type {import('../shared/types').Rule} */
++module.exports = {
++    meta: {
++        type: "problem",
++        docs: {
++            description: "disallow expressions where the operation doesn't affect the value",
++            recommended: false,
++            url: "https://eslint.org/docs/rules/no-constant-binary-expression"
++        },
++        schema: [],
++        messages: {
++            constantBinaryOperand: "Unexpected constant binary expression. Compares constantly with the {{otherSide}}-hand side of the `{{operator}}`.",
++            constantShortCircuit: "Unexpected constant {{property}} on the left-hand side of a `{{operator}}` expression.",
++            alwaysNew: "Unexpected comparison to newly constructed object. These two values can never be equal.",
++            bothAlwaysNew: "Unexpected comparison of two newly constructed objects. These two values can never be equal."
++        }
++    },
++
++    create(context) {
++        return {
++            LogicalExpression(node) {
++                const { operator, left } = node;
++                const scope = context.getScope();
++
++                if ((operator === "&&" || operator === "||") && isConstant(scope, left, true)) {
++                    context.report({ node: left, messageId: "constantShortCircuit", data: { property: "truthiness", operator } });
++                } else if (operator === "??" && hasConstantNullishness(scope, left)) {
++                    context.report({ node: left, messageId: "constantShortCircuit", data: { property: "nullishness", operator } });
++                }
++            },
++            BinaryExpression(node) {
++                const scope = context.getScope();
++                const { right, left, operator } = node;
++                const rightConstantOperand = findBinaryExpressionConstantOperand(scope, left, right, operator);
++                const leftConstantOperand = findBinaryExpressionConstantOperand(scope, right, left, operator);
++
++                if (rightConstantOperand) {
++                    context.report({ node: rightConstantOperand, messageId: "constantBinaryOperand", data: { operator, otherSide: "left" } });
++                } else if (leftConstantOperand) {
++                    context.report({ node: leftConstantOperand, messageId: "constantBinaryOperand", data: { operator, otherSide: "right" } });
++                } else if (operator === "===" || operator === "!==") {
++                    if (isAlwaysNew(scope, left)) {
++                        context.report({ node: left, messageId: "alwaysNew" });
++                    } else if (isAlwaysNew(scope, right)) {
++                        context.report({ node: right, messageId: "alwaysNew" });
++                    }
++                } else if (operator === "==" || operator === "!=") {
++
++                    /*
++                     * If both sides are "new", then both sides are objects and
++                     * therefore they will be compared by reference even with `==`
++                     * equality.
++                     */
++                    if (isAlwaysNew(scope, left) && isAlwaysNew(scope, right)) {
++                        context.report({ node: left, messageId: "bothAlwaysNew" });
++                    }
++                }
++
++            }
++
++            /*
++             * In theory we could handle short circuting assignment operators,
++             * for some constant values, but that would require walking the
++             * scope to find the value of the variable being assigned. This is
++             * dependant on https://github.com/eslint/eslint/issues/13776
++             *
++             * AssignmentExpression() {},
++             */
++        };
++    }
++};
+diff --git a/lib/rules/no-constant-condition.js b/lib/rules/no-constant-condition.js
+index 3d08c689a..a0871fe97 100644
+--- a/lib/rules/no-constant-condition.js
++++ b/lib/rules/no-constant-condition.js
+@@ -5,6 +5,8 @@
+ 
+ "use strict";
+ 
++const { isConstant } = require("./utils/ast-utils");
++
+ //------------------------------------------------------------------------------
+ // Helpers
+ //------------------------------------------------------------------------------
+@@ -53,201 +55,6 @@ module.exports = {
+         // Helpers
+         //--------------------------------------------------------------------------
+ 
+-        /**
+-         * Returns literal's value converted to the Boolean type
+-         * @param {ASTNode} node any `Literal` node
+-         * @returns {boolean | null} `true` when node is truthy, `false` when node is falsy,
+-         *  `null` when it cannot be determined.
+-         */
+-        function getBooleanValue(node) {
+-            if (node.value === null) {
+-
+-                /*
+-                 * it might be a null literal or bigint/regex literal in unsupported environments .
+-                 * https://github.com/estree/estree/blob/14df8a024956ea289bd55b9c2226a1d5b8a473ee/es5.md#regexpliteral
+-                 * https://github.com/estree/estree/blob/14df8a024956ea289bd55b9c2226a1d5b8a473ee/es2020.md#bigintliteral
+-                 */
+-
+-                if (node.raw === "null") {
+-                    return false;
+-                }
+-
+-                // regex is always truthy
+-                if (typeof node.regex === "object") {
+-                    return true;
+-                }
+-
+-                return null;
+-            }
+-
+-            return !!node.value;
+-        }
+-
+-        /**
+-         * Checks if a branch node of LogicalExpression short circuits the whole condition
+-         * @param {ASTNode} node The branch of main condition which needs to be checked
+-         * @param {string} operator The operator of the main LogicalExpression.
+-         * @returns {boolean} true when condition short circuits whole condition
+-         */
+-        function isLogicalIdentity(node, operator) {
+-            switch (node.type) {
+-                case "Literal":
+-                    return (operator === "||" && getBooleanValue(node) === true) ||
+-                           (operator === "&&" && getBooleanValue(node) === false);
+-
+-                case "UnaryExpression":
+-                    return (operator === "&&" && node.operator === "void");
+-
+-                case "LogicalExpression":
+-
+-                    /*
+-                     * handles `a && false || b`
+-                     * `false` is an identity element of `&&` but not `||`
+-                     */
+-                    return operator === node.operator &&
+-                             (
+-                                 isLogicalIdentity(node.left, operator) ||
+-                                 isLogicalIdentity(node.right, operator)
+-                             );
+-
+-                case "AssignmentExpression":
+-                    return ["||=", "&&="].includes(node.operator) &&
+-                        operator === node.operator.slice(0, -1) &&
+-                        isLogicalIdentity(node.right, operator);
+-
+-                // no default
+-            }
+-            return false;
+-        }
+-
+-        /**
+-         * Checks if an identifier is a reference to a global variable.
+-         * @param {ASTNode} node An identifier node to check.
+-         * @returns {boolean} `true` if the identifier is a reference to a global variable.
+-         */
+-        function isReferenceToGlobalVariable(node) {
+-            const scope = context.getScope();
+-            const reference = scope.references.find(ref => ref.identifier === node);
+-
+-            return Boolean(
+-                reference &&
+-                reference.resolved &&
+-                reference.resolved.scope.type === "global" &&
+-                reference.resolved.defs.length === 0
+-            );
+-        }
+-
+-        /**
+-         * Checks if a node has a constant truthiness value.
+-         * @param {ASTNode} node The AST node to check.
+-         * @param {boolean} inBooleanPosition `true` if checking the test of a
+-         * condition. `false` in all other cases. When `false`, checks if -- for
+-         * both string and number -- if coerced to that type, the value will
+-         * be constant.
+-         * @returns {Bool} true when node's truthiness is constant
+-         * @private
+-         */
+-        function isConstant(node, inBooleanPosition) {
+-
+-            // node.elements can return null values in the case of sparse arrays ex. [,]
+-            if (!node) {
+-                return true;
+-            }
+-            switch (node.type) {
+-                case "Literal":
+-                case "ArrowFunctionExpression":
+-                case "FunctionExpression":
+-                    return true;
+-                case "ClassExpression":
+-                case "ObjectExpression":
+-
+-                    /**
+-                     * In theory objects like:
+-                     *
+-                     * `{toString: () => a}`
+-                     * `{valueOf: () => a}`
+-                     *
+-                     * Or a classes like:
+-                     *
+-                     * `class { static toString() { return a } }`
+-                     * `class { static valueOf() { return a } }`
+-                     *
+-                     * Are not constant verifiably when `inBooleanPosition` is
+-                     * false, but it's an edge case we've opted not to handle.
+-                     */
+-                    return true;
+-                case "TemplateLiteral":
+-                    return (inBooleanPosition && node.quasis.some(quasi => quasi.value.cooked.length)) ||
+-                        node.expressions.every(exp => isConstant(exp, false));
+-
+-                case "ArrayExpression": {
+-                    if (!inBooleanPosition) {
+-                        return node.elements.every(element => isConstant(element, false));
+-                    }
+-                    return true;
+-                }
+-
+-                case "UnaryExpression":
+-                    if (
+-                        node.operator === "void" ||
+-                        node.operator === "typeof" && inBooleanPosition
+-                    ) {
+-                        return true;
+-                    }
+-
+-                    if (node.operator === "!") {
+-                        return isConstant(node.argument, true);
+-                    }
+-
+-                    return isConstant(node.argument, false);
+-
+-                case "BinaryExpression":
+-                    return isConstant(node.left, false) &&
+-                            isConstant(node.right, false) &&
+-                            node.operator !== "in";
+-
+-                case "LogicalExpression": {
+-                    const isLeftConstant = isConstant(node.left, inBooleanPosition);
+-                    const isRightConstant = isConstant(node.right, inBooleanPosition);
+-                    const isLeftShortCircuit = (isLeftConstant && isLogicalIdentity(node.left, node.operator));
+-                    const isRightShortCircuit = (inBooleanPosition && isRightConstant && isLogicalIdentity(node.right, node.operator));
+-
+-                    return (isLeftConstant && isRightConstant) ||
+-                        isLeftShortCircuit ||
+-                        isRightShortCircuit;
+-                }
+-                case "NewExpression":
+-                    return inBooleanPosition;
+-                case "AssignmentExpression":
+-                    if (node.operator === "=") {
+-                        return isConstant(node.right, inBooleanPosition);
+-                    }
+-
+-                    if (["||=", "&&="].includes(node.operator) && inBooleanPosition) {
+-                        return isLogicalIdentity(node.right, node.operator.slice(0, -1));
+-                    }
+-
+-                    return false;
+-
+-                case "SequenceExpression":
+-                    return isConstant(node.expressions[node.expressions.length - 1], inBooleanPosition);
+-                case "SpreadElement":
+-                    return isConstant(node.argument, inBooleanPosition);
+-                case "CallExpression":
+-                    if (node.callee.type === "Identifier" && node.callee.name === "Boolean") {
+-                        if (node.arguments.length === 0 || isConstant(node.arguments[0], true)) {
+-                            return isReferenceToGlobalVariable(node.callee);
+-                        }
+-                    }
+-                    return false;
+-                case "Identifier":
+-                    return node.name === "undefined" && isReferenceToGlobalVariable(node);
+-
+-                // no default
+-            }
+-            return false;
+-        }
+-
+         /**
+          * Tracks when the given node contains a constant condition.
+          * @param {ASTNode} node The AST node to check.
+@@ -255,7 +62,7 @@ module.exports = {
+          * @private
+          */
+         function trackConstantConditionLoop(node) {
+-            if (node.test && isConstant(node.test, true)) {
++            if (node.test && isConstant(context.getScope(), node.test, true)) {
+                 loopsInCurrentScope.add(node);
+             }
+         }
+@@ -280,7 +87,7 @@ module.exports = {
+          * @private
+          */
+         function reportIfConstant(node) {
+-            if (node.test && isConstant(node.test, true)) {
++            if (node.test && isConstant(context.getScope(), node.test, true)) {
+                 context.report({ node: node.test, messageId: "unexpected" });
+             }
+         }
+diff --git a/lib/rules/utils/ast-utils.js b/lib/rules/utils/ast-utils.js
+index ecde099fa..56da22ad5 100644
+--- a/lib/rules/utils/ast-utils.js
++++ b/lib/rules/utils/ast-utils.js
+@@ -788,6 +788,203 @@ function getModuleExportName(node) {
+     return node.value;
+ }
+ 
++/**
++ * Returns literal's value converted to the Boolean type
++ * @param {ASTNode} node any `Literal` node
++ * @returns {boolean | null} `true` when node is truthy, `false` when node is falsy,
++ *  `null` when it cannot be determined.
++ */
++function getBooleanValue(node) {
++    if (node.value === null) {
++
++        /*
++         * it might be a null literal or bigint/regex literal in unsupported environments .
++         * https://github.com/estree/estree/blob/14df8a024956ea289bd55b9c2226a1d5b8a473ee/es5.md#regexpliteral
++         * https://github.com/estree/estree/blob/14df8a024956ea289bd55b9c2226a1d5b8a473ee/es2020.md#bigintliteral
++         */
++
++        if (node.raw === "null") {
++            return false;
++        }
++
++        // regex is always truthy
++        if (typeof node.regex === "object") {
++            return true;
++        }
++
++        return null;
++    }
++
++    return !!node.value;
++}
++
++/**
++ * Checks if a branch node of LogicalExpression short circuits the whole condition
++ * @param {ASTNode} node The branch of main condition which needs to be checked
++ * @param {string} operator The operator of the main LogicalExpression.
++ * @returns {boolean} true when condition short circuits whole condition
++ */
++function isLogicalIdentity(node, operator) {
++    switch (node.type) {
++        case "Literal":
++            return (operator === "||" && getBooleanValue(node) === true) ||
++                  (operator === "&&" && getBooleanValue(node) === false);
++
++        case "UnaryExpression":
++            return (operator === "&&" && node.operator === "void");
++
++        case "LogicalExpression":
++
++            /*
++             * handles `a && false || b`
++             * `false` is an identity element of `&&` but not `||`
++             */
++            return operator === node.operator &&
++                    (
++                        isLogicalIdentity(node.left, operator) ||
++                        isLogicalIdentity(node.right, operator)
++                    );
++
++        case "AssignmentExpression":
++            return ["||=", "&&="].includes(node.operator) &&
++               operator === node.operator.slice(0, -1) &&
++               isLogicalIdentity(node.right, operator);
++
++       // no default
++    }
++    return false;
++}
++
++/**
++ * Checks if an identifier is a reference to a global variable.
++ * @param {Scope} scope The scope in which the identifier is referenced.
++ * @param {ASTNode} node An identifier node to check.
++ * @returns {boolean} `true` if the identifier is a reference to a global variable.
++ */
++function isReferenceToGlobalVariable(scope, node) {
++    const reference = scope.references.find(ref => ref.identifier === node);
++
++    return Boolean(
++        reference &&
++            reference.resolved &&
++            reference.resolved.scope.type === "global" &&
++            reference.resolved.defs.length === 0
++    );
++}
++
++
++/**
++ * Checks if a  node has a constant truthiness value.
++ * @param {Scope} scope Scope in which the node appears.
++ * @param {ASTNode} node The AST node to check.
++ * @param {boolean} inBooleanPosition `true` if checking the test of a
++ * condition. `false` in all other cases. When `false`, checks if -- for
++ * both string and number -- if coerced to that type, the value will
++ * be constant.
++ * @returns {boolean} true when node's truthiness is constant
++ * @private
++ */
++function isConstant(scope, node, inBooleanPosition) {
++
++    // node.elements can return null values in the case of sparse arrays ex. [,]
++    if (!node) {
++        return true;
++    }
++    switch (node.type) {
++        case "Literal":
++        case "ArrowFunctionExpression":
++        case "FunctionExpression":
++            return true;
++        case "ClassExpression":
++        case "ObjectExpression":
++
++            /**
++             * In theory objects like:
++             *
++             * `{toString: () => a}`
++             * `{valueOf: () => a}`
++             *
++             * Or a classes like:
++             *
++             * `class { static toString() { return a } }`
++             * `class { static valueOf() { return a } }`
++             *
++             * Are not constant verifiably when `inBooleanPosition` is
++             * false, but it's an edge case we've opted not to handle.
++             */
++            return true;
++        case "TemplateLiteral":
++            return (inBooleanPosition && node.quasis.some(quasi => quasi.value.cooked.length)) ||
++                        node.expressions.every(exp => isConstant(scope, exp, false));
++
++        case "ArrayExpression": {
++            if (!inBooleanPosition) {
++                return node.elements.every(element => isConstant(scope, element, false));
++            }
++            return true;
++        }
++
++        case "UnaryExpression":
++            if (
++                node.operator === "void" ||
++                        node.operator === "typeof" && inBooleanPosition
++            ) {
++                return true;
++            }
++
++            if (node.operator === "!") {
++                return isConstant(scope, node.argument, true);
++            }
++
++            return isConstant(scope, node.argument, false);
++
++        case "BinaryExpression":
++            return isConstant(scope, node.left, false) &&
++                            isConstant(scope, node.right, false) &&
++                            node.operator !== "in";
++
++        case "LogicalExpression": {
++            const isLeftConstant = isConstant(scope, node.left, inBooleanPosition);
++            const isRightConstant = isConstant(scope, node.right, inBooleanPosition);
++            const isLeftShortCircuit = (isLeftConstant && isLogicalIdentity(node.left, node.operator));
++            const isRightShortCircuit = (inBooleanPosition && isRightConstant && isLogicalIdentity(node.right, node.operator));
++
++            return (isLeftConstant && isRightConstant) ||
++                        isLeftShortCircuit ||
++                        isRightShortCircuit;
++        }
++        case "NewExpression":
++            return inBooleanPosition;
++        case "AssignmentExpression":
++            if (node.operator === "=") {
++                return isConstant(scope, node.right, inBooleanPosition);
++            }
++
++            if (["||=", "&&="].includes(node.operator) && inBooleanPosition) {
++                return isLogicalIdentity(node.right, node.operator.slice(0, -1));
++            }
++
++            return false;
++
++        case "SequenceExpression":
++            return isConstant(scope, node.expressions[node.expressions.length - 1], inBooleanPosition);
++        case "SpreadElement":
++            return isConstant(scope, node.argument, inBooleanPosition);
++        case "CallExpression":
++            if (node.callee.type === "Identifier" && node.callee.name === "Boolean") {
++                if (node.arguments.length === 0 || isConstant(scope, node.arguments[0], true)) {
++                    return isReferenceToGlobalVariable(scope, node.callee);
++                }
++            }
++            return false;
++        case "Identifier":
++            return node.name === "undefined" && isReferenceToGlobalVariable(scope, node);
++
++                // no default
++    }
++    return false;
++}
++
+ //------------------------------------------------------------------------------
+ // Public Interface
+ //------------------------------------------------------------------------------
+@@ -1905,6 +2102,7 @@ module.exports = {
+         return OCTAL_OR_NON_OCTAL_DECIMAL_ESCAPE_PATTERN.test(rawString);
+     },
+ 
++    isReferenceToGlobalVariable,
+     isLogicalExpression,
+     isCoalesceExpression,
+     isMixedLogicalAndCoalesceExpressions,
+@@ -1918,5 +2116,6 @@ module.exports = {
+     isSameReference,
+     isLogicalAssignmentOperator,
+     getSwitchCaseColonToken,
+-    getModuleExportName
++    getModuleExportName,
++    isConstant
+ };
+diff --git a/tools/rule-types.json b/tools/rule-types.json
+index 85484c492..d69028448 100644
+--- a/tools/rule-types.json
++++ b/tools/rule-types.json
+@@ -90,6 +90,7 @@
+     "no-confusing-arrow": "suggestion",
+     "no-console": "suggestion",
+     "no-const-assign": "problem",
++    "no-constant-binary-expression": "problem",
+     "no-constant-condition": "problem",
+     "no-constructor-return": "problem",
+     "no-continue": "suggestion",

@@ -1,0 +1,238 @@
+diff --git a/.changeset/silly-buses-perform.md b/.changeset/silly-buses-perform.md
+new file mode 100644
+index 0000000000..26b2eb78b1
+--- /dev/null
++++ b/.changeset/silly-buses-perform.md
+@@ -0,0 +1,5 @@
++---
++'xstate': patch
++---
++
++Fixed an issue that prevented events sent from the exit actions of the invoking state to be delivered to the invoked actor (when leaving that state).
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index 61d4a15a52..f431c7ea3a 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -1011,7 +1011,10 @@ class StateNode<
+     _event: SCXML.Event<TEvent>,
+     prevState?: State<TContext, any, any, any, any>,
+     predictableExec?: PredictableActionArgumentsExec
+-  ): Array<Array<ActionObject<TContext, TEvent>>> {
++  ): Array<{
++    type: string;
++    actions: Array<ActionObject<TContext, TEvent>>;
++  }> {
+     const prevConfig = prevState
+       ? getConfiguration([], this.getStateNodes(prevState.value))
+       : [];
+@@ -1085,29 +1088,40 @@ class StateNode<
+         const invokeActions = stateNode.activities.map((activity) =>
+           start(activity)
+         );
+-        return toActionObjects(
+-          predictableExec
+-            ? [...entryActions, ...invokeActions]
+-            : [...invokeActions, ...entryActions],
+-          this.machine.options.actions as any
+-        );
++        return {
++          type: 'entry',
++          actions: toActionObjects(
++            predictableExec
++              ? [...entryActions, ...invokeActions]
++              : [...invokeActions, ...entryActions],
++            this.machine.options.actions as any
++          )
++        };
+       })
+-      .concat([doneEvents.map(raise) as Array<ActionObject<TContext, TEvent>>]);
+-
+-    const exitActions = Array.from(exitStates).map((stateNode) =>
+-      toActionObjects(
++      .concat({
++        type: 'state_done',
++        actions: doneEvents.map(raise) as Array<ActionObject<TContext, TEvent>>
++      });
++
++    const exitActions = Array.from(exitStates).map((stateNode) => ({
++      type: 'exit',
++      actions: toActionObjects(
+         [
+           ...stateNode.onExit,
+           ...stateNode.activities.map((activity) => stop(activity))
+         ],
+         this.machine.options.actions as any
+       )
+-    );
++    }));
+ 
+     const actions = exitActions
+-      .concat([
+-        toActionObjects(transition.actions, this.machine.options.actions as any)
+-      ])
++      .concat({
++        type: 'transition',
++        actions: toActionObjects(
++          transition.actions,
++          this.machine.options.actions as any
++        )
++      })
+       .concat(entryActions);
+ 
+     if (isDone) {
+@@ -1124,7 +1138,7 @@ class StateNode<
+           (action.type !== actionTypes.send ||
+             (!!action.to && action.to !== SpecialTargets.Internal))
+       );
+-      return actions.concat([stopActions]);
++      return actions.concat({ type: 'stop', actions: stopActions });
+     }
+ 
+     return actions;
+@@ -1288,7 +1302,7 @@ class StateNode<
+     );
+     const activities = currentState ? { ...currentState.activities } : {};
+     for (const block of actionBlocks) {
+-      for (const action of block) {
++      for (const action of block.actions) {
+         if (action.type === actionTypes.start) {
+           activities[
+             action.activity!.id || action.activity!.type
+diff --git a/packages/core/src/actions.ts b/packages/core/src/actions.ts
+index b9ad522951..95c28cb477 100644
+--- a/packages/core/src/actions.ts
++++ b/packages/core/src/actions.ts
+@@ -627,16 +627,19 @@ export function choose<TContext, TEvent extends EventObject>(
+ }
+ 
+ const pluckAssigns = <TContext, TEvent extends EventObject>(
+-  actionBlocks: Array<Array<ActionObject<TContext, TEvent>>>
++  actionBlocks: Array<{
++    type: string;
++    actions: Array<ActionObject<TContext, TEvent>>;
++  }>
+ ): AssignAction<TContext, TEvent>[] => {
+   const assignActions: AssignAction<TContext, TEvent>[] = [];
+ 
+   for (const block of actionBlocks) {
+     let i = 0;
+-    while (i < block.length) {
+-      if (block[i].type === actionTypes.assign) {
+-        assignActions.push(block[i] as AssignAction<TContext, TEvent>);
+-        block.splice(i, 1);
++    while (i < block.actions.length) {
++      if (block.actions[i].type === actionTypes.assign) {
++        assignActions.push(block.actions[i] as AssignAction<TContext, TEvent>);
++        block.actions.splice(i, 1);
+         continue;
+       }
+       i++;
+@@ -651,7 +654,10 @@ export function resolveActions<TContext, TEvent extends EventObject>(
+   currentState: State<TContext, TEvent, any, any, any> | undefined,
+   currentContext: TContext,
+   _event: SCXML.Event<TEvent>,
+-  actionBlocks: Array<Array<ActionObject<TContext, TEvent>>>,
++  actionBlocks: Array<{
++    type: string;
++    actions: Array<ActionObject<TContext, TEvent>>;
++  }>,
+   predictableExec?: PredictableActionArgumentsExec,
+   preserveActionOrder: boolean = false
+ ): [Array<ActionObject<TContext, TEvent>>, TContext] {
+@@ -667,7 +673,10 @@ export function resolveActions<TContext, TEvent extends EventObject>(
+ 
+   const deferredToBlockEnd: Array<ActionObject<TContext, TEvent>> = [];
+ 
+-  function handleAction(actionObject: ActionObject<TContext, TEvent>) {
++  function handleAction(
++    blockType: string,
++    actionObject: ActionObject<TContext, TEvent>
++  ) {
+     switch (actionObject.type) {
+       case actionTypes.raise: {
+         return resolveRaise(actionObject as RaiseAction<TEvent>);
+@@ -691,7 +700,11 @@ export function resolveActions<TContext, TEvent extends EventObject>(
+         }
+ 
+         if (predictableExec && sendAction.to !== SpecialTargets.Internal) {
+-          deferredToBlockEnd.push(sendAction);
++          if (blockType === 'entry') {
++            deferredToBlockEnd.push(sendAction);
++          } else {
++            predictableExec?.(sendAction, updatedContext, _event);
++          }
+         }
+ 
+         return sendAction;
+@@ -733,10 +746,13 @@ export function resolveActions<TContext, TEvent extends EventObject>(
+           updatedContext,
+           _event,
+           [
+-            toActionObjects(
+-              toArray(matchedActions),
+-              machine.options.actions as any
+-            )
++            {
++              type: blockType,
++              actions: toActionObjects(
++                toArray(matchedActions),
++                machine.options.actions as any
++              )
++            }
+           ],
+           predictableExec,
+           preserveActionOrder
+@@ -759,10 +775,13 @@ export function resolveActions<TContext, TEvent extends EventObject>(
+           updatedContext,
+           _event,
+           [
+-            toActionObjects(
+-              toArray(matchedActions),
+-              machine.options.actions as any
+-            )
++            {
++              type: blockType,
++              actions: toActionObjects(
++                toArray(matchedActions),
++                machine.options.actions as any
++              )
++            }
+           ],
+           predictableExec,
+           preserveActionOrder
+@@ -812,11 +831,14 @@ export function resolveActions<TContext, TEvent extends EventObject>(
+     }
+   }
+ 
+-  function processBlock(block: ActionObject<TContext, TEvent>[]) {
++  function processBlock(block: {
++    type: string;
++    actions: ActionObject<TContext, TEvent>[];
++  }) {
+     let resolvedActions: Array<ActionObject<TContext, TEvent>> = [];
+ 
+-    for (const action of block) {
+-      const resolved = handleAction(action);
++    for (const action of block.actions) {
++      const resolved = handleAction(block.type, action);
+       if (resolved) {
+         resolvedActions = resolvedActions.concat(resolved);
+       }
+diff --git a/packages/core/src/interpreter.ts b/packages/core/src/interpreter.ts
+index b0d12ccdd3..80fc64d520 100644
+--- a/packages/core/src/interpreter.ts
++++ b/packages/core/src/interpreter.ts
+@@ -645,7 +645,12 @@ export class Interpreter<
+           this.state,
+           this.state.context,
+           _event,
+-          [exitActions],
++          [
++            {
++              type: 'exit',
++              actions: exitActions
++            }
++          ],
+           this.machine.config.predictableActionArguments
+             ? this._exec
+             : undefined,

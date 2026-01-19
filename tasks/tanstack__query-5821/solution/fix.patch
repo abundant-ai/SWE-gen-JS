@@ -1,0 +1,257 @@
+diff --git a/packages/eslint-plugin-query/src/configs.ts b/packages/eslint-plugin-query/src/configs.ts
+new file mode 100644
+index 000000000..8bd85a1a1
+--- /dev/null
++++ b/packages/eslint-plugin-query/src/configs.ts
+@@ -0,0 +1,22 @@
++import { rules } from './rules'
++import type { TSESLint } from '@typescript-eslint/utils'
++
++function generateRecommendedConfig(
++  allRules: Record<string, TSESLint.RuleModule<any, any>>,
++) {
++  return Object.entries(allRules).reduce((memo, [name, rule]) => {
++    const { recommended } = rule.meta.docs || {}
++
++    return {
++      ...memo,
++      ...(recommended ? { [`@tanstack/query/${name}`]: recommended } : {}),
++    }
++  }, {} as Record<string, 'strict' | 'error' | 'warn'>)
++}
++
++export const configs = {
++  recommended: {
++    plugins: ['@tanstack/eslint-plugin-query'],
++    rules: generateRecommendedConfig(rules),
++  },
++}
+diff --git a/packages/eslint-plugin-query/src/rules.ts b/packages/eslint-plugin-query/src/rules.ts
+new file mode 100644
+index 000000000..cbe7d4b7a
+--- /dev/null
++++ b/packages/eslint-plugin-query/src/rules.ts
+@@ -0,0 +1,5 @@
++import * as exhaustiveDeps from './rules/exhaustive-deps.rule'
++
++export const rules = {
++  [exhaustiveDeps.name]: exhaustiveDeps.rule,
++}
+diff --git a/packages/eslint-plugin-query/src/rules/exhaustive-deps.rule.ts b/packages/eslint-plugin-query/src/rules/exhaustive-deps.rule.ts
+new file mode 100644
+index 000000000..098a13a84
+--- /dev/null
++++ b/packages/eslint-plugin-query/src/rules/exhaustive-deps.rule.ts
+@@ -0,0 +1,154 @@
++import { AST_NODE_TYPES } from '@typescript-eslint/utils'
++import { ASTUtils } from '../utils/ast-utils'
++import { createRule } from '../utils/create-rule'
++import { uniqueBy } from '../utils/unique-by'
++import { ExhaustiveDepsUtils } from './exhaustive-deps.utils'
++import type { TSESLint } from '@typescript-eslint/utils'
++
++const QUERY_KEY = 'queryKey'
++const QUERY_FN = 'queryFn'
++
++export const name = 'exhaustive-deps'
++
++export const rule = createRule({
++  name,
++  meta: {
++    type: 'problem',
++    docs: {
++      description: 'Exhaustive deps rule for useQuery',
++      recommended: 'error',
++    },
++    messages: {
++      missingDeps: `The following dependencies are missing in your queryKey: {{deps}}`,
++      fixTo: 'Fix to {{result}}',
++    },
++    hasSuggestions: true,
++    fixable: 'code',
++    schema: [],
++  },
++  defaultOptions: [],
++
++  create(context) {
++    return {
++      Property(node) {
++        if (
++          node.parent === undefined ||
++          !ASTUtils.isObjectExpression(node.parent) ||
++          !ASTUtils.isIdentifierWithName(node.key, QUERY_KEY)
++        ) {
++          return
++        }
++
++        const scopeManager = context.getSourceCode().scopeManager
++        const queryKey = ASTUtils.findPropertyWithIdentifierKey(
++          node.parent.properties,
++          QUERY_KEY,
++        )
++        const queryFn = ASTUtils.findPropertyWithIdentifierKey(
++          node.parent.properties,
++          QUERY_FN,
++        )
++
++        if (
++          scopeManager === null ||
++          queryKey === undefined ||
++          queryFn === undefined ||
++          queryFn.value.type !== AST_NODE_TYPES.ArrowFunctionExpression
++        ) {
++          return
++        }
++
++        let queryKeyNode = queryKey.value
++
++        if (
++          queryKeyNode.type === AST_NODE_TYPES.TSAsExpression &&
++          queryKeyNode.expression.type === AST_NODE_TYPES.ArrayExpression
++        ) {
++          queryKeyNode = queryKeyNode.expression
++        }
++
++        if (queryKeyNode.type === AST_NODE_TYPES.Identifier) {
++          const expression = ASTUtils.getReferencedExpressionByIdentifier({
++            context,
++            node: queryKeyNode,
++          })
++
++          if (expression?.type === AST_NODE_TYPES.ArrayExpression) {
++            queryKeyNode = expression
++          }
++        }
++
++        const sourceCode = context.getSourceCode()
++        const queryKeyValue = queryKeyNode
++        const externalRefs = ASTUtils.getExternalRefs({
++          scopeManager,
++          sourceCode,
++          node: queryFn.value,
++        })
++
++        const relevantRefs = externalRefs.filter((reference) =>
++          ExhaustiveDepsUtils.isRelevantReference({
++            context,
++            reference,
++            scopeManager,
++          }),
++        )
++
++        const existingKeys = ASTUtils.getNestedIdentifiers(queryKeyValue).map(
++          (identifier) => ASTUtils.mapKeyNodeToText(identifier, sourceCode),
++        )
++
++        const missingRefs = relevantRefs
++          .map((ref) => ({
++            ref: ref,
++            text: ASTUtils.mapKeyNodeToText(ref.identifier, sourceCode),
++          }))
++          .filter(({ ref, text }) => {
++            return (
++              !ref.isTypeReference &&
++              !ASTUtils.isAncestorIsCallee(ref.identifier) &&
++              !existingKeys.some((existingKey) => existingKey === text) &&
++              !existingKeys.includes(text.split('.')[0] ?? '')
++            )
++          })
++          .map(({ ref, text }) => ({
++            identifier: ref.identifier,
++            text: text,
++          }))
++
++        const uniqueMissingRefs = uniqueBy(missingRefs, (x) => x.text)
++
++        if (uniqueMissingRefs.length > 0) {
++          const missingAsText = uniqueMissingRefs
++            .map((ref) => ASTUtils.mapKeyNodeToText(ref.identifier, sourceCode))
++            .join(', ')
++
++          const existingWithMissing = sourceCode
++            .getText(queryKeyValue)
++            .replace(/\]$/, `, ${missingAsText}]`)
++
++          const suggestions: TSESLint.ReportSuggestionArray<string> = []
++
++          if (queryKeyNode.type === AST_NODE_TYPES.ArrayExpression) {
++            suggestions.push({
++              messageId: 'fixTo',
++              data: { result: existingWithMissing },
++              fix(fixer) {
++                return fixer.replaceText(queryKeyValue, existingWithMissing)
++              },
++            })
++          }
++
++          context.report({
++            node: node,
++            messageId: 'missingDeps',
++            data: {
++              deps: uniqueMissingRefs.map((ref) => ref.text).join(', '),
++            },
++            suggest: suggestions,
++          })
++        }
++      },
++    }
++  },
++})
+diff --git a/packages/eslint-plugin-query/src/rules/exhaustive-deps.utils.ts b/packages/eslint-plugin-query/src/rules/exhaustive-deps.utils.ts
+new file mode 100644
+index 000000000..ff3a15c79
+--- /dev/null
++++ b/packages/eslint-plugin-query/src/rules/exhaustive-deps.utils.ts
+@@ -0,0 +1,41 @@
++import { AST_NODE_TYPES } from '@typescript-eslint/utils'
++import { ASTUtils } from '../utils/ast-utils'
++import type { TSESLint } from '@typescript-eslint/utils'
++
++export const ExhaustiveDepsUtils = {
++  isRelevantReference(params: {
++    context: Readonly<TSESLint.RuleContext<string, readonly unknown[]>>
++    reference: TSESLint.Scope.Reference
++    scopeManager: TSESLint.Scope.ScopeManager
++  }) {
++    const { reference, scopeManager, context } = params
++    const component = ASTUtils.getFunctionAncestor(context)
++
++    if (
++      component !== undefined &&
++      !ASTUtils.isDeclaredInNode({
++        scopeManager,
++        reference,
++        functionNode: component,
++      })
++    ) {
++      return false
++    }
++
++    return (
++      reference.identifier.name !== 'undefined' &&
++      reference.identifier.parent?.type !== AST_NODE_TYPES.NewExpression &&
++      !ExhaustiveDepsUtils.isQueryClientReference(reference)
++    )
++  },
++  isQueryClientReference(reference: TSESLint.Scope.Reference) {
++    const declarator = reference.resolved?.defs[0]?.node
++
++    return (
++      declarator?.type === AST_NODE_TYPES.VariableDeclarator &&
++      declarator.init?.type === AST_NODE_TYPES.CallExpression &&
++      declarator.init.callee.type === AST_NODE_TYPES.Identifier &&
++      declarator.init.callee.name === 'useQueryClient'
++    )
++  },
++}
+diff --git a/packages/eslint-plugin-query/src/rules/index.ts b/packages/eslint-plugin-query/src/rules/index.ts
+deleted file mode 100644
+index eb0acbae7..000000000
+--- a/packages/eslint-plugin-query/src/rules/index.ts
++++ /dev/null
+@@ -1,5 +0,0 @@
+-import * as exhaustiveDeps from './exhaustive-deps/exhaustive-deps.rule'
+-
+-export const rules = {
+-  [exhaustiveDeps.name]: exhaustiveDeps.rule,
+-}

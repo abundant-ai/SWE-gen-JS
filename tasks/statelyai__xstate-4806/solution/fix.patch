@@ -1,0 +1,321 @@
+diff --git a/.changeset/healthy-pigs-happen.md b/.changeset/healthy-pigs-happen.md
+new file mode 100644
+index 0000000000..b3f670d86d
+--- /dev/null
++++ b/.changeset/healthy-pigs-happen.md
+@@ -0,0 +1,22 @@
++---
++'xstate': minor
++---
++
++Inline actor logic is now permitted when named actors are present. Defining inline actors will no longer cause a TypeScript error:
++
++```ts
++const machine = setup({
++  actors: {
++    existingActor: fromPromise(async () => {
++      // ...
++    })
++  }
++}).createMachine({
++  invoke: {
++    src: fromPromise(async () => {
++      // Inline actor
++    })
++    // ...
++  }
++});
++```
+diff --git a/packages/core/src/actions/spawnChild.ts b/packages/core/src/actions/spawnChild.ts
+index 6312e2f724..14a5ac9d2c 100644
+--- a/packages/core/src/actions/spawnChild.ts
++++ b/packages/core/src/actions/spawnChild.ts
+@@ -139,22 +139,32 @@ type DistributeActors<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TActor extends ProvidedActor
+-> = TActor extends any
+-  ? ConditionalRequired<
+-      [
+-        src: TActor['src'],
+-        options?: SpawnActionOptions<
+-          TContext,
+-          TExpressionEvent,
+-          TEvent,
+-          TActor
+-        > & {
+-          [K in RequiredActorOptions<TActor>]: unknown;
+-        }
+-      ],
+-      IsNotNever<RequiredActorOptions<TActor>>
+-    >
+-  : never;
++> =
++  | (TActor extends any
++      ? ConditionalRequired<
++          [
++            src: TActor['src'],
++            options?: SpawnActionOptions<
++              TContext,
++              TExpressionEvent,
++              TEvent,
++              TActor
++            > & {
++              [K in RequiredActorOptions<TActor>]: unknown;
++            }
++          ],
++          IsNotNever<RequiredActorOptions<TActor>>
++        >
++      : never)
++  | [
++      src: AnyActorLogic,
++      options?: SpawnActionOptions<
++        TContext,
++        TExpressionEvent,
++        TEvent,
++        ProvidedActor
++      > & { id?: never }
++    ];
+ 
+ type SpawnArguments<
+   TContext extends MachineContext,
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index 6f5621a926..6533e6a34b 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -46,10 +46,21 @@ type GetConcreteLogic<
+ export type Spawner<TActor extends ProvidedActor> = IsLiteralString<
+   TActor['src']
+ > extends true
+-  ? <TSrc extends TActor['src']>(
+-      logic: TSrc,
+-      ...[options]: SpawnOptions<TActor, TSrc>
+-    ) => ActorRefFrom<GetConcreteLogic<TActor, TSrc>>
++  ? {
++      <TSrc extends TActor['src']>(
++        logic: TSrc,
++        ...[options]: SpawnOptions<TActor, TSrc>
++      ): ActorRefFrom<GetConcreteLogic<TActor, TSrc>>;
++      <TLogic extends AnyActorLogic>(
++        src: TLogic,
++        options?: {
++          id?: never;
++          systemId?: string;
++          input?: InputFrom<TLogic>;
++          syncSnapshot?: boolean;
++        }
++      ): ActorRefFrom<TLogic>;
++    }
+   : <TLogic extends AnyActorLogic | string>(
+       src: TLogic,
+       options?: {
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 24eb9d7861..65a62eb94c 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -581,77 +581,134 @@ type DistributeActors<
+   TEmitted extends EventObject,
+   TSpecificActor extends ProvidedActor
+ > = TSpecificActor extends { src: infer TSrc }
+-  ? Compute<
+-      {
+-        systemId?: string;
+-        /**
+-         * The source of the machine to be invoked, or the machine itself.
+-         */
+-        src: TSrc;
+-
+-        /**
+-         * The unique identifier for the invoked machine. If not specified, this
+-         * will be the machine's own `id`, or the URL (from `src`).
+-         */
+-        id?: TSpecificActor['id'];
+-
+-        // TODO: currently we do not enforce required inputs here
+-        // in a sense, we shouldn't - they could be provided within the `implementations` object
+-        // how do we verify if the required input has been provided?
+-        input?:
+-          | Mapper<TContext, TEvent, InputFrom<TSpecificActor['logic']>, TEvent>
+-          | InputFrom<TSpecificActor['logic']>;
+-        /**
+-         * The transition to take upon the invoked child machine reaching its final top-level state.
+-         */
+-        onDone?:
+-          | string
+-          | SingleOrArray<
+-              TransitionConfigOrTarget<
+-                TContext,
+-                DoneActorEvent<OutputFrom<TSpecificActor['logic']>>,
+-                TEvent,
+-                TActor,
+-                TAction,
+-                TGuard,
+-                TDelay,
+-                TEmitted
+-              >
+-            >;
+-        /**
+-         * The transition to take upon the invoked child machine sending an error event.
+-         */
+-        onError?:
+-          | string
+-          | SingleOrArray<
+-              TransitionConfigOrTarget<
+-                TContext,
+-                ErrorActorEvent,
+-                TEvent,
+-                TActor,
+-                TAction,
+-                TGuard,
+-                TDelay,
+-                TEmitted
+-              >
+-            >;
+-
+-        onSnapshot?:
+-          | string
+-          | SingleOrArray<
+-              TransitionConfigOrTarget<
+-                TContext,
+-                SnapshotEvent<SnapshotFrom<TSpecificActor['logic']>>,
+-                TEvent,
+-                TActor,
+-                TAction,
+-                TGuard,
+-                TDelay,
+-                TEmitted
+-              >
+-            >;
+-      } & { [K in RequiredActorOptions<TSpecificActor>]: unknown }
+-    >
++  ?
++      | Compute<
++          {
++            systemId?: string;
++            /**
++             * The source of the machine to be invoked, or the machine itself.
++             */
++            src: TSrc;
++
++            /**
++             * The unique identifier for the invoked machine. If not specified, this
++             * will be the machine's own `id`, or the URL (from `src`).
++             */
++            id?: TSpecificActor['id'];
++
++            // TODO: currently we do not enforce required inputs here
++            // in a sense, we shouldn't - they could be provided within the `implementations` object
++            // how do we verify if the required input has been provided?
++            input?:
++              | Mapper<
++                  TContext,
++                  TEvent,
++                  InputFrom<TSpecificActor['logic']>,
++                  TEvent
++                >
++              | InputFrom<TSpecificActor['logic']>;
++            /**
++             * The transition to take upon the invoked child machine reaching its final top-level state.
++             */
++            onDone?:
++              | string
++              | SingleOrArray<
++                  TransitionConfigOrTarget<
++                    TContext,
++                    DoneActorEvent<OutputFrom<TSpecificActor['logic']>>,
++                    TEvent,
++                    TActor,
++                    TAction,
++                    TGuard,
++                    TDelay,
++                    TEmitted
++                  >
++                >;
++            /**
++             * The transition to take upon the invoked child machine sending an error event.
++             */
++            onError?:
++              | string
++              | SingleOrArray<
++                  TransitionConfigOrTarget<
++                    TContext,
++                    ErrorActorEvent,
++                    TEvent,
++                    TActor,
++                    TAction,
++                    TGuard,
++                    TDelay,
++                    TEmitted
++                  >
++                >;
++
++            onSnapshot?:
++              | string
++              | SingleOrArray<
++                  TransitionConfigOrTarget<
++                    TContext,
++                    SnapshotEvent<SnapshotFrom<TSpecificActor['logic']>>,
++                    TEvent,
++                    TActor,
++                    TAction,
++                    TGuard,
++                    TDelay,
++                    TEmitted
++                  >
++                >;
++          } & { [K in RequiredActorOptions<TSpecificActor>]: unknown }
++        >
++      | {
++          id?: never;
++          systemId?: string;
++          src: AnyActorLogic;
++          input?:
++            | Mapper<TContext, TEvent, NonReducibleUnknown, TEvent>
++            | NonReducibleUnknown;
++          onDone?:
++            | string
++            | SingleOrArray<
++                TransitionConfigOrTarget<
++                  TContext,
++                  DoneActorEvent<unknown>,
++                  TEvent,
++                  TActor,
++                  TAction,
++                  TGuard,
++                  TDelay,
++                  TEmitted
++                >
++              >;
++          onError?:
++            | string
++            | SingleOrArray<
++                TransitionConfigOrTarget<
++                  TContext,
++                  ErrorActorEvent,
++                  TEvent,
++                  TActor,
++                  TAction,
++                  TGuard,
++                  TDelay,
++                  TEmitted
++                >
++              >;
++
++          onSnapshot?:
++            | string
++            | SingleOrArray<
++                TransitionConfigOrTarget<
++                  TContext,
++                  SnapshotEvent,
++                  TEvent,
++                  TActor,
++                  TAction,
++                  TGuard,
++                  TDelay,
++                  TEmitted
++                >
++              >;
++        }
+   : never;
+ 
+ export type InvokeConfig<

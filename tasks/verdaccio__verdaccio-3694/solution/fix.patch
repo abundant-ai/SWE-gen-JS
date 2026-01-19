@@ -1,0 +1,233 @@
+diff --git a/.changeset/tender-tigers-hammer.md b/.changeset/tender-tigers-hammer.md
+new file mode 100644
+index 000000000..784b9e20e
+--- /dev/null
++++ b/.changeset/tender-tigers-hammer.md
+@@ -0,0 +1,7 @@
++---
++'@verdaccio/auth': minor
++'@verdaccio/core': minor
++'verdaccio-htpasswd': minor
++---
++
++feat: async bcrypt hash
+diff --git a/packages/core/core/src/constants.ts b/packages/core/core/src/constants.ts
+index 781167c17..47c684e11 100644
+--- a/packages/core/core/src/constants.ts
++++ b/packages/core/core/src/constants.ts
+@@ -109,3 +109,10 @@ export const PACKAGE_ACCESS = {
+   SCOPE: '@*/*',
+   ALL: '**',
+ };
++
++export enum HtpasswdHashAlgorithm {
++  md5 = 'md5',
++  sha1 = 'sha1',
++  crypt = 'crypt',
++  bcrypt = 'bcrypt',
++}
+diff --git a/packages/core/core/src/index.ts b/packages/core/core/src/index.ts
+index 932d7ff64..88a45630e 100644
+--- a/packages/core/core/src/index.ts
++++ b/packages/core/core/src/index.ts
+@@ -23,6 +23,7 @@ export {
+   DEFAULT_PASSWORD_VALIDATION,
+   DEFAULT_USER,
+   USERS,
++  HtpasswdHashAlgorithm,
+ } from './constants';
+ const validationUtils = validatioUtils;
+ export {
+diff --git a/packages/core/types/src/configuration.ts b/packages/core/types/src/configuration.ts
+index e613b9b32..a7af0e7ad 100644
+--- a/packages/core/types/src/configuration.ts
++++ b/packages/core/types/src/configuration.ts
+@@ -18,9 +18,6 @@ export type LoggerLevel = 'http' | 'fatal' | 'warn' | 'info' | 'debug' | 'trace'
+ 
+ export type LoggerConfigItem = {
+   type?: LoggerType;
+-  /**
+-   * The format
+-   */
+   format?: LoggerFormat;
+   path?: string;
+   level?: string;
+diff --git a/packages/plugins/htpasswd/src/htpasswd.ts b/packages/plugins/htpasswd/src/htpasswd.ts
+index fa034e83c..a3c749bc5 100644
+--- a/packages/plugins/htpasswd/src/htpasswd.ts
++++ b/packages/plugins/htpasswd/src/htpasswd.ts
+@@ -2,12 +2,12 @@ import buildDebug from 'debug';
+ import fs from 'fs';
+ import { dirname, resolve } from 'path';
+ 
+-import { pluginUtils } from '@verdaccio/core';
++import { constants, pluginUtils } from '@verdaccio/core';
+ import { unlockFile } from '@verdaccio/file-locking';
+ import { Callback, Logger } from '@verdaccio/types';
+ 
+ import {
+-  HtpasswdHashAlgorithm,
++  DEFAULT_BCRYPT_ROUNDS,
+   HtpasswdHashConfig,
+   addUserToHTPasswd,
+   changePasswordToHTPasswd,
+@@ -17,6 +17,8 @@ import {
+   verifyPassword,
+ } from './utils';
+ 
++type HtpasswdHashAlgorithm = constants.HtpasswdHashAlgorithm;
++
+ const debug = buildDebug('verdaccio:plugin:htpasswd');
+ 
+ export type HTPasswdConfig = {
+@@ -27,7 +29,6 @@ export type HTPasswdConfig = {
+   slow_verify_ms?: number;
+ };
+ 
+-export const DEFAULT_BCRYPT_ROUNDS = 10;
+ export const DEFAULT_SLOW_VERIFY_MS = 200;
+ 
+ /**
+@@ -63,15 +64,19 @@ export default class HTPasswd
+     let algorithm: HtpasswdHashAlgorithm;
+     let rounds: number | undefined;
+ 
+-    if (config.algorithm === undefined) {
+-      algorithm = HtpasswdHashAlgorithm.bcrypt;
+-    } else if (HtpasswdHashAlgorithm[config.algorithm] !== undefined) {
+-      algorithm = HtpasswdHashAlgorithm[config.algorithm];
++    if (typeof config.algorithm === 'undefined') {
++      algorithm = constants.HtpasswdHashAlgorithm.bcrypt;
++    } else if (constants.HtpasswdHashAlgorithm[config.algorithm] !== undefined) {
++      algorithm = constants.HtpasswdHashAlgorithm[config.algorithm];
+     } else {
+-      throw new Error(`Invalid algorithm "${config.algorithm}"`);
++      this.logger.warn(
++        `The algorithm selected %s is invalid, switching to to default one "bcrypt", password validation can be affected`,
++        config.algorithm
++      );
++      algorithm = constants.HtpasswdHashAlgorithm.bcrypt;
+     }
+     debug(`password hash algorithm: ${algorithm}`);
+-    if (algorithm === HtpasswdHashAlgorithm.bcrypt) {
++    if (algorithm === constants.HtpasswdHashAlgorithm.bcrypt) {
+       rounds = config.rounds || DEFAULT_BCRYPT_ROUNDS;
+     } else if (config.rounds !== undefined) {
+       this.logger.warn({ algo: algorithm }, 'Option "rounds" is not valid for "@{algo}" algorithm');
+@@ -202,7 +207,7 @@ export default class HTPasswd
+       }
+ 
+       try {
+-        this._writeFile(addUserToHTPasswd(body, user, password, this.hashConfig), cb);
++        this._writeFile(await addUserToHTPasswd(body, user, password, this.hashConfig), cb);
+       } catch (err: any) {
+         return cb(err);
+       }
+diff --git a/packages/plugins/htpasswd/src/utils.ts b/packages/plugins/htpasswd/src/utils.ts
+index 87e2e7fd1..c9a15df76 100644
+--- a/packages/plugins/htpasswd/src/utils.ts
++++ b/packages/plugins/htpasswd/src/utils.ts
+@@ -3,18 +3,15 @@ import bcrypt from 'bcryptjs';
+ import crypto from 'crypto';
+ import createError, { HttpError } from 'http-errors';
+ 
+-import { API_ERROR, HTTP_STATUS } from '@verdaccio/core';
++import { API_ERROR, HTTP_STATUS, constants } from '@verdaccio/core';
+ import { readFile } from '@verdaccio/file-locking';
+ import { Callback } from '@verdaccio/types';
+ 
+ import crypt3 from './crypt3';
+ 
+-export enum HtpasswdHashAlgorithm {
+-  md5 = 'md5',
+-  sha1 = 'sha1',
+-  crypt = 'crypt',
+-  bcrypt = 'bcrypt',
+-}
++export const DEFAULT_BCRYPT_ROUNDS = 10;
++
++type HtpasswdHashAlgorithm = constants.HtpasswdHashAlgorithm;
+ 
+ export interface HtpasswdHashConfig {
+   algorithm: HtpasswdHashAlgorithm;
+@@ -80,24 +77,24 @@ export async function verifyPassword(passwd: string, hash: string): Promise<bool
+  * @param {HtpasswdHashConfig} hashConfig
+  * @returns {string}
+  */
+-export function generateHtpasswdLine(
++export async function generateHtpasswdLine(
+   user: string,
+   passwd: string,
+   hashConfig: HtpasswdHashConfig
+-): string {
++): Promise<string> {
+   let hash: string;
+ 
+   switch (hashConfig.algorithm) {
+-    case HtpasswdHashAlgorithm.bcrypt:
+-      hash = bcrypt.hashSync(passwd, hashConfig.rounds);
++    case constants.HtpasswdHashAlgorithm.bcrypt:
++      hash = await bcrypt.hash(passwd, hashConfig.rounds || DEFAULT_BCRYPT_ROUNDS);
+       break;
+-    case HtpasswdHashAlgorithm.crypt:
++    case constants.HtpasswdHashAlgorithm.crypt:
+       hash = crypt3(passwd);
+       break;
+-    case HtpasswdHashAlgorithm.md5:
++    case constants.HtpasswdHashAlgorithm.md5:
+       hash = md5(passwd);
+       break;
+-    case HtpasswdHashAlgorithm.sha1:
++    case constants.HtpasswdHashAlgorithm.sha1:
+       hash = '{SHA}' + crypto.createHash('sha1').update(passwd, 'utf8').digest('base64');
+       break;
+     default:
+@@ -116,12 +113,12 @@ export function generateHtpasswdLine(
+  * @param {HtpasswdHashConfig} hashConfig
+  * @returns {string}
+  */
+-export function addUserToHTPasswd(
++export async function addUserToHTPasswd(
+   body: string,
+   user: string,
+   passwd: string,
+   hashConfig: HtpasswdHashConfig
+-): string {
++): Promise<string> {
+   if (user !== encodeURIComponent(user)) {
+     const err = createError('username should not contain non-uri-safe characters');
+ 
+@@ -129,7 +126,7 @@ export function addUserToHTPasswd(
+     throw err;
+   }
+ 
+-  let newline = generateHtpasswdLine(user, passwd, hashConfig);
++  let newline = await generateHtpasswdLine(user, passwd, hashConfig);
+ 
+   if (body.length && body[body.length - 1] !== '\n') {
+     newline = '\n' + newline;
+@@ -190,13 +187,14 @@ export async function sanityCheck(
+ }
+ 
+ /**
++ * /**
+  * changePasswordToHTPasswd - change password for existing user
+  * @param {string} body
+  * @param {string} user
+  * @param {string} passwd
+  * @param {string} newPasswd
+  * @param {HtpasswdHashConfig} hashConfig
+- * @returns {string}
++ * @returns {Promise<string>}
+  */
+ export async function changePasswordToHTPasswd(
+   body: string,
+@@ -215,7 +213,7 @@ export async function changePasswordToHTPasswd(
+   if (!passwordValid) {
+     throw new Error(`Unable to change password for user '${user}': invalid old password`);
+   }
+-  const updatedUserLine = generateHtpasswdLine(username, newPasswd, hashConfig);
++  const updatedUserLine = await generateHtpasswdLine(username, newPasswd, hashConfig);
+   lines.splice(userLineIndex, 1, updatedUserLine);
+   return lines.join('\n');
+ }

@@ -1,0 +1,253 @@
+diff --git a/integration/nest-application/global-prefix/src/app.module.ts b/integration/nest-application/global-prefix/src/app.module.ts
+index 848d4aaa7..2123145a8 100644
+--- a/integration/nest-application/global-prefix/src/app.module.ts
++++ b/integration/nest-application/global-prefix/src/app.module.ts
+@@ -1,7 +1,22 @@
+-import { Module } from '@nestjs/common';
++import { MiddlewareConsumer, Module, RequestMethod } from '@nestjs/common';
+ import { AppController } from './app.controller';
+ 
++export const MIDDLEWARE_VALUE = 'middleware';
++export const MIDDLEWARE_PARAM_VALUE = 'middleware_param';
++
+ @Module({
+   controllers: [AppController],
+ })
+-export class AppModule {}
++export class AppModule {
++  configure(consumer: MiddlewareConsumer) {
++    consumer
++      .apply((req, res, next) => res.end(MIDDLEWARE_VALUE))
++      .forRoutes({ path: MIDDLEWARE_VALUE, method: RequestMethod.GET })
++      .apply((req, res, next) => res.status(201).end(MIDDLEWARE_VALUE))
++      .forRoutes({ path: MIDDLEWARE_VALUE, method: RequestMethod.POST })
++      .apply((req, res, next) => res.end(MIDDLEWARE_PARAM_VALUE))
++      .forRoutes({ path: MIDDLEWARE_VALUE + '/*', method: RequestMethod.GET })
++      .apply((req, res, next) => res.status(201).end(MIDDLEWARE_PARAM_VALUE))
++      .forRoutes({ path: MIDDLEWARE_VALUE + '/*', method: RequestMethod.POST });
++  }
++}
+diff --git a/packages/core/middleware/middleware-module.ts b/packages/core/middleware/middleware-module.ts
+index 417727f40..748887811 100644
+--- a/packages/core/middleware/middleware-module.ts
++++ b/packages/core/middleware/middleware-module.ts
+@@ -9,6 +9,7 @@ import {
+   addLeadingSlash,
+   isUndefined,
+ } from '@nestjs/common/utils/shared.utils';
++import { isRouteExcluded, isRequestMethodAll } from '../router/utils';
+ import { ApplicationConfig } from '../application-config';
+ import { InvalidMiddlewareException } from '../errors/exceptions/invalid-middleware.exception';
+ import { RuntimeException } from '../errors/exceptions/runtime.exception';
+@@ -26,7 +27,6 @@ import { MiddlewareBuilder } from './builder';
+ import { MiddlewareContainer } from './container';
+ import { MiddlewareResolver } from './resolver';
+ import { RoutesMapper } from './routes-mapper';
+-import { isRequestMethodAll } from './utils';
+ 
+ export class MiddlewareModule {
+   private readonly routerProxy = new RouterProxy();
+@@ -272,17 +272,26 @@ export class MiddlewareModule {
+     ) => void,
+   ) {
+     const prefix = this.config.getGlobalPrefix();
+-    const basePath = addLeadingSlash(prefix);
+-    if (basePath?.endsWith('/') && path?.startsWith('/')) {
+-      // strip slash when a wildcard is being used
+-      // and global prefix has been set
+-      path = path?.slice(1);
++    const excludedRoutes = this.config.getGlobalPrefixOptions().exclude;
++    if (
++      Array.isArray(excludedRoutes) &&
++      isRouteExcluded(excludedRoutes, path, method)
++    ) {
++      path = addLeadingSlash(path);
++    } else {
++      const basePath = addLeadingSlash(prefix);
++      if (basePath?.endsWith('/') && path?.startsWith('/')) {
++        // strip slash when a wildcard is being used
++        // and global prefix has been set
++        path = path?.slice(1);
++      }
++      path = basePath + path;
+     }
+     const isMethodAll = isRequestMethodAll(method);
+     const requestMethod = RequestMethod[method];
+     const router = await applicationRef.createMiddlewareFactory(method);
+     router(
+-      basePath + path,
++      path,
+       isMethodAll
+         ? proxy
+         : <TRequest, TResponse>(
+diff --git a/packages/core/middleware/utils.ts b/packages/core/middleware/utils.ts
+index 31e67b67a..f0cdddf99 100644
+--- a/packages/core/middleware/utils.ts
++++ b/packages/core/middleware/utils.ts
+@@ -4,32 +4,34 @@ import { isFunction } from '@nestjs/common/utils/shared.utils';
+ import { iterate } from 'iterare';
+ import * as pathToRegexp from 'path-to-regexp';
+ import { v4 as uuid } from 'uuid';
++import { ExcludeRouteMetadata } from '../router/interfaces/exclude-route-metadata.interface';
++import { isRouteExcluded } from '../router/utils';
+ 
+-type RouteInfoRegex = RouteInfo & { regex: RegExp };
+-
+-export const isRequestMethodAll = (method: RequestMethod) => {
+-  return RequestMethod.ALL === method || (method as number) === -1;
++export const mapToExcludeRoute = (
++  routes: RouteInfo[],
++): ExcludeRouteMetadata[] => {
++  return routes.map(({ path, method }) => ({
++    pathRegex: pathToRegexp(path),
++    requestMethod: method,
++  }));
+ };
+ 
+ export const filterMiddleware = <T extends Function | Type<any> = any>(
+   middleware: T[],
+-  excludedRoutes: RouteInfo[],
++  routes: RouteInfo[],
+   httpAdapter: HttpServer,
+ ) => {
+-  const excluded = excludedRoutes.map(route => ({
+-    ...route,
+-    regex: pathToRegexp(route.path),
+-  }));
++  const excludedRoutes = mapToExcludeRoute(routes);
+   return iterate([])
+     .concat(middleware)
+     .filter(isFunction)
+-    .map((item: T) => mapToClass(item, excluded, httpAdapter))
++    .map((item: T) => mapToClass(item, excludedRoutes, httpAdapter))
+     .toArray();
+ };
+ 
+ export const mapToClass = <T extends Function | Type<any>>(
+   middleware: T,
+-  excludedRoutes: RouteInfoRegex[],
++  excludedRoutes: ExcludeRouteMetadata[],
+   httpAdapter: HttpServer,
+ ) => {
+   if (isMiddlewareClass(middleware)) {
+@@ -39,7 +41,11 @@ export const mapToClass = <T extends Function | Type<any>>(
+     const MiddlewareHost = class extends (middleware as Type<any>) {
+       use(...params: unknown[]) {
+         const [req, _, next] = params as [Record<string, any>, any, Function];
+-        const isExcluded = isRouteExcluded(req, excludedRoutes, httpAdapter);
++        const isExcluded = isMiddlewareRouteExcluded(
++          req,
++          excludedRoutes,
++          httpAdapter,
++        );
+         if (isExcluded) {
+           return next();
+         }
+@@ -52,7 +58,11 @@ export const mapToClass = <T extends Function | Type<any>>(
+     class {
+       use = (...params: unknown[]) => {
+         const [req, _, next] = params as [Record<string, any>, any, Function];
+-        const isExcluded = isRouteExcluded(req, excludedRoutes, httpAdapter);
++        const isExcluded = isMiddlewareRouteExcluded(
++          req,
++          excludedRoutes,
++          httpAdapter,
++        );
+         if (isExcluded) {
+           return next();
+         }
+@@ -80,9 +90,9 @@ export function assignToken(metatype: Type<any>, token = uuid()): Type<any> {
+   return metatype;
+ }
+ 
+-export function isRouteExcluded(
++export function isMiddlewareRouteExcluded(
+   req: Record<string, any>,
+-  excludedRoutes: RouteInfoRegex[],
++  excludedRoutes: ExcludeRouteMetadata[],
+   httpAdapter: HttpServer,
+ ): boolean {
+   if (excludedRoutes.length <= 0) {
+@@ -96,11 +106,5 @@ export function isRouteExcluded(
+       ? originalUrl.slice(0, queryParamsIndex)
+       : originalUrl;
+ 
+-  const isExcluded = excludedRoutes.some(({ method, regex }) => {
+-    if (isRequestMethodAll(method) || RequestMethod[method] === reqMethod) {
+-      return regex.exec(pathname);
+-    }
+-    return false;
+-  });
+-  return isExcluded;
++  return isRouteExcluded(excludedRoutes, pathname, RequestMethod[reqMethod]);
+ }
+diff --git a/packages/core/router/route-path-factory.ts b/packages/core/router/route-path-factory.ts
+index 3beef2e96..e53a35b95 100644
+--- a/packages/core/router/route-path-factory.ts
++++ b/packages/core/router/route-path-factory.ts
+@@ -12,6 +12,7 @@ import {
+ } from '@nestjs/common/utils/shared.utils';
+ import { ApplicationConfig } from '../application-config';
+ import { RoutePathMetadata } from './interfaces/route-path-metadata.interface';
++import { isRouteExcluded } from './utils';
+ 
+ export class RoutePathFactory {
+   constructor(private readonly applicationConfig: ApplicationConfig) {}
+@@ -101,17 +102,10 @@ export class RoutePathFactory {
+       return false;
+     }
+     const options = this.applicationConfig.getGlobalPrefixOptions();
+-    if (!options.exclude) {
+-      return false;
+-    }
+-    return options.exclude.some(route => {
+-      if (!route.pathRegex.exec(path)) {
+-        return false;
+-      }
+-      return (
+-        route.requestMethod === RequestMethod.ALL ||
+-        route.requestMethod === requestMethod
+-      );
+-    });
++    const excludedRoutes = options.exclude;
++    return (
++      Array.isArray(excludedRoutes) &&
++      isRouteExcluded(excludedRoutes, path, requestMethod)
++    );
+   }
+ }
+diff --git a/packages/core/router/utils/exclude-route.util.ts b/packages/core/router/utils/exclude-route.util.ts
+new file mode 100644
+index 000000000..798260bf2
+--- /dev/null
++++ b/packages/core/router/utils/exclude-route.util.ts
+@@ -0,0 +1,22 @@
++import { RequestMethod } from '@nestjs/common';
++import { ExcludeRouteMetadata } from '../interfaces/exclude-route-metadata.interface';
++
++export const isRequestMethodAll = (method: RequestMethod) => {
++  return RequestMethod.ALL === method || (method as number) === -1;
++};
++
++export function isRouteExcluded(
++  excludedRoutes: ExcludeRouteMetadata[],
++  path: string,
++  requestMethod?: RequestMethod,
++) {
++  return excludedRoutes.some(route => {
++    if (
++      isRequestMethodAll(route.requestMethod) ||
++      route.requestMethod === requestMethod
++    ) {
++      return route.pathRegex.exec(path);
++    }
++    return false;
++  });
++}
+diff --git a/packages/core/router/utils/index.ts b/packages/core/router/utils/index.ts
+index bf2f27b1d..a3524ed90 100644
+--- a/packages/core/router/utils/index.ts
++++ b/packages/core/router/utils/index.ts
+@@ -1 +1,2 @@
++export * from './exclude-route.util';
+ export * from './flatten-route-paths.util';

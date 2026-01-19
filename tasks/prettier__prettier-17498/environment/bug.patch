@@ -1,0 +1,581 @@
+diff --git a/changelog_unreleased/typescript/17498.md b/changelog_unreleased/typescript/17498.md
+deleted file mode 100644
+index 77db2f5dd..000000000
+--- a/changelog_unreleased/typescript/17498.md
++++ /dev/null
+@@ -1,16 +0,0 @@
+-#### Improve new line detect in mapped type (#17498 by @fisker)
+-
+-<!-- prettier-ignore -->
+-```jsx
+-// Input
+-type A = { readonly
+- [A in B]: T}
+-
+-// Prettier stable
+-type A = {
+-  readonly [A in B]: T;
+-};
+-
+-// Prettier main
+-type A = { readonly [A in B]: T };
+-```
+diff --git a/src/language-js/clean.js b/src/language-js/clean.js
+index 5dd02f7ed..aa209a344 100644
+--- a/src/language-js/clean.js
++++ b/src/language-js/clean.js
+@@ -190,6 +190,12 @@ function clean(original, cloned) {
+     cloned.expression.type = "ChainExpression";
+   }
+ 
++  // `@typescript-eslint/typescript-estree` v8
++  if (original.type === "TSMappedType") {
++    delete cloned.key;
++    delete cloned.constraint;
++  }
++
+   // `@typescript-eslint/typescript-estree` v8
+   if (original.type === "TSEnumDeclaration") {
+     delete cloned.body;
+diff --git a/src/language-js/comments/handle-comments.js b/src/language-js/comments/handle-comments.js
+index 84ca9f1b9..b9a89e671 100644
+--- a/src/language-js/comments/handle-comments.js
++++ b/src/language-js/comments/handle-comments.js
+@@ -69,7 +69,6 @@ function handleOwnLineComment(context) {
+     handleBreakAndContinueStatementComments,
+     handleNestedConditionalExpressionComments,
+     handleCommentsInDestructuringPattern,
+-    handleTSMappedTypeComments,
+   ].some((fn) => fn(context));
+ }
+ 
+@@ -96,7 +95,6 @@ function handleEndOfLineComment(context) {
+     handleSwitchDefaultCaseComments,
+     handleLastUnionElementInExpression,
+     handleLastBinaryOperatorOperand,
+-    handleTSMappedTypeComments,
+   ].some((fn) => fn(context));
+ }
+ 
+@@ -115,6 +113,7 @@ function handleRemainingComment(context) {
+     handleOnlyComments,
+     handleCommentAfterArrowParams,
+     handleFunctionNameComments,
++    handleTSMappedTypeComments,
+     handleBreakAndContinueStatementComments,
+     handleTSFunctionTrailingComments,
+   ].some((fn) => fn(context));
+@@ -907,7 +906,8 @@ function handleIgnoreComments({ comment, enclosingNode, followingNode }) {
+   if (
+     isPrettierIgnoreComment(comment) &&
+     enclosingNode?.type === "TSMappedType" &&
+-    followingNode === enclosingNode.key
++    followingNode?.type === "TSTypeParameter" &&
++    followingNode.constraint
+   ) {
+     enclosingNode.prettierIgnore = true;
+     comment.unignore = true;
+@@ -915,15 +915,27 @@ function handleIgnoreComments({ comment, enclosingNode, followingNode }) {
+   }
+ }
+ 
+-function handleTSMappedTypeComments({ comment, precedingNode, enclosingNode }) {
++function handleTSMappedTypeComments({
++  comment,
++  precedingNode,
++  enclosingNode,
++  followingNode,
++}) {
+   if (enclosingNode?.type !== "TSMappedType") {
+-    return;
++    return false;
+   }
+ 
+-  if (!precedingNode) {
+-    addDanglingComment(enclosingNode, comment);
++  if (followingNode?.type === "TSTypeParameter" && followingNode.name) {
++    addLeadingComment(followingNode.name, comment);
+     return true;
+   }
++
++  if (precedingNode?.type === "TSTypeParameter" && precedingNode.constraint) {
++    addTrailingComment(precedingNode.constraint, comment);
++    return true;
++  }
++
++  return false;
+ }
+ 
+ function handleSwitchDefaultCaseComments({
+diff --git a/src/language-js/parse/postprocess/index.js b/src/language-js/parse/postprocess/index.js
+index 9329ad013..bc77ae1c6 100644
+--- a/src/language-js/parse/postprocess/index.js
++++ b/src/language-js/parse/postprocess/index.js
+@@ -148,7 +148,14 @@ function postprocess(ast, options) {
+ 
+       case "TSTypeParameter":
+         // babel-ts
+-        fixBabelTSTypeParameter(node);
++        if (typeof node.name === "string") {
++          const start = locStart(node);
++          node.name = {
++            type: "Identifier",
++            name: node.name,
++            range: [start, start + node.name.length],
++          };
++        }
+         break;
+ 
+       // For hack-style pipeline
+@@ -163,19 +170,6 @@ function postprocess(ast, options) {
+           return node.types[0];
+         }
+         break;
+-
+-      // Remove this when update `@babel/parser` to v8
+-      // https://github.com/typescript-eslint/typescript-eslint/pull/7065
+-      case "TSMappedType":
+-        if (!node.constraint && !node.key) {
+-          const { name: key, constraint } = fixBabelTSTypeParameter(
+-            node.typeParameter,
+-          );
+-          node.constraint = constraint;
+-          node.key = key;
+-          delete node.typeParameter;
+-        }
+-        break;
+     }
+ 
+     /* c8 ignore next 3 */
+@@ -192,19 +186,6 @@ function postprocess(ast, options) {
+   return ast;
+ }
+ 
+-function fixBabelTSTypeParameter(node) {
+-  if (node.type === "TSTypeParameter" && typeof node.name === "string") {
+-    const start = locStart(node);
+-    node.name = {
+-      type: "Identifier",
+-      name: node.name,
+-      range: [start, start + node.name.length],
+-    };
+-  }
+-
+-  return node;
+-}
+-
+ function isUnbalancedLogicalTree(node) {
+   return (
+     node.type === "LogicalExpression" &&
+diff --git a/src/language-js/print/mapped-type.js b/src/language-js/print/mapped-type.js
+index 1cfbe4b48..d37f43d07 100644
+--- a/src/language-js/print/mapped-type.js
++++ b/src/language-js/print/mapped-type.js
+@@ -1,6 +1,5 @@
+ import {
+   group,
+-  hardline,
+   ifBreak,
+   indent,
+   line,
+@@ -9,8 +8,6 @@ import {
+ import { printDanglingComments } from "../../main/comments/print.js";
+ import hasNewlineInRange from "../../utils/has-newline-in-range.js";
+ import { locStart } from "../loc.js";
+-import getTextWithoutComments from "../utils/get-text-without-comments.js";
+-import { CommentCheckFlags, hasComment } from "../utils/index.js";
+ 
+ /**
+  * @param {string | null} optional
+@@ -55,44 +52,25 @@ function printTypeScriptMappedTypeModifier(tokenNode, keyword) {
+   return keyword;
+ }
+ 
+-function printTypeScriptMappedType(path, options, print) {
++function printTypescriptMappedType(path, options, print) {
+   const { node } = path;
+   // Break after `{` like `printObject`
+-  let shouldBreak = false;
+-  if (options.objectWrap === "preserve") {
+-    const start = locStart(node);
+-    const textAfter = getTextWithoutComments(
+-      options,
+-      start + 1,
+-      locStart(node.key),
++  const shouldBreak =
++    options.objectWrap === "preserve" &&
++    hasNewlineInRange(
++      options.originalText,
++      locStart(node),
++      // Ideally, this should be the next token after `{`, but there is no node starts with it.
++      locStart(node.typeParameter),
+     );
+-    const nextTokenIndex = start + 1 + textAfter.search(/\S/u);
+-    if (hasNewlineInRange(options.originalText, start, nextTokenIndex)) {
+-      shouldBreak = true;
+-    }
+-  }
+ 
+   return group(
+     [
+       "{",
+       indent([
+         options.bracketSpacing ? line : softline,
+-        hasComment(node, CommentCheckFlags.Dangling)
+-          ? group([printDanglingComments(path, options), hardline])
+-          : "",
+         group([
+-          node.readonly
+-            ? [
+-                printTypeScriptMappedTypeModifier(node.readonly, "readonly"),
+-                " ",
+-              ]
+-            : "",
+-          "[",
+-          print("key"),
+-          " in ",
+-          print("constraint"),
+-          node.nameType ? [" as ", print("nameType")] : "",
+-          "]",
++          print("typeParameter"),
+           node.optional
+             ? printTypeScriptMappedTypeModifier(node.optional, "?")
+             : "",
+@@ -101,6 +79,7 @@ function printTypeScriptMappedType(path, options, print) {
+         ]),
+         options.semi ? ifBreak(";") : "",
+       ]),
++      printDanglingComments(path, options),
+       options.bracketSpacing ? line : softline,
+       "}",
+     ],
+@@ -108,4 +87,8 @@ function printTypeScriptMappedType(path, options, print) {
+   );
+ }
+ 
+-export { printFlowMappedTypeProperty, printTypeScriptMappedType };
++export {
++  printFlowMappedTypeProperty,
++  printTypescriptMappedType,
++  printTypeScriptMappedTypeModifier,
++};
+diff --git a/src/language-js/print/type-parameters.js b/src/language-js/print/type-parameters.js
+index 083851c92..5368c07ed 100644
+--- a/src/language-js/print/type-parameters.js
++++ b/src/language-js/print/type-parameters.js
+@@ -20,6 +20,7 @@ import {
+   shouldPrintComma,
+ } from "../utils/index.js";
+ import { isArrowFunctionVariableDeclarator } from "./assignment.js";
++import { printTypeScriptMappedTypeModifier } from "./mapped-type.js";
+ import {
+   printTypeAnnotationProperty,
+   shouldHugType,
+@@ -126,7 +127,7 @@ function printDanglingCommentsForInline(path, options) {
+ }
+ 
+ function printTypeParameter(path, options, print) {
+-  const { node } = path;
++  const { node, parent } = path;
+ 
+   /**
+    * @type {Doc[]}
+@@ -135,6 +136,27 @@ function printTypeParameter(path, options, print) {
+ 
+   const name = node.type === "TSTypeParameter" ? print("name") : node.name;
+ 
++  if (parent.type === "TSMappedType") {
++    if (parent.readonly) {
++      parts.push(
++        printTypeScriptMappedTypeModifier(parent.readonly, "readonly"),
++        " ",
++      );
++    }
++    parts.push("[", name);
++    if (node.constraint) {
++      parts.push(" in ", print("constraint"));
++    }
++    if (parent.nameType) {
++      parts.push(
++        " as ",
++        path.callParent(() => print("nameType")),
++      );
++    }
++    parts.push("]");
++    return parts;
++  }
++
+   if (node.variance) {
+     parts.push(print("variance"));
+   }
+diff --git a/src/language-js/print/typescript.js b/src/language-js/print/typescript.js
+index f849ff49c..1d81ab98f 100644
+--- a/src/language-js/print/typescript.js
++++ b/src/language-js/print/typescript.js
+@@ -25,7 +25,7 @@ import {
+   shouldGroupFunctionParameters,
+ } from "./function-parameters.js";
+ import { printInterface } from "./interface.js";
+-import { printTypeScriptMappedType } from "./mapped-type.js";
++import { printTypescriptMappedType } from "./mapped-type.js";
+ import {
+   printDeclareToken,
+   printOptionalToken,
+@@ -230,7 +230,7 @@ function printTypescript(path, options, print) {
+       return [node.operator, " ", print("typeAnnotation")];
+ 
+     case "TSMappedType":
+-      return printTypeScriptMappedType(path, options, print);
++      return printTypescriptMappedType(path, options, print);
+ 
+     case "TSMethodSignature": {
+       const kind = node.kind && node.kind !== "method" ? `${node.kind} ` : "";
+diff --git a/src/language-js/traverse/visitor-keys.evaluate.js b/src/language-js/traverse/visitor-keys.evaluate.js
+index f93d479a6..f461dcfc8 100644
+--- a/src/language-js/traverse/visitor-keys.evaluate.js
++++ b/src/language-js/traverse/visitor-keys.evaluate.js
+@@ -66,8 +66,11 @@ const excludeKeys = {
+   ExportNamedDeclaration: ["assertions"],
+   ImportDeclaration: ["assertions"],
+   ImportExpression: ["attributes"],
+-  TSMappedType: ["typeParameter"],
+ 
++  // `key` and `constraint` added in `@typescript-eslint/typescript-estree` v8
++  // https://github.com/typescript-eslint/typescript-eslint/pull/7065
++  // TODO: Use the new AST properties instead
++  TSMappedType: ["key", "constraint"],
+   // `body` added in `@typescript-eslint/typescript-estree` v8
+   // https://github.com/typescript-eslint/typescript-eslint/pull/8920
+   // TODO: Use the new AST properties instead
+diff --git a/tests/format/html/multiparser/ts/__snapshots__/format.test.js.snap b/tests/format/html/multiparser/ts/__snapshots__/format.test.js.snap
+index 9ccd1d622..dc8edd9c7 100644
+--- a/tests/format/html/multiparser/ts/__snapshots__/format.test.js.snap
++++ b/tests/format/html/multiparser/ts/__snapshots__/format.test.js.snap
+@@ -32,7 +32,9 @@ printWidth: 80
+ <html lang="en">
+   <head>
+     <script lang="ts">
+-      type X = { [K in keyof Y]: Partial<K> };
++      type X = {
++        [K in keyof Y]: Partial<K>;
++      };
+ 
+       class Foo<T> {
+         constructor(private foo: keyof Apple) {}
+diff --git a/tests/format/typescript/comments/__snapshots__/format.test.js.snap b/tests/format/typescript/comments/__snapshots__/format.test.js.snap
+index 92b93e816..5d8c59465 100644
+--- a/tests/format/typescript/comments/__snapshots__/format.test.js.snap
++++ b/tests/format/typescript/comments/__snapshots__/format.test.js.snap
+@@ -838,12 +838,6 @@ type L = { [l in L /* commentL */]: string }
+ 
+ type M = { [m in M] /* commentG */: string }
+ 
+-// https://github.com/excalidraw/excalidraw/blob/712f2675195ace8d507f563ec4306efe319b3c84/packages/common/src/utility-types.ts#L61-L64
+-type MakeBrand<T extends string> = {
+-  /** @private using ~ to sort last in intellisense */
+-  [K in \`~brand~\${T}\`]: T;
+-};
+-
+ =====================================output=====================================
+ type A = {
+   // commentA
+@@ -851,8 +845,7 @@ type A = {
+ };
+ 
+ type B = {
+-  /* commentB */
+-  [b in B]: string;
++  /* commentB */ [b in B]: string;
+ };
+ 
+ type C = {
+@@ -887,12 +880,6 @@ type L = { [l in L /* commentL */]: string };
+ 
+ type M = { [m in M /* commentG */]: string };
+ 
+-// https://github.com/excalidraw/excalidraw/blob/712f2675195ace8d507f563ec4306efe319b3c84/packages/common/src/utility-types.ts#L61-L64
+-type MakeBrand<T extends string> = {
+-  /** @private using ~ to sort last in intellisense */
+-  [K in \`~brand~\${T}\`]: T;
+-};
+-
+ ================================================================================
+ `;
+ 
+diff --git a/tests/format/typescript/comments/mapped_types.ts b/tests/format/typescript/comments/mapped_types.ts
+index 6d058cf0f..e9839c50d 100644
+--- a/tests/format/typescript/comments/mapped_types.ts
++++ b/tests/format/typescript/comments/mapped_types.ts
+@@ -38,9 +38,3 @@ type K = { [k in /* commentK */ K]: string }
+ type L = { [l in L /* commentL */]: string }
+ 
+ type M = { [m in M] /* commentG */: string }
+-
+-// https://github.com/excalidraw/excalidraw/blob/712f2675195ace8d507f563ec4306efe319b3c84/packages/common/src/utility-types.ts#L61-L64
+-type MakeBrand<T extends string> = {
+-  /** @private using ~ to sort last in intellisense */
+-  [K in `~brand~${T}`]: T;
+-};
+diff --git a/tests/format/typescript/mapped-type/__snapshots__/format.test.js.snap b/tests/format/typescript/mapped-type/__snapshots__/format.test.js.snap
+index 32308d7d6..fe565652c 100644
+--- a/tests/format/typescript/mapped-type/__snapshots__/format.test.js.snap
++++ b/tests/format/typescript/mapped-type/__snapshots__/format.test.js.snap
+@@ -129,8 +129,7 @@ type Type = {
+ 
+ type Type = {
+   // foo
+-  /* bar */
+-  readonly [T in number];
++  /* bar */ readonly [T in number];
+ };
+ 
+ ================================================================================
+diff --git a/tests/format/typescript/mapped-type/break-mode/__snapshots__/format.test.js.snap b/tests/format/typescript/mapped-type/break-mode/__snapshots__/format.test.js.snap
+index 34b8d2c0d..403d4b605 100644
+--- a/tests/format/typescript/mapped-type/break-mode/__snapshots__/format.test.js.snap
++++ b/tests/format/typescript/mapped-type/break-mode/__snapshots__/format.test.js.snap
+@@ -20,72 +20,20 @@ T}
+ type A7 = { readonly [A in B]: T
+ }
+ 
+-type B1 = {  [A in B]: T}
+-type B2 = {
+- [A in B]: T}
+-type B4 = {  [
+-A in B]: T}
+-
+-type C1 = { +readonly [A in B]: T}
+-type C2 = {+
+-readonly [A in B]: T}
+-type C3 = {
+-+readonly [A in B]: T}
+-
+-
+-type D1 = { -readonly [A in B]: T}
+-type D2 = {-
+-readonly [A in B]: T}
+-type D3 = {
+--readonly [A in B]: T}
+-
+ =====================================output=====================================
+ type A1 = { readonly [A in B]: T };
+ type A2 = {
+   readonly [A in B]: T;
+ };
+-type A3 = { readonly [A in B]: T };
+-type A4 = { readonly [A in B]: T };
++type A3 = {
++  readonly [A in B]: T;
++};
++type A4 = {
++  readonly [A in B]: T;
++};
+ type A5 = { readonly [A in B]: T };
+ type A6 = { readonly [A in B]: T };
+ type A7 = { readonly [A in B]: T };
+ 
+-type B1 = { [A in B]: T };
+-type B2 = {
+-  [A in B]: T;
+-};
+-type B4 = { [A in B]: T };
+-
+-type C1 = { +readonly [A in B]: T };
+-type C2 = { +readonly [A in B]: T };
+-type C3 = {
+-  +readonly [A in B]: T;
+-};
+-
+-type D1 = { -readonly [A in B]: T };
+-type D2 = { -readonly [A in B]: T };
+-type D3 = {
+-  -readonly [A in B]: T;
+-};
+-
+-================================================================================
+-`;
+-
+-exports[`issue-10571.ts format 1`] = `
+-====================================options=====================================
+-parsers: ["typescript"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-function foo() {
+-  return obj as {[K in any]: any;
+-    };
+-}
+-
+-=====================================output=====================================
+-function foo() {
+-  return obj as { [K in any]: any };
+-}
+-
+ ================================================================================
+ `;
+diff --git a/tests/format/typescript/mapped-type/break-mode/break-mode.ts b/tests/format/typescript/mapped-type/break-mode/break-mode.ts
+index c071fd190..3bada24aa 100644
+--- a/tests/format/typescript/mapped-type/break-mode/break-mode.ts
++++ b/tests/format/typescript/mapped-type/break-mode/break-mode.ts
+@@ -11,22 +11,3 @@ type A6 = { readonly [A in B]:
+ T}
+ type A7 = { readonly [A in B]: T
+ }
+-
+-type B1 = {  [A in B]: T}
+-type B2 = {
+- [A in B]: T}
+-type B4 = {  [
+-A in B]: T}
+-
+-type C1 = { +readonly [A in B]: T}
+-type C2 = {+
+-readonly [A in B]: T}
+-type C3 = {
+-+readonly [A in B]: T}
+-
+-
+-type D1 = { -readonly [A in B]: T}
+-type D2 = {-
+-readonly [A in B]: T}
+-type D3 = {
+--readonly [A in B]: T}
+diff --git a/tests/format/typescript/mapped-type/break-mode/issue-10571.ts b/tests/format/typescript/mapped-type/break-mode/issue-10571.ts
+deleted file mode 100644
+index a830223d0..000000000
+--- a/tests/format/typescript/mapped-type/break-mode/issue-10571.ts
++++ /dev/null
+@@ -1,4 +0,0 @@
+-function foo() {
+-  return obj as {[K in any]: any;
+-    };
+-}
+diff --git a/tests/format/typescript/prettier-ignore/__snapshots__/format.test.js.snap b/tests/format/typescript/prettier-ignore/__snapshots__/format.test.js.snap
+index 574b60950..865c74682 100644
+--- a/tests/format/typescript/prettier-ignore/__snapshots__/format.test.js.snap
++++ b/tests/format/typescript/prettier-ignore/__snapshots__/format.test.js.snap
+@@ -146,7 +146,7 @@ type a = {
+ };
+ 
+ type a = {
+-  [A in B]: /* prettier-ignore */ C  |  D;
++  [A in B /* prettier-ignore */]: C | D;
+ };
+ 
+ type a = {
+diff --git a/tests/unit/__snapshots__/visitor-keys.js.snap b/tests/unit/__snapshots__/visitor-keys.js.snap
+index f29ea2b9c..702675cd5 100644
+--- a/tests/unit/__snapshots__/visitor-keys.js.snap
++++ b/tests/unit/__snapshots__/visitor-keys.js.snap
+@@ -900,10 +900,9 @@ exports[`visitor keys estree 1`] = `
+     "literal",
+   ],
+   "TSMappedType": [
+-    "constraint",
+-    "key",
+     "nameType",
+     "typeAnnotation",
++    "typeParameter",
+   ],
+   "TSMethodSignature": [
+     "key",

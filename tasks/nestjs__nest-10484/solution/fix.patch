@@ -1,0 +1,278 @@
+diff --git a/package-lock.json b/package-lock.json
+index f87802c0e..b4787ecac 100644
+Binary files a/package-lock.json and b/package-lock.json differ
+diff --git a/package.json b/package.json
+index c7d438b5b..8be22714c 100644
+--- a/package.json
++++ b/package.json
+@@ -77,13 +77,13 @@
+     "@fastify/cors": "^8.0.0",
+     "@fastify/formbody": "7.3.0",
+     "@fastify/middie": "8.0.0",
+-    "@fastify/multipart": "7.3.0",
++    "@fastify/multipart": "7.2.0",
+     "@fastify/static": "6.5.0",
+     "@fastify/view": "7.1.1",
+     "@grpc/grpc-js": "1.7.3",
+     "@grpc/proto-loader": "0.7.3",
+     "@nestjs/apollo": "10.1.4",
+-    "@nestjs/graphql": "10.1.5",
++    "@nestjs/graphql": "10.1.4",
+     "@nestjs/mongoose": "9.2.0",
+     "@nestjs/typeorm": "9.0.1",
+     "@types/amqplib": "0.8.2",
+@@ -94,9 +94,9 @@
+     "@types/cors": "2.8.12",
+     "@types/express": "4.17.14",
+     "@types/gulp": "4.0.9",
+-    "@types/http-errors": "2.0.0",
++    "@types/http-errors": "1.8.2",
+     "@types/mocha": "10.0.0",
+-    "@types/node": "18.11.8",
++    "@types/node": "18.11.5",
+     "@types/redis": "4.0.11",
+     "@types/reflect-metadata": "0.1.0",
+     "@types/sinon": "10.0.13",
+@@ -130,7 +130,7 @@
+     "fancy-log": "2.0.0",
+     "fastify": "4.9.2",
+     "graphql": "15.8.0",
+-    "graphql-tools": "8.3.7",
++    "graphql-tools": "8.3.6",
+     "gulp": "4.0.2",
+     "gulp-clang-format": "1.0.27",
+     "gulp-clean": "0.4.0",
+diff --git a/packages/common/interfaces/middleware/middleware-configuration.interface.ts b/packages/common/interfaces/middleware/middleware-configuration.interface.ts
+index aef5012ed..15414b6cb 100644
+--- a/packages/common/interfaces/middleware/middleware-configuration.interface.ts
++++ b/packages/common/interfaces/middleware/middleware-configuration.interface.ts
+@@ -1,9 +1,11 @@
+ import { RequestMethod } from '../../enums';
+ import { Type } from '../type.interface';
++import { VersionValue } from '../version-options.interface';
+ 
+ export interface RouteInfo {
+   path: string;
+   method: RequestMethod;
++  version?: VersionValue;
+ }
+ 
+ export interface MiddlewareConfiguration<T = any> {
+diff --git a/packages/core/middleware/middleware-module.ts b/packages/core/middleware/middleware-module.ts
+index 7ba73c5c2..777f58964 100644
+--- a/packages/core/middleware/middleware-module.ts
++++ b/packages/core/middleware/middleware-module.ts
+@@ -1,4 +1,4 @@
+-import { HttpServer } from '@nestjs/common';
++import { HttpServer, VersioningType } from '@nestjs/common';
+ import { RequestMethod } from '@nestjs/common/enums/request-method.enum';
+ import {
+   MiddlewareConfiguration,
+@@ -20,6 +20,7 @@ import { Injector } from '../injector/injector';
+ import { InstanceWrapper } from '../injector/instance-wrapper';
+ import { InstanceToken, Module } from '../injector/module';
+ import { REQUEST_CONTEXT_ID } from '../router/request/request-constants';
++import { RoutePathFactory } from '../router/route-path-factory';
+ import { RouterExceptionFilters } from '../router/router-exception-filters';
+ import { RouterProxy } from '../router/router-proxy';
+ import { isRequestMethodAll, isRouteExcluded } from '../router/utils';
+@@ -40,6 +41,8 @@ export class MiddlewareModule {
+   private container: NestContainer;
+   private httpAdapter: HttpServer;
+ 
++  constructor(private readonly routePathFactory: RoutePathFactory) {}
++
+   public async register(
+     middlewareContainer: MiddlewareContainer,
+     container: NestContainer,
+@@ -174,8 +177,7 @@ export class MiddlewareModule {
+       await this.bindHandler(
+         instanceWrapper,
+         applicationRef,
+-        routeInfo.method,
+-        routeInfo.path,
++        routeInfo,
+         moduleRef,
+         collection,
+       );
+@@ -185,8 +187,7 @@ export class MiddlewareModule {
+   private async bindHandler(
+     wrapper: InstanceWrapper<NestMiddleware>,
+     applicationRef: HttpServer,
+-    method: RequestMethod,
+-    path: string,
++    routeInfo: RouteInfo,
+     moduleRef: Module,
+     collection: Map<InstanceToken, InstanceWrapper>,
+   ) {
+@@ -197,12 +198,11 @@ export class MiddlewareModule {
+     const isStatic = wrapper.isDependencyTreeStatic();
+     if (isStatic) {
+       const proxy = await this.createProxy(instance);
+-      return this.registerHandler(applicationRef, method, path, proxy);
++      return this.registerHandler(applicationRef, routeInfo, proxy);
+     }
+     await this.registerHandler(
+       applicationRef,
+-      method,
+-      path,
++      routeInfo,
+       async <TRequest, TResponse>(
+         req: TRequest,
+         res: TResponse,
+@@ -266,8 +266,7 @@ export class MiddlewareModule {
+ 
+   private async registerHandler(
+     applicationRef: HttpServer,
+-    method: RequestMethod,
+-    path: string,
++    { path, method, version }: RouteInfo,
+     proxy: <TRequest, TResponse>(
+       req: TRequest,
+       res: TResponse,
+@@ -291,6 +290,15 @@ export class MiddlewareModule {
+       }
+       path = basePath + path;
+     }
++
++    const applicationVersioningConfig = this.config.getVersioning();
++    if (version && applicationVersioningConfig.type === VersioningType.URI) {
++      const versionPrefix = this.routePathFactory.getVersionPrefix(
++        applicationVersioningConfig,
++      );
++      path = `/${versionPrefix}${version.toString()}${path}`;
++    }
++
+     const isMethodAll = isRequestMethodAll(method);
+     const requestMethod = RequestMethod[method];
+     const router = await applicationRef.createMiddlewareFactory(method);
+diff --git a/packages/core/middleware/routes-mapper.ts b/packages/core/middleware/routes-mapper.ts
+index bbb8ea36c..5309bb109 100644
+--- a/packages/core/middleware/routes-mapper.ts
++++ b/packages/core/middleware/routes-mapper.ts
+@@ -1,5 +1,5 @@
+ import { MODULE_PATH, PATH_METADATA } from '@nestjs/common/constants';
+-import { RouteInfo, Type } from '@nestjs/common/interfaces';
++import { RouteInfo, Type, VersionValue } from '@nestjs/common/interfaces';
+ import {
+   addLeadingSlash,
+   isString,
+@@ -22,35 +22,54 @@ export class RoutesMapper {
+     route: Type<any> | RouteInfo | string,
+   ): RouteInfo[] {
+     if (isString(route)) {
+-      const defaultRequestMethod = -1;
+-      return [
+-        {
+-          path: addLeadingSlash(route),
+-          method: defaultRequestMethod,
+-        },
+-      ];
++      return this.getRouteInfoFromPath(route);
+     }
+     const routePathOrPaths = this.getRoutePath(route);
+     if (this.isRouteInfo(routePathOrPaths, route)) {
+-      return [
+-        {
+-          path: addLeadingSlash(route.path),
+-          method: route.method,
+-        },
+-      ];
++      return this.getRouteInfoFromObject(route);
+     }
++
++    return this.getRouteInfoFromController(route, routePathOrPaths);
++  }
++
++  private getRouteInfoFromPath(routePath: string): RouteInfo[] {
++    const defaultRequestMethod = -1;
++    return [
++      {
++        path: addLeadingSlash(routePath),
++        method: defaultRequestMethod,
++      },
++    ];
++  }
++
++  private getRouteInfoFromObject(routeInfoObject: RouteInfo): RouteInfo[] {
++    const routeInfo: RouteInfo = {
++      path: addLeadingSlash(routeInfoObject.path),
++      method: routeInfoObject.method,
++    };
++
++    if (routeInfoObject.version) {
++      routeInfo.version = routeInfoObject.version;
++    }
++    return [routeInfo];
++  }
++
++  private getRouteInfoFromController(
++    controller: Type<any>,
++    routePath: string,
++  ): RouteInfo[] {
+     const controllerPaths = this.routerExplorer.scanForPaths(
+-      Object.create(route),
+-      route.prototype,
++      Object.create(controller),
++      controller.prototype,
+     );
+-    const moduleRef = this.getHostModuleOfController(route);
++    const moduleRef = this.getHostModuleOfController(controller);
+     const modulePath = this.getModulePath(moduleRef?.metatype);
+ 
+     const concatPaths = <T>(acc: T[], currentValue: T[]) =>
+       acc.concat(currentValue);
+ 
+     return []
+-      .concat(routePathOrPaths)
++      .concat(routePath)
+       .map(routePath =>
+         controllerPaths
+           .map(item =>
+@@ -58,10 +77,16 @@ export class RoutesMapper {
+               let path = modulePath ?? '';
+               path += this.normalizeGlobalPath(routePath) + addLeadingSlash(p);
+ 
+-              return {
++              const routeInfo: RouteInfo = {
+                 path,
+                 method: item.requestMethod,
+               };
++
++              if (item.version) {
++                routeInfo.version = item.version;
++              }
++
++              return routeInfo;
+             }),
+           )
+           .reduce(concatPaths, []),
+diff --git a/packages/core/nest-application.ts b/packages/core/nest-application.ts
+index 39a7c3424..a06ee4c98 100644
+--- a/packages/core/nest-application.ts
++++ b/packages/core/nest-application.ts
+@@ -42,6 +42,7 @@ import { MiddlewareModule } from './middleware/middleware-module';
+ import { NestApplicationContext } from './nest-application-context';
+ import { ExcludeRouteMetadata } from './router/interfaces/exclude-route-metadata.interface';
+ import { Resolver } from './router/interfaces/resolver.interface';
++import { RoutePathFactory } from './router/route-path-factory';
+ import { RoutesResolver } from './router/routes-resolver';
+ 
+ const { SocketModule } = optionalRequire(
+@@ -63,7 +64,7 @@ export class NestApplication
+   private readonly logger = new Logger(NestApplication.name, {
+     timestamp: true,
+   });
+-  private readonly middlewareModule = new MiddlewareModule();
++  private readonly middlewareModule: MiddlewareModule;
+   private readonly middlewareContainer = new MiddlewareContainer(
+     this.container,
+   );
+@@ -85,6 +86,7 @@ export class NestApplication
+ 
+     this.selectContextModule();
+     this.registerHttpServer();
++    this.middlewareModule = new MiddlewareModule(new RoutePathFactory(config));
+ 
+     this.routesResolver = new RoutesResolver(
+       this.container,

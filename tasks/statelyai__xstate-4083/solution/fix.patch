@@ -1,0 +1,266 @@
+diff --git a/.changeset/light-spiders-attend.md b/.changeset/light-spiders-attend.md
+new file mode 100644
+index 0000000000..778204cbce
+--- /dev/null
++++ b/.changeset/light-spiders-attend.md
+@@ -0,0 +1,5 @@
++---
++"xstate": patch
++---
++
++Remove `State['changed']`. A new instance of `State` is being created if there are matching transitions for the received event. If there are no matching transitions then the current state is being returned.
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index 1e1c17717a..5a53ede5b1 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -56,15 +56,6 @@ export class State<
+   public historyValue: Readonly<HistoryValue<TContext, TEvent>> = {};
+   public _internalQueue: Array<TEvent>;
+   public _initial: boolean = false;
+-  /**
+-   * Indicates whether the state has changed from the previous state. A state is considered "changed" if:
+-   *
+-   * - Its value is not equal to its previous value, or:
+-   * - It has any new actions (side-effects) to execute.
+-   *
+-   * An initial state (with no history) will return `undefined`.
+-   */
+-  public changed: boolean | undefined;
+   /**
+    * The enabled state nodes representative of the state value.
+    */
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index a56ae32dee..b793831a5b 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -292,7 +292,7 @@ export class StateMachine<
+     preInitial._initial = true;
+ 
+     if (actorCtx) {
+-      const [nextState] = resolveActionsAndContext(
++      const nextState = resolveActionsAndContext(
+         actions,
+         initEvent as TEvent,
+         preInitial,
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index e414329342..e82fd6f537 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1039,13 +1039,10 @@ export function microstep<
+   const mutConfiguration = new Set(currentState.configuration);
+ 
+   if (!currentState._initial && !willTransition) {
+-    const inertState = cloneState(currentState, {});
+-
+-    inertState.changed = false;
+-    return inertState;
++    return currentState;
+   }
+ 
+-  const [microstate, actions] = microstepProcedure(
++  const microstate = microstepProcedure(
+     currentState._initial
+       ? [
+           {
+@@ -1064,19 +1061,9 @@ export function microstep<
+     actorCtx
+   );
+ 
+-  const { context } = microstate;
+-
+-  const nextState = cloneState(microstate, {
++  return cloneState(microstate, {
+     value: {} // TODO: make optional
+   });
+-
+-  nextState.changed = currentState._initial
+-    ? undefined
+-    : !stateValuesEqual(nextState.value, currentState.value) ||
+-      actions.length > 0 ||
+-      context !== currentState.context;
+-
+-  return nextState;
+ }
+ 
+ function microstepProcedure(
+@@ -1085,7 +1072,7 @@ function microstepProcedure(
+   mutConfiguration: Set<AnyStateNode>,
+   event: AnyEventObject,
+   actorCtx: AnyActorContext
+-): [typeof currentState, BaseActionObject[]] {
++): typeof currentState {
+   const actions: BaseActionObject[] = [];
+   const historyValue = {
+     ...currentState.historyValue
+@@ -1130,7 +1117,7 @@ function microstepProcedure(
+   }
+ 
+   try {
+-    const [nextState, resolvedActions] = resolveActionsAndContext(
++    const nextState = resolveActionsAndContext(
+       actions,
+       event,
+       currentState,
+@@ -1143,18 +1130,15 @@ function microstepProcedure(
+ 
+     internalQueue.push(...nextState._internalQueue);
+ 
+-    return [
+-      cloneState(currentState, {
+-        configuration: nextConfiguration,
+-        historyValue,
+-        _internalQueue: internalQueue,
+-        context: nextState.context,
+-        done,
+-        output,
+-        children: nextState.children
+-      }),
+-      resolvedActions
+-    ];
++    return cloneState(currentState, {
++      configuration: nextConfiguration,
++      historyValue,
++      _internalQueue: internalQueue,
++      context: nextState.context,
++      done,
++      output,
++      children: nextState.children
++    });
+   } catch (e) {
+     // TODO: Refactor this once proper error handling is implemented.
+     // See https://github.com/statelyai/rfcs/pull/4
+@@ -1434,14 +1418,12 @@ export function resolveActionsAndContext<
+   event: TEvent,
+   currentState: State<TContext, TEvent, any>,
+   actorCtx: AnyActorContext | undefined
+-): [AnyState, BaseActionObject[]] {
++): AnyState {
+   const { machine } = currentState;
+-  const resolvedActions: BaseActionObject[] = [];
+   const raiseActions: Array<RaiseActionObject<TContext, TEvent>> = [];
+   let intermediateState = currentState;
+ 
+   function handleAction(action: BaseActionObject): void {
+-    resolvedActions.push(action);
+     if (actorCtx?.self.status === ActorStatus.Running) {
+       action.execute?.(actorCtx!);
+     } else {
+@@ -1494,12 +1476,9 @@ export function resolveActionsAndContext<
+     resolveAction(actionObject);
+   }
+ 
+-  return [
+-    cloneState(intermediateState, {
+-      _internalQueue: raiseActions.map((a) => a.params.event)
+-    }),
+-    resolvedActions
+-  ];
++  return cloneState(intermediateState, {
++    _internalQueue: raiseActions.map((a) => a.params.event)
++  });
+ }
+ 
+ export function macrostep(
+@@ -1519,7 +1498,7 @@ export function macrostep(
+ 
+   // Handle stop event
+   if (event.type === stopSignalType) {
+-    nextState = stopStep(event, nextState, actorCtx)[0];
++    nextState = stopStep(event, nextState, actorCtx);
+     states.push(nextState);
+ 
+     return {
+diff --git a/packages/xstate-react/src/useActor.ts b/packages/xstate-react/src/useActor.ts
+index f713995d0a..f136bbac75 100644
+--- a/packages/xstate-react/src/useActor.ts
++++ b/packages/xstate-react/src/useActor.ts
+@@ -1,10 +1,9 @@
+ import isDevelopment from '#is-development';
+ import { useCallback, useEffect } from 'react';
+-import { useSyncExternalStoreWithSelector } from 'use-sync-external-store/shim/with-selector';
++import { useSyncExternalStore } from 'use-sync-external-store/shim';
+ import {
+   ActorRefFrom,
+   AnyActorLogic,
+-  AnyState,
+   InterpreterOptions,
+   InterpreterStatus,
+   SnapshotFrom
+@@ -12,14 +11,6 @@ import {
+ import { useIdleInterpreter } from './useActorRef.ts';
+ import { isActorRef } from 'xstate/actors';
+ 
+-function identity<T>(a: T): T {
+-  return a;
+-}
+-
+-const isEqual = (prevState: AnyState, nextState: AnyState) => {
+-  return prevState === nextState || nextState.changed === false;
+-};
+-
+ export function useActor<TLogic extends AnyActorLogic>(
+   logic: TLogic,
+   options: InterpreterOptions<TLogic> = {}
+@@ -44,12 +35,10 @@ export function useActor<TLogic extends AnyActorLogic>(
+     [actorRef]
+   );
+ 
+-  const actorSnapshot = useSyncExternalStoreWithSelector(
++  const actorSnapshot = useSyncExternalStore(
+     subscribe,
+     getSnapshot,
+-    getSnapshot,
+-    identity,
+-    isEqual
++    getSnapshot
+   );
+ 
+   useEffect(() => {
+diff --git a/packages/xstate-svelte/src/useMachine.ts b/packages/xstate-svelte/src/useMachine.ts
+index ee56633213..85c1428ef4 100644
+--- a/packages/xstate-svelte/src/useMachine.ts
++++ b/packages/xstate-svelte/src/useMachine.ts
+@@ -62,10 +62,13 @@ export function useMachine<TMachine extends AnyStateMachine>(
+ 
+   onDestroy(() => service.stop());
+ 
+-  const state = readable(service.getSnapshot(), (set) => {
+-    return service.subscribe((state) => {
+-      if (state.changed) {
+-        set(state);
++  let snapshot = service.getSnapshot();
++
++  const state = readable(snapshot, (set) => {
++    return service.subscribe((nextSnapshot) => {
++      if (snapshot !== nextSnapshot) {
++        snapshot = nextSnapshot;
++        set(snapshot);
+       }
+     }).unsubscribe;
+   });
+diff --git a/packages/xstate-vue/src/useMachine.ts b/packages/xstate-vue/src/useMachine.ts
+index 264eae25bd..9fc6435dbc 100644
+--- a/packages/xstate-vue/src/useMachine.ts
++++ b/packages/xstate-vue/src/useMachine.ts
+@@ -45,15 +45,17 @@ export function useMachine<TMachine extends AnyStateMachine>(
+   getMachine: MaybeLazy<TMachine>,
+   ...[options = {}]: RestParams<TMachine>
+ ): UseMachineReturn<TMachine> {
+-  function listener(nextState: StateFrom<TMachine>) {
+-    if (nextState.changed) {
+-      state.value = nextState;
++  function listener(nextSnapshot: StateFrom<TMachine>) {
++    if (nextSnapshot !== snapshot) {
++      snapshot = nextSnapshot;
++      state.value = snapshot;
+     }
+   }
+ 
+   const service = useInterpret(getMachine, options, listener);
+ 
+-  const state = shallowRef(service.getSnapshot());
++  let snapshot = service.getSnapshot();
++  const state = shallowRef(snapshot);
+ 
+   return { state, send: service.send, service } as any;
+ }

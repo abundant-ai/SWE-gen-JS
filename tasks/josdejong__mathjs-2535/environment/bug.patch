@@ -1,0 +1,234 @@
+diff --git a/HISTORY.md b/HISTORY.md
+index 6ab942b16..13a803b5c 100644
+--- a/HISTORY.md
++++ b/HISTORY.md
+@@ -5,8 +5,6 @@
+ - Fix #2526, #2529: improve TypeScript definitions of function `round`, `fix`,
+   `floor`, `ceil`, and `nthRoot`, and improved the number only implementations 
+   of those functions  (#2531, #2539). Thanks @simlaticak and @gwhitney.
+-- Fix #2532: matrix index symbol `end` not working when used inside
+-  a sub-expression.
+ 
+ 
+ # 2022-04-19, version 10.5.0
+diff --git a/docs/expressions/syntax.md b/docs/expressions/syntax.md
+index 4fb985bc6..34487b9e3 100644
+--- a/docs/expressions/syntax.md
++++ b/docs/expressions/syntax.md
+@@ -549,11 +549,8 @@ can be replaced by using indexes. Indexes are enclosed in square brackets, and
+ contain a number or a range for each of the matrix dimensions. A range can have
+ its start and/or end undefined. When the start is undefined, the range will start
+ at 1, when the end is undefined, the range will end at the end of the matrix.
+-
+ There is a context variable `end` available as well to denote the end of the
+-matrix. This variable cannot be used in multiple nested indices. In that case,
+-`end` will be resolved as the end of the innermost matrix. To solve this, 
+-resolving of the nested index needs to be split in two separate operations.
++matrix.
+ 
+ *IMPORTANT: matrix indexes and ranges work differently from the math.js indexes
+ in JavaScript: They are one-based with an included upper-bound, similar to most
+diff --git a/src/expression/node/IndexNode.js b/src/expression/node/IndexNode.js
+index d39525baa..9d3cd092c 100644
+--- a/src/expression/node/IndexNode.js
++++ b/src/expression/node/IndexNode.js
+@@ -1,16 +1,17 @@
++import { isBigNumber, isConstantNode, isNode, isRangeNode, isSymbolNode } from '../../utils/is.js'
+ import { map } from '../../utils/array.js'
+-import { getSafeProperty } from '../../utils/customs.js'
+-import { factory } from '../../utils/factory.js'
+-import { isArray, isConstantNode, isMatrix, isNode, isString, typeOf } from '../../utils/is.js'
+ import { escape } from '../../utils/string.js'
++import { factory } from '../../utils/factory.js'
++import { getSafeProperty } from '../../utils/customs.js'
+ 
+ const name = 'IndexNode'
+ const dependencies = [
++  'Range',
+   'Node',
+   'size'
+ ]
+ 
+-export const createIndexNode = /* #__PURE__ */ factory(name, dependencies, ({ Node, size }) => {
++export const createIndexNode = /* #__PURE__ */ factory(name, dependencies, ({ Range, Node, size }) => {
+   /**
+    * @constructor IndexNode
+    * @extends Node
+@@ -70,34 +71,66 @@ export const createIndexNode = /* #__PURE__ */ factory(name, dependencies, ({ No
+     //       we can beforehand resolve the zero-based value
+ 
+     // optimization for a simple object property
+-    const evalDimensions = map(this.dimensions, function (dimension, i) {
+-      const needsEnd = dimension
+-        .filter(node => node.isSymbolNode && node.name === 'end')
+-        .length > 0
+-
+-      if (needsEnd) {
+-        // SymbolNode 'end' is used inside the index,
+-        // like in `A[end]` or `A[end - 2]`
++    const evalDimensions = map(this.dimensions, function (range, i) {
++      if (isRangeNode(range)) {
++        if (range.needsEnd()) {
++          // create a range containing end (like '4:end')
++          const childArgNames = Object.create(argNames)
++          childArgNames.end = true
++
++          const evalStart = range.start._compile(math, childArgNames)
++          const evalEnd = range.end._compile(math, childArgNames)
++          const evalStep = range.step
++            ? range.step._compile(math, childArgNames)
++            : function () { return 1 }
++
++          return function evalDimension (scope, args, context) {
++            const s = size(context).valueOf()
++            const childArgs = Object.create(args)
++            childArgs.end = s[i]
++
++            return createRange(
++              evalStart(scope, childArgs, context),
++              evalEnd(scope, childArgs, context),
++              evalStep(scope, childArgs, context)
++            )
++          }
++        } else {
++          // create range
++          const evalStart = range.start._compile(math, argNames)
++          const evalEnd = range.end._compile(math, argNames)
++          const evalStep = range.step
++            ? range.step._compile(math, argNames)
++            : function () { return 1 }
++
++          return function evalDimension (scope, args, context) {
++            return createRange(
++              evalStart(scope, args, context),
++              evalEnd(scope, args, context),
++              evalStep(scope, args, context)
++            )
++          }
++        }
++      } else if (isSymbolNode(range) && range.name === 'end') {
++        // SymbolNode 'end'
+         const childArgNames = Object.create(argNames)
+         childArgNames.end = true
+ 
+-        const _evalDimension = dimension._compile(math, childArgNames)
++        const evalRange = range._compile(math, childArgNames)
+ 
+         return function evalDimension (scope, args, context) {
+-          if (!isMatrix(context) && !isArray(context) && !isString(context)) {
+-            throw new TypeError('Cannot resolve "end": ' +
+-              'context must be a Matrix, Array, or string but is ' + typeOf(context))
+-          }
+-
+           const s = size(context).valueOf()
+           const childArgs = Object.create(args)
+           childArgs.end = s[i]
+ 
+-          return _evalDimension(scope, childArgs, context)
++          return evalRange(scope, childArgs, context)
+         }
+       } else {
+-        // SymbolNode `end` not used
+-        return dimension._compile(math, argNames)
++        // ConstantNode
++        const evalRange = range._compile(math, argNames)
++        return function evalDimension (scope, args, context) {
++          return evalRange(scope, args, context)
++        }
+       }
+     })
+ 
+@@ -232,5 +265,14 @@ export const createIndexNode = /* #__PURE__ */ factory(name, dependencies, ({ No
+       : ('_{' + dimensions.join(',') + '}')
+   }
+ 
++  // helper function to create a Range from start, step and end
++  function createRange (start, end, step) {
++    return new Range(
++      isBigNumber(start) ? start.toNumber() : start,
++      isBigNumber(end) ? end.toNumber() : end,
++      isBigNumber(step) ? step.toNumber() : step
++    )
++  }
++
+   return IndexNode
+ }, { isClass: true, isNode: true })
+diff --git a/test/unit-tests/expression/node/AccessorNode.test.js b/test/unit-tests/expression/node/AccessorNode.test.js
+index d5872ec46..dcf661861 100644
+--- a/test/unit-tests/expression/node/AccessorNode.test.js
++++ b/test/unit-tests/expression/node/AccessorNode.test.js
+@@ -76,27 +76,6 @@ describe('AccessorNode', function () {
+     assert.deepStrictEqual(expr.evaluate(scope), [[3, 4]])
+   })
+ 
+-  it('should compile a AccessorNode with "end" in an expression', function () {
+-    const a = new SymbolNode('a')
+-    const index = new IndexNode([
+-      new OperatorNode(
+-        '-',
+-        'subtract',
+-        [
+-          new SymbolNode('end'),
+-          new ConstantNode(2)
+-        ]
+-      )
+-    ])
+-    const n = new AccessorNode(a, index)
+-    const expr = n.compile()
+-
+-    const scope = {
+-      a: [1, 2, 3, 4]
+-    }
+-    assert.deepStrictEqual(expr.evaluate(scope), 2)
+-  })
+-
+   it('should compile a AccessorNode with a property', function () {
+     const a = new SymbolNode('a')
+     const index = new IndexNode([new ConstantNode('b')])
+@@ -206,46 +185,6 @@ describe('AccessorNode', function () {
+     assert.deepStrictEqual(expr.evaluate(scope), [[3, 4]])
+   })
+ 
+-  it('should use the inner context when using "end" in a nested index', function () {
+-    // A[B[end]]
+-    const node = new AccessorNode(
+-      new SymbolNode('A'),
+-      new IndexNode([
+-        new AccessorNode(
+-          new SymbolNode('B'),
+-          new IndexNode([
+-            new SymbolNode('end')
+-          ])
+-        )
+-      ])
+-    )
+-
+-    // here, end should resolve to the end of B, which is 3 (whilst the end of A is 6)
+-    const expr = node.compile()
+-    const scope = {
+-      A: [4, 5, 6, 7, 8, 9],
+-      B: [1, 2, 3]
+-    }
+-    assert.deepStrictEqual(expr.evaluate(scope), 6)
+-  })
+-
+-  it('should give a proper error message when using "end" inside the index of an object', function () {
+-    const obj = new SymbolNode('value')
+-    const index = new IndexNode([
+-      new SymbolNode('end')
+-    ])
+-    const n = new AccessorNode(obj, index)
+-    const expr = n.compile()
+-
+-    assert.throws(function () {
+-      expr.evaluate({ value: { end: true } })
+-    }, /TypeError: Cannot resolve "end": context must be a Matrix, Array, or string but is Object/)
+-
+-    assert.throws(function () {
+-      expr.evaluate({ value: 42 })
+-    }, /TypeError: Cannot resolve "end": context must be a Matrix, Array, or string but is number/)
+-  })
+-
+   it('should compile a AccessorNode with bignumber setting', function () {
+     const a = new bigmath.SymbolNode('a')
+     const b = new bigmath.ConstantNode(2)

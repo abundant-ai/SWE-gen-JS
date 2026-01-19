@@ -1,0 +1,139 @@
+diff --git a/integration/websockets/src/app.gateway.ts b/integration/websockets/src/app.gateway.ts
+index 21b3998b7..d473280f4 100644
+--- a/integration/websockets/src/app.gateway.ts
++++ b/integration/websockets/src/app.gateway.ts
+@@ -1,8 +1,10 @@
++import { UseInterceptors } from '@nestjs/common';
+ import {
+   MessageBody,
+   SubscribeMessage,
+   WebSocketGateway,
+ } from '@nestjs/websockets';
++import { RequestInterceptor } from './request.interceptor';
+ 
+ @WebSocketGateway(8080)
+ export class ApplicationGateway {
+@@ -13,4 +15,13 @@ export class ApplicationGateway {
+       data,
+     };
+   }
++
++  @UseInterceptors(RequestInterceptor)
++  @SubscribeMessage('getClient')
++  getPathCalled(client, data) {
++    return {
++      event: 'popClient',
++      data: { ...data, path: client.pattern },
++    };
++  }
+ }
+diff --git a/integration/websockets/src/request.interceptor.ts b/integration/websockets/src/request.interceptor.ts
+new file mode 100644
+index 000000000..7dad7e9bf
+--- /dev/null
++++ b/integration/websockets/src/request.interceptor.ts
+@@ -0,0 +1,11 @@
++import { CallHandler, ExecutionContext, Injectable } from '@nestjs/common';
++
++@Injectable()
++export class RequestInterceptor {
++  intercept(context: ExecutionContext, next: CallHandler) {
++    const client = context.switchToWs().getClient();
++    const pattern = context.switchToWs().getPattern();
++    client.pattern = pattern;
++    return next.handle();
++  }
++}
+diff --git a/integration/websockets/src/server.gateway.ts b/integration/websockets/src/server.gateway.ts
+index 3add1945a..8700fa8a0 100644
+--- a/integration/websockets/src/server.gateway.ts
++++ b/integration/websockets/src/server.gateway.ts
+@@ -1,4 +1,6 @@
++import { UseInterceptors } from '@nestjs/common';
+ import { SubscribeMessage, WebSocketGateway } from '@nestjs/websockets';
++import { RequestInterceptor } from './request.interceptor';
+ 
+ @WebSocketGateway()
+ export class ServerGateway {
+@@ -9,4 +11,13 @@ export class ServerGateway {
+       data,
+     };
+   }
++
++  @UseInterceptors(RequestInterceptor)
++  @SubscribeMessage('getClient')
++  getPathCalled(client, data) {
++    return {
++      event: 'popClient',
++      data: { ...data, path: client.pattern },
++    };
++  }
+ }
+diff --git a/packages/common/interfaces/features/arguments-host.interface.ts b/packages/common/interfaces/features/arguments-host.interface.ts
+index 6ab4da9ca..23ea6c90f 100644
+--- a/packages/common/interfaces/features/arguments-host.interface.ts
++++ b/packages/common/interfaces/features/arguments-host.interface.ts
+@@ -31,6 +31,10 @@ export interface WsArgumentsHost {
+    * Returns the client object.
+    */
+   getClient<T = any>(): T;
++  /**
++   * Returns the pattern for the event
++   */
++  getPattern(): string;
+ }
+ 
+ /**
+diff --git a/packages/core/helpers/execution-context-host.ts b/packages/core/helpers/execution-context-host.ts
+index 922b98ed3..83b460a9a 100644
+--- a/packages/core/helpers/execution-context-host.ts
++++ b/packages/core/helpers/execution-context-host.ts
+@@ -59,6 +59,7 @@ export class ExecutionContextHost implements ExecutionContext {
+     return Object.assign(this, {
+       getClient: () => this.getArgByIndex(0),
+       getData: () => this.getArgByIndex(1),
++      getPattern: () => this.getArgByIndex(this.getArgs().length - 1),
+     });
+   }
+ }
+diff --git a/packages/websockets/context/ws-context-creator.ts b/packages/websockets/context/ws-context-creator.ts
+index 3dca71f95..0ccec159c 100644
+--- a/packages/websockets/context/ws-context-creator.ts
++++ b/packages/websockets/context/ws-context-creator.ts
+@@ -23,7 +23,7 @@ import {
+   InterceptorsContextCreator,
+ } from '@nestjs/core/interceptors';
+ import { PipesConsumer, PipesContextCreator } from '@nestjs/core/pipes';
+-import { PARAM_ARGS_METADATA } from '../constants';
++import { MESSAGE_METADATA, PARAM_ARGS_METADATA } from '../constants';
+ import { WsException } from '../errors/ws-exception';
+ import { WsParamsFactory } from '../factories/ws-params-factory';
+ import { ExceptionFiltersContext } from './exception-filters-context';
+@@ -66,7 +66,6 @@ export class WsContextCreator {
+       methodName,
+       contextType,
+     );
+-
+     const exceptionHandler = this.exceptionFiltersContext.create(
+       instance,
+       callback,
+@@ -110,6 +109,8 @@ export class WsContextCreator {
+     };
+ 
+     return this.wsProxy.create(async (...args: unknown[]) => {
++      args.push(this.reflectCallbackPattern(callback));
++
+       const initialArgs = this.contextUtils.createNullArray(argsLength);
+       fnCanActivate && (await fnCanActivate(args));
+ 
+@@ -131,6 +132,10 @@ export class WsContextCreator {
+     return Reflect.getMetadata(PARAMTYPES_METADATA, instance, callback.name);
+   }
+ 
++  public reflectCallbackPattern(callback: (...args: any[]) => any): string {
++    return Reflect.getMetadata(MESSAGE_METADATA, callback);
++  }
++
+   public createGuardsFn<TContext extends string = ContextType>(
+     guards: any[],
+     instance: Controller,

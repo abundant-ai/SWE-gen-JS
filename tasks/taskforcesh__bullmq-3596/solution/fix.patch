@@ -1,0 +1,136 @@
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index 6b794dc41a..f395e50522 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -11,6 +11,7 @@ import {
+   ParentKeys,
+   ParentKeyOpts,
+   RedisClient,
++  RetryOptions,
+   WorkerOptions,
+ } from '../interfaces';
+ import {
+@@ -1387,17 +1388,28 @@ export class Job<
+    * Attempts to retry the job. Only a job that has failed or completed can be retried.
+    *
+    * @param state - completed / failed
++   * @param opts - options to retry a job
+    * @returns A promise that resolves when the job has been successfully moved to the wait queue.
+    * The queue emits a waiting event when the job is successfully moved.
+    * @throws Will throw an error if the job does not exist, is locked, or is not in the expected state.
+    */
+-  retry(state: FinishedStatus = 'failed'): Promise<void> {
++  async retry(
++    state: FinishedStatus = 'failed',
++    opts: RetryOptions = {},
++  ): Promise<void> {
++    await this.scripts.reprocessJob(this, state, opts);
+     this.failedReason = null;
+     this.finishedOn = null;
+     this.processedOn = null;
+     this.returnvalue = null;
+ 
+-    return this.scripts.reprocessJob(this, state);
++    if (opts.resetAttemptsMade) {
++      this.attemptsMade = 0;
++    }
++
++    if (opts.resetAttemptsStarted) {
++      this.attemptsStarted = 0;
++    }
+   }
+ 
+   /**
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 2bd328aa33..4c58960f4f 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -25,6 +25,7 @@ import {
+   MoveToDelayedOpts,
+   RepeatableOptions,
+   RetryJobOpts,
++  RetryOptions,
+   ScriptQueueContext,
+ } from '../interfaces';
+ import {
+@@ -1420,6 +1421,7 @@ export class Scripts {
+   async reprocessJob<T = any, R = any, N extends string = string>(
+     job: MinimalJob<T, R, N>,
+     state: 'failed' | 'completed',
++    opts: RetryOptions = {},
+   ): Promise<void> {
+     const client = await this.queue.client;
+ 
+@@ -1439,6 +1441,8 @@ export class Scripts {
+       (job.opts.lifo ? 'R' : 'L') + 'PUSH',
+       state === 'failed' ? 'failedReason' : 'returnvalue',
+       state,
++      opts.resetAttemptsMade ? '1' : '0',
++      opts.resetAttemptsStarted ? '1' : '0',
+     ];
+ 
+     const result = await this.execCommand(
+diff --git a/src/commands/reprocessJob-8.lua b/src/commands/reprocessJob-8.lua
+index 7188c2be13..583c54e43a 100644
+--- a/src/commands/reprocessJob-8.lua
++++ b/src/commands/reprocessJob-8.lua
+@@ -15,6 +15,8 @@
+     ARGV[2] (job.opts.lifo ? 'R' : 'L') + 'PUSH'
+     ARGV[3] propVal - failedReason/returnvalue
+     ARGV[4] prev state - failed/completed
++    ARGV[5] reset attemptsMade - "1" or "0"
++    ARGV[6] reset attemptsStarted - "1" or "0"
+ 
+   Output:
+      1 means the operation was a success
+@@ -32,7 +34,17 @@ local jobKey = KEYS[1]
+ if rcall("EXISTS", jobKey) == 1 then
+   local jobId = ARGV[1]
+   if (rcall("ZREM", KEYS[3], jobId) == 1) then
+-    rcall("HDEL", jobKey, "finishedOn", "processedOn", ARGV[3])
++    local attributesToRemove = {}
++
++    if ARGV[5] == "1" then
++      table.insert(attributesToRemove, "atm")
++    end
++
++    if ARGV[6] == "1" then
++      table.insert(attributesToRemove, "ats")
++    end
++
++    rcall("HDEL", jobKey, "finishedOn", "processedOn", ARGV[3], unpack(attributesToRemove))
+ 
+     local target, isPausedOrMaxed = getTargetQueueList(KEYS[5], KEYS[7], KEYS[4], KEYS[6])
+     addJobInTargetList(target, KEYS[8], ARGV[2], isPausedOrMaxed, jobId)
+diff --git a/src/interfaces/index.ts b/src/interfaces/index.ts
+index d142efe8fc..dee1a621c7 100644
+--- a/src/interfaces/index.ts
++++ b/src/interfaces/index.ts
+@@ -23,6 +23,7 @@ export * from './redis-streams';
+ export * from './repeatable-job';
+ export * from './repeatable-options';
+ export * from './repeat-options';
++export * from './retry-options';
+ export * from './script-queue-context';
+ export * from './sandboxed-job-processor';
+ export * from './sandboxed-job';
+diff --git a/src/interfaces/retry-options.ts b/src/interfaces/retry-options.ts
+new file mode 100644
+index 0000000000..ca974600b4
+--- /dev/null
++++ b/src/interfaces/retry-options.ts
+@@ -0,0 +1,14 @@
++/**
++ * Retry method options
++ */
++export interface RetryOptions {
++  /**
++   * Attempts made counter is reset to zero when retrying the job.
++   */
++  resetAttemptsMade?: boolean;
++
++  /**
++   * Attempts started counter is reset to zero when retrying the job.
++   */
++  resetAttemptsStarted?: boolean;
++}

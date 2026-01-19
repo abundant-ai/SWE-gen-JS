@@ -1,0 +1,216 @@
+diff --git a/.changeset/busy-pens-send.md b/.changeset/busy-pens-send.md
+new file mode 100644
+index 0000000000..e0b837916a
+--- /dev/null
++++ b/.changeset/busy-pens-send.md
+@@ -0,0 +1,26 @@
++---
++"@biomejs/biome": minor
++---
++
++Enhanced the `init` command. The `init` command now checks if the existing project contains known ignore files and known generated folders.
++
++If Biome finds `.gitignore` or `.ignore` files, it will add the following configuration to `biome.json`:
++```diff
++{
+++  "vcs": {
+++    "enabled": true,
+++    "clientKind": "git",
+++    "useIgnoreFile": true
+++  }
++}
++```
++
++If Biome finds a `dist/` folder, it will exclude it automatically using the double-exclude syntax:
++
++```diff
++{
+++  "files": {
+++    "includes": ["**", "!!**/dist"]
+++  }
++}
++```
+diff --git a/crates/biome_cli/src/commands/init.rs b/crates/biome_cli/src/commands/init.rs
+index c167d83b25..ae1efca4ac 100644
+--- a/crates/biome_cli/src/commands/init.rs
++++ b/crates/biome_cli/src/commands/init.rs
+@@ -1,27 +1,102 @@
+ use crate::{CliDiagnostic, CliSession};
+-use biome_configuration::Configuration;
++use biome_configuration::vcs::{GIT_IGNORE_FILE_NAME, IGNORE_FILE_NAME, VcsConfiguration};
++use biome_configuration::{Configuration, FilesConfiguration};
++use biome_console::fmt::{Display, Formatter};
+ use biome_console::{ConsoleExt, markup};
++use biome_diagnostics::{Category, Diagnostic, PrintDiagnostic, Severity, category};
+ use biome_fs::ConfigName;
+ use biome_service::configuration::create_config;
+ 
+ pub(crate) fn init(session: CliSession, emit_jsonc: bool) -> Result<(), CliDiagnostic> {
+     let fs = session.app.workspace.fs();
+-    create_config(fs, Configuration::init(), emit_jsonc)?;
++    let working_directory = fs.working_directory().unwrap_or_default();
++    let mut config = Configuration::init();
++    let mut vcs_enabled = false;
++    let mut dist_enabled = false;
++    if fs.path_exists(&working_directory.join(IGNORE_FILE_NAME))
++        || fs.path_exists(&working_directory.join(GIT_IGNORE_FILE_NAME))
++    {
++        vcs_enabled = true;
++        config.vcs = Some(VcsConfiguration::new_git_ignore());
++    }
++
++    if fs.path_exists(&working_directory.join("dist")) {
++        dist_enabled = true;
++        config.files = Some(FilesConfiguration {
++            includes: Some(vec![
++                "**".parse::<biome_glob::NormalizedGlob>().unwrap(),
++                "!!**/dist".parse::<biome_glob::NormalizedGlob>().unwrap(),
++            ]),
++            ignore_unknown: None,
++            max_size: None,
++            experimental_scanner_ignores: None,
++        })
++    }
++
++    create_config(fs, config, emit_jsonc)?;
+     let file_created = if emit_jsonc {
+         ConfigName::biome_jsonc()
+     } else {
+         ConfigName::biome_json()
+     };
+-    session.app.console.log(markup! {
+-"
+-Welcome to Biome! Let's get you started...
++    let diagnostic = InitDiagnostic {
++        dist_enabled,
++        vcs_enabled,
++        file_created,
++    };
++    session
++        .app
++        .console
++        .log(markup! {{PrintDiagnostic::simple(&diagnostic)}});
++
++    Ok(())
++}
++
++#[derive(Debug)]
++struct InitDiagnostic {
++    dist_enabled: bool,
++    vcs_enabled: bool,
++    file_created: &'static str,
++}
++
++impl Diagnostic for InitDiagnostic {
++    fn category(&self) -> Option<&'static Category> {
++        Some(category!("init"))
++    }
++
++    fn severity(&self) -> Severity {
++        Severity::Information
++    }
++
++    fn message(&self, fmt: &mut Formatter<'_>) -> std::io::Result<()> {
++        fmt.write_markup(markup! {
++            {self}
++        })
++    }
++}
++
++impl Display for InitDiagnostic {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::io::Result<()> {
++        f.write_markup(markup! {"Welcome to Biome! Let's get you started...
+ 
+ "<Info><Emphasis>"Files created "</Emphasis></Info>"
+ 
+-  "<Dim>"- "</Dim><Emphasis>{file_created}</Emphasis>"
+-    Your project configuration. See "<Hyperlink href="https://biomejs.dev/reference/configuration">"https://biomejs.dev/reference/configuration"</Hyperlink>"
++  "<Dim>"- "</Dim><Emphasis>{self.file_created}</Emphasis>"
++    Your project configuration. See "<Hyperlink href="https://biomejs.dev/reference/configuration">"https://biomejs.dev/reference/configuration"</Hyperlink>})?;
+ 
+-"<Info><Emphasis>"Next Steps "</Emphasis></Info>"
++        if self.vcs_enabled {
++            f.write_markup(markup!{
++                "\n\nFound an ignore file. Biome enabled "<Hyperlink href="https://biomejs.dev/guides/integrate-in-vcs">"VCS integration."</Hyperlink>
++            })?;
++        }
++
++        if self.dist_enabled {
++            f.write_markup(markup!{
++                "\n\nFound a "<Emphasis>"dist/"</Emphasis>" folder. Biome ignored it "<Hyperlink href="https://biomejs.dev/reference/configuration/#interaction-with-the-scanner">"using the double-exclude syntax."</Hyperlink>
++            })?;
++        }
++
++        f.write_markup(markup! {<Info><Emphasis>"\n\nNext Steps "</Emphasis></Info>"
+ 
+   "<Dim>"1."</Dim>" "<Emphasis>"Setup an editor extension"</Emphasis>"
+      Get live errors as you type and format when you save.
+@@ -42,6 +117,8 @@ Welcome to Biome! Let's get you started...
+      Ask questions and contribute on GitHub: "<Hyperlink href="https://github.com/biomejs/biome">"https://github.com/biomejs/biome"</Hyperlink>"
+      Seek for help on Discord: "<Hyperlink href="https://biomejs.dev/chat">"https://biomejs.dev/chat"</Hyperlink>"
+ "
+-    });
+-    Ok(())
++    })?;
++
++        Ok(())
++    }
+ }
+diff --git a/crates/biome_configuration/src/vcs.rs b/crates/biome_configuration/src/vcs.rs
+index 0b7fd35979..520140e9c9 100644
+--- a/crates/biome_configuration/src/vcs.rs
++++ b/crates/biome_configuration/src/vcs.rs
+@@ -65,6 +65,15 @@ impl VcsConfiguration {
+     pub fn should_use_ignore_file(&self) -> bool {
+         self.use_ignore_file.unwrap_or_default().into()
+     }
++    pub fn new_git_ignore() -> Self {
++        Self {
++            enabled: Some(true.into()),
++            client_kind: Some(VcsClientKind::Git),
++            use_ignore_file: Some(true.into()),
++            root: None,
++            default_branch: None,
++        }
++    }
+ }
+ 
+ impl DeserializableValidator for VcsConfiguration {
+diff --git a/crates/biome_diagnostics_categories/src/categories.rs b/crates/biome_diagnostics_categories/src/categories.rs
+index c00d4cc1f6..49c0f049cd 100644
+--- a/crates/biome_diagnostics_categories/src/categories.rs
++++ b/crates/biome_diagnostics_categories/src/categories.rs
+@@ -408,6 +408,7 @@ define_categories! {
+     "check",
+     "ci",
+     "stdin",
++    "init",
+     "configuration",
+     "assist",
+     "migrate",
+diff --git a/crates/biome_fs/src/fs/memory.rs b/crates/biome_fs/src/fs/memory.rs
+index 105d3e53a2..1418be1409 100644
+--- a/crates/biome_fs/src/fs/memory.rs
++++ b/crates/biome_fs/src/fs/memory.rs
+@@ -201,7 +201,8 @@ impl FileSystem for MemoryFileSystem {
+     }
+ 
+     fn path_exists(&self, path: &Utf8Path) -> bool {
+-        self.path_is_file(path)
++        let files = self.files.0.read();
++        files.contains_key(path)
+     }
+ 
+     fn path_kind(&self, path: &Utf8Path) -> Result<PathKind, FileSystemDiagnostic> {
+diff --git a/packages/@biomejs/backend-jsonrpc/src/workspace.ts b/packages/@biomejs/backend-jsonrpc/src/workspace.ts
+index 596150bd29..5a8a228f61 100644
+--- a/packages/@biomejs/backend-jsonrpc/src/workspace.ts
++++ b/packages/@biomejs/backend-jsonrpc/src/workspace.ts
+@@ -9207,6 +9207,7 @@ export type Category =
+ 	| "check"
+ 	| "ci"
+ 	| "stdin"
++	| "init"
+ 	| "configuration"
+ 	| "assist"
+ 	| "migrate"

@@ -1,0 +1,128 @@
+diff --git a/.changeset/friendly-phones-kneel.md b/.changeset/friendly-phones-kneel.md
+new file mode 100644
+index 0000000000..44a0a82b57
+--- /dev/null
++++ b/.changeset/friendly-phones-kneel.md
+@@ -0,0 +1,19 @@
++---
++'xstate': minor
++---
++
++Params of `actions` and `guards` can now be resolved dynamically
++
++```ts
++createMachine({
++  types: {} as {
++    actions: { type: 'greet'; params: { surname: string } } | { type: 'poke' };
++  },
++  entry: {
++    type: 'greet',
++    params: ({ context }) => ({
++      surname: 'Doe'
++    })
++  }
++});
++```
+diff --git a/packages/core/src/guards.ts b/packages/core/src/guards.ts
+index 31a58ad08e..466129a048 100644
+--- a/packages/core/src/guards.ts
++++ b/packages/core/src/guards.ts
+@@ -6,7 +6,8 @@ import type {
+   ParameterizedObject,
+   AnyState,
+   NoRequiredParams,
+-  NoInfer
++  NoInfer,
++  WithDynamicParams
+ } from './types.ts';
+ import { isStateId } from './stateUtils.ts';
+ 
+@@ -37,7 +38,7 @@ export type Guard<
+   TGuard extends ParameterizedObject
+ > =
+   | NoRequiredParams<TGuard>
+-  | TGuard
++  | WithDynamicParams<TContext, TExpressionEvent, TGuard>
+   | GuardPredicate<TContext, TExpressionEvent, TExpressionGuard, TGuard>;
+ 
+ export type UnknownGuard = UnknownReferencedGuard | UnknownInlineGuard;
+@@ -242,6 +243,11 @@ export function evaluateGuard<
+       ? undefined
+       : typeof guard === 'string'
+       ? { type: guard }
++      : typeof guard.params === 'function'
++      ? {
++          type: guard.type,
++          params: guard.params({ context, event })
++        }
+       : guard
+   };
+ 
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index cfd49ed27f..5dd7cb42c0 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1449,7 +1449,13 @@ export function resolveActionsAndContext<
+         ? undefined
+         : typeof action === 'string'
+         ? { type: action }
+-        : action
++        : typeof action.params === 'function'
++        ? {
++            type: action.type,
++            params: action.params({ context: intermediateState.context, event })
++          }
++        : // TS isn't able to narrow it down here
++          (action as { type: string })
+     };
+ 
+     if (!('resolve' in resolved)) {
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 2c19b46dfe..63c397796b 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -193,6 +193,32 @@ export type NoRequiredParams<T extends ParameterizedObject> = T extends any
+     : never
+   : never;
+ 
++type ConditionalRequired<T, Condition extends boolean> = Condition extends true
++  ? Required<T>
++  : T;
++
++export type WithDynamicParams<
++  TContext extends MachineContext,
++  TExpressionEvent extends EventObject,
++  T extends ParameterizedObject
++> = T extends any
++  ? ConditionalRequired<
++      {
++        type: T['type'];
++        params?:
++          | T['params']
++          | (({
++              context,
++              event
++            }: {
++              context: TContext;
++              event: TExpressionEvent;
++            }) => T['params']);
++      },
++      undefined extends T['params'] ? false : true
++    >
++  : never;
++
+ export type Action<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject,
+@@ -202,8 +228,10 @@ export type Action<
+   TGuard extends ParameterizedObject,
+   TDelay extends string
+ > =
++  // TODO: consider merging `NoRequiredParams` and `WithDynamicParams` into one
++  // this way we could iterate over `TAction` (and `TGuard` in the `Guard` type) once and not twice
+   | NoRequiredParams<TAction>
+-  | TAction
++  | WithDynamicParams<TContext, TExpressionEvent, TAction>
+   | ActionFunction<
+       TContext,
+       TExpressionEvent,

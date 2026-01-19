@@ -1,0 +1,446 @@
+diff --git a/.changeset/stupid-feet-flash.md b/.changeset/stupid-feet-flash.md
+new file mode 100644
+index 0000000000..c150d34d1c
+--- /dev/null
++++ b/.changeset/stupid-feet-flash.md
+@@ -0,0 +1,30 @@
++---
++'xstate': major
++---
++
++The final `output` of a state machine is now specified directly in the `output` property of the machine config:
++
++```ts
++const machine = createMachine({
++  initial: 'started',
++  states: {
++    started: {
++      // ...
++    },
++    finished: {
++      type: 'final'
++      // moved to the top level
++      //
++      // output: {
++      //   status: 200
++      // }
++    }
++  },
++  // This will be the final output of the machine
++  // present on `snapshot.output` and in the done events received by the parent
++  // when the machine reaches the top-level final state ("finished")
++  output: {
++    status: 200
++  }
++});
++```
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 76ff47576b..93f5e1076e 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -49,6 +49,7 @@ import type {
+ } from './types.ts';
+ import { isErrorActorEvent, resolveReferencedActor } from './utils.ts';
+ import { createActor } from './interpreter.ts';
++import isDevelopment from '#is-development';
+ 
+ export const STATE_IDENTIFIER = '#';
+ export const WILDCARD = '*';
+@@ -193,6 +194,18 @@ export class StateMachine<
+ 
+     this.states = this.root.states; // TODO: remove!
+     this.events = this.root.events;
++
++    if (
++      isDevelopment &&
++      !this.root.output &&
++      Object.values(this.states).some(
++        (state) => state.type === 'final' && !!state.output
++      )
++    ) {
++      console.warn(
++        'Missing `machine.output` declaration (top-level final state with output detected)'
++      );
++    }
+   }
+ 
+   /**
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index 9a37b76796..d2f6fd793b 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -13,7 +13,6 @@ import {
+ import type {
+   DelayedTransitionDefinition,
+   EventObject,
+-  FinalStateNodeConfig,
+   InitialTransitionDefinition,
+   InvokeDefinition,
+   MachineContext,
+@@ -29,7 +28,8 @@ import type {
+   ParameterizedObject,
+   AnyStateMachine,
+   AnyStateNodeConfig,
+-  ProvidedActor
++  ProvidedActor,
++  NonReducibleUnknown
+ } from './types.ts';
+ import {
+   createInvokeId,
+@@ -134,7 +134,9 @@ export class StateNode<
+   /**
+    * The output data sent with the "xstate.done.state._id_" event if this is a final state node.
+    */
+-  public output?: Mapper<TContext, TEvent, any>;
++  public output?:
++    | Mapper<MachineContext, EventObject, unknown, EventObject>
++    | NonReducibleUnknown;
+ 
+   /**
+    * The order this state node appears. Corresponds to the implicit document order.
+@@ -216,9 +218,7 @@ export class StateNode<
+ 
+     this.meta = this.config.meta;
+     this.output =
+-      this.type === 'final'
+-        ? (this.config as FinalStateNodeConfig<TContext, TEvent>).output
+-        : undefined;
++      this.type === 'final' || !this.parent ? this.config.output : undefined;
+     this.tags = toArray(config.tags).slice();
+   }
+ 
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 3dfe23403d..70610b78be 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -45,7 +45,7 @@ import {
+ } from './types.ts';
+ import {
+   isArray,
+-  mapContext,
++  resolveOutput,
+   normalizeTarget,
+   toArray,
+   toStatePath,
+@@ -67,15 +67,26 @@ function getOutput<TContext extends MachineContext, TEvent extends EventObject>(
+   event: TEvent,
+   self: AnyActorRef
+ ) {
+-  const machine = configuration[0].machine;
++  const { machine } = configuration[0];
++  const { root } = machine;
++
++  if (!root.output) {
++    return undefined;
++  }
++
+   const finalChildStateNode = configuration.find(
+     (stateNode) =>
+       stateNode.type === 'final' && stateNode.parent === machine.root
++  )!;
++
++  const doneStateEvent = createDoneStateEvent(
++    finalChildStateNode.id,
++    finalChildStateNode.output
++      ? resolveOutput(finalChildStateNode.output, context, event, self)
++      : undefined
+   );
+ 
+-  return finalChildStateNode && finalChildStateNode.output
+-    ? mapContext(finalChildStateNode.output, context, event, self)
+-    : undefined;
++  return resolveOutput(root.output, context, doneStateEvent, self);
+ }
+ 
+ export const isAtomicStateNode = (stateNode: StateNode<any, any>) =>
+@@ -1178,7 +1189,7 @@ function enterStates(
+         createDoneStateEvent(
+           parent!.id,
+           stateNodeToEnter.output
+-            ? mapContext(
++            ? resolveOutput(
+                 stateNodeToEnter.output,
+                 currentState.context,
+                 event,
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index a5fe64d115..da0353234e 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -361,7 +361,9 @@ export interface InvokeDefinition<
+    */
+   src: string;
+ 
+-  input?: Mapper<TContext, TEvent, NonReducibleUnknown> | NonReducibleUnknown;
++  input?:
++    | Mapper<TContext, TEvent, NonReducibleUnknown, TEvent>
++    | NonReducibleUnknown;
+   /**
+    * The transition to take upon the invoked child machine reaching its final top-level state.
+    */
+@@ -584,7 +586,7 @@ type DistributeActors<
+         // in a sense, we shouldn't - they could be provided within the `implementations` object
+         // how do we verify if the required input has been provided?
+         input?:
+-          | Mapper<TContext, TEvent, InputFrom<TSpecificActor['logic']>>
++          | Mapper<TContext, TEvent, InputFrom<TSpecificActor['logic']>, TEvent>
+           | InputFrom<TSpecificActor['logic']>;
+         /**
+          * The transition to take upon the invoked child machine reaching its final top-level state.
+@@ -673,7 +675,7 @@ export type InvokeConfig<
+       src: AnyActorLogic | string; // TODO: fix types
+ 
+       input?:
+-        | Mapper<TContext, TEvent, NonReducibleUnknown>
++        | Mapper<TContext, TEvent, NonReducibleUnknown, TEvent>
+         | NonReducibleUnknown;
+       /**
+        * The transition to take upon the invoked child machine reaching its final top-level state.
+@@ -860,7 +862,7 @@ export interface StateNodeConfig<
+    * The output data will be evaluated with the current `context` and placed on the `.data` property
+    * of the event.
+    */
+-  output?: Mapper<TContext, TEvent, TOutput> | TOutput;
++  output?: Mapper<TContext, TEvent, unknown, TEvent> | NonReducibleUnknown;
+   /**
+    * The unique ID of the state node, which can be referenced as a transition target via the
+    * `#id` syntax.
+@@ -915,7 +917,16 @@ export interface StateNodeDefinition<
+   exit: UnknownAction[];
+   meta: any;
+   order: number;
+-  output?: FinalStateNodeConfig<TContext, TEvent>['output'];
++  output?: StateNodeConfig<
++    TContext,
++    TEvent,
++    ProvidedActor,
++    ParameterizedObject,
++    ParameterizedObject,
++    string,
++    string,
++    unknown
++  >['output'];
+   invoke: Array<InvokeDefinition<TContext, TEvent, TODO, TODO, TODO, TODO>>;
+   description?: string;
+   tags: string[];
+@@ -980,18 +991,6 @@ export interface HistoryStateNodeConfig<
+   target: string | undefined;
+ }
+ 
+-export interface FinalStateNodeConfig<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> extends AtomicStateNodeConfig<TContext, TEvent> {
+-  type: 'final';
+-  /**
+-   * The data to be sent with the "xstate.done.state.<id>" event. The data can be
+-   * static or dynamic (based on assigners).
+-   */
+-  output?: Mapper<TContext, TEvent, any>;
+-}
+-
+ export type SimpleOrStateNodeConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+@@ -1058,7 +1057,10 @@ export interface MachineImplementationsSimplified<
+   actors: Record<
+     string,
+     | AnyActorLogic
+-    | { src: AnyActorLogic; input: Mapper<TContext, TEvent, any> | any }
++    | {
++        src: AnyActorLogic;
++        input: Mapper<TContext, TEvent, unknown, TEvent> | NonReducibleUnknown;
++      }
+   >;
+   delays: DelayFunctionMap<TContext, TEvent, TAction>;
+ }
+@@ -1127,7 +1129,8 @@ type MachineImplementationsActors<
+           | Mapper<
+               TContext,
+               MaybeNarrowedEvent<TIndexedEvents, TEventsCausingActors, K>,
+-              InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>
++              InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>,
++              Cast<Prop<TIndexedEvents, keyof TIndexedEvents>, EventObject>
+             >
+           | InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>;
+       };
+@@ -1324,42 +1327,6 @@ export type ContextFactory<
+   TInput
+ > = ({ spawn, input }: { spawn: Spawner<TActor>; input: TInput }) => TContext;
+ 
+-type RootStateNodeConfig<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject,
+-  TActor extends ProvidedActor,
+-  TAction extends ParameterizedObject,
+-  TGuard extends ParameterizedObject,
+-  TDelay extends string,
+-  TTag extends string,
+-  TOutput
+-> = Omit<
+-  StateNodeConfig<
+-    TContext,
+-    TEvent,
+-    TActor,
+-    TAction,
+-    TGuard,
+-    TDelay,
+-    TTag,
+-    TOutput
+-  >,
+-  'states'
+-> & {
+-  states?:
+-    | StatesConfig<
+-        TContext,
+-        TEvent,
+-        TActor,
+-        TAction,
+-        TGuard,
+-        TDelay,
+-        TTag,
+-        TOutput
+-      >
+-    | undefined;
+-};
+-
+ export type MachineConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject,
+@@ -1371,15 +1338,18 @@ export type MachineConfig<
+   TInput = any,
+   TOutput = unknown,
+   TTypesMeta = TypegenDisabled
+-> = (RootStateNodeConfig<
+-  NoInfer<TContext>,
+-  NoInfer<TEvent>,
+-  NoInfer<TActor>,
+-  NoInfer<TAction>,
+-  NoInfer<TGuard>,
+-  NoInfer<TDelay>,
+-  NoInfer<TTag>,
+-  NoInfer<TOutput>
++> = (Omit<
++  StateNodeConfig<
++    NoInfer<TContext>,
++    NoInfer<TEvent>,
++    NoInfer<TActor>,
++    NoInfer<TAction>,
++    NoInfer<TGuard>,
++    NoInfer<TDelay>,
++    NoInfer<TTag>,
++    NoInfer<TOutput>
++  >,
++  'output'
+ > & {
+   /**
+    * The initial context (extended state)
+@@ -1400,6 +1370,8 @@ export type MachineConfig<
+     TOutput,
+     TTypesMeta
+   >;
++  // TODO: make it conditionally required
++  output?: Mapper<TContext, DoneStateEvent, TOutput, TEvent> | TOutput;
+ }) &
+   (Equals<TContext, MachineContext> extends true
+     ? { context?: InitialContext<LowInfer<TContext>, TActor, TInput> }
+@@ -1638,22 +1610,18 @@ export type PropertyAssigner<
+ 
+ export type Mapper<
+   TContext extends MachineContext,
+-  TEvent extends EventObject,
+-  TResult
++  TExpressionEvent extends EventObject,
++  TResult,
++  TEvent extends EventObject
+ > = (args: {
+   context: TContext;
+-  event: TEvent;
+-  self: ActorRef<TEvent, any>;
++  event: TExpressionEvent;
++  self: ActorRef<
++    TEvent,
++    MachineSnapshot<TContext, TEvent, ProvidedActor, string, unknown>
++  >;
+ }) => TResult;
+ 
+-export type PropertyMapper<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject,
+-  TParams extends {}
+-> = {
+-  [K in keyof TParams]?: Mapper<TContext, TEvent, TParams[K]> | TParams[K];
+-};
+-
+ export interface TransitionDefinition<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index 2607fc6b36..026dde6bc5 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -6,7 +6,6 @@ import type {
+   ActorLogic,
+   AnyEventObject,
+   EventObject,
+-  InvokeConfig,
+   MachineContext,
+   Mapper,
+   Observer,
+@@ -15,12 +14,10 @@ import type {
+   StateLike,
+   StateValue,
+   Subscribable,
+-  TransitionConfig,
+   TransitionConfigTarget,
+-  TODO,
+   AnyActorRef,
+   AnyTransitionConfig,
+-  AnyInvokeConfig
++  NonReducibleUnknown
+ } from './types.ts';
+ 
+ export function keys<T extends object>(value: T): Array<keyof T & string> {
+@@ -225,21 +222,24 @@ export function toArray<T>(value: readonly T[] | T | undefined): readonly T[] {
+   return toArrayStrict(value);
+ }
+ 
+-export function mapContext<
++export function resolveOutput<
+   TContext extends MachineContext,
+-  TEvent extends EventObject
++  TExpressionEvent extends EventObject
+ >(
+-  mapper: Mapper<TContext, TEvent, any>,
++  mapper:
++    | Mapper<TContext, TExpressionEvent, unknown, EventObject>
++    | NonReducibleUnknown,
+   context: TContext,
+-  event: TEvent,
++  event: TExpressionEvent,
+   self: AnyActorRef
+-): any {
++): unknown {
+   if (typeof mapper === 'function') {
+     return mapper({ context, event, self });
+   }
+ 
+   if (
+     isDevelopment &&
++    !!mapper &&
+     typeof mapper === 'object' &&
+     Object.values(mapper).some((val) => typeof val === 'function')
+   ) {
+@@ -412,7 +412,12 @@ export function createInvokeId(stateNodeId: string, index: number): string {
+ export function resolveReferencedActor(
+   referenced:
+     | AnyActorLogic
+-    | { src: AnyActorLogic; input: Mapper<any, any, any> | any }
++    | {
++        src: AnyActorLogic;
++        input:
++          | Mapper<MachineContext, EventObject, unknown, EventObject>
++          | NonReducibleUnknown;
++      }
+     | undefined
+ ) {
+   return referenced

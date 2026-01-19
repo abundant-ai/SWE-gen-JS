@@ -1,0 +1,128 @@
+diff --git a/changelog_unreleased/mdx/17996.md b/changelog_unreleased/mdx/17996.md
+new file mode 100644
+index 000000000..371c82c87
+--- /dev/null
++++ b/changelog_unreleased/mdx/17996.md
+@@ -0,0 +1,18 @@
++#### Fix `import` and `export` parsing (#17996 by @kovsu & @fisker)
++
++<!-- prettier-ignore -->
++```mdx
++{/* Input */}
++- import is a word in lists
++- export is a word in lists, too!
++
++{/* Prettier stable */}
++- import is a word in list
++  s
++- export is a word in lists, too
++  !
++
++{/* Prettier main */}
++- import is a word in lists
++- export is a word in lists, too!
++```
+diff --git a/src/language-markdown/embed.js b/src/language-markdown/embed.js
+index 5108091f4..c017487a4 100644
+--- a/src/language-markdown/embed.js
++++ b/src/language-markdown/embed.js
+@@ -57,7 +57,12 @@ function embed(path, options) {
+     // MDX
+     case "import":
+     case "export":
+-      return (textToDoc) => textToDoc(node.value, { parser: "babel" });
++      return (textToDoc) =>
++        textToDoc(node.value, {
++          // TODO: Rename this option since it's not used in HTML
++          __onHtmlBindingRoot: (ast) => validateImportExport(ast, node.type),
++          parser: "babel",
++        });
+     case "jsx":
+       return (textToDoc) =>
+         textToDoc(`<$>${node.value}</$>`, {
+@@ -69,4 +74,22 @@ function embed(path, options) {
+   return null;
+ }
+ 
++function validateImportExport(ast, type) {
++  const {
++    program: { body },
++  } = ast;
++
++  // https://github.com/mdx-js/mdx/blob/3430138958c9c0344ecad9d59e0d6b5d72bedae3/packages/remark-mdx/extract-imports-and-exports.js#L16
++  if (
++    !body.every(
++      (node) =>
++        node.type === "ImportDeclaration" ||
++        node.type === "ExportDefaultDeclaration" ||
++        node.type === "ExportNamedDeclaration",
++    )
++  ) {
++    throw new Error(`Unexpected '${type}' in MDX.`);
++  }
++}
++
+ export default embed;
+diff --git a/src/language-markdown/mdx.js b/src/language-markdown/mdx.js
+index 3dd36a77a..f5d1aa918 100644
+--- a/src/language-markdown/mdx.js
++++ b/src/language-markdown/mdx.js
+@@ -1,5 +1,5 @@
+ /**
+- * modified from https://github.com/mdx-js/mdx/blob/master/packages/mdx
++ * modified from https://github.com/mdx-js/mdx/blob/c91b00c673bcf3e7c28b861fd692b69016026c45/packages/remark-mdx/index.js
+  *
+  * The MIT License (MIT)
+  *
+@@ -31,12 +31,13 @@ const EMPTY_NEWLINE = "\n\n";
+ 
+ const isImport = (text) => IMPORT_REGEX.test(text);
+ const isExport = (text) => EXPORT_REGEX.test(text);
++const isImportOrExport = (text) => isImport(text) || isExport(text);
+ 
+ const tokenizeEsSyntax = (eat, value) => {
+   const index = value.indexOf(EMPTY_NEWLINE);
+-  const subvalue = value.slice(0, index);
++  const subvalue = index === -1 ? value : value.slice(0, index);
+ 
+-  if (isExport(subvalue) || isImport(subvalue)) {
++  if (isImportOrExport(subvalue)) {
+     return eat(subvalue)({
+       type: isExport(subvalue) ? "export" : "import",
+       value: subvalue,
+@@ -44,6 +45,11 @@ const tokenizeEsSyntax = (eat, value) => {
+   }
+ };
+ 
++tokenizeEsSyntax.notInBlock = true;
++
++tokenizeEsSyntax.locator = (value /* , fromIndex*/) =>
++  isImportOrExport(value) ? -1 : 1;
++
+ const tokenizeEsComment = (eat, value) => {
+   const match = ES_COMMENT_REGEX.exec(value);
+ 
+@@ -55,10 +61,6 @@ const tokenizeEsComment = (eat, value) => {
+   }
+ };
+ 
+-/* c8 ignore next 2 */
+-tokenizeEsSyntax.locator = (value /* , fromIndex*/) =>
+-  isExport(value) || isImport(value) ? -1 : 1;
+-
+ tokenizeEsComment.locator = (value, fromIndex) => value.indexOf("{", fromIndex);
+ 
+ /** @import {Plugin, Settings} from "unified" */
+diff --git a/src/language-markdown/printer-markdown.js b/src/language-markdown/printer-markdown.js
+index 06db9a182..55e43f8d8 100644
+--- a/src/language-markdown/printer-markdown.js
++++ b/src/language-markdown/printer-markdown.js
+@@ -432,7 +432,7 @@ function genericPrint(path, options, print) {
+     case "import":
+     case "export":
+     case "jsx":
+-      return node.value;
++      return node.value.trimEnd();
+     case "esComment":
+       return ["{/* ", node.value, " */}"];
+     case "math":

@@ -1,0 +1,159 @@
+diff --git a/.changeset/silent-turtles-walk.md b/.changeset/silent-turtles-walk.md
+new file mode 100644
+index 0000000000..5e525b4bae
+--- /dev/null
++++ b/.changeset/silent-turtles-walk.md
+@@ -0,0 +1,5 @@
++---
++"@biomejs/biome": minor
++---
++
++Added the `useAriaPropsForRole` lint rule for HTML. The rule enforces that elements with ARIA roles must have all required ARIA attributes for that role.
+diff --git a/crates/biome_html_analyze/src/lint/a11y.rs b/crates/biome_html_analyze/src/lint/a11y.rs
+index 5d4dc8240a..4d6b2aa688 100644
+--- a/crates/biome_html_analyze/src/lint/a11y.rs
++++ b/crates/biome_html_analyze/src/lint/a11y.rs
+@@ -6,8 +6,9 @@ use biome_analyze::declare_lint_group;
+ pub mod no_access_key;
+ pub mod no_distracting_elements;
+ pub mod no_header_scope;
++pub mod use_aria_props_for_role;
+ pub mod use_button_type;
+ pub mod use_html_lang;
+ pub mod use_iframe_title;
+ pub mod use_valid_aria_role;
+-declare_lint_group! { pub A11y { name : "a11y" , rules : [self :: no_access_key :: NoAccessKey , self :: no_distracting_elements :: NoDistractingElements , self :: no_header_scope :: NoHeaderScope , self :: use_button_type :: UseButtonType , self :: use_html_lang :: UseHtmlLang , self :: use_iframe_title :: UseIframeTitle , self :: use_valid_aria_role :: UseValidAriaRole ,] } }
++declare_lint_group! { pub A11y { name : "a11y" , rules : [self :: no_access_key :: NoAccessKey , self :: no_distracting_elements :: NoDistractingElements , self :: no_header_scope :: NoHeaderScope , self :: use_aria_props_for_role :: UseAriaPropsForRole , self :: use_button_type :: UseButtonType , self :: use_html_lang :: UseHtmlLang , self :: use_iframe_title :: UseIframeTitle , self :: use_valid_aria_role :: UseValidAriaRole ,] } }
+diff --git a/crates/biome_html_analyze/src/lint/a11y/use_aria_props_for_role.rs b/crates/biome_html_analyze/src/lint/a11y/use_aria_props_for_role.rs
+new file mode 100644
+index 0000000000..28ee3937f0
+--- /dev/null
++++ b/crates/biome_html_analyze/src/lint/a11y/use_aria_props_for_role.rs
+@@ -0,0 +1,108 @@
++use biome_analyze::RuleSource;
++use biome_analyze::context::RuleContext;
++use biome_analyze::{Ast, Rule, RuleDiagnostic, declare_lint_rule};
++use biome_aria_metadata::AriaRole;
++use biome_console::markup;
++use biome_diagnostics::Severity;
++use biome_html_syntax::{AnyHtmlElement, HtmlAttribute};
++use biome_rowan::{AstNode, Text};
++use biome_rule_options::use_aria_props_supported_by_role::UseAriaPropsSupportedByRoleOptions;
++
++declare_lint_rule! {
++    /// Enforce that elements with ARIA roles must have all required ARIA attributes for that role.
++    ///
++    /// Remember that this rule only supports static values for the `role` attribute.
++    /// Dynamic `role` values are not checked.
++    ///
++    /// ## Examples
++    ///
++    /// ### Invalid
++    ///
++    /// ```html,expect_diagnostic
++    /// <span role="checkbox"></span>
++    /// ```
++    ///
++    /// ```html,expect_diagnostic
++    /// <span role="heading"></span>
++    /// ```
++    ///
++    /// ### Valid
++    ///
++    /// ```html
++    /// <span role="checkbox" aria-checked="true"></span>
++    /// ```
++    ///
++    /// ```html
++    /// <span role="heading" aria-level="1"></span>
++    /// ```
++    ///
++    ///
++    /// ## Accessibility guidelines
++    /// - [WCAG 4.1.2](https://www.w3.org/WAI/WCAG21/Understanding/name-role-value)
++    ///
++    /// ### Resources
++    /// - [ARIA Spec, Roles](https://www.w3.org/TR/wai-aria/#roles)
++    /// - [Chrome Audit Rules, AX_ARIA_03](https://github.com/GoogleChrome/accessibility-developer-tools/wiki/Audit-Rules#ax_aria_03)
++    ///
++    pub UseAriaPropsForRole {
++        version: "next",
++        name: "useAriaPropsForRole",
++        language: "html",
++        sources: &[RuleSource::EslintJsxA11y("role-has-required-aria-props").same()],
++        recommended: true,
++        severity: Severity::Error,
++    }
++}
++
++#[derive(Default, Debug)]
++pub struct UseAriaPropsForRoleState {
++    missing_aria_props: Box<[&'static str]>,
++    attribute: Option<(HtmlAttribute, Text)>,
++}
++
++impl Rule for UseAriaPropsForRole {
++    type Query = Ast<AnyHtmlElement>;
++    type State = UseAriaPropsForRoleState;
++    type Signals = Option<Self::State>;
++    type Options = UseAriaPropsSupportedByRoleOptions;
++
++    fn run(ctx: &RuleContext<Self>) -> Self::Signals {
++        let node = ctx.query();
++
++        let role_attribute = node.find_attribute_by_name("role")?;
++        let role_attribute_name = role_attribute.initializer()?.value().ok()?.string_value()?;
++        let role = AriaRole::from_roles(role_attribute_name.trim());
++        let missing_aria_props: Vec<_> = role
++            .into_iter()
++            .flat_map(|role| role.required_attributes().iter())
++            .filter_map(|attribute| {
++                let attribute_name = attribute.as_str();
++                node.find_attribute_by_name(attribute_name)
++                    .is_none()
++                    .then_some(attribute_name)
++            })
++            .collect();
++        if missing_aria_props.is_empty() {
++            return None;
++        }
++
++        Some(UseAriaPropsForRoleState {
++            attribute: Some((role_attribute, role_attribute_name)),
++            missing_aria_props: missing_aria_props.into_boxed_slice(),
++        })
++    }
++
++    fn diagnostic(_ctx: &RuleContext<Self>, state: &Self::State) -> Option<RuleDiagnostic> {
++        state.attribute.as_ref().map(|(attribute, role_name)| {
++            let role_name = role_name.trim();
++            RuleDiagnostic::new(
++                rule_category!(),
++                attribute.range(),
++                markup! {
++                "The element with the "<Emphasis>{role_name}</Emphasis>" ARIA role does not have the required ARIA attributes."
++                },
++            )
++            .footer_list(markup! { "Missing ARIA prop(s):" }, &state.missing_aria_props)
++        })
++    }
++}
+diff --git a/xtask/codegen/src/generate_new_analyzer_rule.rs b/xtask/codegen/src/generate_new_analyzer_rule.rs
+index b385ecca5c..7fac49a984 100644
+--- a/xtask/codegen/src/generate_new_analyzer_rule.rs
++++ b/xtask/codegen/src/generate_new_analyzer_rule.rs
+@@ -543,12 +543,12 @@ pub fn generate_new_analyzer_rule(kind: LanguageKind, category: Category, rule_n
+     } else {
+         rule_kind
+     };
+-    let valid_contents = if matches!(kind, LanguageKind::HtmlVue) {
++    let valid_contents = if matches!(kind, LanguageKind::HtmlVue | LanguageKind::Html) {
+         "<!-- should not generate diagnostics -->\n<div>ok</div>"
+     } else {
+         "/* should not generate diagnostics */\n// var a = 1;"
+     };
+-    let invalid_contents = if matches!(kind, LanguageKind::HtmlVue) {
++    let invalid_contents = if matches!(kind, LanguageKind::HtmlVue | LanguageKind::Html) {
+         "<!-- should generate diagnostics -->\n<div></div>"
+     } else {
+         "/* should generate diagnostics */\nvar a = 1;\na = 2;\na = 3;"

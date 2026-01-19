@@ -1,0 +1,365 @@
+diff --git a/index.js b/index.js
+index cb55f7d..439ff17 100644
+--- a/index.js
++++ b/index.js
+@@ -7,6 +7,7 @@ const Transform = require('stream').Transform;
+ const urlLib = require('url');
+ const fs = require('fs');
+ const querystring = require('querystring');
++const CacheableRequest = require('cacheable-request');
+ const duplexer3 = require('duplexer3');
+ const intoStream = require('into-stream');
+ const isStream = require('is-stream');
+@@ -87,7 +88,8 @@ function requestAsEventEmitter(opts) {
+ 
+ 		let progressInterval;
+ 
+-		const req = fn.request(opts, res => {
++		const cacheableRequest = new CacheableRequest(fn.request, opts.cache);
++		const cacheReq = cacheableRequest(opts, res => {
+ 			clearInterval(progressInterval);
+ 
+ 			ee.emit('uploadProgress', {
+@@ -172,7 +174,7 @@ function requestAsEventEmitter(opts) {
+ 
+ 				const response = opts.decompress === true &&
+ 					typeof decompressResponse === 'function' &&
+-					req.method !== 'HEAD' ? decompressResponse(progressStream) : progressStream;
++					opts.method !== 'HEAD' ? decompressResponse(progressStream) : progressStream;
+ 
+ 				if (!opts.decompress && ['gzip', 'deflate'].indexOf(res.headers['content-encoding']) !== -1) {
+ 					opts.encoding = null;
+@@ -190,62 +192,66 @@ function requestAsEventEmitter(opts) {
+ 			});
+ 		});
+ 
+-		req.once('error', err => {
+-			clearInterval(progressInterval);
++		cacheReq.on('error', err => ee.emit('error', new got.CacheError(err, opts)));
+ 
+-			const backoff = opts.retries(++retryCount, err);
++		cacheReq.on('request', req => {
++			req.once('error', err => {
++				clearInterval(progressInterval);
+ 
+-			if (backoff) {
+-				setTimeout(get, backoff, opts);
+-				return;
+-			}
++				const backoff = opts.retries(++retryCount, err);
+ 
+-			ee.emit('error', new got.RequestError(err, opts));
+-		});
++				if (backoff) {
++					setTimeout(get, backoff, opts);
++					return;
++				}
+ 
+-		ee.on('request', req => {
+-			ee.emit('uploadProgress', {
+-				percent: 0,
+-				transferred: 0,
+-				total: uploadBodySize
++				ee.emit('error', new got.RequestError(err, opts));
+ 			});
+ 
+-			req.connection.on('connect', () => {
+-				const uploadEventFrequency = 150;
++			ee.on('request', req => {
++				ee.emit('uploadProgress', {
++					percent: 0,
++					transferred: 0,
++					total: uploadBodySize
++				});
+ 
+-				progressInterval = setInterval(() => {
+-					const lastUploaded = uploaded;
+-					const headersSize = Buffer.byteLength(req._header);
+-					uploaded = req.connection.bytesWritten - headersSize;
++				req.connection.on('connect', () => {
++					const uploadEventFrequency = 150;
+ 
+-					// Prevent the known issue of `bytesWritten` being larger than body size
+-					if (uploadBodySize && uploaded > uploadBodySize) {
+-						uploaded = uploadBodySize;
+-					}
++					progressInterval = setInterval(() => {
++						const lastUploaded = uploaded;
++						const headersSize = Buffer.byteLength(req._header);
++						uploaded = req.connection.bytesWritten - headersSize;
+ 
+-					// Don't emit events with unchanged progress and
+-					// prevent last event from being emitted, because
+-					// it's emitted when `response` is emitted
+-					if (uploaded === lastUploaded || uploaded === uploadBodySize) {
+-						return;
+-					}
++						// Prevent the known issue of `bytesWritten` being larger than body size
++						if (uploadBodySize && uploaded > uploadBodySize) {
++							uploaded = uploadBodySize;
++						}
++
++						// Don't emit events with unchanged progress and
++						// prevent last event from being emitted, because
++						// it's emitted when `response` is emitted
++						if (uploaded === lastUploaded || uploaded === uploadBodySize) {
++							return;
++						}
+ 
+-					ee.emit('uploadProgress', {
+-						percent: uploadBodySize ? uploaded / uploadBodySize : 0,
+-						transferred: uploaded,
+-						total: uploadBodySize
+-					});
+-				}, uploadEventFrequency);
++						ee.emit('uploadProgress', {
++							percent: uploadBodySize ? uploaded / uploadBodySize : 0,
++							transferred: uploaded,
++							total: uploadBodySize
++						});
++					}, uploadEventFrequency);
++				});
+ 			});
+-		});
+ 
+-		if (opts.gotTimeout) {
+-			clearInterval(progressInterval);
+-			timedOut(req, opts.gotTimeout);
+-		}
++			if (opts.gotTimeout) {
++				clearInterval(progressInterval);
++				timedOut(req, opts.gotTimeout);
++			}
+ 
+-		setImmediate(() => {
+-			ee.emit('request', req);
++			setImmediate(() => {
++				ee.emit('request', req);
++			});
+ 		});
+ 	};
+ 
+@@ -270,7 +276,7 @@ function asPromise(opts) {
+ 
+ 	const proxy = new EventEmitter();
+ 
+-	const cancelable = new PCancelable((onCancel, resolve, reject) => {
++	const promise = timeoutFn(new PCancelable((onCancel, resolve, reject) => {
+ 		const ee = requestAsEventEmitter(opts);
+ 		let cancelOnRequest = false;
+ 
+@@ -332,11 +338,7 @@ function asPromise(opts) {
+ 		ee.on('error', reject);
+ 		ee.on('uploadProgress', proxy.emit.bind(proxy, 'uploadProgress'));
+ 		ee.on('downloadProgress', proxy.emit.bind(proxy, 'downloadProgress'));
+-	});
+-
+-	const promise = timeoutFn(cancelable);
+-
+-	promise.cancel = cancelable.cancel.bind(cancelable);
++	}));
+ 
+ 	promise.on = (name, fn) => {
+ 		proxy.on(name, fn);
+@@ -434,8 +436,9 @@ function normalizeArguments(url, opts) {
+ 		{
+ 			path: '',
+ 			retries: 2,
++			cache: false,
+ 			decompress: true,
+-			useElectronNet: false
++			useElectronNet: true
+ 		},
+ 		url,
+ 		{
+@@ -571,7 +574,6 @@ for (const method of methods) {
+ class StdError extends Error {
+ 	constructor(message, error, opts) {
+ 		super(message);
+-		Error.captureStackTrace(this, this.constructor);
+ 		this.name = 'StdError';
+ 
+ 		if (error.code !== undefined) {
+@@ -589,6 +591,13 @@ class StdError extends Error {
+ 	}
+ }
+ 
++got.CacheError = class extends StdError {
++	constructor(error, opts) {
++		super(error.message, error, opts);
++		this.name = 'CacheError';
++	}
++};
++
+ got.RequestError = class extends StdError {
+ 	constructor(error, opts) {
+ 		super(error.message, error, opts);
+@@ -640,6 +649,4 @@ got.UnsupportedProtocolError = class extends StdError {
+ 	}
+ };
+ 
+-got.CancelError = PCancelable.CancelError;
+-
+ module.exports = got;
+diff --git a/package.json b/package.json
+index d6a5e60..46a5f37 100644
+--- a/package.json
++++ b/package.json
+@@ -50,6 +50,7 @@
+ 		"electron"
+ 	],
+ 	"dependencies": {
++		"cacheable-request": "^2.0.0",
+ 		"decompress-response": "^3.2.0",
+ 		"duplexer3": "^0.1.4",
+ 		"get-stream": "^3.0.0",
+diff --git a/readme.md b/readme.md
+index 65e019c..147e849 100644
+--- a/readme.md
++++ b/readme.md
+@@ -19,6 +19,7 @@ Created because [`request`](https://github.com/request/request) is bloated *(sev
+ 
+ - [Promise & stream API](#api)
+ - [Request cancelation](#aborting-the-request)
++- [RFC compliant caching](#cache-adapters)
+ - [Follows redirects](#followredirect)
+ - [Retries on network failure](#retries)
+ - [Progress events](#onuploadprogress-progress)
+@@ -69,6 +70,10 @@ It's a `GET` request by default, but can be changed in `options`.
+ 
+ Returns a Promise for a `response` object with a `body` property, a `url` property with the request URL or the final URL after redirects, and a `requestUrl` property with the original request URL.
+ 
++The response object will normally be a [Node.js HTTP response stream](https://nodejs.org/api/http.html#http_class_http_incomingmessage), however if returned from the cache it will be a [responselike object](https://github.com/lukechilds/responselike) which behaves in the same way.
++
++The response will also have a `fromCache` property set with a boolean value.
++
+ ##### url
+ 
+ Type: `string` `Object`
+@@ -170,12 +175,19 @@ Decompress the response automatically.
+ 
+ If this is disabled, a compressed response is returned as a `Buffer`. This may be useful if you want to handle decompression yourself or stream the raw compressed data.
+ 
++###### cache
++
++Type: `Object`<br>
++Default: `false`
++
++[Cache adapter instance](#cache-adapters) for storing cached data.
++
+ ###### useElectronNet
+ 
+ Type: `boolean`<br>
+-Default: `false`
++Default: `true`
+ 
+-When used in Electron, Got will use [`electron.net`](https://electron.atom.io/docs/api/net/) instead of the Node.js `http` module. According to the Electron docs, it should be fully compatible, but it's not entirely. See [#315](https://github.com/sindresorhus/got/issues/315).
++When used in Electron, Got will automatically use [`electron.net`](https://electron.atom.io/docs/api/net/) instead of the Node.js `http` module. It should be fully compatible, but you can turn it off here if you encounter a problem. Please open an issue if you do!
+ 
+ 
+ #### Streams
+@@ -253,6 +265,10 @@ Each error contains (if available) `statusCode`, `statusMessage`, `host`, `hostn
+ 
+ In Promise mode, the `response` is attached to the error.
+ 
++#### got.CacheError
++
++When a cache method fails, for example if the database goes down, or there's a filesystem error.
++
+ #### got.RequestError
+ 
+ When a request fails. Contains a `code` property with error class code, like `ECONNREFUSED`.
+@@ -277,45 +293,63 @@ When server redirects you more than 10 times. Includes a `redirectUrls` property
+ 
+ When given an unsupported protocol.
+ 
+-#### got.CancelError
+ 
+-When the request is aborted with `.cancel()`.
++## Aborting the request
+ 
++The promise returned by Got has a `.cancel()` function which, when called, aborts the request.
+ 
+-## Aborting the request
++<a name="cache-adapters"></a>
++## Cache
+ 
+-The promise returned by Got has a [`.cancel()`](https://github.com/sindresorhus/p-cancelable) method which, when called, aborts the request.
++You can use the JavaScript `Map` type as an in memory cache:
+ 
+ ```js
+-const request = got(url, options);
+-
+-request.catch(err => {
+-  if (request.canceled) {
+-    // Handle cancelation
+-  }
++const got = require('got');
++const map = new Map();
+ 
+-  // Handle other errors
+-});
++(async () => {
++    let response = await got('todomvc.com', {cache: map});
++    console.log(response.fromCache);
++    //=> false
+ 
+-request.cancel();
++    response = await got('todomvc.com', {cache: map});
++    console.log(response.fromCache);
++    //=> true
++})();
+ ```
+ 
+-Or
++Got uses [Keyv](https://github.com/lukechilds/keyv) internally to support a wide range of storage adapters. For something more scalable you could use an [official Keyv storage adapter](https://github.com/lukechilds/keyv#official-storage-adapters):
++
++```
++npm install @keyv/redis
++```
+ 
+ ```js
+-const request = got(url, options);
++const got = require('got');
++const KeyvRedis = require('@keyv/redis');
+ 
+-request.catch(err => {
+-  if (err instanceof got.CancelError) {
+-    // Handle cancelation
+-  }
++const redis = new KeyvRedis('redis://user:pass@localhost:6379');
+ 
+-  // Handle other errors
+-});
++got('todomvc.com', {cache: redis});
++```
++
++Got supports anything that follows the Map API so it's easy to write your own storage adapter or use a third-party solution.
+ 
+-request.cancel();
++For example, the following are all valid storage adapters
++
++```js
++const storageAdapter = new Map();
++// or
++const storageAdapter = require('./my-storage-adapter');
++// or
++const QuickLRU = require('quick-lru');
++const storageAdapter = new QuickLRU({maxSize: 1000});
++
++got('todomvc.com', {cache: storageAdapter});
+ ```
+ 
++View the [Keyv docs](https://github.com/lukechilds/keyv) for more information on how to use storage adapters.
++
+ 
+ ## Proxies
+ 
+@@ -482,7 +516,6 @@ Bear in mind, if you send an `if-modified-since` header and receive a `304 Not M
+ 
+ - [gh-got](https://github.com/sindresorhus/gh-got) - Convenience wrapper for interacting with the GitHub API
+ - [travis-got](https://github.com/samverschueren/travis-got) - Convenience wrapper for interacting with the Travis API
+-- [graphql-got](https://github.com/kevva/graphql-got) - Convenience wrapper for got to interact with GraphQL
+ 
+ 
+ ## Created by

@@ -1,0 +1,415 @@
+diff --git a/.changeset/shy-grapes-decide.md b/.changeset/shy-grapes-decide.md
+new file mode 100644
+index 0000000000..3c49eb0525
+--- /dev/null
++++ b/.changeset/shy-grapes-decide.md
+@@ -0,0 +1,39 @@
++---
++'xstate': minor
++---
++
++The new `enqueueActions(...)` action creator can now be used to enqueue actions to be executed. This is a helpful alternative to the `pure(...)` and `choose(...)` action creators.
++
++```ts
++const machine = createMachine({
++  // ...
++  entry: enqueueActions(({ context, event, enqueue, check }) => {
++    // assign action
++    enqueue.assign({
++      count: context.count + 1
++    });
++
++    // Conditional actions (replaces choose(...))
++    if (event.someOption) {
++      enqueue.sendTo('someActor', { type: 'blah', thing: context.thing });
++
++      // other actions
++      enqueue('namedAction');
++      // with params
++      enqueue({ type: 'greet', params: { message: 'hello' } });
++    } else {
++      // inline
++      enqueue(() => console.log('hello'));
++
++      // even built-in actions
++    }
++
++    // Use check(...) to conditionally enqueue actions based on a guard
++    if (check({ type: 'someGuard' })) {
++      // ...
++    }
++
++    // no return
++  })
++});
++```
+diff --git a/packages/core/src/actions.ts b/packages/core/src/actions.ts
+index 711ed0084d..e00f2f81e3 100644
+--- a/packages/core/src/actions.ts
++++ b/packages/core/src/actions.ts
+@@ -5,8 +5,12 @@ export {
+ } from './actions/assign.ts';
+ export { cancel, type CancelAction } from './actions/cancel.ts';
+ export { choose, type ChooseAction } from './actions/choose.ts';
++export {
++  enqueueActions,
++  type EnqueueActionsAction
++} from './actions/enqueueActions.ts';
+ export { log, type LogAction } from './actions/log.ts';
+-export { pure, type PureAction } from './actions/pure.ts';
++export { pure } from './actions/pure.ts';
+ export { raise, type RaiseAction } from './actions/raise.ts';
+ export {
+   escalate,
+@@ -15,5 +19,5 @@ export {
+   sendTo,
+   type SendToAction
+ } from './actions/send.ts';
+-export { stop, stopChild, type StopAction } from './actions/stopChild.ts';
+ export { spawnChild, type SpawnAction } from './actions/spawnChild.ts';
++export { stop, stopChild, type StopAction } from './actions/stopChild.ts';
+diff --git a/packages/core/src/actions/enqueueActions.ts b/packages/core/src/actions/enqueueActions.ts
+new file mode 100644
+index 0000000000..45f6511d7b
+--- /dev/null
++++ b/packages/core/src/actions/enqueueActions.ts
+@@ -0,0 +1,224 @@
++import isDevelopment from '#is-development';
++import { Guard, evaluateGuard } from '../guards.ts';
++import {
++  Action,
++  ActionArgs,
++  AnyActorRef,
++  AnyActorScope,
++  AnyMachineSnapshot,
++  EventObject,
++  MachineContext,
++  ParameterizedObject,
++  ProvidedActor
++} from '../types.ts';
++import { assign } from './assign.ts';
++import { cancel } from './cancel.ts';
++import { raise } from './raise.ts';
++import { sendTo } from './send.ts';
++import { spawnChild } from './spawnChild.ts';
++import { stopChild } from './stopChild.ts';
++
++interface ActionEnqueuer<
++  TContext extends MachineContext,
++  TExpressionEvent extends EventObject,
++  TEvent extends EventObject,
++  TActor extends ProvidedActor,
++  TAction extends ParameterizedObject,
++  TGuard extends ParameterizedObject,
++  TDelay extends string
++> {
++  (
++    action: Action<
++      TContext,
++      TExpressionEvent,
++      TEvent,
++      undefined,
++      TActor,
++      TAction,
++      TGuard,
++      TDelay
++    >
++  ): void;
++  assign: (
++    ...args: Parameters<
++      typeof assign<TContext, TExpressionEvent, undefined, TEvent, TActor>
++    >
++  ) => void;
++  cancel: (
++    ...args: Parameters<
++      typeof cancel<TContext, TExpressionEvent, undefined, TEvent>
++    >
++  ) => void;
++  raise: (
++    ...args: Parameters<
++      typeof raise<TContext, TExpressionEvent, TEvent, undefined, TDelay>
++    >
++  ) => void;
++  sendTo: <TTargetActor extends AnyActorRef>(
++    ...args: Parameters<
++      typeof sendTo<
++        TContext,
++        TExpressionEvent,
++        undefined,
++        TTargetActor,
++        TEvent,
++        TDelay
++      >
++    >
++  ) => void;
++  spawnChild: (
++    ...args: Parameters<
++      typeof spawnChild<TContext, TExpressionEvent, undefined, TEvent, TActor>
++    >
++  ) => void;
++  stopChild: (
++    ...args: Parameters<
++      typeof stopChild<TContext, TExpressionEvent, undefined, TEvent>
++    >
++  ) => void;
++}
++
++function resolveEnqueueActions(
++  _: AnyActorScope,
++  state: AnyMachineSnapshot,
++  args: ActionArgs<any, any, any>,
++  _actionParams: ParameterizedObject['params'] | undefined,
++  {
++    collect
++  }: {
++    collect: ({
++      context,
++      event,
++      enqueue,
++      check
++    }: {
++      context: MachineContext;
++      event: EventObject;
++      enqueue: ActionEnqueuer<
++        MachineContext,
++        EventObject,
++        EventObject,
++        ProvidedActor,
++        ParameterizedObject,
++        ParameterizedObject,
++        string
++      >;
++      check: (
++        guard: Guard<
++          MachineContext,
++          EventObject,
++          undefined,
++          ParameterizedObject
++        >
++      ) => boolean;
++    }) => void;
++  }
++) {
++  const actions: any[] = [];
++  const enqueue: Parameters<typeof collect>[0]['enqueue'] = function enqueue(
++    action
++  ) {
++    actions.push(action);
++  };
++  enqueue.assign = (...args) => {
++    actions.push(assign(...args));
++  };
++  enqueue.cancel = (...args) => {
++    actions.push(cancel(...args));
++  };
++  enqueue.raise = (...args) => {
++    actions.push(raise(...args));
++  };
++  enqueue.sendTo = (...args) => {
++    actions.push(sendTo(...args));
++  };
++  enqueue.spawnChild = (...args) => {
++    actions.push(spawnChild(...args));
++  };
++  enqueue.stopChild = (...args) => {
++    actions.push(stopChild(...args));
++  };
++
++  collect({
++    context: args.context,
++    event: args.event,
++    enqueue,
++    check: (guard) => evaluateGuard(guard, state.context, args.event, state)
++  });
++
++  return [state, undefined, actions];
++}
++
++export interface EnqueueActionsAction<
++  TContext extends MachineContext,
++  TExpressionEvent extends EventObject,
++  TEvent extends EventObject,
++  TActor extends ProvidedActor,
++  TAction extends ParameterizedObject,
++  TGuard extends ParameterizedObject,
++  TDelay extends string
++> {
++  (args: ActionArgs<TContext, TExpressionEvent, TEvent>, params: unknown): void;
++  _out_TEvent?: TEvent;
++  _out_TActor?: TActor;
++  _out_TAction?: TAction;
++  _out_TGuard?: TGuard;
++  _out_TDelay?: TDelay;
++}
++
++export function enqueueActions<
++  TContext extends MachineContext,
++  TExpressionEvent extends EventObject,
++  TEvent extends EventObject = TExpressionEvent,
++  TActor extends ProvidedActor = ProvidedActor,
++  TAction extends ParameterizedObject = ParameterizedObject,
++  // `TGuard` is only required by `choose`, if we remove `choose` then we can remove this whole type parameter
++  TGuard extends ParameterizedObject = ParameterizedObject,
++  TDelay extends string = string
++>(
++  collect: ({
++    context,
++    event,
++    check,
++    enqueue
++  }: {
++    context: TContext;
++    event: TExpressionEvent;
++    check: (
++      guard: Guard<TContext, TExpressionEvent, undefined, TGuard>
++    ) => boolean;
++    enqueue: ActionEnqueuer<
++      TContext,
++      TExpressionEvent,
++      TEvent,
++      TActor,
++      TAction,
++      TGuard,
++      TDelay
++    >;
++  }) => void
++): EnqueueActionsAction<
++  TContext,
++  TExpressionEvent,
++  TEvent,
++  TActor,
++  TAction,
++  TGuard,
++  TDelay
++> {
++  function enqueueActions(
++    args: ActionArgs<TContext, TExpressionEvent, TEvent>,
++    params: unknown
++  ) {
++    if (isDevelopment) {
++      throw new Error(`This isn't supposed to be called`);
++    }
++  }
++
++  enqueueActions.type = 'xstate.enqueueActions';
++  enqueueActions.collect = collect;
++
++  enqueueActions.resolve = resolveEnqueueActions;
++
++  return enqueueActions;
++}
+diff --git a/packages/core/src/actions/pure.ts b/packages/core/src/actions/pure.ts
+index 76a3b813a9..747aed1549 100644
+--- a/packages/core/src/actions/pure.ts
++++ b/packages/core/src/actions/pure.ts
+@@ -1,60 +1,18 @@
+-import isDevelopment from '#is-development';
+ import {
+   Actions,
+-  ActionArgs,
+-  UnknownAction,
+-  AnyActorScope,
+-  AnyMachineSnapshot,
+   EventObject,
+   MachineContext,
+-  ParameterizedObject,
+-  SingleOrArray,
+   NoInfer,
++  ParameterizedObject,
+   ProvidedActor
+ } from '../types.ts';
+ import { toArray } from '../utils.ts';
++import { EnqueueActionsAction, enqueueActions } from './enqueueActions.ts';
+ 
+-function resolvePure(
+-  _: AnyActorScope,
+-  state: AnyMachineSnapshot,
+-  args: ActionArgs<any, any, any>,
+-  _actionParams: ParameterizedObject['params'] | undefined,
+-  {
+-    get
+-  }: {
+-    get: ({
+-      context,
+-      event
+-    }: {
+-      context: MachineContext;
+-      event: EventObject;
+-    }) => SingleOrArray<UnknownAction> | undefined;
+-  }
+-) {
+-  return [
+-    state,
+-    undefined,
+-    toArray(get({ context: args.context, event: args.event }))
+-  ];
+-}
+-
+-export interface PureAction<
+-  TContext extends MachineContext,
+-  TExpressionEvent extends EventObject,
+-  TEvent extends EventObject,
+-  TActor extends ProvidedActor,
+-  TAction extends ParameterizedObject,
+-  TGuard extends ParameterizedObject,
+-  TDelay extends string
+-> {
+-  (args: ActionArgs<TContext, TExpressionEvent, TEvent>, params: unknown): void;
+-  _out_TEvent?: TEvent;
+-  _out_TActor?: TActor;
+-  _out_TAction?: TAction;
+-  _out_TGuard?: TGuard;
+-  _out_TDelay?: TDelay;
+-}
+-
++/**
++ *
++ * @deprecated Use `enqueueActions(...)` instead
++ */
+ export function pure<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject,
+@@ -82,7 +40,7 @@ export function pure<
+         TDelay
+       >
+     | undefined
+-): PureAction<
++): EnqueueActionsAction<
+   TContext,
+   TExpressionEvent,
+   TEvent,
+@@ -91,19 +49,7 @@ export function pure<
+   TGuard,
+   TDelay
+ > {
+-  function pure(
+-    args: ActionArgs<TContext, TExpressionEvent, TEvent>,
+-    params: unknown
+-  ) {
+-    if (isDevelopment) {
+-      throw new Error(`This isn't supposed to be called`);
+-    }
+-  }
+-
+-  pure.type = 'xstate.pure';
+-  pure.get = getActions;
+-
+-  pure.resolve = resolvePure;
+-
+-  return pure;
++  return enqueueActions(({ context, event, enqueue }) => {
++    toArray(getActions({ context, event })).forEach(enqueue);
++  });
+ }
+diff --git a/packages/core/src/actions/spawnChild.ts b/packages/core/src/actions/spawnChild.ts
+index 976eaca202..d57a709a01 100644
+--- a/packages/core/src/actions/spawnChild.ts
++++ b/packages/core/src/actions/spawnChild.ts
+@@ -12,7 +12,6 @@ import {
+   MachineContext,
+   ParameterizedObject,
+   AnyActorLogic,
+-  Snapshot,
+   ProvidedActor,
+   IsLiteralString,
+   InputFrom,

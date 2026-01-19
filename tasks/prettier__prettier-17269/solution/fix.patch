@@ -1,0 +1,173 @@
+diff --git a/changelog_unreleased/json/17269.md b/changelog_unreleased/json/17269.md
+new file mode 100644
+index 000000000..844860667
+--- /dev/null
++++ b/changelog_unreleased/json/17269.md
+@@ -0,0 +1,15 @@
++#### Allow format comment-only JSONC files (#17269 by @fisker)
++
++<!-- prettier-ignore -->
++```jsonc
++// Input
++// Comment
++
++// Prettier stable
++SyntaxError: Unexpected token (1:11)
++> 1 | // Comment
++    |           ^
++
++// Prettier main
++// Comment
++```
+diff --git a/src/language-js/print/estree.js b/src/language-js/print/estree.js
+index 97ce1dc52..3e5c93882 100644
+--- a/src/language-js/print/estree.js
++++ b/src/language-js/print/estree.js
+@@ -101,7 +101,7 @@ function printEstree(path, options, print, args) {
+     case "JsExpressionRoot":
+       return print("node");
+     case "JsonRoot":
+-      return [print("node"), hardline];
++      return [printDanglingComments(path, options), print("node"), hardline];
+     case "File":
+       return printHtmlBinding(path, options, print) ?? print("program");
+     // Babel extension.
+diff --git a/src/language-json/parser-json.js b/src/language-json/parser-json.js
+index c4673438e..9ef5b96d6 100644
+--- a/src/language-json/parser-json.js
++++ b/src/language-json/parser-json.js
+@@ -1,35 +1,76 @@
+-import { parseExpression } from "@babel/parser";
++import { parse, parseExpression } from "@babel/parser";
+ import createError from "../common/parser-create-error.js";
+ import createBabelParseError from "../language-js/parse/utils/create-babel-parse-error.js";
+ import createParser from "../language-js/parse/utils/create-parser.js";
+ import wrapBabelExpression from "../language-js/parse/utils/wrap-babel-expression.js";
+ import isNonEmptyArray from "../utils/is-non-empty-array.js";
+ 
+-function createJsonParse(options = {}) {
+-  const { allowComments = true } = options;
+-
+-  return function parse(text) {
+-    let ast;
+-    try {
+-      ast = parseExpression(text, {
+-        tokens: true,
+-        ranges: true,
+-        attachComment: false,
+-      });
+-    } catch (/** @type {any} */ error) {
++const babelParseOptions = {
++  tokens: true,
++  ranges: true,
++  attachComment: false,
++};
++
++function parseEmptyJson(text) {
++  const file = parse(text, babelParseOptions);
++
++  const { program } = file;
++
++  // Not an empty JSON
++  /* c8 ignore next */
++  if (
++    !(
++      program.body.length === 0 &&
++      program.directives.length === 0 &&
++      !program.interpreter
++    )
++  ) {
++    return;
++  }
++
++  return file;
++}
++
++function parseJson(text, options = {}) {
++  const { allowComments = true, allowEmpty = false } = options;
++
++  let ast;
++  try {
++    ast = parseExpression(text, babelParseOptions);
++  } catch (/** @type {any} */ error) {
++    if (
++      allowEmpty &&
++      error.code === "BABEL_PARSER_SYNTAX_ERROR" &&
++      error.reasonCode === "UnexpectedToken" &&
++      error.pos === text.length
++    ) {
++      try {
++        ast = parseEmptyJson(text);
++      } catch {
++        // No op
++      }
++    }
++
++    if (!ast) {
+       throw createBabelParseError(error);
+     }
++  }
+ 
++  // @ts-expect-error
++  if (!allowComments && isNonEmptyArray(ast.comments)) {
+     // @ts-expect-error
+-    if (!allowComments && isNonEmptyArray(ast.comments)) {
+-      // @ts-expect-error
+-      throw createJsonError(ast.comments[0], "Comment");
+-    }
++    throw createJsonError(ast.comments[0], "Comment");
++  }
+ 
+-    assertJsonNode(ast);
++  ast = wrapBabelExpression(ast, { type: "JsonRoot", text });
+ 
+-    return wrapBabelExpression(ast, { type: "JsonRoot", text });
+-  };
++  if (ast.node.type === "File") {
++    delete ast.node;
++  } else {
++    assertJsonNode(ast.node);
++  }
++
++  return ast;
+ }
+ 
+ function createJsonError(node, description) {
+@@ -131,19 +172,15 @@ function assertJsonNode(node) {
+   }
+ }
+ 
+-const parseJson = createJsonParse();
+-
+ const jsonParsers = {
+   json: createParser({
+-    parse: parseJson,
+-    hasPragma() {
+-      return true;
+-    },
++    parse: (text) => parseJson(text),
++    hasPragma: () => true,
+   }),
+-  json5: createParser(parseJson),
+-  jsonc: createParser(parseJson),
++  json5: createParser((text) => parseJson(text)),
++  jsonc: createParser((text) => parseJson(text, { allowEmpty: true })),
+   "json-stringify": createParser({
+-    parse: createJsonParse({ allowComments: false }),
++    parse: (text) => parseJson(text, { allowComments: false }),
+     astFormat: "estree-json",
+   }),
+ };
+diff --git a/src/main/comments/attach.js b/src/main/comments/attach.js
+index c545053f7..6bf14c22d 100644
+--- a/src/main/comments/attach.js
++++ b/src/main/comments/attach.js
+@@ -193,7 +193,7 @@ function attachComments(ast, options) {
+         addLeadingComment(ast, comment);
+         continue;
+       }
+-      if (locEnd(comment) - locEnd(ast) >= 0) {
++      if (locEnd(comment) > locEnd(ast)) {
+         addTrailingComment(ast, comment);
+         continue;
+       }

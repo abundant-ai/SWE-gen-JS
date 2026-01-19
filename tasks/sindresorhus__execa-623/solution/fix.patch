@@ -1,0 +1,697 @@
+diff --git a/index.js b/index.js
+index ad62e94..0d95c02 100644
+--- a/index.js
++++ b/index.js
+@@ -7,7 +7,9 @@ import stripFinalNewline from 'strip-final-newline';
+ import {npmRunPathEnv} from 'npm-run-path';
+ import onetime from 'onetime';
+ import {makeError} from './lib/error.js';
+-import {handleStdioOption, handleInputSync, handleOutputSync, pipeStdioOptions, normalizeStdioNode} from './lib/stdio.js';
++import {handleInputAsync, pipeOutputAsync} from './lib/stdio/async.js';
++import {handleInputSync, pipeOutputSync} from './lib/stdio/sync.js';
++import {normalizeStdioNode} from './lib/stdio/normalize.js';
+ import {spawnedKill, spawnedCancel, setupTimeout, validateTimeout, setExitHandler} from './lib/kill.js';
+ import {addPipeMethods} from './lib/pipe.js';
+ import {getSpawnedResult, makeAllStream} from './lib/stream.js';
+@@ -75,7 +77,7 @@ const handleOutput = (options, value, error) => {
+ 
+ export function execa(file, args, options) {
+ 	const parsed = handleArguments(file, args, options);
+-	const stdioStreams = handleStdioOption(parsed.options);
++	const stdioStreams = handleInputAsync(parsed.options);
+ 	validateTimeout(parsed.options);
+ 
+ 	const command = joinCommand(file, args);
+@@ -158,7 +160,7 @@ export function execa(file, args, options) {
+ 
+ 	const handlePromiseOnce = onetime(handlePromise);
+ 
+-	pipeStdioOptions(spawned, stdioStreams);
++	pipeOutputAsync(spawned, stdioStreams);
+ 
+ 	spawned.all = makeAllStream(spawned, parsed.options);
+ 
+@@ -169,7 +171,7 @@ export function execa(file, args, options) {
+ 
+ export function execaSync(file, args, options) {
+ 	const parsed = handleArguments(file, args, options);
+-	const stdioArray = handleInputSync(parsed.options);
++	const stdioStreams = handleInputSync(parsed.options);
+ 
+ 	const command = joinCommand(file, args);
+ 	const escapedCommand = getEscapedCommand(file, args);
+@@ -193,7 +195,7 @@ export function execaSync(file, args, options) {
+ 		});
+ 	}
+ 
+-	handleOutputSync(stdioArray, result);
++	pipeOutputSync(stdioStreams, result);
+ 	const stdout = handleOutput(parsed.options, result.stdout, result.error);
+ 	const stderr = handleOutput(parsed.options, result.stderr, result.error);
+ 
+diff --git a/lib/stdio.js b/lib/stdio.js
+deleted file mode 100644
+index c25b2c9..0000000
+--- a/lib/stdio.js
++++ /dev/null
+@@ -1,289 +0,0 @@
+-import {createReadStream, createWriteStream, readFileSync, writeFileSync} from 'node:fs';
+-import {isAbsolute} from 'node:path';
+-import {Readable, Writable} from 'node:stream';
+-import {isStream as isNodeStream} from 'is-stream';
+-
+-const arrifyStdio = (stdio = []) => Array.isArray(stdio) ? stdio : [stdio, stdio, stdio];
+-
+-const isIterableStdin = stdinOption => typeof stdinOption === 'object'
+-	&& stdinOption !== null
+-	&& !isNodeStream(stdinOption)
+-	&& !isReadableStream(stdinOption)
+-	&& (typeof stdinOption[Symbol.asyncIterator] === 'function' || typeof stdinOption[Symbol.iterator] === 'function');
+-
+-const getIterableStdin = stdioOption => isIterableStdin(stdioOption)
+-	? stdioOption
+-	: undefined;
+-
+-const isUrlInstance = stdioOption => Object.prototype.toString.call(stdioOption) === '[object URL]';
+-const hasFileProtocol = url => url.protocol === 'file:';
+-const isFileUrl = stdioOption => isUrlInstance(stdioOption) && hasFileProtocol(stdioOption);
+-const isRegularUrl = stdioOption => isUrlInstance(stdioOption) && !hasFileProtocol(stdioOption);
+-
+-const stringIsFilePath = stdioOption => stdioOption.startsWith('.') || isAbsolute(stdioOption);
+-const isFilePath = stdioOption => typeof stdioOption === 'string' && stringIsFilePath(stdioOption);
+-const isUnknownStdioString = stdioOption => typeof stdioOption === 'string' && !stringIsFilePath(stdioOption) && !KNOWN_STDIO.has(stdioOption);
+-
+-const isReadableStream = stdioOption => Object.prototype.toString.call(stdioOption) === '[object ReadableStream]';
+-const isWritableStream = stdioOption => Object.prototype.toString.call(stdioOption) === '[object WritableStream]';
+-
+-// Check whether the `stdin` option results in `spawned.stdin` being `undefined`.
+-// We use a deny list instead of an allow list to be forward compatible with new options.
+-const cannotPipeStdin = stdinOption => NO_PIPE_STDIO.has(stdinOption)
+-	|| isNodeStream(stdinOption)
+-	|| isReadableStream(stdinOption)
+-	|| typeof stdinOption === 'number'
+-	|| isIterableStdin(stdinOption)
+-	|| isFileUrl(stdinOption)
+-	|| isFilePath(stdinOption);
+-
+-const NO_PIPE_STDIO = new Set(['ipc', 'ignore', 'inherit']);
+-const KNOWN_STDIO = new Set([...NO_PIPE_STDIO, 'overlapped', 'pipe']);
+-
+-const validateFileSdio = (stdioOption, optionName) => {
+-	if (isRegularUrl(stdioOption)) {
+-		throw new TypeError(`The \`${optionName}: URL\` option must use the \`file:\` scheme.
+-For example, you can use the \`pathToFileURL()\` method of the \`url\` core module.`);
+-	}
+-
+-	if (isUnknownStdioString(stdioOption)) {
+-		throw new TypeError(`The \`${optionName}: filePath\` option must either be an absolute file path or start with \`.\`.`);
+-	}
+-};
+-
+-const validateInputOptions = (stdioArray, input, inputFile) => {
+-	if (input !== undefined && inputFile !== undefined) {
+-		throw new TypeError('The `input` and `inputFile` options cannot be both set.');
+-	}
+-
+-	const noPipeStdin = cannotPipeStdin(stdioArray[0]);
+-	if (noPipeStdin && input !== undefined) {
+-		throw new TypeError('The `input` and `stdin` options cannot be both set.');
+-	}
+-
+-	if (noPipeStdin && inputFile !== undefined) {
+-		throw new TypeError('The `inputFile` and `stdin` options cannot be both set.');
+-	}
+-
+-	validateFileSdio(stdioArray[0], 'stdin');
+-	validateFileSdio(stdioArray[1], 'stdout');
+-	validateFileSdio(stdioArray[2], 'stderr');
+-};
+-
+-const getStdioStreams = (stdioArray, {input, inputFile}) => [
+-	{...getStdinStream(stdioArray[0], input, inputFile), isInput: true},
+-	getOutputStream(stdioArray[1]),
+-	getOutputStream(stdioArray[2]),
+-];
+-
+-const getStdinStream = (stdinOption, input, inputFile) => {
+-	const iterableStdin = getIterableStdin(stdinOption);
+-
+-	if (iterableStdin !== undefined) {
+-		return {value: Readable.from(iterableStdin)};
+-	}
+-
+-	if (isReadableStream(stdinOption)) {
+-		return {value: Readable.fromWeb(stdinOption)};
+-	}
+-
+-	if (isFileUrl(stdinOption) || isFilePath(stdinOption)) {
+-		return {value: createReadStream(stdinOption), finite: true};
+-	}
+-
+-	if (inputFile !== undefined) {
+-		return {value: createReadStream(inputFile), finite: true};
+-	}
+-
+-	if (input === undefined) {
+-		return {};
+-	}
+-
+-	if (isNodeStream(input)) {
+-		return {value: input};
+-	}
+-
+-	return {value: input, single: true};
+-};
+-
+-const getOutputStream = stdioOption => {
+-	if (isWritableStream(stdioOption)) {
+-		return {value: Writable.fromWeb(stdioOption)};
+-	}
+-
+-	if (isFileUrl(stdioOption) || isFilePath(stdioOption)) {
+-		return {value: createWriteStream(stdioOption), finite: true};
+-	}
+-
+-	return {};
+-};
+-
+-// When the `stdin: Iterable | ReadableStream | URL | filePath`, `input` or `inputFile` option is used, we pipe to `spawned.std*`.
+-// Therefore the `std*` options must be either `pipe` or `overlapped`. Other values do not set `spawned.std*`.
+-const transformStdioItem = (stdioItem, index, stdioStreams) =>
+-	stdioStreams[index]?.value !== undefined && stdioItem !== 'overlapped' ? 'pipe' : stdioItem;
+-
+-const transformStdio = (stdio, stdioStreams) => Array.isArray(stdio)
+-	? stdio.map((stdioItem, index) => transformStdioItem(stdioItem, index, stdioStreams))
+-	: stdio;
+-
+-// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in async mode
+-export const handleStdioOption = options => {
+-	const stdio = normalizeStdio(options);
+-	const stdioArray = arrifyStdio(stdio);
+-	validateInputOptions(stdioArray, options.input, options.inputFile);
+-	const stdioStreams = getStdioStreams(stdioArray, options);
+-	options.stdio = transformStdio(stdio, stdioStreams);
+-	return stdioStreams;
+-};
+-
+-// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, after spawning, in async mode
+-export const pipeStdioOptions = (spawned, stdioStreams) => {
+-	for (const [index, stdioStream] of stdioStreams.entries()) {
+-		pipeStdioOption(spawned.stdio[index], stdioStream);
+-	}
+-};
+-
+-const pipeStdioOption = (childStream, {single, value, isInput}) => {
+-	if (value === undefined) {
+-		return;
+-	}
+-
+-	if (!isInput) {
+-		childStream.pipe(value);
+-		return;
+-	}
+-
+-	if (single) {
+-		childStream.end(value);
+-		return;
+-	}
+-
+-	value.pipe(childStream);
+-};
+-
+-const transformStdioItemSync = stdioItem => isFileUrl(stdioItem) || isFilePath(stdioItem) ? 'pipe' : stdioItem;
+-
+-const transformStdioSync = stdio => Array.isArray(stdio)
+-	? stdio.map(stdioItem => transformStdioItemSync(stdioItem))
+-	: stdio;
+-
+-const validateInputOptionsSync = (stdinOption, input) => {
+-	if (getIterableStdin(stdinOption) !== undefined) {
+-		throw new TypeError('The `stdin` option cannot be an iterable in sync mode');
+-	}
+-
+-	if (isReadableStream(stdinOption)) {
+-		throw new TypeError('The `stdin` option cannot be a stream in sync mode');
+-	}
+-
+-	if (isNodeStream(input)) {
+-		throw new TypeError('The `input` option cannot be a stream in sync mode');
+-	}
+-};
+-
+-const validateOutputOptionsSync = (stdioOption, optionName) => {
+-	if (isWritableStream(stdioOption)) {
+-		throw new TypeError(`The \`${optionName}\` option cannot be a stream in sync mode`);
+-	}
+-};
+-
+-const validateOptionsSync = (stdioArray, {input, inputFile}) => {
+-	validateInputOptions(stdioArray, input, inputFile);
+-	validateInputOptionsSync(stdioArray[0], input);
+-	validateOutputOptionsSync(stdioArray[1], 'stdout');
+-	validateOutputOptionsSync(stdioArray[2], 'stderr');
+-};
+-
+-const getInputOption = (stdinOption, {input, inputFile}) => {
+-	if (isFileUrl(stdinOption) || isFilePath(stdinOption)) {
+-		return readFileSync(stdinOption);
+-	}
+-
+-	if (inputFile !== undefined) {
+-		return readFileSync(inputFile);
+-	}
+-
+-	return input;
+-};
+-
+-// Handle `input`, `inputFile` and `stdin` options, before spawning, in sync mode
+-export const handleInputSync = options => {
+-	const stdio = normalizeStdio(options);
+-	const stdioArray = arrifyStdio(stdio);
+-	validateOptionsSync(stdioArray, options);
+-
+-	const input = getInputOption(stdioArray[0], options);
+-	if (input !== undefined) {
+-		options.input = input;
+-	}
+-
+-	options.stdio = transformStdioSync(stdio);
+-	return stdioArray;
+-};
+-
+-// Handle `stdout` and `stderr` options, before spawning, in sync mode
+-const handleOutputOption = (stdioOption, result) => {
+-	if (result === null) {
+-		return;
+-	}
+-
+-	if (isFileUrl(stdioOption) || isFilePath(stdioOption)) {
+-		writeFileSync(stdioOption, result);
+-	}
+-};
+-
+-export const handleOutputSync = (stdioArray, {stdout, stderr}) => {
+-	handleOutputOption(stdioArray[1], stdout);
+-	handleOutputOption(stdioArray[2], stderr);
+-};
+-
+-const aliases = ['stdin', 'stdout', 'stderr'];
+-
+-const hasAlias = options => aliases.some(alias => options[alias] !== undefined);
+-
+-export const normalizeStdio = options => {
+-	if (!options) {
+-		return;
+-	}
+-
+-	const {stdio} = options;
+-
+-	if (stdio === undefined) {
+-		return aliases.map(alias => options[alias]);
+-	}
+-
+-	if (hasAlias(options)) {
+-		throw new Error(`It's not possible to provide \`stdio\` in combination with one of ${aliases.map(alias => `\`${alias}\``).join(', ')}`);
+-	}
+-
+-	if (typeof stdio === 'string') {
+-		return stdio;
+-	}
+-
+-	if (!Array.isArray(stdio)) {
+-		throw new TypeError(`Expected \`stdio\` to be of type \`string\` or \`Array\`, got \`${typeof stdio}\``);
+-	}
+-
+-	const length = Math.max(stdio.length, aliases.length);
+-	return Array.from({length}, (value, index) => stdio[index]);
+-};
+-
+-// `ipc` is pushed unless it is already present
+-export const normalizeStdioNode = options => {
+-	const stdio = normalizeStdio(options);
+-
+-	if (stdio === 'ipc') {
+-		return 'ipc';
+-	}
+-
+-	if (stdio === undefined || typeof stdio === 'string') {
+-		return [stdio, stdio, stdio, 'ipc'];
+-	}
+-
+-	if (stdio.includes('ipc')) {
+-		return stdio;
+-	}
+-
+-	return [...stdio, 'ipc'];
+-};
+diff --git a/lib/stdio/async.js b/lib/stdio/async.js
+new file mode 100644
+index 0000000..8f1b7a1
+--- /dev/null
++++ b/lib/stdio/async.js
+@@ -0,0 +1,46 @@
++import {createReadStream, createWriteStream} from 'node:fs';
++import {Readable, Writable} from 'node:stream';
++import {handleInput} from './input.js';
++
++// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in async mode
++export const handleInputAsync = options => handleInput(addPropertiesAsync, options);
++
++const addPropertiesAsync = {
++	input: {
++		filePath: ({value}) => ({value: createReadStream(value)}),
++		webStream: ({value}) => ({value: Readable.fromWeb(value)}),
++		iterable: ({value}) => ({value: Readable.from(value)}),
++	},
++	output: {
++		filePath: ({value}) => ({value: createWriteStream(value)}),
++		webStream: ({value}) => ({value: Writable.fromWeb(value)}),
++		iterable({optionName}) {
++			throw new TypeError(`The \`${optionName}\` option cannot be an iterable.`);
++		},
++	},
++};
++
++// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, after spawning, in async mode
++export const pipeOutputAsync = (spawned, stdioStreams) => {
++	for (const [index, stdioStream] of stdioStreams.entries()) {
++		pipeStdioOption(spawned.stdio[index], stdioStream);
++	}
++};
++
++const pipeStdioOption = (childStream, {type, value, direction}) => {
++	if (type === 'native') {
++		return;
++	}
++
++	if (direction === 'output') {
++		childStream.pipe(value);
++		return;
++	}
++
++	if (type === 'stringOrBuffer') {
++		childStream.end(value);
++		return;
++	}
++
++	value.pipe(childStream);
++};
+diff --git a/lib/stdio/input.js b/lib/stdio/input.js
+new file mode 100644
+index 0000000..3326ce9
+--- /dev/null
++++ b/lib/stdio/input.js
+@@ -0,0 +1,98 @@
++import {isStream as isNodeStream} from 'is-stream';
++import {getStdioOptionType, isRegularUrl, isUnknownStdioString} from './type.js';
++import {normalizeStdio} from './normalize.js';
++
++// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in async/sync mode
++export const handleInput = (addProperties, options) => {
++	const stdio = normalizeStdio(options);
++	const stdioArray = arrifyStdio(stdio);
++	const stdioStreams = stdioArray.map((stdioOption, index) => getStdioStream(stdioOption, index, addProperties, options));
++	options.stdio = transformStdio(stdio, stdioStreams);
++	return stdioStreams;
++};
++
++const arrifyStdio = (stdio = []) => Array.isArray(stdio) ? stdio : [stdio, stdio, stdio];
++
++const getStdioStream = (stdioOption, index, addProperties, {input, inputFile}) => {
++	let stdioStream = {
++		type: getStdioOptionType(stdioOption),
++		value: stdioOption,
++		optionName: OPTION_NAMES[index],
++		direction: index === 0 ? 'input' : 'output',
++	};
++	validateFileStdio(stdioStream);
++
++	stdioStream = handleInputOption(stdioStream, index, input);
++	stdioStream = handleInputFileOption(stdioStream, index, inputFile, input);
++
++	return {
++		...stdioStream,
++		...addProperties[stdioStream.direction][stdioStream.type]?.(stdioStream),
++	};
++};
++
++const OPTION_NAMES = ['stdin', 'stdout', 'stderr'];
++
++const validateFileStdio = ({type, value, optionName}) => {
++	if (type !== 'native') {
++		return;
++	}
++
++	validateRegularUrl(value, optionName);
++
++	if (isUnknownStdioString(value)) {
++		throw new TypeError(`The \`${optionName}: filePath\` option must either be an absolute file path or start with \`.\`.`);
++	}
++};
++
++// Override the `stdin` option with the `input` option
++const handleInputOption = (stdioStream, index, input) => {
++	if (input === undefined || index !== 0) {
++		return stdioStream;
++	}
++
++	const optionName = 'input';
++	validateInputOption(stdioStream.value, optionName);
++	const type = isNodeStream(input) ? 'nodeStream' : 'stringOrBuffer';
++	return {...stdioStream, value: input, type, optionName};
++};
++
++// Override the `stdin` option with the `inputFile` option
++const handleInputFileOption = (stdioStream, index, inputFile, input) => {
++	if (inputFile === undefined || index !== 0) {
++		return stdioStream;
++	}
++
++	if (input !== undefined) {
++		throw new TypeError('The `input` and `inputFile` options cannot be both set.');
++	}
++
++	const optionName = 'inputFile';
++	validateInputOption(stdioStream.value, optionName);
++	validateRegularUrl(inputFile, optionName);
++	return {...stdioStream, value: inputFile, type: 'filePath', optionName};
++};
++
++const validateInputOption = (value, optionName) => {
++	if (!CAN_USE_INPUT.has(value)) {
++		throw new TypeError(`The \`${optionName}\` and \`stdin\` options cannot be both set.`);
++	}
++};
++
++const CAN_USE_INPUT = new Set([undefined, null, 'overlapped', 'pipe']);
++
++const validateRegularUrl = (value, optionName) => {
++	if (isRegularUrl(value)) {
++		throw new TypeError(`The \`${optionName}: URL\` option must use the \`file:\` scheme.
++For example, you can use the \`pathToFileURL()\` method of the \`url\` core module.`);
++	}
++};
++
++// When the `std*: Iterable | WebStream | URL | filePath`, `input` or `inputFile` option is used, we pipe to `spawned.std*`.
++// Therefore the `std*` options must be either `pipe` or `overlapped`. Other values do not set `spawned.std*`.
++const transformStdio = (stdio, stdioStreams) => Array.isArray(stdio)
++	? stdio.map((stdioItem, index) => transformStdioItem(stdioItem, index, stdioStreams))
++	: stdio;
++
++const transformStdioItem = (stdioItem, index, stdioStreams) =>
++	stdioStreams[index].type !== 'native' && stdioItem !== 'overlapped' ? 'pipe' : stdioItem;
+diff --git a/lib/stdio/normalize.js b/lib/stdio/normalize.js
+new file mode 100644
+index 0000000..2a1bf64
+--- /dev/null
++++ b/lib/stdio/normalize.js
+@@ -0,0 +1,50 @@
++// Add support for `stdin`/`stdout`/`stderr` as an alias for `stdio`
++export const normalizeStdio = options => {
++	if (!options) {
++		return;
++	}
++
++	const {stdio} = options;
++
++	if (stdio === undefined) {
++		return aliases.map(alias => options[alias]);
++	}
++
++	if (hasAlias(options)) {
++		throw new Error(`It's not possible to provide \`stdio\` in combination with one of ${aliases.map(alias => `\`${alias}\``).join(', ')}`);
++	}
++
++	if (typeof stdio === 'string') {
++		return stdio;
++	}
++
++	if (!Array.isArray(stdio)) {
++		throw new TypeError(`Expected \`stdio\` to be of type \`string\` or \`Array\`, got \`${typeof stdio}\``);
++	}
++
++	const length = Math.max(stdio.length, aliases.length);
++	return Array.from({length}, (value, index) => stdio[index]);
++};
++
++const hasAlias = options => aliases.some(alias => options[alias] !== undefined);
++
++const aliases = ['stdin', 'stdout', 'stderr'];
++
++// Same but for `execaNode()`, i.e. push `ipc` unless already present
++export const normalizeStdioNode = options => {
++	const stdio = normalizeStdio(options);
++
++	if (stdio === 'ipc') {
++		return 'ipc';
++	}
++
++	if (stdio === undefined || typeof stdio === 'string') {
++		return [stdio, stdio, stdio, 'ipc'];
++	}
++
++	if (stdio.includes('ipc')) {
++		return stdio;
++	}
++
++	return [...stdio, 'ipc'];
++};
+diff --git a/lib/stdio/sync.js b/lib/stdio/sync.js
+new file mode 100644
+index 0000000..6b32ab4
+--- /dev/null
++++ b/lib/stdio/sync.js
+@@ -0,0 +1,56 @@
++import {readFileSync, writeFileSync} from 'node:fs';
++import {handleInput} from './input.js';
++import {TYPE_TO_MESSAGE} from './type.js';
++
++// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in sync mode
++export const handleInputSync = options => {
++	const stdioStreams = handleInput(addPropertiesSync, options);
++	addInputOptionSync(stdioStreams, options);
++	return stdioStreams;
++};
++
++const forbiddenIfSync = ({type, optionName}) => {
++	throw new TypeError(`The \`${optionName}\` option cannot be ${TYPE_TO_MESSAGE[type]} in sync mode.`);
++};
++
++const addPropertiesSync = {
++	input: {
++		filePath: ({value}) => ({value: readFileSync(value), type: 'stringOrBuffer'}),
++		webStream: forbiddenIfSync,
++		nodeStream: forbiddenIfSync,
++		iterable: forbiddenIfSync,
++	},
++	output: {
++		webStream: forbiddenIfSync,
++		nodeStream: forbiddenIfSync,
++		iterable: forbiddenIfSync,
++	},
++};
++
++const addInputOptionSync = (stdioStreams, options) => {
++	const inputValue = stdioStreams.find(({type}) => type === 'stringOrBuffer')?.value;
++	if (inputValue !== undefined) {
++		options.input = inputValue;
++	}
++};
++
++// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, after spawning, in sync mode
++export const pipeOutputSync = (stdioStreams, result) => {
++	if (result.output === null) {
++		return;
++	}
++
++	for (const [index, stdioStream] of stdioStreams.entries()) {
++		pipeStdioOptionSync(result.output[index], stdioStream);
++	}
++};
++
++const pipeStdioOptionSync = (result, {type, value, direction}) => {
++	if (result === null || direction === 'input') {
++		return;
++	}
++
++	if (type === 'filePath') {
++		writeFileSync(value, result);
++	}
++};
+diff --git a/lib/stdio/type.js b/lib/stdio/type.js
+new file mode 100644
+index 0000000..92a3dbb
+--- /dev/null
++++ b/lib/stdio/type.js
+@@ -0,0 +1,51 @@
++import {isAbsolute} from 'node:path';
++import {isStream as isNodeStream} from 'is-stream';
++
++// The `stdin`/`stdout`/`stderr` option can be of many types. This detects it.
++export const getStdioOptionType = stdioOption => {
++	if (isFileUrl(stdioOption) || isFilePath(stdioOption)) {
++		return 'filePath';
++	}
++
++	if (isWebStream(stdioOption)) {
++		return 'webStream';
++	}
++
++	if (isNodeStream(stdioOption)) {
++		return 'native';
++	}
++
++	if (isIterableObject(stdioOption)) {
++		return 'iterable';
++	}
++
++	return 'native';
++};
++
++const isUrlInstance = stdioOption => Object.prototype.toString.call(stdioOption) === '[object URL]';
++const hasFileProtocol = url => url.protocol === 'file:';
++const isFileUrl = stdioOption => isUrlInstance(stdioOption) && hasFileProtocol(stdioOption);
++export const isRegularUrl = stdioOption => isUrlInstance(stdioOption) && !hasFileProtocol(stdioOption);
++
++const stringIsFilePath = stdioOption => stdioOption.startsWith('.') || isAbsolute(stdioOption);
++const isFilePath = stdioOption => typeof stdioOption === 'string' && stringIsFilePath(stdioOption);
++export const isUnknownStdioString = stdioOption => typeof stdioOption === 'string' && !stringIsFilePath(stdioOption) && !KNOWN_STDIO_STRINGS.has(stdioOption);
++const KNOWN_STDIO_STRINGS = new Set(['ipc', 'ignore', 'inherit', 'overlapped', 'pipe']);
++
++const isReadableStream = stdioOption => Object.prototype.toString.call(stdioOption) === '[object ReadableStream]';
++const isWritableStream = stdioOption => Object.prototype.toString.call(stdioOption) === '[object WritableStream]';
++const isWebStream = stdioOption => isReadableStream(stdioOption) || isWritableStream(stdioOption);
++
++const isIterableObject = stdinOption => typeof stdinOption === 'object'
++	&& stdinOption !== null
++	&& (typeof stdinOption[Symbol.asyncIterator] === 'function' || typeof stdinOption[Symbol.iterator] === 'function');
++
++// Convert types to human-friendly strings for error messages
++export const TYPE_TO_MESSAGE = {
++	filePath: 'a file path',
++	webStream: 'a web stream',
++	nodeStream: 'a Node.js stream',
++	native: 'any value',
++	iterable: 'an iterable',
++	stringOrBuffer: 'a string or Uint8Array',
++};
+diff --git a/lib/stream.js b/lib/stream.js
+index 222f6ae..0818553 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -58,12 +58,12 @@ const applyEncoding = async (stream, maxBuffer, encoding) => {
+ // However, those might be infinite streams, e.g. a TTY passed as input or output.
+ // We wait for completion or not depending on whether `finite` is `true`.
+ // In either case, we handle `error` events while the process is running.
+-const waitForStreamEnd = ({value, finite, single}, processDone) => {
+-	if (value === undefined || single) {
++const waitForStreamEnd = ({value, type}, processDone) => {
++	if (type === 'native' || type === 'stringOrBuffer') {
+ 		return;
+ 	}
+ 
+-	return finite
++	return type === 'filePath'
+ 		? finished(value)
+ 		: Promise.race([processDone, throwOnStreamError(value)]);
+ };

@@ -1,0 +1,343 @@
+diff --git a/README.md b/README.md
+index d1b0f8a..05ee99f 100644
+--- a/README.md
++++ b/README.md
+@@ -11,6 +11,7 @@ Yup is a schema builder for runtime value parsing and validation. Define a schem
+ - Built-in async validation support. Model server-side and client-side validation equally well
+ - Extensible: add your own type-safe methods and schema
+ - Rich error details, make debugging a breeze
++- Compatible with [Standard Schema](https://github.com/standard-schema/standard-schema)
+ 
+ ## Getting Started
+ 
+@@ -471,6 +472,10 @@ try {
+ }
+ ```
+ 
++## Standard Schema Support
++
++Yup is compatible with [Standard Schema](https://github.com/standard-schema/standard-schema).
++
+ ## API
+ 
+ ### `yup`
+diff --git a/package.json b/package.json
+index d8b0d15..0455337 100644
+--- a/package.json
++++ b/package.json
+@@ -72,6 +72,7 @@
+     "@babel/preset-typescript": "^7.22.5",
+     "@rollup/plugin-babel": "^5.3.1",
+     "@rollup/plugin-node-resolve": "^13.3.0",
++    "@standard-schema/spec": "^1.0.0",
+     "@types/jest": "^27.5.2",
+     "@typescript-eslint/eslint-plugin": "^5.62.0",
+     "@typescript-eslint/parser": "^5.62.0",
+diff --git a/src/Lazy.ts b/src/Lazy.ts
+index 0c23a32..eab4a61 100644
+--- a/src/Lazy.ts
++++ b/src/Lazy.ts
+@@ -14,9 +14,14 @@ import type {
+   SchemaFieldDescription,
+   SchemaLazyDescription,
+ } from './schema';
+-import { Flags, Maybe } from './util/types';
++import { Flags, Maybe, ResolveFlags } from './util/types';
+ import ValidationError from './ValidationError';
+ import Schema from './schema';
++import {
++  issuesFromValidationError,
++  StandardResult,
++  StandardSchemaProps,
++} from './standardSchema';
+ 
+ export type LazyBuilder<
+   TSchema extends ISchema<TContext>,
+@@ -179,6 +184,41 @@ class Lazy<T, TContext = AnyObject, TFlags extends Flags = any>
+     next.spec.meta = Object.assign(next.spec.meta || {}, args[0]);
+     return next;
+   }
++
++  get ['~standard']() {
++    const schema = this;
++
++    const standard: StandardSchemaProps<
++      T,
++      ResolveFlags<T, TFlags, undefined>
++    > = {
++      version: 1,
++      vendor: 'yup',
++      async validate(
++        value: unknown,
++      ): Promise<StandardResult<ResolveFlags<T, TFlags, undefined>>> {
++        try {
++          const result = await schema.validate(value, {
++            abortEarly: false,
++          });
++
++          return {
++            value: result as ResolveFlags<T, TFlags, undefined>,
++          };
++        } catch (err) {
++          if (ValidationError.isError(err)) {
++            return {
++              issues: issuesFromValidationError(err),
++            };
++          }
++
++          throw err;
++        }
++      },
++    };
++
++    return standard;
++  }
+ }
+ 
+ export default Lazy;
+diff --git a/src/schema.ts b/src/schema.ts
+index 4a610c9..dd65e72 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -34,6 +34,12 @@ import isAbsent from './util/isAbsent';
+ import type { Flags, Maybe, ResolveFlags, _ } from './util/types';
+ import toArray from './util/toArray';
+ import cloneDeep from './util/cloneDeep';
++import {
++  issuesFromValidationError,
++  StandardResult,
++  type StandardSchema,
++  type StandardSchemaProps,
++} from './standardSchema';
+ 
+ export type SchemaSpec<TDefault> = {
+   coerce: boolean;
+@@ -148,7 +154,9 @@ export default abstract class Schema<
+   TContext = any,
+   TDefault = any,
+   TFlags extends Flags = '',
+-> implements ISchema<TType, TContext, TFlags, TDefault>
++> implements
++    ISchema<TType, TContext, TFlags, TDefault>,
++    StandardSchema<TType, ResolveFlags<TType, TFlags, TDefault>>
+ {
+   readonly type: string;
+ 
+@@ -963,6 +971,41 @@ export default abstract class Schema<
+ 
+     return description;
+   }
++
++  get ['~standard']() {
++    const schema = this;
++
++    const standard: StandardSchemaProps<
++      TType,
++      ResolveFlags<TType, TFlags, TDefault>
++    > = {
++      version: 1,
++      vendor: 'yup',
++      async validate(
++        value: unknown,
++      ): Promise<StandardResult<ResolveFlags<TType, TFlags, TDefault>>> {
++        try {
++          const result = await schema.validate(value, {
++            abortEarly: false,
++          });
++
++          return {
++            value: result as ResolveFlags<TType, TFlags, TDefault>,
++          };
++        } catch (err) {
++          if (err instanceof ValidationError) {
++            return {
++              issues: issuesFromValidationError(err),
++            };
++          }
++
++          throw err;
++        }
++      },
++    };
++
++    return standard;
++  }
+ }
+ 
+ export default interface Schema<
+diff --git a/src/standardSchema.ts b/src/standardSchema.ts
+new file mode 100644
+index 0000000..15a6631
+--- /dev/null
++++ b/src/standardSchema.ts
+@@ -0,0 +1,144 @@
++/**
++ * Copied from @standard-schema/spec to avoid having a dependency on it.
++ * https://github.com/standard-schema/standard-schema/blob/main/packages/spec/src/index.ts
++ */
++
++import ValidationError from './ValidationError';
++
++export interface StandardSchema<Input = unknown, Output = Input> {
++  readonly '~standard': StandardSchemaProps<Input, Output>;
++}
++
++export interface StandardSchemaProps<Input = unknown, Output = Input> {
++  readonly version: 1;
++  readonly vendor: string;
++  readonly validate: (
++    value: unknown,
++  ) => StandardResult<Output> | Promise<StandardResult<Output>>;
++  readonly types?: StandardTypes<Input, Output> | undefined;
++}
++
++export type StandardResult<Output> =
++  | StandardSuccessResult<Output>
++  | StandardFailureResult;
++
++export interface StandardSuccessResult<Output> {
++  readonly value: Output;
++  readonly issues?: undefined;
++}
++
++export interface StandardFailureResult {
++  readonly issues: ReadonlyArray<StandardIssue>;
++}
++
++export interface StandardIssue {
++  readonly message: string;
++  readonly path?: ReadonlyArray<PropertyKey | StandardPathSegment> | undefined;
++}
++
++export interface StandardPathSegment {
++  readonly key: PropertyKey;
++}
++
++export interface StandardTypes<Input, Output> {
++  readonly input: Input;
++  readonly output: Output;
++}
++
++export function createStandardPath(
++  path: string | undefined,
++): StandardIssue['path'] {
++  if (!path?.length) {
++    return undefined;
++  }
++
++  // Array to store the final path segments
++  const segments: string[] = [];
++  // Buffer for building the current segment
++  let currentSegment = '';
++  // Track if we're inside square brackets (array/property access)
++  let inBrackets = false;
++  // Track if we're inside quotes (for property names with special chars)
++  let inQuotes = false;
++
++  for (let i = 0; i < path.length; i++) {
++    const char = path[i];
++
++    if (char === '[' && !inQuotes) {
++      // When entering brackets, push any accumulated segment after splitting on dots
++      if (currentSegment) {
++        segments.push(...currentSegment.split('.').filter(Boolean));
++        currentSegment = '';
++      }
++      inBrackets = true;
++      continue;
++    }
++
++    if (char === ']' && !inQuotes) {
++      if (currentSegment) {
++        // Handle numeric indices (e.g. arr[0])
++        if (/^\d+$/.test(currentSegment)) {
++          segments.push(currentSegment);
++        } else {
++          // Handle quoted property names (e.g. obj["foo.bar"])
++          segments.push(currentSegment.replace(/^"|"$/g, ''));
++        }
++        currentSegment = '';
++      }
++      inBrackets = false;
++      continue;
++    }
++
++    if (char === '"') {
++      // Toggle quote state for handling quoted property names
++      inQuotes = !inQuotes;
++      continue;
++    }
++
++    if (char === '.' && !inBrackets && !inQuotes) {
++      // On dots outside brackets/quotes, push current segment
++      if (currentSegment) {
++        segments.push(currentSegment);
++        currentSegment = '';
++      }
++      continue;
++    }
++
++    currentSegment += char;
++  }
++
++  // Push any remaining segment after splitting on dots
++  if (currentSegment) {
++    segments.push(...currentSegment.split('.').filter(Boolean));
++  }
++
++  return segments;
++}
++
++export function createStandardIssues(
++  error: ValidationError,
++  parentPath?: string,
++): StandardIssue[] {
++  const path = parentPath ? `${parentPath}.${error.path}` : error.path;
++
++  return error.errors.map(
++    (err) =>
++      ({
++        message: err,
++        path: createStandardPath(path),
++      } satisfies StandardIssue),
++  );
++}
++
++export function issuesFromValidationError(
++  error: ValidationError,
++  parentPath?: string,
++): StandardIssue[] {
++  if (!error.inner?.length && error.errors.length) {
++    return createStandardIssues(error, parentPath);
++  }
++
++  const path = parentPath ? `${parentPath}.${error.path}` : error.path;
++
++  return error.inner.flatMap((err) => issuesFromValidationError(err, path));
++}
+diff --git a/yarn.lock b/yarn.lock
+index 18d4944..e891e46 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -2203,6 +2203,13 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
++"@standard-schema/spec@npm:^1.0.0":
++  version: 1.0.0
++  resolution: "@standard-schema/spec@npm:1.0.0"
++  checksum: 10c0/a1ab9a8bdc09b5b47aa8365d0e0ec40cc2df6437be02853696a0e377321653b0d3ac6f079a8c67d5ddbe9821025584b1fb71d9cc041a6666a96f1fadf2ece15f
++  languageName: node
++  linkType: hard
++
+ "@textlint/ast-node-types@npm:^12.1.1":
+   version: 12.1.1
+   resolution: "@textlint/ast-node-types@npm:12.1.1"
+@@ -15117,6 +15124,7 @@ __metadata:
+     "@babel/preset-typescript": "npm:^7.22.5"
+     "@rollup/plugin-babel": "npm:^5.3.1"
+     "@rollup/plugin-node-resolve": "npm:^13.3.0"
++    "@standard-schema/spec": "npm:^1.0.0"
+     "@types/jest": "npm:^27.5.2"
+     "@typescript-eslint/eslint-plugin": "npm:^5.62.0"
+     "@typescript-eslint/parser": "npm:^5.62.0"

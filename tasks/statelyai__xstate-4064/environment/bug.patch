@@ -1,0 +1,262 @@
+diff --git a/.changeset/red-berries-occur.md b/.changeset/red-berries-occur.md
+deleted file mode 100644
+index 774ff4e375..0000000000
+--- a/.changeset/red-berries-occur.md
++++ /dev/null
+@@ -1,30 +0,0 @@
+----
+-'xstate': patch
+----
+-
+-Guard objects can now reference other guard objects:
+-
+-```ts
+-const machine = createMachine(
+-  {
+-    initial: 'home',
+-    states: {
+-      home: {
+-        on: {
+-          NEXT: {
+-            target: 'success',
+-            guard: 'hasSelection'
+-          }
+-        }
+-      },
+-      success: {}
+-    }
+-  },
+-  {
+-    guards: {
+-      // `hasSelection` is a guard object that references the `stateIn` guard
+-      hasSelection: stateIn('selected')
+-    }
+-  }
+-);
+-```
+diff --git a/packages/core/src/guards.ts b/packages/core/src/guards.ts
+index 65f7db598e..d1fb9d1121 100644
+--- a/packages/core/src/guards.ts
++++ b/packages/core/src/guards.ts
+@@ -108,29 +108,14 @@ export function toGuardDefinition<
+   TEvent extends EventObject
+ >(
+   guardConfig: GuardConfig<TContext, TEvent>,
+-  getPredicate?: (
+-    guardType: string
+-  ) => GuardPredicate<TContext, TEvent> | GuardDefinition<TContext, TEvent>
++  getPredicate?: (guardType: string) => GuardPredicate<TContext, TEvent>
+ ): GuardDefinition<TContext, TEvent> {
+-  // TODO: check for cycles and consider a refactor to more lazily evaluated guards
+-  // TODO: resolve this more recursively: https://github.com/statelyai/xstate/pull/4064#discussion_r1229915724
+   if (isString(guardConfig)) {
+-    const predicateOrDef = getPredicate?.(guardConfig);
+-
+-    if (isFunction(predicateOrDef)) {
+-      return {
+-        type: guardConfig,
+-        predicate: predicateOrDef,
+-        params: { type: guardConfig }
+-      };
+-    } else if (predicateOrDef) {
+-      return predicateOrDef;
+-    } else {
+-      return {
+-        type: guardConfig,
+-        params: { type: guardConfig }
+-      };
+-    }
++    return {
++      type: guardConfig,
++      predicate: getPredicate?.(guardConfig) || undefined,
++      params: { type: guardConfig }
++    };
+   }
+ 
+   if (isFunction(guardConfig)) {
+@@ -144,28 +129,13 @@ export function toGuardDefinition<
+     };
+   }
+ 
+-  const predicateOrDef = getPredicate?.(guardConfig.type);
+-
+-  if (isFunction(predicateOrDef)) {
+-    return {
+-      type: guardConfig.type,
+-      params: guardConfig.params || guardConfig,
+-      children: (
+-        guardConfig.children as Array<GuardConfig<TContext, TEvent>>
+-      )?.map((childGuard) => toGuardDefinition(childGuard, getPredicate)),
+-      predicate:
+-        getPredicate?.(guardConfig.type) || (guardConfig as any).predicate
+-    };
+-  } else if (predicateOrDef) {
+-    return predicateOrDef;
+-  } else {
+-    return {
+-      type: guardConfig.type,
+-      params: guardConfig.params || guardConfig,
+-      children: (
+-        guardConfig.children as Array<GuardConfig<TContext, TEvent>>
+-      )?.map((childGuard) => toGuardDefinition(childGuard, getPredicate)),
+-      predicate: (guardConfig as any).predicate
+-    };
+-  }
++  return {
++    type: guardConfig.type,
++    params: guardConfig.params || guardConfig,
++    children: (
++      guardConfig.children as Array<GuardConfig<TContext, TEvent>>
++    )?.map((childGuard) => toGuardDefinition(childGuard, getPredicate)),
++    predicate:
++      getPredicate?.(guardConfig.type) || (guardConfig as any).predicate
++  };
+ }
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 659421747d..d744a7087a 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -834,15 +834,10 @@ type MachineImplementationsGuards<
+   >,
+   TIndexedEvents = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedEvents'>
+ > = {
+-  [K in keyof TEventsCausingGuards]?:
+-    | GuardPredicate<
+-        TContext,
+-        Cast<Prop<TIndexedEvents, TEventsCausingGuards[K]>, EventObject>
+-      >
+-    | GuardConfig<
+-        TContext,
+-        Cast<Prop<TIndexedEvents, TEventsCausingGuards[K]>, EventObject>
+-      >;
++  [K in keyof TEventsCausingGuards]?: GuardPredicate<
++    TContext,
++    Cast<Prop<TIndexedEvents, TEventsCausingGuards[K]>, EventObject>
++  >;
+ };
+ 
+ type MachineImplementationsActors<
+diff --git a/packages/core/test/guards.test.ts b/packages/core/test/guards.test.ts
+index 5780ac5108..1e437afde9 100644
+--- a/packages/core/test/guards.test.ts
++++ b/packages/core/test/guards.test.ts
+@@ -555,70 +555,6 @@ describe('referencing guards', () => {
+       Guard 'missing-predicate' is not implemented.'."
+     `);
+   });
+-
+-  it('should be possible to reference a composite guard that only uses inline predicates', () => {
+-    const machine = createMachine(
+-      {
+-        initial: 'a',
+-        states: {
+-          a: {
+-            on: {
+-              EVENT: {
+-                target: 'b',
+-                guard: 'referenced'
+-              }
+-            }
+-          },
+-          b: {}
+-        }
+-      },
+-      {
+-        guards: {
+-          referenced: not(() => false)
+-        }
+-      }
+-    );
+-
+-    const actorRef = interpret(machine).start();
+-    actorRef.send({ type: 'EVENT' });
+-
+-    expect(actorRef.getSnapshot().matches('b')).toBeTruthy();
+-  });
+-
+-  it('should be possible to reference a composite guard that references other guards recursively', () => {
+-    const machine = createMachine(
+-      {
+-        initial: 'a',
+-        states: {
+-          a: {
+-            on: {
+-              EVENT: {
+-                target: 'b',
+-                guard: 'referenced'
+-              }
+-            }
+-          },
+-          b: {}
+-        }
+-      },
+-      {
+-        guards: {
+-          truthy: () => true,
+-          falsy: () => false,
+-          referenced: or([
+-            () => false,
+-            not('truthy'),
+-            and([not('falsy'), 'truthy'])
+-          ])
+-        }
+-      }
+-    );
+-
+-    const actorRef = interpret(machine).start();
+-    actorRef.send({ type: 'EVENT' });
+-
+-    expect(actorRef.getSnapshot().matches('b')).toBeTruthy();
+-  });
+ });
+ 
+ describe('guards - other', () => {
+diff --git a/packages/core/test/stateIn.test.ts b/packages/core/test/stateIn.test.ts
+index 121880afb7..160647062d 100644
+--- a/packages/core/test/stateIn.test.ts
++++ b/packages/core/test/stateIn.test.ts
+@@ -424,44 +424,4 @@ describe('transition "in" check', () => {
+     actorRef.send({ type: 'TIMER' });
+     expect(actorRef.getSnapshot().value).toEqual('green');
+   });
+-
+-  it('should be possible to use a referenced `stateIn` guard', () => {
+-    const machine = createMachine(
+-      {
+-        type: 'parallel',
+-        // machine definition,
+-        states: {
+-          selected: {},
+-          location: {
+-            initial: 'home',
+-            states: {
+-              home: {
+-                on: {
+-                  NEXT: {
+-                    target: 'success',
+-                    guard: 'hasSelection'
+-                  }
+-                }
+-              },
+-              success: {}
+-            }
+-          }
+-        }
+-      },
+-      {
+-        guards: {
+-          hasSelection: stateIn('selected')
+-        }
+-      }
+-    );
+-
+-    const actor = interpret(machine).start();
+-    actor.send({
+-      type: 'NEXT'
+-    });
+-    expect(actor.getSnapshot().value).toEqual({
+-      selected: {},
+-      location: 'success'
+-    });
+-  });
+ });

@@ -1,0 +1,208 @@
+diff --git a/docs/api/immutabilityMiddleware.mdx b/docs/api/immutabilityMiddleware.mdx
+index c0a376cc..ae192a7f 100644
+--- a/docs/api/immutabilityMiddleware.mdx
++++ b/docs/api/immutabilityMiddleware.mdx
+@@ -29,11 +29,11 @@ interface ImmutableStateInvariantMiddlewareOptions {
+    */
+   isImmutable?: IsImmutableFunc
+   /** 
+-    An array of dot-separated path strings that match named nodes from 
++    An array of dot-separated path strings or RegExps that match named nodes from 
+     the root state to ignore when checking for immutability.
+     Defaults to undefined
+    */
+-  ignoredPaths?: string[]
++  ignoredPaths?: (string | RegExp)[]
+   /** Print a warning if checks take longer than N ms. Default: 32ms */
+   warnAfter?: number
+   // @deprecated. Use ignoredPaths
+diff --git a/docs/api/serializabilityMiddleware.mdx b/docs/api/serializabilityMiddleware.mdx
+index 84e7d3f0..0aa074a6 100644
+--- a/docs/api/serializabilityMiddleware.mdx
++++ b/docs/api/serializabilityMiddleware.mdx
+@@ -39,16 +39,17 @@ interface SerializableStateInvariantMiddlewareOptions {
+   ignoredActions?: string[]
+ 
+   /**
+-   * An array of dot-separated path strings to ignore when checking
+-   * for serializability, Defaults to ['meta.arg', 'meta.baseQueryMeta']
++   * An array of dot-separated path strings or regular expressions to ignore
++   * when checking for serializability, Defaults to
++   * ['meta.arg', 'meta.baseQueryMeta']
+    */
+-  ignoredActionPaths?: string[]
++  ignoredActionPaths?: (string | RegExp)[]
+ 
+   /**
+-   * An array of dot-separated path strings to ignore when checking
+-   * for serializability, Defaults to []
++   * An array of dot-separated path strings or regular expressions to ignore
++   * when checking for serializability, Defaults to []
+    */
+-  ignoredPaths?: string[]
++  ignoredPaths?: (string | RegExp)[]
+   /**
+    * Execution time warning threshold. If the middleware takes longer
+    * than `warnAfter` ms, a warning will be displayed in the console.
+diff --git a/packages/toolkit/etc/redux-toolkit.api.md b/packages/toolkit/etc/redux-toolkit.api.md
+index 62dd2715..5a113e63 100644
+--- a/packages/toolkit/etc/redux-toolkit.api.md
++++ b/packages/toolkit/etc/redux-toolkit.api.md
+@@ -511,7 +511,7 @@ export function findNonSerializableValue(
+   path?: string,
+   isSerializable?: (value: unknown) => boolean,
+   getEntries?: (value: unknown) => [string, any][],
+-  ignoredPaths?: readonly string[]
++  ignoredPaths?: readonly (string | RegExp)[]
+ ): NonSerializableValue | false
+ 
+ export { freeze }
+@@ -762,9 +762,9 @@ export { Selector }
+ // @public
+ export interface SerializableStateInvariantMiddlewareOptions {
+   getEntries?: (value: any) => [string, any][]
+-  ignoredActionPaths?: string[]
++  ignoredActionPaths?: (string | RegExp)[]
+   ignoredActions?: string[]
+-  ignoredPaths?: string[]
++  ignoredPaths?: (string | RegExp)[]
+   ignoreState?: boolean
+   isSerializable?: (value: any) => boolean
+   warnAfter?: number
+diff --git a/packages/toolkit/src/immutableStateInvariantMiddleware.ts b/packages/toolkit/src/immutableStateInvariantMiddleware.ts
+index 754edcb1..69f42b67 100644
+--- a/packages/toolkit/src/immutableStateInvariantMiddleware.ts
++++ b/packages/toolkit/src/immutableStateInvariantMiddleware.ts
+@@ -72,7 +72,7 @@ export function isImmutableDefault(value: unknown): boolean {
+ 
+ export function trackForMutations(
+   isImmutable: IsImmutableFunc,
+-  ignorePaths: string[] | undefined,
++  ignorePaths: IgnorePaths | undefined,
+   obj: any
+ ) {
+   const trackedProperties = trackProperties(isImmutable, ignorePaths, obj)
+@@ -116,11 +116,11 @@ function trackProperties(
+   return tracked as TrackedProperty
+ }
+ 
+-type IgnorePaths = readonly string[]
++type IgnorePaths = readonly (string | RegExp)[]
+ 
+ function detectMutations(
+   isImmutable: IsImmutableFunc,
+-  ignorePaths: IgnorePaths = [],
++  ignoredPaths: IgnorePaths = [],
+   trackedProperty: TrackedProperty,
+   obj: any,
+   sameParentRef: boolean = false,
+@@ -147,19 +147,30 @@ function detectMutations(
+     keysToDetect[key] = true
+   }
+ 
++  const hasIgnoredPaths = ignoredPaths.length > 0
++
+   for (let key in keysToDetect) {
+-    const childPath = path ? path + '.' + key : key
+-    if (ignorePaths.length && ignorePaths.indexOf(childPath) !== -1) {
+-      continue
++    const nestedPath = path ? path + '.' + key : key
++
++    if (hasIgnoredPaths) {
++      const hasMatches = ignoredPaths.some((ignored) => {
++        if (ignored instanceof RegExp) {
++          return ignored.test(nestedPath)
++        }
++        return nestedPath === ignored
++      })
++      if (hasMatches) {
++        continue
++      }
+     }
+ 
+     const result = detectMutations(
+       isImmutable,
+-      ignorePaths,
++      ignoredPaths,
+       trackedProperty.children[key],
+       obj[key],
+       sameRef,
+-      childPath
++      nestedPath
+     )
+ 
+     if (result.wasMutated) {
+@@ -189,7 +200,7 @@ export interface ImmutableStateInvariantMiddlewareOptions {
+     the root state to ignore when checking for immutability.
+     Defaults to undefined
+    */
+-  ignoredPaths?: string[]
++  ignoredPaths?: IgnorePaths
+   /** Print a warning if checks take longer than N ms. Default: 32ms */
+   warnAfter?: number
+   // @deprecated. Use ignoredPaths
+diff --git a/packages/toolkit/src/serializableStateInvariantMiddleware.ts b/packages/toolkit/src/serializableStateInvariantMiddleware.ts
+index 9058451b..5aeafb26 100644
+--- a/packages/toolkit/src/serializableStateInvariantMiddleware.ts
++++ b/packages/toolkit/src/serializableStateInvariantMiddleware.ts
+@@ -28,6 +28,8 @@ interface NonSerializableValue {
+   value: unknown
+ }
+ 
++type IgnorePaths = readonly (string | RegExp)[]
++
+ /**
+  * @public
+  */
+@@ -36,7 +38,7 @@ export function findNonSerializableValue(
+   path: string = '',
+   isSerializable: (value: unknown) => boolean = isPlain,
+   getEntries?: (value: unknown) => [string, any][],
+-  ignoredPaths: readonly string[] = []
++  ignoredPaths: IgnorePaths = []
+ ): NonSerializableValue | false {
+   let foundNestedSerializable: NonSerializableValue | false
+ 
+@@ -58,8 +60,16 @@ export function findNonSerializableValue(
+   for (const [key, nestedValue] of entries) {
+     const nestedPath = path ? path + '.' + key : key
+ 
+-    if (hasIgnoredPaths && ignoredPaths.indexOf(nestedPath) >= 0) {
+-      continue
++    if (hasIgnoredPaths) {
++      const hasMatches = ignoredPaths.some((ignored) => {
++        if (ignored instanceof RegExp) {
++          return ignored.test(nestedPath)
++        }
++        return nestedPath === ignored
++      })
++      if (hasMatches) {
++        continue
++      }
+     }
+ 
+     if (!isSerializable(nestedValue)) {
+@@ -113,16 +123,17 @@ export interface SerializableStateInvariantMiddlewareOptions {
+   ignoredActions?: string[]
+ 
+   /**
+-   * An array of dot-separated path strings to ignore when checking
+-   * for serializability, Defaults to ['meta.arg', 'meta.baseQueryMeta']
++   * An array of dot-separated path strings or regular expressions to ignore
++   * when checking for serializability, Defaults to
++   * ['meta.arg', 'meta.baseQueryMeta']
+    */
+-  ignoredActionPaths?: string[]
++  ignoredActionPaths?: (string | RegExp)[]
+ 
+   /**
+-   * An array of dot-separated path strings to ignore when checking
+-   * for serializability, Defaults to []
++   * An array of dot-separated path strings or regular expressions to ignore
++   * when checking for serializability, Defaults to []
+    */
+-  ignoredPaths?: string[]
++  ignoredPaths?: (string | RegExp)[]
+   /**
+    * Execution time warning threshold. If the middleware takes longer
+    * than `warnAfter` ms, a warning will be displayed in the console.

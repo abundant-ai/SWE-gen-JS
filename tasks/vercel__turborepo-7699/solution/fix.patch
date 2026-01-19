@@ -1,0 +1,150 @@
+diff --git a/crates/turborepo-vt100/src/entire_screen.rs b/crates/turborepo-vt100/src/entire_screen.rs
+new file mode 100644
+index 0000000000..684b0e7194
+--- /dev/null
++++ b/crates/turborepo-vt100/src/entire_screen.rs
+@@ -0,0 +1,21 @@
++pub struct EntireScreen<'a>(pub(crate) &'a crate::Screen);
++
++impl<'a> EntireScreen<'a> {
++    #[must_use]
++    pub fn cell(&self, row: u16, col: u16) -> Option<&crate::Cell> {
++        self.0.grid().all_row(row).and_then(|r| r.get(col))
++    }
++
++    #[must_use]
++    pub fn contents(&self) -> String {
++        let mut s = String::new();
++        self.0.grid().write_full_contents(&mut s);
++        s
++    }
++
++    /// Size required to render all contents
++    #[must_use]
++    pub fn size(&self) -> (usize, u16) {
++        self.0.grid().size_with_contents()
++    }
++}
+diff --git a/crates/turborepo-vt100/src/grid.rs b/crates/turborepo-vt100/src/grid.rs
+index 2c01769cc9..4c8b7cf264 100644
+--- a/crates/turborepo-vt100/src/grid.rs
++++ b/crates/turborepo-vt100/src/grid.rs
+@@ -63,6 +63,22 @@ impl Grid {
+         self.size
+     }
+ 
++    /// Size of screen without trailing blank rows
++    pub fn size_with_contents(&self) -> (usize, u16) {
++        let cols = self.size.cols;
++        let last_row_with_content = self.all_rows().enumerate().fold(
++            0,
++            |last_row_with_contents, (row_index, row)| {
++                if row.is_blank() {
++                    last_row_with_contents
++                } else {
++                    row_index
++                }
++            },
++        );
++        (last_row_with_content + 1, cols)
++    }
++
+     pub fn set_size(&mut self, size: Size) {
+         if size.cols != self.size.cols {
+             for row in &mut self.rows {
+@@ -129,6 +145,21 @@ impl Grid {
+         self.rows.iter()
+     }
+ 
++    pub fn all_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
++        self.scrollback.iter().chain(self.rows.iter())
++    }
++
++    pub(crate) fn all_row(&self, row: u16) -> Option<&crate::row::Row> {
++        let row = usize::from(row);
++        if row < self.scrollback.len() {
++            self.scrollback.get(row)
++        } else if row < self.scrollback.len() + self.rows.len() {
++            self.rows.get(row - self.scrollback.len())
++        } else {
++            None
++        }
++    }
++
+     pub fn drawing_rows_mut(
+         &mut self,
+     ) -> impl Iterator<Item = &mut crate::row::Row> {
+@@ -196,6 +227,21 @@ impl Grid {
+         }
+     }
+ 
++    pub fn write_full_contents(&self, contents: &mut String) {
++        let mut wrapping = false;
++        for row in self.all_rows() {
++            row.write_contents(contents, 0, self.size.cols, wrapping);
++            if !row.wrapped() {
++                contents.push('\n');
++            }
++            wrapping = row.wrapped();
++        }
++
++        while contents.ends_with('\n') {
++            contents.truncate(contents.len() - 1);
++        }
++    }
++
+     pub fn write_contents_formatted(
+         &self,
+         contents: &mut Vec<u8>,
+diff --git a/crates/turborepo-vt100/src/lib.rs b/crates/turborepo-vt100/src/lib.rs
+index 418c08719a..3817fa4567 100644
+--- a/crates/turborepo-vt100/src/lib.rs
++++ b/crates/turborepo-vt100/src/lib.rs
+@@ -50,6 +50,7 @@
+ mod attrs;
+ mod callbacks;
+ mod cell;
++mod entire_screen;
+ mod grid;
+ mod parser;
+ mod perform;
+@@ -60,5 +61,6 @@ mod term;
+ pub use attrs::Color;
+ pub use callbacks::Callbacks;
+ pub use cell::Cell;
++pub use entire_screen::EntireScreen;
+ pub use parser::Parser;
+ pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+diff --git a/crates/turborepo-vt100/src/parser.rs b/crates/turborepo-vt100/src/parser.rs
+index 2844e17f7e..0904369664 100644
+--- a/crates/turborepo-vt100/src/parser.rs
++++ b/crates/turborepo-vt100/src/parser.rs
+@@ -57,6 +57,13 @@ impl Parser {
+     pub fn screen_mut(&mut self) -> &mut crate::Screen {
+         &mut self.screen.0
+     }
++
++    /// Returns a reference to an `EntireScreen` object containing the
++    /// terminal state where all contents including scrollback and displayed.
++    #[must_use]
++    pub fn entire_screen(&self) -> crate::EntireScreen {
++        crate::EntireScreen(self.screen())
++    }
+ }
+ 
+ impl Default for Parser {
+diff --git a/crates/turborepo-vt100/src/row.rs b/crates/turborepo-vt100/src/row.rs
+index eb56f4e3c8..4d0605eae8 100644
+--- a/crates/turborepo-vt100/src/row.rs
++++ b/crates/turborepo-vt100/src/row.rs
+@@ -29,6 +29,10 @@ impl Row {
+         self.wrapped = false;
+     }
+ 
++    pub fn is_blank(&self) -> bool {
++        self.cells().all(|cell| !cell.has_contents())
++    }
++
+     fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
+         self.cells.iter()
+     }

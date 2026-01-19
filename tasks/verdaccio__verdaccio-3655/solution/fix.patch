@@ -1,0 +1,254 @@
+diff --git a/.changeset/rare-planets-travel.md b/.changeset/rare-planets-travel.md
+new file mode 100644
+index 000000000..2f636c308
+--- /dev/null
++++ b/.changeset/rare-planets-travel.md
+@@ -0,0 +1,9 @@
++---
++'@verdaccio/config': minor
++'@verdaccio/core': minor
++'@verdaccio/types': minor
++'@verdaccio/signature': minor
++'@verdaccio/test-helper': minor
++---
++
++feat: add forceEnhancedLegacySignature
+diff --git a/packages/config/src/config-path.ts b/packages/config/src/config-path.ts
+index 6967597d7..6fbfb4999 100644
+--- a/packages/config/src/config-path.ts
++++ b/packages/config/src/config-path.ts
+@@ -28,7 +28,6 @@ const debug = buildDebug('verdaccio:config');
+  * @return {String} the config file path
+  */
+ function findConfigFile(configPath?: string): string {
+-  // console.log(process.env);
+   if (typeof configPath !== 'undefined') {
+     return path.resolve(configPath);
+   }
+diff --git a/packages/config/src/config.ts b/packages/config/src/config.ts
+index a10cf1e3b..0d34bfa0d 100644
+--- a/packages/config/src/config.ts
++++ b/packages/config/src/config.ts
+@@ -2,7 +2,8 @@ import assert from 'assert';
+ import buildDebug from 'debug';
+ import _ from 'lodash';
+ 
+-import { APP_ERROR } from '@verdaccio/core';
++import { APP_ERROR, warningUtils } from '@verdaccio/core';
++import { Codes } from '@verdaccio/core/build/warning-utils';
+ import {
+   Config as AppConfig,
+   AuthConf,
+@@ -45,9 +46,11 @@ class Config implements AppConfig {
+   public users: any;
+   public auth: AuthConf;
+   public server_id: string;
+-  // @deprecated use configPath instead
+-  public config_path: string;
+   public configPath: string;
++  /**
++   * @deprecated use configPath or config.getConfigPath();
++   */
++  public self_path: string;
+   public storage: string | void;
+ 
+   public plugins: string | void | null;
+@@ -57,14 +60,24 @@ class Config implements AppConfig {
+   public secret: string;
+   public flags: FlagsConfig;
+   public userRateLimit: RateLimit;
+-  public constructor(config: ConfigYaml & { config_path: string }) {
++  private configOptions: { forceEnhancedLegacySignature: boolean };
++  public constructor(
++    config: ConfigYaml & { config_path: string },
++    configOptions = { forceEnhancedLegacySignature: true }
++  ) {
+     const self = this;
++    this.configOptions = configOptions;
+     this.storage = process.env.VERDACCIO_STORAGE_PATH || config.storage;
+     if (!config.configPath) {
+-      throw new Error('config_path is required');
++      // backport self_path for previous to version 6
++      // @ts-expect-error
++      config.configPath = config.config_path ?? config.self_path;
++      if (!config.configPath) {
++        throw new Error('configPath property is required');
++      }
+     }
+-    this.config_path = config.config_path ?? (config.configPath as string);
+     this.configPath = config.configPath;
++    this.self_path = this.configPath;
+     debug('config path: %s', this.configPath);
+     this.plugins = config.plugins;
+     this.security = _.merge(defaultSecurity, config.security);
+@@ -117,6 +130,10 @@ class Config implements AppConfig {
+     }
+   }
+ 
++  public getConfigPath() {
++    return this.configPath;
++  }
++
+   /**
+    * Check for package spec
+    */
+@@ -127,18 +144,35 @@ class Config implements AppConfig {
+ 
+   /**
+    * Store or create whether receive a secret key
++   * @secret external secret key
+    */
+   public checkSecretKey(secret?: string): string {
+     debug('check secret key');
+-    if (_.isString(secret) && _.isEmpty(secret) === false) {
++    if (typeof secret === 'string' && _.isEmpty(secret) === false) {
+       this.secret = secret;
+       debug('reusing previous key');
+       return secret;
+     }
+-    // it generates a secret key
++    // generate a new a secret key
+     // FUTURE: this might be an external secret key, perhaps within config file?
+     debug('generate a new key');
+-    this.secret = generateRandomSecretKey();
++    //
++    if (this.configOptions.forceEnhancedLegacySignature) {
++      this.secret = generateRandomSecretKey();
++    } else {
++      this.secret =
++        this.security.enhancedLegacySignature === true
++          ? generateRandomSecretKey()
++          : generateRandomHexString(32);
++      // set this to false allow use old token signature and is not recommended
++      // only use for migration reasons, major release will remove this property and
++      // set it by default
++      if (this.security.enhancedLegacySignature === false) {
++        warningUtils.emit(Codes.VERWAR005);
++      }
++    }
++
++    debug('generated a new secret key %s', this.secret?.length);
+     return this.secret;
+   }
+ }
+diff --git a/packages/config/src/token.ts b/packages/config/src/token.ts
+index 6dbcc01fd..c7e986610 100644
+--- a/packages/config/src/token.ts
++++ b/packages/config/src/token.ts
+@@ -4,7 +4,6 @@ export const TOKEN_VALID_LENGTH = 32;
+ 
+ /**
+  * Secret key must have 32 characters.
+- * @deprecated
+  */
+ export function generateRandomSecretKey(): string {
+   return randomBytes(TOKEN_VALID_LENGTH).toString('base64').substring(0, TOKEN_VALID_LENGTH);
+diff --git a/packages/config/tsconfig.json b/packages/config/tsconfig.json
+index ce4e6177f..ae9179a75 100644
+--- a/packages/config/tsconfig.json
++++ b/packages/config/tsconfig.json
+@@ -9,6 +9,9 @@
+   "references": [
+     {
+       "path": "../utils"
++    },
++    {
++      "path": "../core/core"
+     }
+   ]
+ }
+diff --git a/packages/core/core/src/warning-utils.ts b/packages/core/core/src/warning-utils.ts
+index 41e4b6f40..deb60e05c 100644
+--- a/packages/core/core/src/warning-utils.ts
++++ b/packages/core/core/src/warning-utils.ts
+@@ -9,6 +9,7 @@ export enum Codes {
+   VERWAR002 = 'VERWAR002',
+   VERWAR003 = 'VERWAR003',
+   VERWAR004 = 'VERWAR004',
++  VERWAR005 = 'VERWAR005',
+   // deprecation warnings
+   VERDEP003 = 'VERDEP003',
+ }
+@@ -39,6 +40,12 @@ host:port (e.g. "localhost:4873") or full url '(e.g. "http://localhost:4873/")
+ https://verdaccio.org/docs/en/configuration#listen-port`
+ );
+ 
++warningInstance.create(
++  verdaccioWarning,
++  Codes.VERWAR005,
++  'disable enhanced legacy signature is considered a security risk, please reconsider enable it'
++);
++
+ warningInstance.create(
+   verdaccioDeprecation,
+   Codes.VERDEP003,
+diff --git a/packages/core/types/src/configuration.ts b/packages/core/types/src/configuration.ts
+index 1ac79a235..861dfb16e 100644
+--- a/packages/core/types/src/configuration.ts
++++ b/packages/core/types/src/configuration.ts
+@@ -185,6 +185,7 @@ export interface APITokenOptions {
+ }
+ 
+ export interface Security {
++  enhancedLegacySignature?: boolean;
+   web: JWTOptions;
+   api: APITokenOptions;
+ }
+@@ -266,8 +267,6 @@ export interface ConfigYaml {
+   flags?: FlagsConfig;
+   userRateLimit?: RateLimit;
+   // internal objects, added by internal yaml to JS config parser
+-  // @deprecated use configPath instead
+-  config_path?: string;
+   // save the configuration file path
+   configPath?: string;
+ }
+@@ -282,6 +281,8 @@ export interface Config extends Omit<ConfigYaml, 'packages' | 'security' | 'conf
+   secret: string;
+   // save the configuration file path, it's fails without thi configPath
+   configPath: string;
++  // @deprecated use configPath
++  self_path?: string;
+   // packages from yaml file looks different from packages inside the config file
+   packages: PackageList;
+   // security object defaults is added by the config file but optional in the yaml file
+diff --git a/packages/signature/src/legacy-signature/index.ts b/packages/signature/src/legacy-signature/index.ts
+index d65ce9c03..f1dd41619 100644
+--- a/packages/signature/src/legacy-signature/index.ts
++++ b/packages/signature/src/legacy-signature/index.ts
+@@ -43,8 +43,7 @@ export function aesDecryptDeprecated(buf: Buffer, secret: string): Buffer {
+ export const TOKEN_VALID_LENGTH_DEPRECATED = 64;
+ 
+ /**
+- * Genrate a secret key of 64 characters.
+- * @deprecated keys should be length max of 64
++ * Generate a secret key of 64 characters.
+  */
+ export function generateRandomSecretKeyDeprecated(): string {
+   return generateRandomHexString(6);
+diff --git a/packages/signature/src/signature.ts b/packages/signature/src/signature.ts
+index 0e762c8e7..ee1865e2e 100644
+--- a/packages/signature/src/signature.ts
++++ b/packages/signature/src/signature.ts
+@@ -20,7 +20,7 @@ const VERDACCIO_LEGACY_ENCRYPTION_KEY = process.env.VERDACCIO_LEGACY_ENCRYPTION_
+ 
+ export function aesEncrypt(value: string, key: string): string | void {
+   // https://nodejs.org/api/crypto.html#crypto_crypto_createcipher_algorithm_password_options
+-  // https://www.grainger.xyz/changing-from-cipher-to-cipheriv/
++  // https://www.grainger.xyz/posts/changing-from-cipher-to-cipheriv
+   debug('encrypt %o', value);
+   debug('algorithm %o', defaultAlgorithm);
+   // IV must be a buffer of length 16
+diff --git a/packages/tools/helpers/src/initializeServer.ts b/packages/tools/helpers/src/initializeServer.ts
+index d40bb14c2..70d65a2a8 100644
+--- a/packages/tools/helpers/src/initializeServer.ts
++++ b/packages/tools/helpers/src/initializeServer.ts
+@@ -19,7 +19,7 @@ export async function initializeServer(
+   Storage
+ ): Promise<Application> {
+   const app = express();
+-  const config = new Config(configName);
++  const config = new Config(configName, { forceEnhancedLegacySignature: true });
+   config.storage = path.join(os.tmpdir(), '/storage', generateRandomHexString());
+   // httpass would get path.basename() for configPath thus we need to create a dummy folder
+   // to avoid conflics

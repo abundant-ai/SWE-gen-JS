@@ -1,0 +1,876 @@
+diff --git a/conf/default-cli-options.js b/conf/default-cli-options.js
+index dad03d89e..e09a829d1 100644
+--- a/conf/default-cli-options.js
++++ b/conf/default-cli-options.js
+@@ -24,7 +24,6 @@ module.exports = {
+      */
+     cacheLocation: "",
+     cacheFile: ".eslintcache",
+-    cacheStrategy: "metadata",
+     fix: false,
+     allowInlineConfig: true,
+     reportUnusedDisableDirectives: void 0,
+diff --git a/docs/developer-guide/nodejs-api.md b/docs/developer-guide/nodejs-api.md
+index 708d1fa82..cfa037218 100644
+--- a/docs/developer-guide/nodejs-api.md
++++ b/docs/developer-guide/nodejs-api.md
+@@ -156,8 +156,6 @@ The `ESLint` constructor takes an `options` object. If you omit the `options` ob
+   Default is `false`. If `true` is present, the [`eslint.lintFiles()`][eslint-lintfiles] method caches lint results and uses it if each target file is not changed. Please mind that ESLint doesn't clear the cache when you upgrade ESLint plugins. In that case, you have to remove the cache file manually. The [`eslint.lintText()`][eslint-linttext] method doesn't use caches even if you pass the `options.filePath` to the method.
+ * `options.cacheLocation` (`string`)<br>
+   Default is `.eslintcache`. The [`eslint.lintFiles()`][eslint-lintfiles] method writes caches into this file.
+-* `options.cacheStrategy` (`string`)<br>
+-  Default is `"metadata"`. Strategy for the cache to use for detecting changed files. Can be either `"metadata"` or `"content"`.
+ 
+ ### ◆ eslint.lintFiles(patterns)
+ 
+diff --git a/docs/user-guide/command-line-interface.md b/docs/user-guide/command-line-interface.md
+index 99fd61eb9..64afa0b01 100644
+--- a/docs/user-guide/command-line-interface.md
++++ b/docs/user-guide/command-line-interface.md
+@@ -75,7 +75,6 @@ Caching:
+   --cache                        Only check changed files - default: false
+   --cache-file path::String      Path to the cache file. Deprecated: use --cache-location - default: .eslintcache
+   --cache-location path::String  Path to the cache file or directory
+-  --cache-strategy String        Strategy to use for detecting changed files - either: metadata or content - default: metadata
+ 
+ Miscellaneous:
+   --init                         Run config initialization wizard - default: false
+@@ -441,16 +440,6 @@ Example:
+ 
+     eslint "src/**/*.js" --cache --cache-location "/Users/user/.eslintcache/"
+ 
+-#### `--cache-strategy`
+-
+-Strategy for the cache to use for detecting changed files. Can be either `metadata` or `content`. If no strategy is specified, `metadata` will be used.
+-
+-The `content` strategy can be useful in cases where the modification time of your files change even if their contents have not. For example, this can happen during git operations like git clone because git does not track file modification time.
+-
+-Example:
+-
+-    eslint "src/**/*.js" --cache --cache-strategy content
+-
+ ### Miscellaneous
+ 
+ #### `--init`
+diff --git a/lib/cli-engine/cli-engine.js b/lib/cli-engine/cli-engine.js
+index b1befaa04..3fd4f5ee1 100644
+--- a/lib/cli-engine/cli-engine.js
++++ b/lib/cli-engine/cli-engine.js
+@@ -589,7 +589,7 @@ class CLIEngine {
+             ignore: options.ignore
+         });
+         const lintResultCache =
+-            options.cache ? new LintResultCache(cacheFilePath, options.cacheStrategy) : null;
++            options.cache ? new LintResultCache(cacheFilePath) : null;
+         const linter = new Linter({ cwd: options.cwd });
+ 
+         /** @type {ConfigArray[]} */
+diff --git a/lib/cli-engine/lint-result-cache.js b/lib/cli-engine/lint-result-cache.js
+index 25b856f2f..23a142097 100644
+--- a/lib/cli-engine/lint-result-cache.js
++++ b/lib/cli-engine/lint-result-cache.js
+@@ -15,8 +15,6 @@ const stringify = require("json-stable-stringify-without-jsonify");
+ const pkg = require("../../package.json");
+ const hash = require("./hash");
+ 
+-const debug = require("debug")("eslint:lint-result-cache");
+-
+ //-----------------------------------------------------------------------------
+ // Helpers
+ //-----------------------------------------------------------------------------
+@@ -24,22 +22,6 @@ const debug = require("debug")("eslint:lint-result-cache");
+ const configHashCache = new WeakMap();
+ const nodeVersion = process && process.version;
+ 
+-const validCacheStrategies = ["metadata", "content"];
+-const invalidCacheStrategyErrorMessage = `Cache strategy must be one of: ${validCacheStrategies
+-    .map(strategy => `"${strategy}"`)
+-    .join(", ")}`;
+-
+-/**
+- * Tests whether a provided cacheStrategy is valid
+- * @param {string} cacheStrategy The cache strategy to use
+- * @returns {boolean} true if `cacheStrategy` is one of `validCacheStrategies`; false otherwise
+- */
+-function isValidCacheStrategy(cacheStrategy) {
+-    return (
+-        validCacheStrategies.indexOf(cacheStrategy) !== -1
+-    );
+-}
+-
+ /**
+  * Calculates the hash of the config
+  * @param {ConfigArray} config The config.
+@@ -68,30 +50,11 @@ class LintResultCache {
+      * Creates a new LintResultCache instance.
+      * @param {string} cacheFileLocation The cache file location.
+      *   configuration lookup by file path).
+-     * @param {"metadata" | "content"} cacheStrategy The cache strategy to use.
+      */
+-    constructor(cacheFileLocation, cacheStrategy) {
++    constructor(cacheFileLocation) {
+         assert(cacheFileLocation, "Cache file location is required");
+-        assert(cacheStrategy, "Cache strategy is required");
+-        assert(
+-            isValidCacheStrategy(cacheStrategy),
+-            invalidCacheStrategyErrorMessage
+-        );
+-
+-        debug(`Caching results to ${cacheFileLocation}`);
+-
+-        const useChecksum = cacheStrategy === "content";
+-
+-        debug(
+-            `Using "${cacheStrategy}" strategy to detect changes`
+-        );
+-
+-        this.fileEntryCache = fileEntryCache.create(
+-            cacheFileLocation,
+-            void 0,
+-            useChecksum
+-        );
+-        this.cacheFileLocation = cacheFileLocation;
++
++        this.fileEntryCache = fileEntryCache.create(cacheFileLocation);
+     }
+ 
+     /**
+@@ -113,28 +76,17 @@ class LintResultCache {
+          *    was previously linted
+          * If any of these are not true, we will not reuse the lint results.
+          */
++
+         const fileDescriptor = this.fileEntryCache.getFileDescriptor(filePath);
+         const hashOfConfig = hashOfConfigFor(config);
+-        const changed =
+-            fileDescriptor.changed ||
+-            fileDescriptor.meta.hashOfConfig !== hashOfConfig;
+-
+-        if (fileDescriptor.notFound) {
+-            debug(`File not found on the file system: ${filePath}`);
+-            return null;
+-        }
++        const changed = fileDescriptor.changed || fileDescriptor.meta.hashOfConfig !== hashOfConfig;
+ 
+-        if (changed) {
+-            debug(`Cache entry not found or no longer valid: ${filePath}`);
++        if (fileDescriptor.notFound || changed) {
+             return null;
+         }
+ 
+         // If source is present but null, need to reread the file from the filesystem.
+-        if (
+-            fileDescriptor.meta.results &&
+-            fileDescriptor.meta.results.source === null
+-        ) {
+-            debug(`Rereading cached result source from filesystem: ${filePath}`);
++        if (fileDescriptor.meta.results && fileDescriptor.meta.results.source === null) {
+             fileDescriptor.meta.results.source = fs.readFileSync(filePath, "utf-8");
+         }
+ 
+@@ -160,7 +112,6 @@ class LintResultCache {
+         const fileDescriptor = this.fileEntryCache.getFileDescriptor(filePath);
+ 
+         if (fileDescriptor && !fileDescriptor.notFound) {
+-            debug(`Updating cached result: ${filePath}`);
+ 
+             // Serialize the result, except that we want to remove the file source if present.
+             const resultToSerialize = Object.assign({}, result);
+@@ -184,7 +135,6 @@ class LintResultCache {
+      * @returns {void}
+      */
+     reconcile() {
+-        debug(`Persisting cached results: ${this.cacheFileLocation}`);
+         this.fileEntryCache.reconcile();
+     }
+ }
+diff --git a/lib/cli.js b/lib/cli.js
+index 4216126b6..ce1187800 100644
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -62,7 +62,6 @@ function translateOptions({
+     cache,
+     cacheFile,
+     cacheLocation,
+-    cacheStrategy,
+     config,
+     env,
+     errorOnUnmatchedPattern,
+@@ -89,7 +88,6 @@ function translateOptions({
+         allowInlineConfig: inlineConfig,
+         cache,
+         cacheLocation: cacheLocation || cacheFile,
+-        cacheStrategy,
+         errorOnUnmatchedPattern,
+         extensions: ext,
+         fix: (fix || fixDryRun) && (quiet ? quietFixPredicate : true),
+diff --git a/lib/eslint/eslint.js b/lib/eslint/eslint.js
+index ae2d21008..0bd7a41c6 100644
+--- a/lib/eslint/eslint.js
++++ b/lib/eslint/eslint.js
+@@ -43,7 +43,6 @@ const { version } = require("../../package.json");
+  * @property {ConfigData} [baseConfig] Base config object, extended by all configs used with this instance
+  * @property {boolean} [cache] Enable result caching.
+  * @property {string} [cacheLocation] The cache file to use instead of .eslintcache.
+- * @property {"metadata" | "content"} [cacheStrategy] The strategy used to detect changed files.
+  * @property {string} [cwd] The value to use for the current working directory.
+  * @property {boolean} [errorOnUnmatchedPattern] If `false` then `ESLint#lintFiles()` doesn't throw even if no target files found. Defaults to `true`.
+  * @property {string[]} [extensions] An array of file extensions to check.
+@@ -158,7 +157,6 @@ function processOptions({
+     baseConfig = null,
+     cache = false,
+     cacheLocation = ".eslintcache",
+-    cacheStrategy = "metadata",
+     cwd = process.cwd(),
+     errorOnUnmatchedPattern = true,
+     extensions = null, // ← should be null by default because if it's an array then it suppresses RFC20 feature.
+@@ -218,12 +216,6 @@ function processOptions({
+     if (!isNonEmptyString(cacheLocation)) {
+         errors.push("'cacheLocation' must be a non-empty string.");
+     }
+-    if (
+-        cacheStrategy !== "metadata" &&
+-        cacheStrategy !== "content"
+-    ) {
+-        errors.push("'cacheStrategy' must be any of \"metadata\", \"content\".");
+-    }
+     if (!isNonEmptyString(cwd) || !path.isAbsolute(cwd)) {
+         errors.push("'cwd' must be an absolute path.");
+     }
+@@ -292,7 +284,6 @@ function processOptions({
+         baseConfig,
+         cache,
+         cacheLocation,
+-        cacheStrategy,
+         configFile: overrideConfigFile,
+         cwd,
+         errorOnUnmatchedPattern,
+diff --git a/lib/options.js b/lib/options.js
+index 99a38a770..1681f1dbd 100644
+--- a/lib/options.js
++++ b/lib/options.js
+@@ -214,14 +214,6 @@ module.exports = optionator({
+             type: "path::String",
+             description: "Path to the cache file or directory"
+         },
+-        {
+-            option: "cache-strategy",
+-            dependsOn: ["cache"],
+-            type: "String",
+-            default: "metadata",
+-            enum: ["metadata", "content"],
+-            description: "Strategy to use for detecting changed files in the cache"
+-        },
+         {
+             heading: "Miscellaneous"
+         },
+diff --git a/package.json b/package.json
+index 941635389..fe5a3ba47 100644
+--- a/package.json
++++ b/package.json
+@@ -60,7 +60,7 @@
+     "espree": "^7.3.1",
+     "esquery": "^1.4.0",
+     "esutils": "^2.0.2",
+-    "file-entry-cache": "^6.0.1",
++    "file-entry-cache": "^6.0.0",
+     "functional-red-black-tree": "^1.0.1",
+     "glob-parent": "^5.0.0",
+     "globals": "^12.1.0",
+diff --git a/tests/lib/cli-engine/cli-engine.js b/tests/lib/cli-engine/cli-engine.js
+index 59243b0b7..9e7c49c84 100644
+--- a/tests/lib/cli-engine/cli-engine.js
++++ b/tests/lib/cli-engine/cli-engine.js
+@@ -2702,127 +2702,6 @@ describe("CLIEngine", () => {
+                     assert.deepStrictEqual(result, cachedResult, "result is the same with or without cache");
+                 });
+             });
+-
+-            describe("cacheStrategy", () => {
+-                it("should detect changes using a file's modification time when set to 'metadata'", () => {
+-                    const cacheFile = getFixturePath(".eslintcache");
+-                    const badFile = getFixturePath("cache/src", "fail-file.js");
+-                    const goodFile = getFixturePath("cache/src", "test-file.js");
+-
+-                    doDelete(cacheFile);
+-
+-                    engine = new CLIEngine({
+-                        cwd: path.join(fixtureDir, ".."),
+-                        useEslintrc: false,
+-
+-                        // specifying cache true the cache will be created
+-                        cache: true,
+-                        cacheFile,
+-                        cacheStrategy: "metadata",
+-                        rules: {
+-                            "no-console": 0,
+-                            "no-unused-vars": 2
+-                        },
+-                        extensions: ["js"]
+-                    });
+-
+-                    engine.executeOnFiles([badFile, goodFile]);
+-
+-                    let fileCache = fCache.createFromFile(cacheFile, false);
+-                    const entries = fileCache.normalizeEntries([badFile, goodFile]);
+-
+-                    entries.forEach(entry => {
+-                        assert.isFalse(entry.changed, `the entry for ${entry.key} is initially unchanged`);
+-                    });
+-
+-                    // this should result in a changed entry
+-                    shell.touch(goodFile);
+-                    fileCache = fCache.createFromFile(cacheFile, false);
+-                    assert.isFalse(fileCache.getFileDescriptor(badFile).changed, `the entry for ${badFile} is unchanged`);
+-                    assert.isTrue(fileCache.getFileDescriptor(goodFile).changed, `the entry for ${goodFile} is changed`);
+-                });
+-
+-                it("should not detect changes using a file's modification time when set to 'content'", () => {
+-                    const cacheFile = getFixturePath(".eslintcache");
+-                    const badFile = getFixturePath("cache/src", "fail-file.js");
+-                    const goodFile = getFixturePath("cache/src", "test-file.js");
+-
+-                    doDelete(cacheFile);
+-
+-                    engine = new CLIEngine({
+-                        cwd: path.join(fixtureDir, ".."),
+-                        useEslintrc: false,
+-
+-                        // specifying cache true the cache will be created
+-                        cache: true,
+-                        cacheFile,
+-                        cacheStrategy: "content",
+-                        rules: {
+-                            "no-console": 0,
+-                            "no-unused-vars": 2
+-                        },
+-                        extensions: ["js"]
+-                    });
+-
+-                    engine.executeOnFiles([badFile, goodFile]);
+-
+-                    let fileCache = fCache.createFromFile(cacheFile, true);
+-                    let entries = fileCache.normalizeEntries([badFile, goodFile]);
+-
+-                    entries.forEach(entry => {
+-                        assert.isFalse(entry.changed, `the entry for ${entry.key} is initially unchanged`);
+-                    });
+-
+-                    // this should NOT result in a changed entry
+-                    shell.touch(goodFile);
+-                    fileCache = fCache.createFromFile(cacheFile, true);
+-                    entries = fileCache.normalizeEntries([badFile, goodFile]);
+-                    entries.forEach(entry => {
+-                        assert.isFalse(entry.changed, `the entry for ${entry.key} remains unchanged`);
+-                    });
+-                });
+-
+-                it("should detect changes using a file's contents when set to 'content'", () => {
+-                    const cacheFile = getFixturePath(".eslintcache");
+-                    const badFile = getFixturePath("cache/src", "fail-file.js");
+-                    const goodFile = getFixturePath("cache/src", "test-file.js");
+-                    const goodFileCopy = path.resolve(`${path.dirname(goodFile)}`, "test-file-copy.js");
+-
+-                    shell.cp(goodFile, goodFileCopy);
+-
+-                    doDelete(cacheFile);
+-
+-                    engine = new CLIEngine({
+-                        cwd: path.join(fixtureDir, ".."),
+-                        useEslintrc: false,
+-
+-                        // specifying cache true the cache will be created
+-                        cache: true,
+-                        cacheFile,
+-                        cacheStrategy: "content",
+-                        rules: {
+-                            "no-console": 0,
+-                            "no-unused-vars": 2
+-                        },
+-                        extensions: ["js"]
+-                    });
+-
+-                    engine.executeOnFiles([badFile, goodFileCopy]);
+-
+-                    let fileCache = fCache.createFromFile(cacheFile, true);
+-                    const entries = fileCache.normalizeEntries([badFile, goodFileCopy]);
+-
+-                    entries.forEach(entry => {
+-                        assert.isFalse(entry.changed, `the entry for ${entry.key} is initially unchanged`);
+-                    });
+-
+-                    // this should result in a changed entry
+-                    shell.sed("-i", "abc", "xzy", goodFileCopy);
+-                    fileCache = fCache.createFromFile(cacheFile, true);
+-                    assert.isFalse(fileCache.getFileDescriptor(badFile).changed, `the entry for ${badFile} is unchanged`);
+-                    assert.isTrue(fileCache.getFileDescriptor(goodFileCopy).changed, `the entry for ${goodFileCopy} is changed`);
+-                });
+-            });
+         });
+ 
+         describe("processors", () => {
+diff --git a/tests/lib/cli-engine/lint-result-cache.js b/tests/lib/cli-engine/lint-result-cache.js
+index 41c72308f..a3b6ee3ab 100644
+--- a/tests/lib/cli-engine/lint-result-cache.js
++++ b/tests/lib/cli-engine/lint-result-cache.js
+@@ -20,23 +20,18 @@ const assert = require("chai").assert,
+ //-----------------------------------------------------------------------------
+ 
+ describe("LintResultCache", () => {
+-    const fixturePath = path.resolve(
+-        __dirname,
+-        "../../fixtures/lint-result-cache"
+-    );
++    const fixturePath = path.resolve(__dirname, "../../fixtures/lint-result-cache");
+     const cacheFileLocation = path.join(fixturePath, ".eslintcache");
+     const fileEntryCacheStubs = {};
+ 
+     let LintResultCache,
+         hashStub,
+-        sandbox,
+         fakeConfig,
+         fakeErrorResults,
+         fakeErrorResultsAutofix;
+ 
+     before(() => {
+-        sandbox = sinon.createSandbox();
+-        hashStub = sandbox.stub();
++        hashStub = sinon.stub();
+ 
+         let shouldFix = false;
+ 
+@@ -49,28 +44,21 @@ describe("LintResultCache", () => {
+         });
+ 
+         // Get results without autofixing...
+-        fakeErrorResults = cliEngine.executeOnFiles([
+-            path.join(fixturePath, "test-with-errors.js")
+-        ]).results[0];
++        fakeErrorResults = cliEngine.executeOnFiles([path.join(fixturePath, "test-with-errors.js")]).results[0];
+ 
+         // ...and with autofixing
+         shouldFix = true;
+-        fakeErrorResultsAutofix = cliEngine.executeOnFiles([
+-            path.join(fixturePath, "test-with-errors.js")
+-        ]).results[0];
++        fakeErrorResultsAutofix = cliEngine.executeOnFiles([path.join(fixturePath, "test-with-errors.js")]).results[0];
+ 
+         // Set up LintResultCache with fake fileEntryCache module
+-        LintResultCache = proxyquire(
+-            "../../../lib/cli-engine/lint-result-cache.js",
+-            {
+-                "file-entry-cache": fileEntryCacheStubs,
+-                "./hash": hashStub
+-            }
+-        );
++        LintResultCache = proxyquire("../../../lib/cli-engine/lint-result-cache.js", {
++            "file-entry-cache": fileEntryCacheStubs,
++            "./hash": hashStub
++        });
+     });
+ 
+     afterEach(done => {
+-        sandbox.reset();
++        sinon.reset();
+ 
+         fs.unlink(cacheFileLocation, err => {
+             if (err && err.code !== "ENOENT") {
+@@ -83,28 +71,11 @@ describe("LintResultCache", () => {
+ 
+     describe("constructor", () => {
+         it("should throw an error if cache file path is not provided", () => {
+-            assert.throws(
+-                () => new LintResultCache(),
+-                /Cache file location is required/u
+-            );
+-        });
+-
+-        it("should throw an error if cacheStrategy is not provided", () => {
+-            assert.throws(
+-                () => new LintResultCache(cacheFileLocation),
+-                /Cache strategy is required/u
+-            );
++            assert.throws(() => new LintResultCache(), /Cache file location is required/u);
+         });
+ 
+-        it("should throw an error if cacheStrategy is an invalid value", () => {
+-            assert.throws(
+-                () => new LintResultCache(cacheFileLocation, "foo"),
+-                /Cache strategy must be one of/u
+-            );
+-        });
+-
+-        it("should successfully create an instance if cache file location and cache strategy provided", () => {
+-            const instance = new LintResultCache(cacheFileLocation, "metadata");
++        it("should successfully create an instance if cache file location is provided", () => {
++            const instance = new LintResultCache(cacheFileLocation);
+ 
+             assert.ok(instance, "Instance should have been created successfully");
+         });
+@@ -114,10 +85,12 @@ describe("LintResultCache", () => {
+         const filePath = path.join(fixturePath, "test-with-errors.js");
+         const hashOfConfig = "hashOfConfig";
+ 
+-        let cacheEntry, getFileDescriptorStub, lintResultsCache;
++        let cacheEntry,
++            getFileDescriptorStub,
++            lintResultsCache;
+ 
+         before(() => {
+-            getFileDescriptorStub = sandbox.stub();
++            getFileDescriptorStub = sinon.stub();
+ 
+             fileEntryCacheStubs.create = () => ({
+                 getFileDescriptor: getFileDescriptorStub
+@@ -139,11 +112,12 @@ describe("LintResultCache", () => {
+                 }
+             };
+ 
+-            getFileDescriptorStub.withArgs(filePath).returns(cacheEntry);
++            getFileDescriptorStub.withArgs(filePath)
++                .returns(cacheEntry);
+ 
+             fakeConfig = {};
+ 
+-            lintResultsCache = new LintResultCache(cacheFileLocation, "metadata");
++            lintResultsCache = new LintResultCache(cacheFileLocation);
+         });
+ 
+         describe("when calculating the hashing", () => {
+@@ -153,7 +127,7 @@ describe("LintResultCache", () => {
+                     "../../package.json": { version },
+                     "./hash": hashStub
+                 });
+-                const newLintResultCache = new NewLintResultCache(cacheFileLocation, "metadata");
++                const newLintResultCache = new NewLintResultCache(cacheFileLocation);
+ 
+                 newLintResultCache.getCachedLintResults(filePath, fakeConfig);
+                 assert.ok(hashStub.calledOnce);
+@@ -163,14 +137,13 @@ describe("LintResultCache", () => {
+             it("contains node version during hashing", () => {
+                 const version = "node-=-version";
+ 
+-                sandbox.stub(process, "version").value(version);
++                sinon.stub(process, "version").value(version);
+                 const NewLintResultCache = proxyquire("../../../lib/cli-engine/lint-result-cache.js", {
+                     "./hash": hashStub
+                 });
+-                const newLintResultCache = new NewLintResultCache(cacheFileLocation, "metadata");
++                const newLintResultCache = new NewLintResultCache(cacheFileLocation);
+ 
+                 newLintResultCache.getCachedLintResults(filePath, fakeConfig);
+-
+                 assert.ok(hashStub.calledOnce);
+                 assert.ok(hashStub.calledWithMatch(version));
+             });
+@@ -183,10 +156,7 @@ describe("LintResultCache", () => {
+             });
+ 
+             it("should return null", () => {
+-                const result = lintResultsCache.getCachedLintResults(
+-                    filePath,
+-                    fakeConfig
+-                );
++                const result = lintResultsCache.getCachedLintResults(filePath, fakeConfig);
+ 
+                 assert.ok(getFileDescriptorStub.calledOnce);
+                 assert.isNull(result);
+@@ -199,10 +169,7 @@ describe("LintResultCache", () => {
+             });
+ 
+             it("should return null", () => {
+-                const result = lintResultsCache.getCachedLintResults(
+-                    filePath,
+-                    fakeConfig
+-                );
++                const result = lintResultsCache.getCachedLintResults(filePath, fakeConfig);
+ 
+                 assert.ok(getFileDescriptorStub.calledOnce);
+                 assert.isNull(result);
+@@ -216,10 +183,7 @@ describe("LintResultCache", () => {
+             });
+ 
+             it("should return null", () => {
+-                const result = lintResultsCache.getCachedLintResults(
+-                    filePath,
+-                    fakeConfig
+-                );
++                const result = lintResultsCache.getCachedLintResults(filePath, fakeConfig);
+ 
+                 assert.ok(getFileDescriptorStub.calledOnce);
+                 assert.isNull(result);
+@@ -232,16 +196,10 @@ describe("LintResultCache", () => {
+             });
+ 
+             it("should return expected results", () => {
+-                const result = lintResultsCache.getCachedLintResults(
+-                    filePath,
+-                    fakeConfig
+-                );
++                const result = lintResultsCache.getCachedLintResults(filePath, fakeConfig);
+ 
+                 assert.deepStrictEqual(result, fakeErrorResults);
+-                assert.ok(
+-                    result.source,
+-                    "source property should be hydrated from filesystem"
+-                );
++                assert.ok(result.source, "source property should be hydrated from filesystem");
+             });
+         });
+     });
+@@ -250,10 +208,12 @@ describe("LintResultCache", () => {
+         const filePath = path.join(fixturePath, "test-with-errors.js");
+         const hashOfConfig = "hashOfConfig";
+ 
+-        let cacheEntry, getFileDescriptorStub, lintResultsCache;
++        let cacheEntry,
++            getFileDescriptorStub,
++            lintResultsCache;
+ 
+         before(() => {
+-            getFileDescriptorStub = sandbox.stub();
++            getFileDescriptorStub = sinon.stub();
+ 
+             fileEntryCacheStubs.create = () => ({
+                 getFileDescriptor: getFileDescriptorStub
+@@ -269,22 +229,19 @@ describe("LintResultCache", () => {
+                 meta: {}
+             };
+ 
+-            getFileDescriptorStub.withArgs(filePath).returns(cacheEntry);
++            getFileDescriptorStub.withArgs(filePath)
++                .returns(cacheEntry);
+ 
+             fakeConfig = {};
+ 
+             hashStub.returns(hashOfConfig);
+ 
+-            lintResultsCache = new LintResultCache(cacheFileLocation, "metadata");
++            lintResultsCache = new LintResultCache(cacheFileLocation);
+         });
+ 
+         describe("When lint result has output property", () => {
+             it("does not modify file entry", () => {
+-                lintResultsCache.setCachedLintResults(
+-                    filePath,
+-                    fakeConfig,
+-                    fakeErrorResultsAutofix
+-                );
++                lintResultsCache.setCachedLintResults(filePath, fakeConfig, fakeErrorResultsAutofix);
+ 
+                 assert.notProperty(cacheEntry.meta, "results");
+                 assert.notProperty(cacheEntry.meta, "hashOfConfig");
+@@ -297,11 +254,7 @@ describe("LintResultCache", () => {
+             });
+ 
+             it("does not modify file entry", () => {
+-                lintResultsCache.setCachedLintResults(
+-                    filePath,
+-                    fakeConfig,
+-                    fakeErrorResults
+-                );
++                lintResultsCache.setCachedLintResults(filePath, fakeConfig, fakeErrorResults);
+ 
+                 assert.notProperty(cacheEntry.meta, "results");
+                 assert.notProperty(cacheEntry.meta, "hashOfConfig");
+@@ -310,11 +263,7 @@ describe("LintResultCache", () => {
+ 
+         describe("When file is found on filesystem", () => {
+             beforeEach(() => {
+-                lintResultsCache.setCachedLintResults(
+-                    filePath,
+-                    fakeConfig,
+-                    fakeErrorResults
+-                );
++                lintResultsCache.setCachedLintResults(filePath, fakeConfig, fakeErrorResults);
+             });
+ 
+             it("stores hash of config in file entry", () => {
+@@ -322,9 +271,11 @@ describe("LintResultCache", () => {
+             });
+ 
+             it("stores results (except source) in file entry", () => {
+-                const expectedCachedResults = Object.assign({}, fakeErrorResults, {
+-                    source: null
+-                });
++                const expectedCachedResults = Object.assign(
++                    {},
++                    fakeErrorResults,
++                    { source: null }
++                );
+ 
+                 assert.deepStrictEqual(cacheEntry.meta.results, expectedCachedResults);
+             });
+@@ -344,9 +295,11 @@ describe("LintResultCache", () => {
+             });
+ 
+             it("stores results (except source) in file entry", () => {
+-                const expectedCachedResults = Object.assign({}, fakeErrorResults, {
+-                    source: null
+-                });
++                const expectedCachedResults = Object.assign(
++                    {},
++                    fakeErrorResults,
++                    { source: null }
++                );
+ 
+                 assert.deepStrictEqual(cacheEntry.meta.results, expectedCachedResults);
+             });
+@@ -354,10 +307,11 @@ describe("LintResultCache", () => {
+     });
+ 
+     describe("reconcile", () => {
+-        let reconcileStub, lintResultsCache;
++        let reconcileStub,
++            lintResultsCache;
+ 
+         before(() => {
+-            reconcileStub = sandbox.stub();
++            reconcileStub = sinon.stub();
+ 
+             fileEntryCacheStubs.create = () => ({
+                 reconcile: reconcileStub
+@@ -369,7 +323,7 @@ describe("LintResultCache", () => {
+         });
+ 
+         beforeEach(() => {
+-            lintResultsCache = new LintResultCache(cacheFileLocation, "metadata");
++            lintResultsCache = new LintResultCache(cacheFileLocation);
+         });
+ 
+         it("calls reconcile on the underlying cache", () => {
+diff --git a/tests/lib/eslint/eslint.js b/tests/lib/eslint/eslint.js
+index ec7f13cd8..b8a9c1d20 100644
+--- a/tests/lib/eslint/eslint.js
++++ b/tests/lib/eslint/eslint.js
+@@ -2650,130 +2650,6 @@ describe("ESLint", () => {
+                     assert.deepStrictEqual(result, cachedResult, "result is the same with or without cache");
+                 });
+             });
+-
+-            describe("cacheStrategy", () => {
+-                it("should detect changes using a file's modification time when set to 'metadata'", async () => {
+-                    const cacheLocation = getFixturePath(".eslintcache");
+-
+-                    doDelete(cacheLocation);
+-
+-                    eslint = new ESLint({
+-                        cwd: path.join(fixtureDir, ".."),
+-                        useEslintrc: false,
+-
+-                        // specifying cache true the cache will be created
+-                        cache: true,
+-                        cacheLocation,
+-                        cacheStrategy: "metadata",
+-                        overrideConfig: {
+-                            rules: {
+-                                "no-console": 0,
+-                                "no-unused-vars": 2
+-                            }
+-                        },
+-                        extensions: ["js"]
+-                    });
+-                    const badFile = fs.realpathSync(getFixturePath("cache/src", "fail-file.js"));
+-                    const goodFile = fs.realpathSync(getFixturePath("cache/src", "test-file.js"));
+-
+-                    await eslint.lintFiles([badFile, goodFile]);
+-                    let fileCache = fCache.createFromFile(cacheLocation);
+-                    const entries = fileCache.normalizeEntries([badFile, goodFile]);
+-
+-                    entries.forEach(entry => {
+-                        assert(entry.changed === false, `the entry for ${entry.key} is initially unchanged`);
+-                    });
+-
+-                    // this should result in a changed entry
+-                    shell.touch(goodFile);
+-                    fileCache = fCache.createFromFile(cacheLocation);
+-                    assert(fileCache.getFileDescriptor(badFile).changed === false, `the entry for ${badFile} is unchanged`);
+-                    assert(fileCache.getFileDescriptor(goodFile).changed === true, `the entry for ${goodFile} is changed`);
+-                });
+-
+-                it("should not detect changes using a file's modification time when set to 'content'", async () => {
+-                    const cacheLocation = getFixturePath(".eslintcache");
+-
+-                    doDelete(cacheLocation);
+-
+-                    eslint = new ESLint({
+-                        cwd: path.join(fixtureDir, ".."),
+-                        useEslintrc: false,
+-
+-                        // specifying cache true the cache will be created
+-                        cache: true,
+-                        cacheLocation,
+-                        cacheStrategy: "content",
+-                        overrideConfig: {
+-                            rules: {
+-                                "no-console": 0,
+-                                "no-unused-vars": 2
+-                            }
+-                        },
+-                        extensions: ["js"]
+-                    });
+-                    const badFile = fs.realpathSync(getFixturePath("cache/src", "fail-file.js"));
+-                    const goodFile = fs.realpathSync(getFixturePath("cache/src", "test-file.js"));
+-
+-                    await eslint.lintFiles([badFile, goodFile]);
+-                    let fileCache = fCache.createFromFile(cacheLocation, true);
+-                    let entries = fileCache.normalizeEntries([badFile, goodFile]);
+-
+-                    entries.forEach(entry => {
+-                        assert(entry.changed === false, `the entry for ${entry.key} is initially unchanged`);
+-                    });
+-
+-                    // this should NOT result in a changed entry
+-                    shell.touch(goodFile);
+-                    fileCache = fCache.createFromFile(cacheLocation, true);
+-                    entries = fileCache.normalizeEntries([badFile, goodFile]);
+-                    entries.forEach(entry => {
+-                        assert(entry.changed === false, `the entry for ${entry.key} remains unchanged`);
+-                    });
+-                });
+-
+-                it("should detect changes using a file's contents when set to 'content'", async () => {
+-                    const cacheLocation = getFixturePath(".eslintcache");
+-
+-                    doDelete(cacheLocation);
+-
+-                    eslint = new ESLint({
+-                        cwd: path.join(fixtureDir, ".."),
+-                        useEslintrc: false,
+-
+-                        // specifying cache true the cache will be created
+-                        cache: true,
+-                        cacheLocation,
+-                        cacheStrategy: "content",
+-                        overrideConfig: {
+-                            rules: {
+-                                "no-console": 0,
+-                                "no-unused-vars": 2
+-                            }
+-                        },
+-                        extensions: ["js"]
+-                    });
+-                    const badFile = fs.realpathSync(getFixturePath("cache/src", "fail-file.js"));
+-                    const goodFile = fs.realpathSync(getFixturePath("cache/src", "test-file.js"));
+-                    const goodFileCopy = path.resolve(`${path.dirname(goodFile)}`, "test-file-copy.js");
+-
+-                    shell.cp(goodFile, goodFileCopy);
+-
+-                    await eslint.lintFiles([badFile, goodFileCopy]);
+-                    let fileCache = fCache.createFromFile(cacheLocation, true);
+-                    const entries = fileCache.normalizeEntries([badFile, goodFileCopy]);
+-
+-                    entries.forEach(entry => {
+-                        assert(entry.changed === false, `the entry for ${entry.key} is initially unchanged`);
+-                    });
+-
+-                    // this should result in a changed entry
+-                    shell.sed("-i", "abc", "xzy", goodFileCopy);
+-                    fileCache = fCache.createFromFile(cacheLocation, true);
+-                    assert(fileCache.getFileDescriptor(badFile).changed === false, `the entry for ${badFile} is unchanged`);
+-                    assert(fileCache.getFileDescriptor(goodFileCopy).changed === true, `the entry for ${goodFileCopy} is changed`);
+-                });
+-            });
+         });
+ 
+         describe("processors", () => {

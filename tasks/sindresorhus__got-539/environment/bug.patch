@@ -1,0 +1,262 @@
+diff --git a/advanced-creation.md b/advanced-creation.md
+index 0bef1fc..e781a91 100644
+--- a/advanced-creation.md
++++ b/advanced-creation.md
+@@ -11,7 +11,7 @@ Configure a new `got` instance with the provided settings.<br>
+ 
+ ##### [options](readme.md#options)
+ 
+-To inherit from parent, set it as `got.defaults.options` or use [`got.mergeOptions(defaults.options, options)`](readme.md#gotmergeoptionsparentoptions-newoptions).<br>
++To inherit from parent, set it as `got.defaults.options` or use [`got.mergeOptions(defaults.options, options)`](readme.md#gotmergeOptionsparentoptions-newoptions).<br>
+ **Note**: Avoid using [object spread](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Spread_syntax#Spread_in_object_literals) as it doesn't work recursively.
+ 
+ ##### methods
+diff --git a/readme.md b/readme.md
+index b028cb9..9982cda 100644
+--- a/readme.md
++++ b/readme.md
+@@ -124,7 +124,7 @@ Default: `{}`
+ 
+ Request headers.
+ 
+-Existing headers will be overwritten. Headers set to `null` will be omitted.
++Existing headers will be overwritten. Headers set to `null` or `undefined` will be omitted.
+ 
+ ###### stream
+ 
+@@ -358,7 +358,7 @@ Sets `options.method` to the method name and makes a request.
+ 
+ #### got.extend([options])
+ 
+-Configure a new `got` instance with default `options`. `options` are merged with the parent instance's `defaults.options` using [`got.mergeOptions`](#gotmergeoptionsparentoptions-newoptions).
++Configure a new `got` instance with default `options`. `options` are merged with the extended instance's `defaults.options` as described in [`got.mergeOptions`](#gotmergeoptionsparentoptions-newoptions).
+ 
+ 
+ ```js
+@@ -403,27 +403,29 @@ client.get('/demo');
+ 
+ *Need more control over the behavior of Got? Check out the [`got.create()`](advanced-creation.md).*
+ 
++**Both `got.extend(options)` and `got.create(options)` will freeze the instance's default options. For `got.extend()`, the instance's default options are the result of `got.mergeOptions`, which effectively copies plain `Object` and `Array` values. Therefore, you should treat objects passed to these methods as immutable.**
++
+ #### got.mergeOptions(parentOptions, newOptions)
+ 
+-Extends parent options. Avoid using [object spread](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Spread_syntax#Spread_in_object_literals) as it doesn't work recursively:
++Extends parent options. The options objects are deeply merged to a new object. The value of each property is determined as follows:
+ 
+-```js
+-const a = {headers: {cat: 'meow', wolf: ['bark', 'wrrr']}};
+-const b = {headers: {cow: 'moo', wolf: ['auuu']}};
++- If the new value is `undefined` the parent value is preserved.
++- If the parent value is an instance of `URL` and the new value is a `string` or `URL`, a new URL instance is created, using the parent value as the base: `new URL(new, parent)`.
++- If the new value is an `Array`, the new value is recursively merged into an empty array (the source value is discarded). `undefined` elements in the source array are not assigned during the merge, so the resulting array will have an empty item where the source array had an `undefined` item.
++- If the new value is a plain `Object`
++  - If the parent value is a plain `Object`, both values are merged recursively into a new `Object`.
++  - Otherwise, only the new value is merged recursively into a new `Object`.
++- Otherwise, the new value is assigned to the property.
+ 
+-{...a, ...b}            // => {headers: {cow: 'moo', wolf: ['auuu']}}
+-got.mergeOptions(a, b)  // => {headers: {cat: 'meow', cow: 'moo', wolf: ['auuu']}}
+-```
++Avoid using [object spread](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Spread_syntax#Spread_in_object_literals) as it doesn't work recursively:
+ 
+-Options are deeply merged to a new object. The value of each key is determined as follows:
++```js
++const a = {headers: {cat: 'meow', habitat: ['house', 'alley']}};
++const b = {headers: {cow: 'moo', habitat: ['barn']}};
+ 
+-- If the new property is set to `undefined`, it keeps the old one.
+-- If the parent property is an instance of `URL` and the new value is a `string` or `URL`, a new URL instance is created: [`new URL(new, parent)`](https://developer.mozilla.org/en-US/docs/Web/API/URL/URL#Syntax).
+-- If the new property is a plain `Object`:
+-	- If the parent property is a plain `Object` too, both values are merged recursively into a new `Object`.
+-	- Otherwise, only the new value is deeply cloned.
+-- If the new property is an `Array`, it overwrites the old one with a deep clone of the new property.
+-- Otherwise, the new value is assigned to the key.
++{...a, ...b}            // => {headers: {cow: 'moo'}}
++got.mergeOptions(a, b) // => {headers: {cat: 'meow', cow: 'moo', habitat: ['barn']}}
++```
+ 
+ ## Errors
+ 
+diff --git a/source/create.js b/source/create.js
+index 1d86b8a..2cca4a7 100644
+--- a/source/create.js
++++ b/source/create.js
+@@ -1,18 +1,16 @@
+ 'use strict';
+ const errors = require('./errors');
++const mergeOptions = require('./merge-options');
+ const asStream = require('./as-stream');
+ const asPromise = require('./as-promise');
+ const normalizeArguments = require('./normalize-arguments');
+-const merge = require('./merge');
+ const deepFreeze = require('./deep-freeze');
+ 
+ const next = options => options.stream ? asStream(options) : asPromise(options);
+-const mergeOptions = (defaults, options = {}) => merge({}, defaults, options);
+ 
+ const create = defaults => {
+-	defaults = merge({}, defaults);
+ 	if (!defaults.handler) {
+-		defaults.handler = next;
++		defaults.handler = (options, next) => next(options);
+ 	}
+ 
+ 	function got(url, options) {
+diff --git a/source/merge.js b/source/merge-options.js
+similarity index 52%
+rename from source/merge.js
+rename to source/merge-options.js
+index 1402307..91d231c 100644
+--- a/source/merge.js
++++ b/source/merge-options.js
+@@ -1,16 +1,25 @@
+-'use strict';
+ const {URL} = require('url');
+ const is = require('@sindresorhus/is');
+ 
+-const merge = (target, ...sources) => {
++module.exports = (defaults, options = {}) => {
++	return merge({}, defaults, options);
++};
++
++function merge(target, ...sources) {
+ 	for (const source of sources) {
+-		for (const [key, sourceValue] of Object.entries(source)) {
++		const sourceIter = is.array(source) ?
++			source.entries() :
++			Object.entries(source);
++		for (const [key, sourceValue] of sourceIter) {
++			const targetValue = target[key];
+ 			if (is.undefined(sourceValue)) {
+ 				continue;
+ 			}
+-
+-			const targetValue = target[key];
+-			if (is.urlInstance(targetValue) && (is.urlInstance(sourceValue) || is.string(sourceValue))) {
++			if (is.array(sourceValue)) {
++				target[key] = merge(new Array(sourceValue.length), sourceValue);
++			} else if (is.urlInstance(targetValue) && (
++				is.urlInstance(sourceValue) || is.string(sourceValue)
++			)) {
+ 				target[key] = new URL(sourceValue, targetValue);
+ 			} else if (is.plainObject(sourceValue)) {
+ 				if (is.plainObject(targetValue)) {
+@@ -18,15 +27,10 @@ const merge = (target, ...sources) => {
+ 				} else {
+ 					target[key] = merge({}, sourceValue);
+ 				}
+-			} else if (is.array(sourceValue)) {
+-				target[key] = merge([], sourceValue);
+ 			} else {
+ 				target[key] = sourceValue;
+ 			}
+ 		}
+ 	}
+-
+ 	return target;
+-};
+-
+-module.exports = merge;
++}
+diff --git a/test/create.js b/test/create.js
+index bcd60c5..4004757 100644
+--- a/test/create.js
++++ b/test/create.js
+@@ -77,18 +77,26 @@ test('custom headers (extend)', async t => {
+ 	t.is(headers.unicorn, 'rainbow');
+ });
+ 
+-test('extend overwrites arrays with a deep clone', t => {
++test('extend overwrites arrays', t => {
+ 	const statusCodes = [408];
+ 	const a = got.extend({retry: {statusCodes}});
+-	statusCodes[0] = 500;
+-	t.deepEqual(a.defaults.options.retry.statusCodes, [408]);
++	t.deepEqual(a.defaults.options.retry.statusCodes, statusCodes);
+ 	t.not(a.defaults.options.retry.statusCodes, statusCodes);
+ });
+ 
+-test('extend keeps the old value if the new one is undefined', t => {
+-	const a = got.extend({headers: undefined});
++test('extend overwrites null', t => {
++	const statusCodes = null;
++	const a = got.extend({retry: {statusCodes}});
++	t.is(a.defaults.options.retry.statusCodes, statusCodes);
++});
++
++test('extend ignores source values set to undefined', t => {
++	const a = got.extend({
++		headers: {foo: undefined, 'user-agent': undefined}
++	});
++	const b = a.extend({headers: {foo: undefined}});
+ 	t.deepEqual(
+-		a.defaults.options.headers,
++		b.defaults.options.headers,
+ 		got.defaults.options.headers
+ 	);
+ });
+@@ -99,6 +107,12 @@ test('extend merges URL instances', t => {
+ 	t.is(b.defaults.options.baseUrl.toString(), 'https://example.com/foo');
+ });
+ 
++test('extend ignores object values set to undefined (root keys)', t => {
++	t.true(Reflect.has(got.defaults.options, 'headers'));
++	const a = got.extend({headers: undefined});
++	t.deepEqual(a.defaults.options, got.defaults.options);
++});
++
+ test('create', async t => {
+ 	const instance = got.create({
+ 		options: {},
+@@ -147,20 +161,3 @@ test('no tampering with defaults', t => {
+ 	t.is(instance.defaults.options.baseUrl, 'example');
+ 	t.is(instance2.defaults.options.baseUrl, 'example');
+ });
+-
+-test('defaults are cloned on instance creation', t => {
+-	const options = {foo: 'bar'};
+-	const methods = ['get'];
+-	const instance = got.create({
+-		methods,
+-		options
+-	});
+-
+-	t.notThrows(() => {
+-		options.foo = 'foo';
+-		methods[0] = 'post';
+-	});
+-
+-	t.not(options.foo, instance.defaults.options.foo);
+-	t.not(methods[0], instance.defaults.methods[0]);
+-});
+diff --git a/test/headers.js b/test/headers.js
+index 8c8319a..c95a726 100644
+--- a/test/headers.js
++++ b/test/headers.js
+@@ -142,22 +142,12 @@ test('remove null value headers', async t => {
+ 	t.false(Reflect.has(headers, 'user-agent'));
+ });
+ 
+-test('setting a header to undefined keeps the old value', async t => {
++test('remove undefined value headers', async t => {
+ 	const {body} = await got(s.url, {
+ 		headers: {
+-			'user-agent': undefined
++			foo: undefined
+ 		}
+ 	});
+ 	const headers = JSON.parse(body);
+-	t.not(headers['user-agent'], undefined);
+-});
+-
+-test('non-existent headers set to undefined are omitted', async t => {
+-	const {body} = await got(s.url, {
+-		headers: {
+-			blah: undefined
+-		}
+-	});
+-	const headers = JSON.parse(body);
+-	t.false(Reflect.has(headers, 'blah'));
++	t.false(Reflect.has(headers, 'foo'));
+ });

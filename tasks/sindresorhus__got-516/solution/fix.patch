@@ -1,0 +1,171 @@
+diff --git a/readme.md b/readme.md
+index ddc07c3..5e20aaf 100644
+--- a/readme.md
++++ b/readme.md
+@@ -258,6 +258,24 @@ Determines if a `got.HTTPError` is thrown for error responses (non-2xx status co
+ 
+ If this is disabled, requests that encounter an error status code will be resolved with the `response` instead of throwing. This may be useful if you are checking for resource availability and are expecting error responses.
+ 
++###### hooks
++
++Type: `Object<string, Array<Function>>`<br>
++Default: `{ beforeRequest: [] }`
++
++Hooks allow modifications during the request lifecycle. Hook functions may be async and are run serially.
++
++###### hooks.beforeRequest
++
++Type: `Array<Function>`<br>
++Default: `[]`
++
++Called with the normalized request options. Got will make no further changes to the request before it is sent. This is especially useful in conjunction with [`got.extend()`](#instances) and [`got.create()`](advanced-creation.md) when you want to create an API client that uses HMAC-signing.
++
++See the [AWS section](#aws) for an example.
++
++**Note**: Modifying the `body` is not recommended because the `content-length` header has already been computed and assigned.
++
+ #### Streams
+ 
+ **Note**: Progress events, redirect events and request/response events can also be used with promises.
+@@ -626,47 +644,35 @@ got('http://unix:/var/run/docker.sock:/containers/json');
+ got('unix:/var/run/docker.sock:/containers/json');
+ ```
+ 
++
+ ## AWS
+ 
+-Requests to AWS services need to have their headers signed. This can be accomplished by using the [`aws4`](https://www.npmjs.com/package/aws4) package. This is an example for querying an ["Elasticsearch Service"](https://aws.amazon.com/elasticsearch-service/) host with a signed request.
++Requests to AWS services need to have their headers signed. This can be accomplished by using the [`aws4`](https://www.npmjs.com/package/aws4) package. This is an example for querying an ["API Gateway"](https://docs.aws.amazon.com/apigateway/api-reference/signing-requests/) with a signed request.
+ 
+ ```js
+-const url = require('url');
+ const AWS = require('aws-sdk');
+ const aws4 = require('aws4');
+ const got = require('got');
+-const config = require('./config');
+-
+-// Reads keys from the environment or `~/.aws/credentials`. Could be a plain object.
+-const awsConfig = new AWS.Config({ region: config.region });
+ 
+-function request(url, options) {
+-	const awsOpts = {
+-		region: awsConfig.region,
+-		headers: {
+-			accept: 'application/json',
+-			'content-type': 'application/json'
+-		},
+-		method: 'GET',
+-		json: true
+-	};
+-
+-	// We need to parse the URL before passing it to `got` so `aws4` can sign the request
+-	options = {
+-		...url.parse(url),
+-		...awsOpts,
+-		...options
+-	};
+-
+-	aws4.sign(options, awsConfig.credentials);
+-
+-	return got(options);
+-}
+-
+-request(`https://${config.host}/production/users/1`);
++const credentials = await new AWS.CredentialProviderChain().resolvePromise();
++
++// Create a Got instance to use relative paths and signed requests
++const awsClient = got.extend(
++	{
++		baseUrl: 'https://<api-id>.execute-api.<api-region>.amazonaws.com/<stage>/',
++		hooks: {
++			beforeRequest: [
++				async options => {
++					await credentials.getPromise();
++					aws4.sign(options, credentials);
++				}
++			]
++		}
++	}
++);
+ 
+-request(`https://${config.host}/production/`, {
+-	// All usual `got` options
++const response = await awsClient('endpoint/path', {
++	// Request-specific options
+ });
+ ```
+ 
+diff --git a/source/index.js b/source/index.js
+index 1f9f4c4..f4573f8 100644
+--- a/source/index.js
++++ b/source/index.js
+@@ -23,6 +23,9 @@ const defaults = {
+ 		throwHttpErrors: true,
+ 		headers: {
+ 			'user-agent': `${pkg.name}/${pkg.version} (https://github.com/sindresorhus/got)`
++		},
++		hooks: {
++			beforeRequest: []
+ 		}
+ 	}
+ };
+diff --git a/source/normalize-arguments.js b/source/normalize-arguments.js
+index 82a329b..9232d02 100644
+--- a/source/normalize-arguments.js
++++ b/source/normalize-arguments.js
+@@ -8,6 +8,7 @@ const urlToOptions = require('./url-to-options');
+ const isFormData = require('./is-form-data');
+ 
+ const retryAfterStatusCodes = new Set([413, 429, 503]);
++const knownHookEvents = ['beforeRequest'];
+ 
+ module.exports = (url, options, defaults) => {
+ 	if (Reflect.has(options, 'url') || (is.object(url) && Reflect.has(url, 'url'))) {
+@@ -185,5 +186,31 @@ module.exports = (url, options, defaults) => {
+ 		delete options.timeout;
+ 	}
+ 
++	if (is.nullOrUndefined(options.hooks)) {
++		options.hooks = {};
++	}
++	if (is.object(options.hooks)) {
++		for (const hookEvent of knownHookEvents) {
++			const hooks = options.hooks[hookEvent];
++			if (is.nullOrUndefined(hooks)) {
++				options.hooks[hookEvent] = [];
++			} else if (is.array(hooks)) {
++				hooks.forEach(
++					(hook, index) => {
++						if (!is.function_(hook)) {
++							throw new TypeError(
++								`Parameter \`hooks.${hookEvent}[${index}]\` must be a function, not ${is(hook)}`
++							);
++						}
++					}
++				);
++			} else {
++				throw new TypeError(`Parameter \`hooks.${hookEvent}\` must be an array, not ${is(hooks)}`);
++			}
++		}
++	} else {
++		throw new TypeError(`Parameter \`hooks\` must be an object, not ${is(options.hooks)}`);
++	}
++
+ 	return options;
+ };
+diff --git a/source/request-as-event-emitter.js b/source/request-as-event-emitter.js
+index 38c062c..80a9ee6 100644
+--- a/source/request-as-event-emitter.js
++++ b/source/request-as-event-emitter.js
+@@ -241,6 +241,11 @@ module.exports = (options = {}) => {
+ 				options.headers['content-length'] = uploadBodySize;
+ 			}
+ 
++			for (const hook of options.hooks.beforeRequest) {
++				// eslint-disable-next-line no-await-in-loop
++				await hook(options);
++			}
++
+ 			get(options);
+ 		} catch (error) {
+ 			emitter.emit('error', error);

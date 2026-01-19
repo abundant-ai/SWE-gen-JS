@@ -1,0 +1,409 @@
+diff --git a/.changeset/html-use-alt-text.md b/.changeset/html-use-alt-text.md
+new file mode 100644
+index 0000000000..768eb5d844
+--- /dev/null
++++ b/.changeset/html-use-alt-text.md
+@@ -0,0 +1,5 @@
++---
++"@biomejs/biome": minor
++---
++
++Added the [`useAltText`](https://biomejs.dev/linter/rules/use-alt-text/) lint rule for HTML. This rule enforces that elements requiring alternative text (`<img>`, `<area>`, `<input type="image">`, `<object>`) provide meaningful information for screen reader users via `alt`, `title` (for objects), `aria-label`, or `aria-labelledby` attributes. Elements with `aria-hidden="true"` are exempt.
+diff --git a/crates/biome_html_analyze/src/lib.rs b/crates/biome_html_analyze/src/lib.rs
+index 30850f0f47..6c2fbb2fe6 100644
+--- a/crates/biome_html_analyze/src/lib.rs
++++ b/crates/biome_html_analyze/src/lib.rs
+@@ -15,7 +15,7 @@ use biome_analyze::{
+ };
+ use biome_deserialize::TextRange;
+ use biome_diagnostics::Error;
+-use biome_html_syntax::HtmlLanguage;
++use biome_html_syntax::{HtmlFileSource, HtmlLanguage};
+ use biome_suppression::{SuppressionDiagnostic, parse_suppression_comment};
+ use std::ops::Deref;
+ use std::sync::LazyLock;
+@@ -35,13 +35,14 @@ pub fn analyze<'a, F, B>(
+     root: &LanguageRoot<HtmlLanguage>,
+     filter: AnalysisFilter,
+     options: &'a AnalyzerOptions,
++    source_type: HtmlFileSource,
+     emit_signal: F,
+ ) -> (Option<B>, Vec<Error>)
+ where
+     F: FnMut(&dyn AnalyzerSignal<HtmlLanguage>) -> ControlFlow<B> + 'a,
+     B: 'a,
+ {
+-    analyze_with_inspect_matcher(root, filter, |_| {}, options, emit_signal)
++    analyze_with_inspect_matcher(root, filter, |_| {}, options, source_type, emit_signal)
+ }
+ 
+ /// Run the analyzer on the provided `root`: this process will use the given `filter`
+@@ -55,6 +56,7 @@ pub fn analyze_with_inspect_matcher<'a, V, F, B>(
+     filter: AnalysisFilter,
+     inspect_matcher: V,
+     options: &'a AnalyzerOptions,
++    source_type: HtmlFileSource,
+     mut emit_signal: F,
+ ) -> (Option<B>, Vec<Error>)
+ where
+@@ -91,13 +93,15 @@ where
+     let mut registry = RuleRegistry::builder(&filter, root);
+     visit_registry(&mut registry);
+ 
+-    let (registry, services, diagnostics, visitors) = registry.build();
++    let (registry, mut services, diagnostics, visitors) = registry.build();
+ 
+     // Bail if we can't parse a rule option
+     if !diagnostics.is_empty() {
+         return (None, diagnostics);
+     }
+ 
++    services.insert_service(source_type);
++
+     let mut analyzer = biome_analyze::Analyzer::new(
+         METADATA.deref(),
+         biome_analyze::InspectMatcher::new(registry, inspect_matcher),
+@@ -130,6 +134,7 @@ mod tests {
+     use biome_diagnostics::termcolor::NoColor;
+     use biome_diagnostics::{Diagnostic, DiagnosticExt, PrintDiagnostic, Severity};
+     use biome_html_parser::parse_html;
++    use biome_html_syntax::HtmlFileSource;
+     use biome_rowan::TextRange;
+     use std::slice;
+ 
+@@ -159,6 +164,7 @@ mod tests {
+                 ..AnalysisFilter::default()
+             },
+             &options,
++            HtmlFileSource::html(),
+             |signal| {
+                 if let Some(diag) = signal.diagnostic() {
+                     error_ranges.push(diag.location().span.unwrap());
+diff --git a/crates/biome_html_analyze/src/lint/a11y.rs b/crates/biome_html_analyze/src/lint/a11y.rs
+index b276d6550d..bf58bab83f 100644
+--- a/crates/biome_html_analyze/src/lint/a11y.rs
++++ b/crates/biome_html_analyze/src/lint/a11y.rs
+@@ -9,9 +9,10 @@ pub mod no_distracting_elements;
+ pub mod no_header_scope;
+ pub mod no_positive_tabindex;
+ pub mod no_svg_without_title;
++pub mod use_alt_text;
+ pub mod use_aria_props_for_role;
+ pub mod use_button_type;
+ pub mod use_html_lang;
+ pub mod use_iframe_title;
+ pub mod use_valid_aria_role;
+-declare_lint_group! { pub A11y { name : "a11y" , rules : [self :: no_access_key :: NoAccessKey , self :: no_autofocus :: NoAutofocus , self :: no_distracting_elements :: NoDistractingElements , self :: no_header_scope :: NoHeaderScope , self :: no_positive_tabindex :: NoPositiveTabindex , self :: no_svg_without_title :: NoSvgWithoutTitle , self :: use_aria_props_for_role :: UseAriaPropsForRole , self :: use_button_type :: UseButtonType , self :: use_html_lang :: UseHtmlLang , self :: use_iframe_title :: UseIframeTitle , self :: use_valid_aria_role :: UseValidAriaRole ,] } }
++declare_lint_group! { pub A11y { name : "a11y" , rules : [self :: no_access_key :: NoAccessKey , self :: no_autofocus :: NoAutofocus , self :: no_distracting_elements :: NoDistractingElements , self :: no_header_scope :: NoHeaderScope , self :: no_positive_tabindex :: NoPositiveTabindex , self :: no_svg_without_title :: NoSvgWithoutTitle , self :: use_alt_text :: UseAltText , self :: use_aria_props_for_role :: UseAriaPropsForRole , self :: use_button_type :: UseButtonType , self :: use_html_lang :: UseHtmlLang , self :: use_iframe_title :: UseIframeTitle , self :: use_valid_aria_role :: UseValidAriaRole ,] } }
+diff --git a/crates/biome_html_analyze/src/lint/a11y/use_alt_text.rs b/crates/biome_html_analyze/src/lint/a11y/use_alt_text.rs
+new file mode 100644
+index 0000000000..e0544bb6eb
+--- /dev/null
++++ b/crates/biome_html_analyze/src/lint/a11y/use_alt_text.rs
+@@ -0,0 +1,242 @@
++use biome_analyze::{
++    Ast, Rule, RuleDiagnostic, RuleSource, context::RuleContext, declare_lint_rule,
++};
++use biome_console::{fmt::Display, fmt::Formatter, markup};
++use biome_diagnostics::Severity;
++use biome_html_syntax::{AnyHtmlElement, HtmlFileSource};
++use biome_rowan::{AstNode, TextRange};
++use biome_rule_options::use_alt_text::UseAltTextOptions;
++
++declare_lint_rule! {
++    /// Enforce that all elements that require alternative text have meaningful information to relay back to the end user.
++    ///
++    /// This is a critical component of accessibility for screen reader users in order for them
++    /// to understand the content's purpose on the page.
++    /// By default, this rule checks for alternative text on the following elements:
++    /// `<img>`, `<area>`, `<input type="image">`, and `<object>`.
++    ///
++    /// :::note
++    /// In `.html` files, this rule matches element names case-insensitively (e.g., `<IMG>`, `<Img>`).
++    ///
++    /// In component-based frameworks (Vue, Svelte, Astro), only lowercase element names are checked.
++    /// PascalCase variants like `<Img>` are assumed to be custom components and are ignored.
++    /// :::
++    ///
++    /// ## Examples
++    ///
++    /// ### Invalid
++    ///
++    /// ```html,expect_diagnostic
++    /// <img src="image.png" />
++    /// ```
++    ///
++    /// ```html,expect_diagnostic
++    /// <input type="image" src="image.png" />
++    /// ```
++    ///
++    /// ```html,expect_diagnostic
++    /// <area href="foo" />
++    /// ```
++    ///
++    /// ```html,expect_diagnostic
++    /// <object data="foo"></object>
++    /// ```
++    ///
++    /// ### Valid
++    ///
++    /// ```html
++    /// <img src="image.png" alt="A beautiful landscape" />
++    /// ```
++    ///
++    /// ```html
++    /// <input type="image" src="image.png" alt="Submit" />
++    /// ```
++    ///
++    /// ```html
++    /// <img src="image.png" aria-label="A beautiful landscape" />
++    /// ```
++    ///
++    /// ```html
++    /// <img src="image.png" aria-labelledby="image-description" />
++    /// ```
++    ///
++    /// ```html
++    /// <object data="foo" title="Embedded content"></object>
++    /// ```
++    ///
++    /// ```html
++    /// <!-- Decorative images can be hidden from assistive technologies -->
++    /// <img src="decorative.png" alt="" />
++    /// ```
++    ///
++    /// ```html
++    /// <img src="decorative.png" aria-hidden="true" />
++    /// ```
++    ///
++    /// ## Accessibility guidelines
++    ///
++    /// - [WCAG 1.1.1](https://www.w3.org/WAI/WCAG21/Understanding/non-text-content.html)
++    ///
++    pub UseAltText {
++        version: "next",
++        name: "useAltText",
++        language: "html",
++        sources: &[RuleSource::EslintJsxA11y("alt-text").same()],
++        recommended: true,
++        severity: Severity::Error,
++    }
++}
++
++/// The type of element being validated
++pub enum ValidatedElement {
++    Object,
++    Img,
++    Area,
++    Input,
++}
++
++impl Display for ValidatedElement {
++    fn fmt(&self, fmt: &mut Formatter) -> std::io::Result<()> {
++        match self {
++            Self::Object => fmt.write_markup(markup!(<Emphasis>"title"</Emphasis>)),
++            _ => fmt.write_markup(markup!(<Emphasis>"alt"</Emphasis>)),
++        }
++    }
++}
++
++impl Rule for UseAltText {
++    type Query = Ast<AnyHtmlElement>;
++    type State = (ValidatedElement, TextRange);
++    type Signals = Option<Self::State>;
++    type Options = UseAltTextOptions;
++
++    fn run(ctx: &RuleContext<Self>) -> Self::Signals {
++        let element = ctx.query();
++        let file_source = ctx.source_type::<HtmlFileSource>();
++
++        let element_name = element.name()?;
++        let is_html_file = file_source.is_html();
++
++        let has_alt = has_valid_alt_text(element);
++        let has_aria_label = has_valid_label(element, "aria-label");
++        let has_aria_labelledby = has_valid_label(element, "aria-labelledby");
++        let aria_hidden = is_aria_hidden(element);
++
++        let name_matches = |name: &str| -> bool {
++            if is_html_file {
++                element_name.eq_ignore_ascii_case(name)
++            } else {
++                element_name.text() == name
++            }
++        };
++
++        if name_matches("object") {
++            let has_title = has_valid_label(element, "title");
++
++            if !has_title && !has_aria_label && !has_aria_labelledby && !aria_hidden {
++                // For object elements, check if it has accessible child content
++                // In HTML, we can't easily check for accessible children, so we flag all
++                // object elements without title/aria-label/aria-labelledby
++                return Some((
++                    ValidatedElement::Object,
++                    element.syntax().text_trimmed_range(),
++                ));
++            }
++        } else if name_matches("img") {
++            if !has_alt && !has_aria_label && !has_aria_labelledby && !aria_hidden {
++                return Some((ValidatedElement::Img, element.syntax().text_trimmed_range()));
++            }
++        } else if name_matches("area") {
++            if !has_alt && !has_aria_label && !has_aria_labelledby && !aria_hidden {
++                return Some((
++                    ValidatedElement::Area,
++                    element.syntax().text_trimmed_range(),
++                ));
++            }
++        } else if name_matches("input")
++            && has_type_image_attribute(element)
++            && !has_alt
++            && !has_aria_label
++            && !has_aria_labelledby
++            && !aria_hidden
++        {
++            return Some((
++                ValidatedElement::Input,
++                element.syntax().text_trimmed_range(),
++            ));
++        }
++
++        None
++    }
++
++    fn diagnostic(_ctx: &RuleContext<Self>, state: &Self::State) -> Option<RuleDiagnostic> {
++        let (validated_element, range) = state;
++        let message = markup!(
++            "Provide a text alternative through the "{validated_element}", "<Emphasis>"aria-label"</Emphasis>", or "<Emphasis>"aria-labelledby"</Emphasis>" attribute."
++        )
++        .to_owned();
++        Some(
++            RuleDiagnostic::new(rule_category!(), range, message)
++                .note(markup! {
++                    "Meaningful alternative text on elements helps users relying on screen readers to understand content's purpose within a page."
++                })
++                .note(markup! {
++                    "If the content is decorative, redundant, or obscured, consider hiding it from assistive technologies with the "<Emphasis>"aria-hidden"</Emphasis>" attribute."
++                }),
++        )
++    }
++}
++
++/// Check if the element has a type="image" attribute
++fn has_type_image_attribute(element: &AnyHtmlElement) -> bool {
++    element
++        .find_attribute_by_name("type")
++        .is_some_and(|attribute| {
++            attribute
++                .initializer()
++                .and_then(|init| init.value().ok())
++                .and_then(|value| value.string_value())
++                .is_some_and(|value| value.eq_ignore_ascii_case("image"))
++        })
++}
++
++/// Check if the element has a valid alt attribute
++fn has_valid_alt_text(element: &AnyHtmlElement) -> bool {
++    // The alt attribute exists - even an empty alt="" is valid for decorative images
++    // If there's no initializer, it's treated as an empty string (valid)
++    // If there's an initializer with a value, any value is valid
++    element.find_attribute_by_name("alt").is_some()
++}
++
++/// Check if the element has a valid label attribute (aria-label, aria-labelledby, or title)
++fn has_valid_label(element: &AnyHtmlElement, name_to_lookup: &str) -> bool {
++    element
++        .find_attribute_by_name(name_to_lookup)
++        .is_some_and(|attribute| {
++            // If no initializer, the attribute is present but empty - not valid for labels
++            let Some(initializer) = attribute.initializer() else {
++                return false;
++            };
++
++            // Check if the value is not empty
++            initializer
++                .value()
++                .ok()
++                .and_then(|value| value.string_value())
++                .is_some_and(|value| !value.trim().is_empty())
++        })
++}
++
++/// Check if the element has aria-hidden="true"
++fn is_aria_hidden(element: &AnyHtmlElement) -> bool {
++    element
++        .find_attribute_by_name("aria-hidden")
++        .is_some_and(|attribute| {
++            // Only aria-hidden="true" means hidden (must have initializer with value "true")
++            attribute
++                .initializer()
++                .and_then(|init| init.value().ok())
++                .and_then(|value| value.string_value())
++                .is_some_and(|value| value == "true")
++        })
++}
+diff --git a/crates/biome_service/src/file_handlers/html.rs b/crates/biome_service/src/file_handlers/html.rs
+index 4c888d54d2..4daad8e970 100644
+--- a/crates/biome_service/src/file_handlers/html.rs
++++ b/crates/biome_service/src/file_handlers/html.rs
+@@ -793,9 +793,11 @@ fn lint(params: LintParams) -> LintResults {
+ 
+     let mut process_lint = ProcessLint::new(&params);
+ 
+-    let (_, analyze_diagnostics) = analyze(&tree, filter, &analyzer_options, |signal| {
+-        process_lint.process_signal(signal)
+-    });
++    let source_type = params.language.to_html_file_source().unwrap_or_default();
++    let (_, analyze_diagnostics) =
++        analyze(&tree, filter, &analyzer_options, source_type, |signal| {
++            process_lint.process_signal(signal)
++        });
+ 
+     process_lint.into_result(
+         params
+@@ -826,7 +828,7 @@ pub(crate) fn code_actions(params: CodeActionsParams) -> PullActionsResult {
+     let _ = debug_span!("Code actions HTML", range =? range, path =? path).entered();
+     let tree = parse.tree();
+     let _ = trace_span!("Parsed file", tree =? tree).entered();
+-    let Some(_) = language.to_html_file_source() else {
++    let Some(source_type) = language.to_html_file_source() else {
+         error!("Could not determine the HTML file source of the file");
+         return PullActionsResult {
+             actions: Vec::new(),
+@@ -851,7 +853,7 @@ pub(crate) fn code_actions(params: CodeActionsParams) -> PullActionsResult {
+         range,
+     };
+ 
+-    analyze(&tree, filter, &analyzer_options, |signal| {
++    analyze(&tree, filter, &analyzer_options, source_type, |signal| {
+         actions.extend(signal.actions().into_code_action_iter().map(|item| {
+             CodeAction {
+                 category: item.category.clone(),
+@@ -905,8 +907,12 @@ pub(crate) fn fix_all(params: FixAllParams) -> Result<FixFileResult, WorkspaceEr
+         tree.syntax().text_range_with_trivia().len().into(),
+     );
+ 
++    let source_type = params
++        .document_file_source
++        .to_html_file_source()
++        .unwrap_or_default();
+     loop {
+-        let (action, _) = analyze(&tree, filter, &analyzer_options, |signal| {
++        let (action, _) = analyze(&tree, filter, &analyzer_options, source_type, |signal| {
+             process_fix_all.process_signal(signal)
+         });
+ 
+diff --git a/xtask/rules_check/src/lib.rs b/xtask/rules_check/src/lib.rs
+index 177b272f5b..d476cb2b3a 100644
+--- a/xtask/rules_check/src/lib.rs
++++ b/xtask/rules_check/src/lib.rs
+@@ -508,7 +508,7 @@ fn assert_lint(
+ 
+                 let options = test.create_analyzer_options::<HtmlLanguage>(config)?;
+ 
+-                biome_html_analyze::analyze(&root, filter, &options, |signal| {
++                biome_html_analyze::analyze(&root, filter, &options, source, |signal| {
+                     if let Some(mut diag) = signal.diagnostic() {
+                         for action in signal.actions() {
+                             if !action.is_suppression() {

@@ -1,0 +1,108 @@
+diff --git a/package.json b/package.json
+index 6f35c2a8..02a6bbaa 100644
+--- a/package.json
++++ b/package.json
+@@ -45,7 +45,7 @@
+   "scripts": {
+     "build": "yarn build:packages",
+     "test": "yarn test:packages",
+-    "build:examples": "yarn workspaces foreach --include '@reduxjs/*' --include '@examples-query-react/*' -vtp run build",
++    "build:examples": "yarn workspaces foreach --include '@reduxjs/*' --include '@examples-query-react/*' --include '@examples-action-listener/*' -vtp run build",
+     "build:docs": "yarn workspace website run build",
+     "build:packages": "yarn workspaces foreach --include '@reduxjs/*' --include '@rtk-query/*' --include '@rtk-incubator/*' --topological-dev run build",
+     "test:packages": "yarn workspaces foreach --include '@reduxjs/*' --include '@rtk-query/*'  --include '@rtk-incubator/*' run test",
+diff --git a/packages/action-listener-middleware/README.md b/packages/action-listener-middleware/README.md
+index adc988c2..17ae5516 100644
+--- a/packages/action-listener-middleware/README.md
++++ b/packages/action-listener-middleware/README.md
+@@ -285,7 +285,7 @@ Both these methods are cancelation-aware, and will throw a `TaskAbortError` if t
+ 
+ - `fork: (executor: (forkApi: ForkApi) => T | Promise<T>) => ForkedTask<T>`: Launches a "child task" that may be used to accomplish additional work. Accepts any sync or async function as its argument, and returns a `{result, cancel}` object that can be used to check the final status and return value of the child task, or cancel it while in-progress.
+ 
+-Child tasks can be launched, and waited on to collect their return values. The provided `executor` function will be called with a `forkApi` object containing `{pause, delay, signal}`, allowing it to pause or check cancelation status. It can also make use of the `listenerApi` from the listener's scope.
++Child tasks can be launched, and waited on to collect their return values. The provided `executor` function will be called asynchronously with a `forkApi` object containing `{pause, delay, signal}`, allowing it to pause or check cancelation status. It can also make use of the `listenerApi` from the listener's scope.
+ 
+ An example of this might be a listener that forks a child task containing an infinite loop that listens for events from a server. The parent then uses `listenerApi.condition()` to wait for a "stop" action, and cancels the child task.
+ 
+diff --git a/packages/action-listener-middleware/src/index.ts b/packages/action-listener-middleware/src/index.ts
+index 090cfe61..65541989 100644
+--- a/packages/action-listener-middleware/src/index.ts
++++ b/packages/action-listener-middleware/src/index.ts
+@@ -28,6 +28,7 @@ import type {
+   ForkedTask,
+   TypedRemoveListener,
+   TypedStopListening,
++  TaskResult,
+ } from './types'
+ import {
+   abortControllerWithReason,
+@@ -85,9 +86,6 @@ const createFork = (parentAbortSignal: AbortSignal) => {
+   return <T>(taskExecutor: ForkedTaskExecutor<T>): ForkedTask<T> => {
+     assertFunction(taskExecutor, 'taskExecutor')
+     const childAbortController = new AbortController()
+-    const cancel = () => {
+-      abortControllerWithReason(childAbortController, taskCancelled)
+-    }
+ 
+     const result = runTask<T>(
+       async (): Promise<T> => {
+@@ -98,7 +96,6 @@ const createFork = (parentAbortSignal: AbortSignal) => {
+           delay: createDelay(childAbortController.signal),
+           signal: childAbortController.signal,
+         })) as T
+-        validateActive(parentAbortSignal)
+         validateActive(childAbortController.signal)
+         return result
+       },
+@@ -106,8 +103,10 @@ const createFork = (parentAbortSignal: AbortSignal) => {
+     )
+ 
+     return {
+-      result,
+-      cancel,
++      result: createPause<TaskResult<T>>(parentAbortSignal)(result),
++      cancel() {
++        abortControllerWithReason(childAbortController, taskCancelled)
++      },
+     }
+   }
+ }
+diff --git a/packages/action-listener-middleware/src/task.ts b/packages/action-listener-middleware/src/task.ts
+index 8644223b..21839aba 100644
+--- a/packages/action-listener-middleware/src/task.ts
++++ b/packages/action-listener-middleware/src/task.ts
+@@ -37,8 +37,9 @@ export const promisifyAbortSignal = (
+ 
+ /**
+  * Runs a task and returns promise that resolves to {@link TaskResult}.
+- *
+  * Second argument is an optional `cleanUp` function that always runs after task.
++ *
++ * **Note:** `runTask` runs the executor in the next microtask.
+  * @returns
+  */
+ export const runTask = async <T>(
+diff --git a/packages/action-listener-middleware/src/types.ts b/packages/action-listener-middleware/src/types.ts
+index 312bfe19..d2d97e66 100644
+--- a/packages/action-listener-middleware/src/types.ts
++++ b/packages/action-listener-middleware/src/types.ts
+@@ -105,6 +105,19 @@ export type TaskResult<Value> =
+   | TaskCancelled
+ 
+ export interface ForkedTask<T> {
++  /**
++   * A promise that resolves when the task is either completed or cancelled or rejects
++   * if parent listener execution is cancelled or completed.
++   *
++   * ### Example
++   * ```ts
++   * const result = await fork(async (forkApi) => Promise.resolve(4)).result
++   *
++   * if(result.status === 'ok') {
++   *   console.log(result.value) // logs 4
++   * }}
++   * ```
++   */
+   result: Promise<TaskResult<T>>
+   /**
+    * Cancel task if it is in progress or not yet started,

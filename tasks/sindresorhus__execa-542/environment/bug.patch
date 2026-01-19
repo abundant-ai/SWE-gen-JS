@@ -1,0 +1,237 @@
+diff --git a/docs/scripts.md b/docs/scripts.md
+index a0af2d5..6729c3a 100644
+--- a/docs/scripts.md
++++ b/docs/scripts.md
+@@ -635,7 +635,7 @@ await cat
+ 
+ ```js
+ // Execa
+-await $({inputFile: 'file.txt'})`cat`
++await $({input: fs.createReadStream('file.txt')})`cat`
+ ```
+ 
+ ### Silent stderr
+diff --git a/index.d.ts b/index.d.ts
+index 90d91f1..cb68179 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -258,33 +258,15 @@ export type CommonOptions<EncodingType> = {
+ export type Options<EncodingType = string> = {
+ 	/**
+ 	Write some input to the `stdin` of your binary.
+-
+-	If the input is a file, use the `inputFile` option instead.
+ 	*/
+ 	readonly input?: string | Buffer | ReadableStream;
+-
+-	/**
+-	Use a file as input to the the `stdin` of your binary.
+-
+-	If the input is not a file, use the `input` option instead.
+-	*/
+-	readonly inputFile?: string;
+ } & CommonOptions<EncodingType>;
+ 
+ export type SyncOptions<EncodingType = string> = {
+ 	/**
+ 	Write some input to the `stdin` of your binary.
+-
+-	If the input is a file, use the `inputFile` option instead.
+ 	*/
+ 	readonly input?: string | Buffer;
+-
+-	/**
+-	Use a file as input to the the `stdin` of your binary.
+-
+-	If the input is not a file, use the `input` option instead.
+-	*/
+-	readonly inputFile?: string;
+ } & CommonOptions<EncodingType>;
+ 
+ export type NodeOptions<EncodingType = string> = {
+diff --git a/index.js b/index.js
+index 87c8276..e5525b9 100644
+--- a/index.js
++++ b/index.js
+@@ -10,7 +10,7 @@ import {makeError} from './lib/error.js';
+ import {normalizeStdio, normalizeStdioNode} from './lib/stdio.js';
+ import {spawnedKill, spawnedCancel, setupTimeout, validateTimeout, setExitHandler} from './lib/kill.js';
+ import {addPipeMethods} from './lib/pipe.js';
+-import {handleInput, getSpawnedResult, makeAllStream, handleInputSync} from './lib/stream.js';
++import {handleInput, getSpawnedResult, makeAllStream, validateInputSync} from './lib/stream.js';
+ import {mergePromise, getSpawnedPromise} from './lib/promise.js';
+ import {joinCommand, parseCommand, parseTemplates, getEscapedCommand} from './lib/command.js';
+ import {logCommand, verboseDefault} from './lib/verbose.js';
+@@ -159,7 +159,7 @@ export function execa(file, args, options) {
+ 
+ 	const handlePromiseOnce = onetime(handlePromise);
+ 
+-	handleInput(spawned, parsed.options);
++	handleInput(spawned, parsed.options.input);
+ 
+ 	spawned.all = makeAllStream(spawned, parsed.options);
+ 
+@@ -174,11 +174,11 @@ export function execaSync(file, args, options) {
+ 	const escapedCommand = getEscapedCommand(file, args);
+ 	logCommand(escapedCommand, parsed.options);
+ 
+-	const input = handleInputSync(parsed.options);
++	validateInputSync(parsed.options);
+ 
+ 	let result;
+ 	try {
+-		result = childProcess.spawnSync(parsed.file, parsed.args, {...parsed.options, input});
++		result = childProcess.spawnSync(parsed.file, parsed.args, parsed.options);
+ 	} catch (error) {
+ 		throw makeError({
+ 			error,
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 284545b..1520899 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -134,7 +134,6 @@ execa('unicorns', {buffer: false});
+ execa('unicorns', {input: ''});
+ execa('unicorns', {input: Buffer.from('')});
+ execa('unicorns', {input: process.stdin});
+-execa('unicorns', {inputFile: ''});
+ execa('unicorns', {stdin: 'pipe'});
+ execa('unicorns', {stdin: 'overlapped'});
+ execa('unicorns', {stdin: 'ipc'});
+diff --git a/lib/stream.js b/lib/stream.js
+index 5f79b79..32bdefe 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -1,47 +1,9 @@
+-import {createReadStream, readFileSync} from 'node:fs';
+ import {isStream} from 'is-stream';
+ import getStream from 'get-stream';
+ import mergeStream from 'merge-stream';
+ 
+-const validateInputOptions = input => {
+-	if (input !== undefined) {
+-		throw new TypeError('The `input` and `inputFile` options cannot be both set.');
+-	}
+-};
+-
+-const getInputSync = ({input, inputFile}) => {
+-	if (typeof inputFile !== 'string') {
+-		return input;
+-	}
+-
+-	validateInputOptions(input);
+-	return readFileSync(inputFile);
+-};
+-
+-// `input` and `inputFile` option in sync mode
+-export const handleInputSync = options => {
+-	const input = getInputSync(options);
+-
+-	if (isStream(input)) {
+-		throw new TypeError('The `input` option cannot be a stream in sync mode');
+-	}
+-
+-	return input;
+-};
+-
+-const getInput = ({input, inputFile}) => {
+-	if (typeof inputFile !== 'string') {
+-		return input;
+-	}
+-
+-	validateInputOptions(input);
+-	return createReadStream(inputFile);
+-};
+-
+-// `input` and `inputFile` option in async mode
+-export const handleInput = (spawned, options) => {
+-	const input = getInput(options);
+-
++// `input` option
++export const handleInput = (spawned, input) => {
+ 	if (input === undefined) {
+ 		return;
+ 	}
+@@ -117,3 +79,9 @@ export const getSpawnedResult = async ({stdout, stderr, all}, {encoding, buffer,
+ 		]);
+ 	}
+ };
++
++export const validateInputSync = ({input}) => {
++	if (isStream(input)) {
++		throw new TypeError('The `input` option cannot be a stream in sync mode');
++	}
++};
+diff --git a/readme.md b/readme.md
+index 4f820e2..e51a3b6 100644
+--- a/readme.md
++++ b/readme.md
+@@ -128,7 +128,7 @@ await execa('echo', ['unicorns'], {all:true}).pipeAll('all.txt');
+ import {execa} from 'execa';
+ 
+ // Similar to `cat < stdin.txt` in Bash
+-const {stdout} = await execa('cat', {inputFile:'stdin.txt'});
++const {stdout} = await execa('cat', {input:fs.createReadStream('stdin.txt')});
+ console.log(stdout);
+ //=> 'unicorns'
+ ```
+@@ -497,16 +497,6 @@ Type: `string | Buffer | stream.Readable`
+ Write some input to the `stdin` of your binary.\
+ Streams are not allowed when using the synchronous methods.
+ 
+-If the input is a file, use the [`inputFile` option](#inputfile) instead.
+-
+-#### inputFile
+-
+-Type: `string`
+-
+-Use a file as input to the the `stdin` of your binary.
+-
+-If the input is not a file, use the [`input` option](#input) instead.
+-
+ #### stdin
+ 
+ Type: `string | number | Stream | undefined`\
+diff --git a/test/stream.js b/test/stream.js
+index 3d2c187..aeceedb 100644
+--- a/test/stream.js
++++ b/test/stream.js
+@@ -71,19 +71,6 @@ test('input can be a Stream', async t => {
+ 	t.is(stdout, 'howdy');
+ });
+ 
+-test('inputFile can be set', async t => {
+-	const inputFile = tempfile();
+-	fs.writeFileSync(inputFile, 'howdy');
+-	const {stdout} = await execa('stdin.js', {inputFile});
+-	t.is(stdout, 'howdy');
+-});
+-
+-test('inputFile and input cannot be both set', t => {
+-	t.throws(() => execa('stdin.js', {inputFile: '', input: ''}), {
+-		message: /cannot be both set/,
+-	});
+-});
+-
+ test('you can write to child.stdin', async t => {
+ 	const subprocess = execa('stdin.js');
+ 	subprocess.stdin.end('unicorns');
+@@ -118,19 +105,6 @@ test('helpful error trying to provide an input stream in sync mode', t => {
+ 	);
+ });
+ 
+-test('inputFile can be set - sync', t => {
+-	const inputFile = tempfile();
+-	fs.writeFileSync(inputFile, 'howdy');
+-	const {stdout} = execaSync('stdin.js', {inputFile});
+-	t.is(stdout, 'howdy');
+-});
+-
+-test('inputFile and input cannot be both set - sync', t => {
+-	t.throws(() => execaSync('stdin.js', {inputFile: '', input: ''}), {
+-		message: /cannot be both set/,
+-	});
+-});
+-
+ test('maxBuffer affects stdout', async t => {
+ 	await t.notThrowsAsync(execa('max-buffer.js', ['stdout', '10'], {maxBuffer: 10}));
+ 	const {stdout, all} = await t.throwsAsync(execa('max-buffer.js', ['stdout', '11'], {maxBuffer: 10, all: true}), {message: /max-buffer.js stdout/});

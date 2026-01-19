@@ -1,0 +1,256 @@
+diff --git a/integration/hooks/e2e/enable-shutdown-hook.spec.ts b/integration/hooks/e2e/enable-shutdown-hook.spec.ts
+index 9e35bb1d0..6cd93d9a1 100644
+--- a/integration/hooks/e2e/enable-shutdown-hook.spec.ts
++++ b/integration/hooks/e2e/enable-shutdown-hook.spec.ts
+@@ -51,21 +51,4 @@ describe('enableShutdownHooks', () => {
+     expect(result.stdout.toString().trim()).to.be.eq('');
+     done();
+   }).timeout(10000);
+-
+-  it('should call the correct hooks with useProcessExit option', done => {
+-    const result = spawnSync('ts-node', [
+-      join(__dirname, '../src/enable-shutdown-hooks-main.ts'),
+-      'SIGHUP',
+-      'SIGHUP',
+-      'graceful',
+-    ]);
+-    const calls = result.stdout
+-      .toString()
+-      .split('\n')
+-      .map((call: string) => call.trim());
+-    expect(calls[0]).to.equal('beforeApplicationShutdown SIGHUP');
+-    expect(calls[1]).to.equal('onApplicationShutdown SIGHUP');
+-    expect(result.status).to.equal(0);
+-    done();
+-  }).timeout(10000);
+ });
+diff --git a/integration/hooks/src/enable-shutdown-hooks-main.ts b/integration/hooks/src/enable-shutdown-hooks-main.ts
+index 8c98caff6..565b2d59f 100644
+--- a/integration/hooks/src/enable-shutdown-hooks-main.ts
++++ b/integration/hooks/src/enable-shutdown-hooks-main.ts
+@@ -7,7 +7,6 @@ import {
+ import { NestFactory } from '@nestjs/core';
+ const SIGNAL = process.argv[2];
+ const SIGNAL_TO_LISTEN = process.argv[3];
+-const USE_GRACEFUL_EXIT = process.argv[4] === 'graceful';
+ 
+ @Injectable()
+ class TestInjectable
+@@ -30,12 +29,10 @@ class AppModule {}
+ async function bootstrap() {
+   const app = await NestFactory.create(AppModule, { logger: false });
+ 
+-  const shutdownOptions = USE_GRACEFUL_EXIT ? { useProcessExit: true } : {};
+-
+   if (SIGNAL_TO_LISTEN && SIGNAL_TO_LISTEN !== 'NONE') {
+-    app.enableShutdownHooks([SIGNAL_TO_LISTEN], shutdownOptions);
++    app.enableShutdownHooks([SIGNAL_TO_LISTEN]);
+   } else if (SIGNAL_TO_LISTEN !== 'NONE') {
+-    app.enableShutdownHooks([], shutdownOptions);
++    app.enableShutdownHooks();
+   }
+ 
+   await app.listen(1800);
+diff --git a/packages/common/interfaces/index.ts b/packages/common/interfaces/index.ts
+index 94ceff93c..206cdac8b 100644
+--- a/packages/common/interfaces/index.ts
++++ b/packages/common/interfaces/index.ts
+@@ -24,7 +24,6 @@ export * from './nest-application-options.interface';
+ export * from './nest-application.interface';
+ export * from './nest-microservice.interface';
+ export * from './scope-options.interface';
+-export * from './shutdown-hooks-options.interface';
+ export * from './type.interface';
+ export * from './version-options.interface';
+ export * from './websockets/web-socket-adapter.interface';
+diff --git a/packages/common/interfaces/nest-application-context.interface.ts b/packages/common/interfaces/nest-application-context.interface.ts
+index 3c2d5c4a3..3a8fe4396 100644
+--- a/packages/common/interfaces/nest-application-context.interface.ts
++++ b/packages/common/interfaces/nest-application-context.interface.ts
+@@ -2,7 +2,6 @@ import { ShutdownSignal } from '../enums/shutdown-signal.enum';
+ import { LoggerService, LogLevel } from '../services/logger.service';
+ import { DynamicModule } from './modules';
+ import { NestApplicationContextOptions } from './nest-application-context-options.interface';
+-import { ShutdownHooksOptions } from './shutdown-hooks-options.interface';
+ import { Type } from './type.interface';
+ 
+ export type SelectOptions = Pick<NestApplicationContextOptions, 'abortOnError'>;
+@@ -144,15 +143,9 @@ export interface INestApplicationContext {
+    * `onApplicationShutdown` function of a provider if the
+    * process receives a shutdown signal.
+    *
+-   * @param {ShutdownSignal[] | string[]} [signals] The system signals to listen to
+-   * @param {ShutdownHooksOptions} [options] Options for configuring shutdown hooks behavior
+-   *
+    * @returns {this} The Nest application context instance
+    */
+-  enableShutdownHooks(
+-    signals?: ShutdownSignal[] | string[],
+-    options?: ShutdownHooksOptions,
+-  ): this;
++  enableShutdownHooks(signals?: ShutdownSignal[] | string[]): this;
+ 
+   /**
+    * Initializes the Nest application.
+diff --git a/packages/common/interfaces/shutdown-hooks-options.interface.ts b/packages/common/interfaces/shutdown-hooks-options.interface.ts
+deleted file mode 100644
+index 3508c9467..000000000
+--- a/packages/common/interfaces/shutdown-hooks-options.interface.ts
++++ /dev/null
+@@ -1,21 +0,0 @@
+-/**
+- * Options for configuring shutdown hooks behavior.
+- *
+- * @publicApi
+- */
+-export interface ShutdownHooksOptions {
+-  /**
+-   * If true, uses `process.exit()` instead of `process.kill(process.pid, signal)`
+-   * after shutdown hooks complete. This ensures the 'exit' event is properly
+-   * triggered, which is required for async loggers (like Pino with transports)
+-   * to flush their buffers before the process terminates.
+-   *
+-   * Note: Using `process.exit()` will:
+-   * - Change the exit code (e.g., SIGTERM: 143 → 0)
+-   * - May not trigger other signal handlers from third-party libraries
+-   * - May affect orchestrator (Kubernetes, Docker) behavior
+-   *
+-   * @default false
+-   */
+-  useProcessExit?: boolean;
+-}
+diff --git a/packages/core/nest-application-context.ts b/packages/core/nest-application-context.ts
+index 209283655..8d9eb92e0 100644
+--- a/packages/core/nest-application-context.ts
++++ b/packages/core/nest-application-context.ts
+@@ -10,7 +10,6 @@ import {
+   DynamicModule,
+   GetOrResolveOptions,
+   SelectOptions,
+-  ShutdownHooksOptions,
+   Type,
+ } from '@nestjs/common/interfaces';
+ import { NestApplicationContextOptions } from '@nestjs/common/interfaces/nest-application-context-options.interface';
+@@ -317,14 +316,10 @@ export class NestApplicationContext<
+    * process receives a shutdown signal.
+    *
+    * @param {ShutdownSignal[]} [signals=[]] The system signals it should listen to
+-   * @param {ShutdownHooksOptions} [options={}] Options for configuring shutdown hooks behavior
+    *
+    * @returns {this} The Nest application context instance
+    */
+-  public enableShutdownHooks(
+-    signals: (ShutdownSignal | string)[] = [],
+-    options: ShutdownHooksOptions = {},
+-  ): this {
++  public enableShutdownHooks(signals: (ShutdownSignal | string)[] = []): this {
+     if (isEmpty(signals)) {
+       signals = Object.keys(ShutdownSignal).map(
+         (key: string) => ShutdownSignal[key],
+@@ -341,7 +336,7 @@ export class NestApplicationContext<
+       .filter(signal => !this.activeShutdownSignals.includes(signal))
+       .toArray();
+ 
+-    this.listenToShutdownSignals(signals, options);
++    this.listenToShutdownSignals(signals);
+     return this;
+   }
+ 
+@@ -356,12 +351,8 @@ export class NestApplicationContext<
+    * process events
+    *
+    * @param {string[]} signals The system signals it should listen to
+-   * @param {ShutdownHooksOptions} options Options for configuring shutdown hooks behavior
+    */
+-  protected listenToShutdownSignals(
+-    signals: string[],
+-    options: ShutdownHooksOptions = {},
+-  ) {
++  protected listenToShutdownSignals(signals: string[]) {
+     let receivedSignal = false;
+     const cleanup = async (signal: string) => {
+       try {
+@@ -377,15 +368,7 @@ export class NestApplicationContext<
+         await this.dispose();
+         await this.callShutdownHook(signal);
+         signals.forEach(sig => process.removeListener(sig, cleanup));
+-
+-        if (options.useProcessExit) {
+-          // Use process.exit() to ensure the 'exit' event is properly triggered.
+-          // This is required for async loggers (like Pino with transports)
+-          // to flush their buffers before the process terminates.
+-          process.exit(0);
+-        } else {
+-          process.kill(process.pid, signal);
+-        }
++        process.kill(process.pid, signal);
+       } catch (err) {
+         Logger.error(
+           MESSAGES.ERROR_DURING_SHUTDOWN,
+diff --git a/packages/core/test/nest-application-context.spec.ts b/packages/core/test/nest-application-context.spec.ts
+index 7188f1e07..13ce6e660 100644
+--- a/packages/core/test/nest-application-context.spec.ts
++++ b/packages/core/test/nest-application-context.spec.ts
+@@ -1,4 +1,4 @@
+-import { Injectable, InjectionToken, Provider, Scope } from '@nestjs/common';
++import { InjectionToken, Provider, Scope, Injectable } from '@nestjs/common';
+ import { expect } from 'chai';
+ import * as sinon from 'sinon';
+ import { setTimeout } from 'timers/promises';
+@@ -154,56 +154,6 @@ describe('NestApplicationContext', () => {
+ 
+       clock.restore();
+     });
+-
+-    it('should use process.exit when useProcessExit option is enabled', async () => {
+-      const signal = 'SIGTERM';
+-      const applicationContext = await testHelper(A, Scope.DEFAULT);
+-
+-      const processExitStub = sinon.stub(process, 'exit');
+-      const processKillStub = sinon.stub(process, 'kill');
+-
+-      applicationContext.enableShutdownHooks([signal], {
+-        useProcessExit: true,
+-      });
+-
+-      const hookStub = sinon
+-        .stub(applicationContext as any, 'callShutdownHook')
+-        .callsFake(async () => undefined);
+-
+-      const shutdownCleanupRef = applicationContext['shutdownCleanupRef']!;
+-      await shutdownCleanupRef(signal);
+-
+-      hookStub.restore();
+-      processExitStub.restore();
+-      processKillStub.restore();
+-
+-      expect(processExitStub.calledOnceWith(0)).to.be.true;
+-      expect(processKillStub.called).to.be.false;
+-    });
+-
+-    it('should use process.kill when useProcessExit option is not enabled', async () => {
+-      const signal = 'SIGTERM';
+-      const applicationContext = await testHelper(A, Scope.DEFAULT);
+-
+-      const processExitStub = sinon.stub(process, 'exit');
+-      const processKillStub = sinon.stub(process, 'kill');
+-
+-      applicationContext.enableShutdownHooks([signal]);
+-
+-      const hookStub = sinon
+-        .stub(applicationContext as any, 'callShutdownHook')
+-        .callsFake(async () => undefined);
+-
+-      const shutdownCleanupRef = applicationContext['shutdownCleanupRef']!;
+-      await shutdownCleanupRef(signal);
+-
+-      hookStub.restore();
+-      processExitStub.restore();
+-      processKillStub.restore();
+-
+-      expect(processKillStub.calledOnceWith(process.pid, signal)).to.be.true;
+-      expect(processExitStub.called).to.be.false;
+-    });
+   });
+ 
+   describe('get', () => {

@@ -1,0 +1,214 @@
+diff --git a/README.md b/README.md
+index 11a1cc3..c6a7925 100644
+--- a/README.md
++++ b/README.md
+@@ -340,7 +340,7 @@ SchemaDescription {
+   type: string,
+   label: string,
+   meta: object,
+-  tests: Array<{ name: string, params: object }>
++  tests: Array<string>
+ }
+ ```
+ 
+@@ -609,20 +609,21 @@ You can also specify more than one dependent key, in which case each value will
+ 
+ ```javascript
+ var inst = yup.object({
+-  isSpecial: yup.bool(),
+-  isBig: yup.bool(),
+-  count: yup.number().when(['isBig', 'isSpecial'], {
+-    is: true, // alternatively: (isBig, isSpecial) => isBig && isSpecial
+-    then: yup.number().min(5),
+-    otherwise: yup.number().min(0),
+-  }),
+-});
++      isSpecial: yup.bool(),
++      isBig: yup.bool(),
++      count: yup.number()
++        .when(['isBig', 'isSpecial'], {
++          is: true,  // alternatively: (isBig, isSpecial) => isBig && isSpecial
++          then:      yup.number().min(5),
++          otherwise: yup.number().min(0)
++        })
++    })
+ 
+ inst.validate({
+   isBig: true,
+   isSpecial: true,
+-  count: 10,
+-});
++  count: 10
++})
+ ```
+ 
+ Alternatively you can provide a function that returns a schema
+@@ -711,7 +712,6 @@ If an exclusive test is added to a schema with non-exclusive tests of the same n
+ the previous tests are removed and further tests of the same name will replace each other.
+ 
+ ```javascript
+-var max = 64;
+ var schema = yup.mixed().test({
+   name: 'max',
+   exclusive: true,
+diff --git a/src/mixed.js b/src/mixed.js
+index ac45454..ec166b8 100644
+--- a/src/mixed.js
++++ b/src/mixed.js
+@@ -123,7 +123,7 @@ const proto = (SchemaType.prototype = {
+     // manually add the new tests to ensure
+     // the deduping logic is consistent
+     schema.tests.forEach(fn => {
+-      next = next.test(fn.OPTIONS);
++      next = next.test(fn.TEST);
+     });
+ 
+     next._type = schema._type;
+@@ -311,7 +311,7 @@ const proto = (SchemaType.prototype = {
+ 
+   notRequired() {
+     var next = this.clone();
+-    next.tests = next.tests.filter(test => test.OPTIONS.name !== 'required');
++    next.tests = next.tests.filter(test => test.TEST_NAME !== 'required');
+     return next;
+   },
+ 
+@@ -369,9 +369,9 @@ const proto = (SchemaType.prototype = {
+     next._exclusive[opts.name] = !!opts.exclusive;
+ 
+     next.tests = next.tests.filter(fn => {
+-      if (fn.OPTIONS.name === opts.name) {
++      if (fn.TEST_NAME === opts.name) {
+         if (isExclusive) return false;
+-        if (fn.OPTIONS.test === validate.OPTIONS.test) return false;
++        if (fn.TEST.test === validate.TEST.test) return false;
+       }
+       return true;
+     });
+@@ -477,17 +477,15 @@ const proto = (SchemaType.prototype = {
+   },
+ 
+   describe() {
+-    const next = this.clone();
++    let next = this.clone();
+ 
+     return {
+       type: next._type,
+       meta: next._meta,
+       label: next._label,
+       tests: next.tests
+-        .map(fn => ({ name: fn.OPTIONS.name, params: fn.OPTIONS.params }))
+-        .filter(
+-          (n, idx, list) => list.findIndex(c => c.name === n.name) === idx,
+-        ),
++        .map(fn => fn.TEST_NAME, {})
++        .filter((n, idx, list) => list.indexOf(n) === idx),
+     };
+   },
+ });
+diff --git a/src/util/createValidation.js b/src/util/createValidation.js
+index 062cfe4..48f23de 100644
+--- a/src/util/createValidation.js
++++ b/src/util/createValidation.js
+@@ -92,7 +92,9 @@ export default function createValidation(options) {
+     });
+   }
+ 
+-  validate.OPTIONS = options;
++  validate.TEST_NAME = name;
++  validate.TEST_FN = test;
++  validate.TEST = options;
+ 
+   return validate;
+ }
+diff --git a/test/mixed.js b/test/mixed.js
+index 153f79e..511e53b 100644
+--- a/test/mixed.js
++++ b/test/mixed.js
+@@ -334,8 +334,8 @@ describe('Mixed Types ', () => {
+     let inst = mixed().test('test', noop);
+ 
+     inst.tests.length.should.equal(1);
+-    inst.tests[0].OPTIONS.test.should.equal(noop);
+-    inst.tests[0].OPTIONS.message.should.equal('${path} is invalid');
++    inst.tests[0].TEST.test.should.equal(noop);
++    inst.tests[0].TEST.message.should.equal('${path} is invalid');
+   });
+ 
+   it('should allow non string messages', async () => {
+@@ -343,7 +343,7 @@ describe('Mixed Types ', () => {
+     let inst = mixed().test('test', message, () => false);
+ 
+     inst.tests.length.should.equal(1);
+-    inst.tests[0].OPTIONS.message.should.equal(message);
++    inst.tests[0].TEST.message.should.equal(message);
+ 
+     let error = await inst.validate('foo').should.be.rejected();
+ 
+@@ -356,7 +356,7 @@ describe('Mixed Types ', () => {
+       .test('test', 'asdasd', noop);
+ 
+     inst.tests.length.should.equal(1);
+-    inst.tests[0].OPTIONS.message.should.equal('asdasd');
++    inst.tests[0].TEST.message.should.equal('asdasd');
+   });
+ 
+   it('should not dedupe tests with the same test function and different type', () => {
+@@ -538,7 +538,7 @@ describe('Mixed Types ', () => {
+     });
+ 
+     it('should have the tests in the correct order', () => {
+-      reach(next, 'str').tests[0].OPTIONS.name.should.equal('required');
++      reach(next, 'str').tests[0].TEST_NAME.should.equal('required');
+     });
+ 
+     it('should validate correctly', async () => {
+@@ -730,8 +730,8 @@ describe('Mixed Types ', () => {
+ 
+   it('should describe', () => {
+     const desc = object({
+-      foo: array(number().integer()).required(),
+-      bar: string()
++      foos: array(number().integer()).required(),
++      foo: string()
+         .max(2)
+         .meta({ input: 'foo' })
+         .label('str!'),
+@@ -743,32 +743,22 @@ describe('Mixed Types ', () => {
+       label: undefined,
+       tests: [],
+       fields: {
+-        foo: {
++        foos: {
+           type: 'array',
+           meta: undefined,
+           label: undefined,
+-          tests: [
+-            {
+-              name: 'required',
+-              params: undefined,
+-            },
+-          ],
++          tests: ['required'],
+           innerType: {
+             type: 'number',
+             meta: undefined,
+             label: undefined,
+-            tests: [
+-              {
+-                name: 'integer',
+-                params: undefined,
+-              },
+-            ],
++            tests: ['integer'],
+           },
+         },
+-        bar: {
++        foo: {
+           type: 'string',
+           label: 'str!',
+-          tests: [{ name: 'max', params: { max: 2 } }],
++          tests: ['max'],
+           meta: {
+             input: 'foo',
+           },

@@ -1,0 +1,473 @@
+diff --git a/package-lock.json b/package-lock.json
+index 085523b19..05622f529 100644
+Binary files a/package-lock.json and b/package-lock.json differ
+diff --git a/package.json b/package.json
+index f05e80702..6b50dafcb 100644
+--- a/package.json
++++ b/package.json
+@@ -122,7 +122,7 @@
+     "eslint-plugin-import": "2.24.0",
+     "eventsource": "1.1.0",
+     "fancy-log": "1.3.3",
+-    "fastify": "3.20.2",
++    "fastify": "3.20.1",
+     "fastify-cors": "6.0.2",
+     "fastify-formbody": "5.1.0",
+     "fastify-multipart": "4.0.7",
+diff --git a/packages/common/interfaces/http/http-server.interface.ts b/packages/common/interfaces/http/http-server.interface.ts
+index 20abed8d9..b85595c41 100644
+--- a/packages/common/interfaces/http/http-server.interface.ts
++++ b/packages/common/interfaces/http/http-server.interface.ts
+@@ -4,6 +4,7 @@ import {
+   CorsOptionsDelegate,
+ } from '../../interfaces/external/cors-options.interface';
+ import { NestApplicationOptions } from '../../interfaces/nest-application-options.interface';
++import { VersioningOptions, VersionValue } from '../version-options.interface';
+ 
+ export type ErrorHandler<TRequest = any, TResponse = any> = (
+   error: any,
+@@ -73,4 +74,13 @@ export interface HttpServer<TRequest = any, TResponse = any> {
+   close(): any;
+   getType(): string;
+   init?(): Promise<void>;
++  applyVersionFilter?(
++    handler: Function,
++    version: VersionValue,
++    versioningOptions: VersioningOptions,
++  ): <TRequest extends Record<string, any> = any, TResponse = any>(
++    req: TRequest,
++    res: TResponse,
++    next: () => void,
++  ) => any;
+ }
+diff --git a/packages/core/adapters/http-adapter.ts b/packages/core/adapters/http-adapter.ts
+index 8820c4b0c..b5379933a 100644
+--- a/packages/core/adapters/http-adapter.ts
++++ b/packages/core/adapters/http-adapter.ts
+@@ -17,7 +17,7 @@ export abstract class AbstractHttpAdapter<
+ {
+   protected httpServer: TServer;
+ 
+-  constructor(protected readonly instance: any) {}
++  constructor(protected instance?: any) {}
+ 
+   // eslint-disable-next-line @typescript-eslint/no-empty-function
+   public async init() {}
+@@ -88,6 +88,10 @@ export abstract class AbstractHttpAdapter<
+     this.httpServer = httpServer;
+   }
+ 
++  public setInstance<T = any>(instance: T) {
++    this.instance = instance;
++  }
++
+   public getInstance<T = any>(): T {
+     return this.instance as T;
+   }
+diff --git a/packages/core/router/router-explorer.ts b/packages/core/router/router-explorer.ts
+index 26773c7cc..153bf29b4 100644
+--- a/packages/core/router/router-explorer.ts
++++ b/packages/core/router/router-explorer.ts
+@@ -247,7 +247,11 @@ export class RouterExplorer {
+         routePathMetadata.versioningOptions.type !== VersioningType.URI
+       ) {
+         // All versioning (except for URI Versioning) is done via the "Version Filter"
+-        routeHandler = this.applyVersionFilter(routePathMetadata, routeHandler);
++        routeHandler = this.applyVersionFilter(
++          router,
++          routePathMetadata,
++          routeHandler,
++        );
+       }
+ 
+       routePathMetadata.methodPath = path;
+@@ -323,13 +327,20 @@ export class RouterExplorer {
+     };
+   }
+ 
+-  private applyVersionFilter(
++  private applyVersionFilter<T extends HttpServer>(
++    router: T,
+     routePathMetadata: RoutePathMetadata,
+     handler: Function,
+   ) {
+     const { versioningOptions } = routePathMetadata;
+     const version = this.routePathFactory.getVersion(routePathMetadata);
+-
++    if (router?.applyVersionFilter) {
++      return router.applyVersionFilter(handler, version, versioningOptions);
++    }
++    /**
++     * This can be removed in the next major release.
++     * Left for backward-compatibility.
++     */
+     return <TRequest extends Record<string, any> = any, TResponse = any>(
+       req: TRequest,
+       res: TResponse,
+diff --git a/packages/platform-express/adapters/express-adapter.ts b/packages/platform-express/adapters/express-adapter.ts
+index 6497060c6..93a7663a4 100644
+--- a/packages/platform-express/adapters/express-adapter.ts
++++ b/packages/platform-express/adapters/express-adapter.ts
+@@ -1,10 +1,25 @@
+-import { RequestMethod, StreamableFile } from '@nestjs/common';
++import {
++  InternalServerErrorException,
++  RequestMethod,
++  StreamableFile,
++  VersioningType,
++} from '@nestjs/common';
++import {
++  VersioningOptions,
++  VersionValue,
++  VERSION_NEUTRAL,
++} from '@nestjs/common/interfaces';
+ import {
+   CorsOptions,
+   CorsOptionsDelegate,
+ } from '@nestjs/common/interfaces/external/cors-options.interface';
+ import { NestApplicationOptions } from '@nestjs/common/interfaces/nest-application-options.interface';
+-import { isFunction, isNil, isObject } from '@nestjs/common/utils/shared.utils';
++import {
++  isFunction,
++  isNil,
++  isObject,
++  isString,
++} from '@nestjs/common/utils/shared.utils';
+ import { AbstractHttpAdapter } from '@nestjs/core/adapters/http-adapter';
+ import * as bodyParser from 'body-parser';
+ import * as cors from 'cors';
+@@ -155,6 +170,78 @@ export class ExpressAdapter extends AbstractHttpAdapter {
+     return 'express';
+   }
+ 
++  public applyVersionFilter(
++    handler: Function,
++    version: VersionValue,
++    versioningOptions: VersioningOptions,
++  ) {
++    return <TRequest extends Record<string, any> = any, TResponse = any>(
++      req: TRequest,
++      res: TResponse,
++      next: () => void,
++    ) => {
++      if (version === VERSION_NEUTRAL) {
++        return handler(req, res, next);
++      }
++      // URL Versioning is done via the path, so the filter continues forward
++      if (versioningOptions.type === VersioningType.URI) {
++        return handler(req, res, next);
++      }
++      // Media Type (Accept Header) Versioning Handler
++      if (versioningOptions.type === VersioningType.MEDIA_TYPE) {
++        const MEDIA_TYPE_HEADER = 'Accept';
++        const acceptHeaderValue: string | undefined =
++          req.headers?.[MEDIA_TYPE_HEADER] ||
++          req.headers?.[MEDIA_TYPE_HEADER.toLowerCase()];
++
++        const acceptHeaderVersionParameter = acceptHeaderValue
++          ? acceptHeaderValue.split(';')[1]
++          : '';
++
++        if (acceptHeaderVersionParameter) {
++          const headerVersion = acceptHeaderVersionParameter.split(
++            versioningOptions.key,
++          )[1];
++
++          if (Array.isArray(version)) {
++            if (version.includes(headerVersion)) {
++              return handler(req, res, next);
++            }
++          } else if (isString(version)) {
++            if (version === headerVersion) {
++              return handler(req, res, next);
++            }
++          }
++        }
++      }
++      // Header Versioning Handler
++      else if (versioningOptions.type === VersioningType.HEADER) {
++        const customHeaderVersionParameter: string | undefined =
++          req.headers?.[versioningOptions.header] ||
++          req.headers?.[versioningOptions.header.toLowerCase()];
++
++        if (customHeaderVersionParameter) {
++          if (Array.isArray(version)) {
++            if (version.includes(customHeaderVersionParameter)) {
++              return handler(req, res, next);
++            }
++          } else if (isString(version)) {
++            if (version === customHeaderVersionParameter) {
++              return handler(req, res, next);
++            }
++          }
++        }
++      }
++
++      if (!next) {
++        throw new InternalServerErrorException(
++          'HTTP adapter does not support filtering on version',
++        );
++      }
++      return next();
++    };
++  }
++
+   private isMiddlewareApplied(name: string): boolean {
+     const app = this.getInstance();
+     return (
+diff --git a/packages/platform-fastify/adapters/fastify-adapter.ts b/packages/platform-fastify/adapters/fastify-adapter.ts
+index b8ce56eb7..0c393abb1 100644
+--- a/packages/platform-fastify/adapters/fastify-adapter.ts
++++ b/packages/platform-fastify/adapters/fastify-adapter.ts
+@@ -3,7 +3,10 @@ import {
+   Logger,
+   RequestMethod,
+   StreamableFile,
++  VersioningOptions,
++  VersioningType,
+ } from '@nestjs/common';
++import { VersionValue, VERSION_NEUTRAL } from '@nestjs/common/interfaces';
+ import {
+   CorsOptions,
+   CorsOptionsDelegate,
+@@ -26,6 +29,7 @@ import {
+   RequestGenericInterface,
+ } from 'fastify';
+ import * as Reply from 'fastify/lib/reply';
++import { RouteShorthandMethod } from 'fastify/types/route';
+ import * as http2 from 'http2';
+ import * as https from 'https';
+ import {
+@@ -61,6 +65,11 @@ type FastifyHttpsOptions<
+   https: https.ServerOptions;
+ };
+ 
++type VersionedRoute = Function & {
++  version: VersionValue;
++  versioningOptions: VersioningOptions;
++};
++
+ /**
+  * The following type assertion is valid as we enforce "middie" plugin registration
+  * which enhances the FastifyRequest.RawRequest with the "originalUrl" property.
+@@ -91,27 +100,101 @@ export class FastifyAdapter<
+   > = FastifyInstance<TServer, TRawRequest, TRawResponse>,
+ > extends AbstractHttpAdapter<TServer, TRequest, TReply> {
+   protected readonly instance: TInstance;
++
+   private _isParserRegistered: boolean;
+   private isMiddieRegistered: boolean;
++  private versioningOptions: VersioningOptions;
++  private readonly versionConstraint = {
++    name: 'version',
++    validate(value: unknown) {
++      if (typeof value !== 'string' && !Array.isArray(value)) {
++        throw new Error(
++          'Version constraint should be a string or an array of strings.',
++        );
++      }
++    },
++    storage() {
++      const versions = new Map();
++      return {
++        get(version: string | Array<string>) {
++          return versions.get(version) || null;
++        },
++        set(
++          versionOrVersions: string | Array<string>,
++          store: Map<string, any>,
++        ) {
++          const storeVersionConstraint = version =>
++            versions.set(version, store);
++          if (Array.isArray(versionOrVersions))
++            versionOrVersions.forEach(storeVersionConstraint);
++          else storeVersionConstraint(versionOrVersions);
++        },
++        del(version: string | Array<string>) {
++          versions.delete(version);
++        },
++        empty() {
++          versions.clear();
++        },
++      };
++    },
++    deriveConstraint: (req: FastifyRequest) => {
++      // Media Type (Accept Header) Versioning Handler
++      if (this.versioningOptions.type === VersioningType.MEDIA_TYPE) {
++        const MEDIA_TYPE_HEADER = 'Accept';
++        const acceptHeaderValue: string | undefined = (req.headers?.[
++          MEDIA_TYPE_HEADER
++        ] || req.headers?.[MEDIA_TYPE_HEADER.toLowerCase()]) as string;
++
++        const acceptHeaderVersionParameter = acceptHeaderValue
++          ? acceptHeaderValue.split(';')[1]
++          : '';
++
++        if (acceptHeaderVersionParameter) {
++          const headerVersion = acceptHeaderVersionParameter.split(
++            this.versioningOptions.key,
++          )[1];
++          return headerVersion;
++        }
++      }
++      // Header Versioning Handler
++      else if (this.versioningOptions.type === VersioningType.HEADER) {
++        const customHeaderVersionParameter: string | string[] | undefined =
++          req.headers?.[this.versioningOptions.header] ||
++          req.headers?.[this.versioningOptions.header.toLowerCase()];
++
++        if (customHeaderVersionParameter) {
++          return customHeaderVersionParameter;
++        }
++      }
++      return undefined;
++    },
++    mustMatchWhenDerived: false,
++  };
+ 
+   get isParserRegistered(): boolean {
+     return !!this._isParserRegistered;
+   }
+ 
+   constructor(
+-    instanceOrOptions:
++    instanceOrOptions?:
+       | TInstance
+       | FastifyHttp2Options<any>
+       | FastifyHttp2SecureOptions<any>
+       | FastifyHttpsOptions<any>
+-      | FastifyServerOptions<TServer> = fastify() as any,
++      | FastifyServerOptions<TServer>,
+   ) {
++    super();
++
+     const instance =
+       instanceOrOptions && (instanceOrOptions as TInstance).server
+         ? instanceOrOptions
+-        : fastify(instanceOrOptions as FastifyServerOptions);
+-
+-    super(instance);
++        : fastify({
++            constraints: {
++              version: this.versionConstraint as any,
++            },
++            ...(instanceOrOptions as FastifyServerOptions),
++          });
++    this.setInstance(instance);
+   }
+ 
+   public async init() {
+@@ -131,6 +214,47 @@ export class FastifyAdapter<
+     return this.instance.listen(port, ...args);
+   }
+ 
++  public get(...args: any[]) {
++    return this.injectConstraintsIfVersioned('get', ...args);
++  }
++
++  public post(...args: any[]) {
++    return this.injectConstraintsIfVersioned('post', ...args);
++  }
++
++  public head(...args: any[]) {
++    return this.injectConstraintsIfVersioned('head', ...args);
++  }
++
++  public delete(...args: any[]) {
++    return this.injectConstraintsIfVersioned('delete', ...args);
++  }
++
++  public put(...args: any[]) {
++    return this.injectConstraintsIfVersioned('put', ...args);
++  }
++
++  public patch(...args: any[]) {
++    return this.injectConstraintsIfVersioned('patch', ...args);
++  }
++
++  public options(...args: any[]) {
++    return this.injectConstraintsIfVersioned('options', ...args);
++  }
++
++  public applyVersionFilter(
++    handler: Function,
++    version: VersionValue,
++    versioningOptions: VersioningOptions,
++  ) {
++    if (!this.versioningOptions) {
++      this.versioningOptions = versioningOptions;
++    }
++    const versionedRoute = handler as VersionedRoute;
++    versionedRoute.version = version;
++    return versionedRoute;
++  }
++
+   public reply(
+     response: TRawResponse | TReply,
+     body: any,
+@@ -332,4 +456,39 @@ export class FastifyAdapter<
+   private getRequestOriginalUrl(rawRequest: TRawRequest) {
+     return rawRequest.originalUrl || rawRequest.url;
+   }
++
++  private injectConstraintsIfVersioned(
++    routerMethodKey:
++      | 'get'
++      | 'post'
++      | 'put'
++      | 'delete'
++      | 'options'
++      | 'patch'
++      | 'head',
++    ...args: any[]
++  ) {
++    const handlerRef = args[args.length - 1];
++    const isVersioned =
++      typeof handlerRef.version !== 'undefined' &&
++      handlerRef.version !== VERSION_NEUTRAL;
++
++    if (isVersioned) {
++      const isPathAndRouteTuple = args.length === 2;
++      if (isPathAndRouteTuple) {
++        const options = {
++          constraints: {
++            version: handlerRef.version,
++          },
++        };
++        const path = args[0];
++        return this.instance[routerMethodKey](path, options, handlerRef);
++      }
++    }
++    return this.instance[routerMethodKey](
++      ...(args as Parameters<
++        RouteShorthandMethod<TServer, TRawRequest, TRawResponse>
++      >),
++    );
++  }
+ }
+diff --git a/packages/platform-fastify/package.json b/packages/platform-fastify/package.json
+index 9cb220491..98231e054 100644
+--- a/packages/platform-fastify/package.json
++++ b/packages/platform-fastify/package.json
+@@ -17,7 +17,7 @@
+     "access": "public"
+   },
+   "dependencies": {
+-    "fastify": "3.20.2",
++    "fastify": "3.20.1",
+     "fastify-cors": "6.0.2",
+     "fastify-formbody": "5.1.0",
+     "light-my-request": "4.4.1",
+diff --git a/sample/08-webpack/package.json b/sample/08-webpack/package.json
+index af0a4cb2c..0514b46ce 100644
+--- a/sample/08-webpack/package.json
++++ b/sample/08-webpack/package.json
+@@ -31,7 +31,7 @@
+     "ts-loader": "9.2.5",
+     "ts-node": "10.2.0",
+     "webpack": "5.50.0",
+-    "webpack-cli": "4.8.0",
++    "webpack-cli": "4.7.2",
+     "webpack-node-externals": "3.0.0"
+   }
+ }

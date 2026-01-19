@@ -1,0 +1,180 @@
+diff --git a/packages/core/router/router-execution-context.ts b/packages/core/router/router-execution-context.ts
+index d2806f61c..f971cf2df 100644
+--- a/packages/core/router/router-execution-context.ts
++++ b/packages/core/router/router-execution-context.ts
+@@ -444,7 +444,6 @@ export class RouterExecutionContext {
+           result,
+           (res as any).raw || res,
+           (req as any).raw || req,
+-          { additionalHeaders: res.getHeaders?.() },
+         );
+       };
+     }
+diff --git a/packages/core/router/router-response-controller.ts b/packages/core/router/router-response-controller.ts
+index 68f2ef052..aab864095 100644
+--- a/packages/core/router/router-response-controller.ts
++++ b/packages/core/router/router-response-controller.ts
+@@ -3,11 +3,7 @@ import { isFunction, isObject } from '@nestjs/common/utils/shared.utils';
+ import { IncomingMessage } from 'http';
+ import { lastValueFrom, Observable } from 'rxjs';
+ import { debounce } from 'rxjs/operators';
+-import {
+-  AdditionalHeaders,
+-  WritableHeaderStream,
+-  SseStream,
+-} from './sse-stream';
++import { HeaderStream, SseStream } from './sse-stream';
+ 
+ export interface CustomHeader {
+   name: string;
+@@ -89,14 +85,9 @@ export class RouterResponseController {
+ 
+   public async sse<
+     TInput extends Observable<unknown> = any,
+-    TResponse extends WritableHeaderStream = any,
++    TResponse extends HeaderStream = any,
+     TRequest extends IncomingMessage = any,
+-  >(
+-    result: TInput,
+-    response: TResponse,
+-    request: TRequest,
+-    options?: { additionalHeaders: AdditionalHeaders },
+-  ) {
++  >(result: TInput, response: TResponse, request: TRequest) {
+     // It's possible that we sent headers already so don't use a stream
+     if (response.writableEnded) {
+       return;
+@@ -105,7 +96,7 @@ export class RouterResponseController {
+     this.assertObservable(result);
+ 
+     const stream = new SseStream(request);
+-    stream.pipe(response, options);
++    stream.pipe(response);
+ 
+     const subscription = result
+       .pipe(
+diff --git a/packages/core/router/sse-stream.ts b/packages/core/router/sse-stream.ts
+index 22327e6c8..489b7bc67 100644
+--- a/packages/core/router/sse-stream.ts
++++ b/packages/core/router/sse-stream.ts
+@@ -13,15 +13,6 @@ function toDataString(data: string | object): string {
+     .join('');
+ }
+ 
+-export type AdditionalHeaders = Record<
+-  string,
+-  string[] | string | number | undefined
+->;
+-
+-interface ReadHeaders {
+-  getHeaders?(): AdditionalHeaders;
+-}
+-
+ interface WriteHeaders {
+   writableEnded?: boolean;
+   writeHead?(
+@@ -33,8 +24,7 @@ interface WriteHeaders {
+   flushHeaders?(): void;
+ }
+ 
+-export type WritableHeaderStream = NodeJS.WritableStream & WriteHeaders;
+-export type HeaderStream = WritableHeaderStream & ReadHeaders;
++export type HeaderStream = NodeJS.WritableStream & WriteHeaders;
+ 
+ /**
+  * Adapted from https://raw.githubusercontent.com/EventSource/node-ssestream
+@@ -61,16 +51,9 @@ export class SseStream extends Transform {
+     }
+   }
+ 
+-  pipe<T extends WritableHeaderStream>(
+-    destination: T,
+-    options?: {
+-      additionalHeaders?: AdditionalHeaders;
+-      end?: boolean;
+-    },
+-  ): T {
++  pipe<T extends HeaderStream>(destination: T, options?: { end?: boolean }): T {
+     if (destination.writeHead) {
+       destination.writeHead(200, {
+-        ...options?.additionalHeaders,
+         // See https://github.com/dunglas/mercure/blob/master/hub/subscribe.go#L124-L130
+         'Content-Type': 'text/event-stream',
+         Connection: 'keep-alive',
+diff --git a/packages/core/test/router/router-execution-context.spec.ts b/packages/core/test/router/router-execution-context.spec.ts
+index 8bd3b150b..d669b03fd 100644
+--- a/packages/core/test/router/router-execution-context.spec.ts
++++ b/packages/core/test/router/router-execution-context.spec.ts
+@@ -19,7 +19,6 @@ import { PipesConsumer } from '../../pipes/pipes-consumer';
+ import { PipesContextCreator } from '../../pipes/pipes-context-creator';
+ import { RouteParamsFactory } from '../../router/route-params-factory';
+ import { RouterExecutionContext } from '../../router/router-execution-context';
+-import { HeaderStream } from '../../router/sse-stream';
+ import { NoopHttpAdapter } from '../utils/noop-adapter.spec';
+ 
+ describe('RouterExecutionContext', () => {
+@@ -471,38 +470,6 @@ describe('RouterExecutionContext', () => {
+           );
+         }
+       });
+-
+-      it('should apply any headers that exists on the response', async () => {
+-        const result = of('test');
+-        const response = new PassThrough() as HeaderStream;
+-        response.write = sinon.spy();
+-        response.writeHead = sinon.spy();
+-        response.flushHeaders = sinon.spy();
+-        response.getHeaders = sinon
+-          .stub()
+-          .returns({ 'access-control-headers': 'some-cors-value' });
+-
+-        const request = new PassThrough();
+-        request.on = sinon.spy();
+-
+-        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
+-        sinon.stub(contextCreator, 'reflectSse').returns('/');
+-
+-        const handler = contextCreator.createHandleResponseFn(
+-          null,
+-          true,
+-          undefined,
+-          200,
+-        ) as HandlerResponseBasicFn;
+-        await handler(result, response, request);
+-
+-        expect(
+-          (response.writeHead as sinon.SinonSpy).calledWith(
+-            200,
+-            sinon.match.hasNested('access-control-headers', 'some-cors-value'),
+-          ),
+-        ).to.be.true;
+-      });
+     });
+   });
+ });
+diff --git a/packages/core/test/router/sse-stream.spec.ts b/packages/core/test/router/sse-stream.spec.ts
+index b4ccdf191..1e7dda54a 100644
+--- a/packages/core/test/router/sse-stream.spec.ts
++++ b/packages/core/test/router/sse-stream.spec.ts
+@@ -138,21 +138,6 @@ data: hello
+     sse.pipe(sink);
+   });
+ 
+-  it('sets additional headers when provided', callback => {
+-    const sse = new SseStream();
+-    const sink = new Sink(
+-      (status: number, headers: string | OutgoingHttpHeaders) => {
+-        expect(headers).to.contain.keys('access-control-headers');
+-        expect(headers['access-control-headers']).to.equal('some-cors-value');
+-        callback();
+-        return sink;
+-      },
+-    );
+-    sse.pipe(sink, {
+-      additionalHeaders: { 'access-control-headers': 'some-cors-value' },
+-    });
+-  });
+-
+   it('allows an eventsource to connect', callback => {
+     let sse: SseStream;
+     const server = createServer((req, res) => {

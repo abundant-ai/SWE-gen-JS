@@ -1,0 +1,3748 @@
+diff --git a/.changeset/stale-jokes-turn.md b/.changeset/stale-jokes-turn.md
+deleted file mode 100644
+index 60ffa76d53..0000000000
+--- a/.changeset/stale-jokes-turn.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-"@biomejs/biome": patch
+----
+-
+-Fixed [#8138](https://github.com/biomejs/biome/issues/8138) by reverting an internal refactor that caused a regression to the rule `noUnusedPrivateClassMembers`.
+diff --git a/crates/biome_js_analyze/src/lint/correctness/no_unused_private_class_members.rs b/crates/biome_js_analyze/src/lint/correctness/no_unused_private_class_members.rs
+index 28efac642c..cf8d69bd7b 100644
+--- a/crates/biome_js_analyze/src/lint/correctness/no_unused_private_class_members.rs
++++ b/crates/biome_js_analyze/src/lint/correctness/no_unused_private_class_members.rs
+@@ -1,8 +1,9 @@
+-use crate::{
+-    JsRuleAction,
+-    services::semantic::Semantic,
+-    utils::{is_node_equal, rename::RenameSymbolExtensions},
++use crate::JsRuleAction;
++use crate::services::semantic_class::{
++    AccessKind, AnyNamedClassMember, ClassMemberReference, ClassMemberReferences, SemanticClass,
++    SemanticClassModel,
+ };
++use crate::utils::rename::RenameSymbolExtensions;
+ use biome_analyze::{
+     FixKind, Rule, RuleDiagnostic, RuleSource, context::RuleContext, declare_lint_rule,
+ };
+@@ -10,13 +11,11 @@ use biome_console::markup;
+ use biome_diagnostics::Severity;
+ use biome_js_semantic::ReferencesExtensions;
+ use biome_js_syntax::{
+-    AnyJsClassMember, AnyJsClassMemberName, AnyJsComputedMember, AnyJsExpression,
+-    AnyJsFormalParameter, AnyJsName, JsAssignmentExpression, JsClassDeclaration, JsSyntaxKind,
+-    JsSyntaxNode, TsAccessibilityModifier, TsPropertyParameter,
++    AnyJsClassMember, AnyJsClassMemberName, AnyJsFormalParameter, JsClassDeclaration,
++    TsAccessibilityModifier, TsPropertyParameter,
+ };
+ use biome_rowan::{
+-    AstNode, AstNodeList, AstSeparatedList, BatchMutationExt, SyntaxNodeOptionExt, TextRange,
+-    declare_node_union,
++    AstNode, AstNodeList, AstSeparatedList, BatchMutationExt, Text, TextRange, declare_node_union,
+ };
+ use biome_rule_options::no_unused_private_class_members::NoUnusedPrivateClassMembersOptions;
+ 
+@@ -35,7 +34,7 @@ declare_lint_rule! {
+     ///   #usedOnlyInWrite = 5;
+     ///
+     ///   method() {
+-    ///	    this.#usedOnlyInWrite = 212;
++    ///        this.#usedOnlyInWrite = 212;
+     ///   }
+     /// }
+     /// ```
+@@ -59,7 +58,7 @@ declare_lint_rule! {
+     ///   #usedMember = 42;
+     ///
+     ///   method() {
+-    ///	    return this.#usedMember;
++    ///        return this.#usedMember;
+     ///   }
+     /// }
+     /// ```
+@@ -72,9 +71,10 @@ declare_lint_rule! {
+     /// ```ts
+     ///  class TsBioo {
+     ///    private member: number;
++    ///    private anotherMember: number;
+     ///
+-    ///    set_with_name(name: string, value: number) {
+-    ///      this[name] = value;
++    ///    set_with_name(name: 'member' | 'anotherMember', value: number) {
++    ///      this[name]();
+     ///    }
+     ///  }
+     /// ```
+@@ -96,7 +96,9 @@ declare_node_union! {
+ 
+ #[derive(Debug, Clone)]
+ pub enum UnusedMemberAction {
+-    RemoveMember(AnyMember),
++    RemoveMember {
++        member: AnyMember,
++    },
+     RemovePrivateModifier {
+         member: AnyMember,
+         rename_with_underscore: bool,
+@@ -104,16 +106,16 @@ pub enum UnusedMemberAction {
+ }
+ 
+ impl UnusedMemberAction {
+-    fn property_range(&self) -> Option<TextRange> {
++    fn property_range(&self, semantic_class: &SemanticClassModel) -> Option<TextRange> {
+         match self {
+-            Self::RemoveMember(member) => member.property_range(),
+-            Self::RemovePrivateModifier { member, .. } => member.property_range(),
++            Self::RemoveMember { member } => member.member_range(semantic_class),
++            Self::RemovePrivateModifier { member, .. } => member.member_range(semantic_class),
+         }
+     }
+ }
+ 
+ impl Rule for NoUnusedPrivateClassMembers {
+-    type Query = Semantic<JsClassDeclaration>;
++    type Query = SemanticClass<JsClassDeclaration>;
+     type State = UnusedMemberAction;
+     type Signals = Box<[Self::State]>;
+     type Options = NoUnusedPrivateClassMembersOptions;
+@@ -125,12 +127,20 @@ impl Rule for NoUnusedPrivateClassMembers {
+             Box::default()
+         } else {
+             let mut results = Vec::new();
+-            let unused_members = traverse_members_usage(node.syntax(), private_members);
++            let semantic_class = ctx.semantic_class();
++
++            let class_member_references = semantic_class.class_member_references(&node.members());
++
++            let unused_members = traverse_meaningful_read_members_usage(
++                semantic_class,
++                private_members,
++                &class_member_references,
++            );
+ 
+             for member in unused_members {
+                 match &member {
+                     AnyMember::AnyJsClassMember(_) => {
+-                        results.push(UnusedMemberAction::RemoveMember(member));
++                        results.push(UnusedMemberAction::RemoveMember { member });
+                     }
+                     AnyMember::TsPropertyParameter(ts_property_param) => {
+                         // Check if the parameter is also unused in constructor body using semantic analysis
+@@ -147,11 +157,11 @@ impl Rule for NoUnusedPrivateClassMembers {
+         }
+     }
+ 
+-    fn diagnostic(_: &RuleContext<Self>, state: &Self::State) -> Option<RuleDiagnostic> {
++    fn diagnostic(ctx: &RuleContext<Self>, state: &Self::State) -> Option<RuleDiagnostic> {
+         match state {
+-            UnusedMemberAction::RemoveMember(_) => Some(RuleDiagnostic::new(
++            UnusedMemberAction::RemoveMember { .. } => Some(RuleDiagnostic::new(
+                 rule_category!(),
+-                state.property_range(),
++                state.property_range(ctx.semantic_class()),
+                 markup! {
+                     "This private class member is defined but never used."
+                 },
+@@ -163,7 +173,7 @@ impl Rule for NoUnusedPrivateClassMembers {
+                 if *rename_with_underscore {
+                     Some(RuleDiagnostic::new(
+                         rule_category!(),
+-                        state.property_range(),
++                        state.property_range(ctx.semantic_class()),
+                         markup! {
+                             "This private class member is defined but never used."
+                         },
+@@ -171,7 +181,7 @@ impl Rule for NoUnusedPrivateClassMembers {
+                 } else {
+                     Some(RuleDiagnostic::new(
+                         rule_category!(),
+-                        state.property_range(),
++                        state.property_range(ctx.semantic_class()),
+                         markup! {
+                             "This parameter is never used outside of the constructor."
+                         },
+@@ -185,7 +195,7 @@ impl Rule for NoUnusedPrivateClassMembers {
+         let mut mutation = ctx.root().begin();
+ 
+         match state {
+-            UnusedMemberAction::RemoveMember(member) => {
++            UnusedMemberAction::RemoveMember { member, .. } => {
+                 mutation.remove_node(member.clone());
+                 Some(JsRuleAction::new(
+                     ctx.metadata().action_category(ctx.category(), ctx.group()),
+@@ -197,6 +207,7 @@ impl Rule for NoUnusedPrivateClassMembers {
+             UnusedMemberAction::RemovePrivateModifier {
+                 member,
+                 rename_with_underscore,
++                ..
+             } => {
+                 if let AnyMember::TsPropertyParameter(ts_property_param) = member {
+                     // Remove the private modifier
+@@ -222,7 +233,7 @@ impl Rule for NoUnusedPrivateClassMembers {
+                         let name_trimmed = name_token.text_trimmed();
+                         let new_name = format!("_{name_trimmed}");
+                         if !mutation.rename_node_declaration(
+-                            ctx.model(),
++                            ctx.semantic(),
+                             identifier_binding,
+                             &new_name,
+                         ) {
+@@ -241,65 +252,33 @@ impl Rule for NoUnusedPrivateClassMembers {
+     }
+ }
+ 
+-/// Check for private member usage
+-/// if the member usage is found, we remove it from the hashmap
+-fn traverse_members_usage(
+-    syntax: &JsSyntaxNode,
+-    mut private_members: Vec<AnyMember>,
++/// Filters out private class members that are read meaningfully in the class.
++///
++/// Returns only private members **not read meaningfully**.
++fn traverse_meaningful_read_members_usage(
++    semantic_class: &SemanticClassModel,
++    private_members: Vec<AnyMember>,
++    class_member_references: &ClassMemberReferences,
+ ) -> Vec<AnyMember> {
+-    // `true` is at least one member is a TypeScript private member like `private member`.
+-    // The other private members are sharp members `#member`.
+-    let mut ts_private_count = private_members
+-        .iter()
+-        .filter(|member| !member.is_private_sharp())
+-        .count();
+-
+-    for node in syntax.descendants() {
+-        match AnyJsName::try_cast(node) {
+-            Ok(js_name) => {
+-                private_members.retain(|private_member| {
+-                    let member_being_used = private_member.match_js_name(&js_name) == Some(true);
+-
+-                    if !member_being_used {
+-                        return true;
+-                    }
+-
+-                    let is_write_only =
+-                        is_write_only(&js_name) == Some(true) && !private_member.is_accessor();
+-                    let is_in_update_expression = is_in_update_expression(&js_name);
+-
+-                    if is_in_update_expression || is_write_only {
+-                        return true;
+-                    }
+-
+-                    if !private_member.is_private_sharp() {
+-                        ts_private_count -= 1;
+-                    }
+-
+-                    false
+-                });
+-
+-                if private_members.is_empty() {
+-                    break;
+-                }
+-            }
+-            Err(node) => {
+-                if ts_private_count != 0
+-                    && let Some(computed_member) = AnyJsComputedMember::cast(node)
+-                    && matches!(
+-                        computed_member.object(),
+-                        Ok(AnyJsExpression::JsThisExpression(_))
+-                    )
+-                {
+-                    // We consider that all TypeScript private members are used in expressions like `this[something]`.
+-                    private_members.retain(|private_member| private_member.is_private_sharp());
+-                    ts_private_count = 0;
+-                }
+-            }
+-        }
+-    }
++    let ClassMemberReferences { reads, .. } = class_member_references;
+ 
+     private_members
++        .into_iter()
++        .filter_map(|private_member| {
++            if !reads
++                .iter()
++                .filter(|read| read.access_kind == AccessKind::MeaningfulRead)
++                .any(|reference| {
++                    let ClassMemberReference { name, .. } = reference;
++                    private_member.matches_name(semantic_class, name)
++                })
++            {
++                Some(private_member)
++            } else {
++                None
++            }
++        })
++        .collect()
+ }
+ 
+ /// Check if a TsPropertyParameter is also unused as a function parameter
+@@ -325,7 +304,7 @@ fn check_ts_property_parameter_usage(
+         }
+ 
+         if identifier_binding
+-            .all_references(ctx.model())
++            .all_references(ctx.semantic())
+             .next()
+             .is_some()
+         {
+@@ -374,81 +353,7 @@ fn get_constructor_params(
+         })
+ }
+ 
+-/// Check whether the provided `AnyJsName` is part of a potentially write-only assignment expression.
+-/// This function inspects the syntax tree around the given `AnyJsName` to check whether it is involved in an assignment operation and whether that assignment can be write-only.
+-///
+-/// # Returns
+-///
+-/// - `Some(true)`: If the `js_name` is in a write-only assignment.
+-/// - `Some(false)`: If the `js_name` is in a assignments that also reads like shorthand operators
+-/// - `None`: If the parent is not present or grand parent is not a JsAssignmentExpression
+-///
+-/// # Examples of write only expressions
+-///
+-/// ```js
+-/// this.usedOnlyInWrite = 2;
+-/// this.usedOnlyInWrite = this.usedOnlyInWrite;
+-/// ```
+-///
+-/// # Examples of expressions that are NOT write-only
+-///
+-/// ```js
+-/// return this.#val++;   // increment expression used as return value
+-/// return this.#val = 1; // assignment used as expression
+-/// ```
+-///
+-fn is_write_only(js_name: &AnyJsName) -> Option<bool> {
+-    let parent = js_name.syntax().parent()?;
+-    let grand_parent = parent.parent()?;
+-    let assignment_expression = JsAssignmentExpression::cast(grand_parent)?;
+-    let left = assignment_expression.left().ok()?;
+-
+-    if !is_node_equal(left.syntax(), &parent) {
+-        return Some(false);
+-    }
+-
+-    // If it's not a direct child of expression statement, its result is being used
+-    let kind = assignment_expression.syntax().parent().kind();
+-    Some(kind.is_some_and(|kind| matches!(kind, JsSyntaxKind::JS_EXPRESSION_STATEMENT)))
+-}
+-
+-fn is_in_update_expression(js_name: &AnyJsName) -> bool {
+-    let Some(grand_parent) = js_name.syntax().grand_parent() else {
+-        return false;
+-    };
+-
+-    // If it's not a direct child of expression statement, its result is being used
+-    let kind = grand_parent.parent().kind();
+-    if !kind.is_some_and(|kind| matches!(kind, JsSyntaxKind::JS_EXPRESSION_STATEMENT)) {
+-        return false;
+-    }
+-
+-    matches!(
+-        grand_parent.kind(),
+-        JsSyntaxKind::JS_POST_UPDATE_EXPRESSION | JsSyntaxKind::JS_PRE_UPDATE_EXPRESSION
+-    )
+-}
+-
+ impl AnyMember {
+-    fn is_accessor(&self) -> bool {
+-        matches!(
+-            self.syntax().kind(),
+-            JsSyntaxKind::JS_SETTER_CLASS_MEMBER | JsSyntaxKind::JS_GETTER_CLASS_MEMBER
+-        )
+-    }
+-
+-    /// Returns `true` if it is a private property starting with `#`.
+-    fn is_private_sharp(&self) -> bool {
+-        if let Self::AnyJsClassMember(member) = self {
+-            matches!(
+-                member.name(),
+-                Ok(Some(AnyJsClassMemberName::JsPrivateClassMemberName(_)))
+-            )
+-        } else {
+-            false
+-        }
+-    }
+-
+     fn is_private(&self) -> Option<bool> {
+         match self {
+             Self::AnyJsClassMember(member) => {
+@@ -492,69 +397,23 @@ impl AnyMember {
+         }
+     }
+ 
+-    fn property_range(&self) -> Option<TextRange> {
+-        match self {
+-            Self::AnyJsClassMember(member) => match member {
+-                AnyJsClassMember::JsGetterClassMember(member) => Some(member.name().ok()?.range()),
+-                AnyJsClassMember::JsMethodClassMember(member) => Some(member.name().ok()?.range()),
+-                AnyJsClassMember::JsPropertyClassMember(member) => {
+-                    Some(member.name().ok()?.range())
+-                }
+-                AnyJsClassMember::JsSetterClassMember(member) => Some(member.name().ok()?.range()),
+-                _ => None,
+-            },
+-            Self::TsPropertyParameter(ts_property) => match ts_property.formal_parameter().ok()? {
+-                AnyJsFormalParameter::JsBogusParameter(_)
+-                | AnyJsFormalParameter::JsMetavariable(_) => None,
+-                AnyJsFormalParameter::JsFormalParameter(param) => Some(
+-                    param
+-                        .binding()
+-                        .ok()?
+-                        .as_any_js_binding()?
+-                        .as_js_identifier_binding()?
+-                        .name_token()
+-                        .ok()?
+-                        .text_range(),
+-                ),
+-            },
++    fn member_range(&self, semantic_class: &SemanticClassModel) -> Option<TextRange> {
++        if let Some(any_named_class_member) = AnyNamedClassMember::cast(self.syntax().clone())
++            && let Some(prop_name) = semantic_class.extract_named_member(&any_named_class_member)
++        {
++            return Some(prop_name.range);
+         }
+-    }
+ 
+-    fn match_js_name(&self, js_name: &AnyJsName) -> Option<bool> {
+-        let value_token = js_name.value_token().ok()?;
+-        let token = value_token.text_trimmed();
++        None
++    }
+ 
+-        match self {
+-            Self::AnyJsClassMember(member) => match member {
+-                AnyJsClassMember::JsGetterClassMember(member) => {
+-                    Some(member.name().ok()?.name()?.text() == token)
+-                }
+-                AnyJsClassMember::JsMethodClassMember(member) => {
+-                    Some(member.name().ok()?.name()?.text() == token)
+-                }
+-                AnyJsClassMember::JsPropertyClassMember(member) => {
+-                    Some(member.name().ok()?.name()?.text() == token)
+-                }
+-                AnyJsClassMember::JsSetterClassMember(member) => {
+-                    Some(member.name().ok()?.name()?.text() == token)
+-                }
+-                _ => None,
+-            },
+-            Self::TsPropertyParameter(ts_property) => match ts_property.formal_parameter().ok()? {
+-                AnyJsFormalParameter::JsBogusParameter(_)
+-                | AnyJsFormalParameter::JsMetavariable(_) => None,
+-                AnyJsFormalParameter::JsFormalParameter(param) => Some(
+-                    param
+-                        .binding()
+-                        .ok()?
+-                        .as_any_js_binding()?
+-                        .as_js_identifier_binding()?
+-                        .name_token()
+-                        .ok()?
+-                        .text_trimmed()
+-                        == token,
+-                ),
+-            },
++    fn matches_name(&self, semantic_class: &SemanticClassModel, name: &Text) -> bool {
++        if let Some(any_named_class_member) = AnyNamedClassMember::cast(self.syntax().clone())
++            && let Some(prop_name) = semantic_class.extract_named_member(&any_named_class_member)
++        {
++            return prop_name.name.eq(name);
+         }
++
++        false
+     }
+ }
+diff --git a/crates/biome_js_analyze/src/lint/style/use_readonly_class_properties.rs b/crates/biome_js_analyze/src/lint/style/use_readonly_class_properties.rs
+index ac4b770d14..6d2ebf36c3 100644
+--- a/crates/biome_js_analyze/src/lint/style/use_readonly_class_properties.rs
++++ b/crates/biome_js_analyze/src/lint/style/use_readonly_class_properties.rs
+@@ -1,6 +1,7 @@
+ use crate::JsRuleAction;
+ use crate::services::semantic_class::{
+-    AnyPropertyMember, ClassMemberReference, ClassMemberReferences, SemanticClass,
++    AnyNamedClassMember, ClassMemberReference, ClassMemberReferences, NamedClassMember,
++    SemanticClass,
+ };
+ use biome_analyze::{
+     FixKind, Rule, RuleDiagnostic, RuleSource, context::RuleContext, declare_lint_rule,
+@@ -10,11 +11,10 @@ use biome_js_factory::make;
+ use biome_js_syntax::{
+     AnyJsClassMember, AnyJsClassMemberName, AnyJsConstructorParameter, AnyJsPropertyModifier,
+     AnyTsPropertyParameterModifier, JsClassDeclaration, JsClassMemberList, JsFileSource,
+-    JsSyntaxKind, JsSyntaxToken, TextRange, TsAccessibilityModifier, TsPropertyParameter,
+-    TsReadonlyModifier,
++    JsSyntaxKind, JsSyntaxToken, TsAccessibilityModifier, TsPropertyParameter, TsReadonlyModifier,
+ };
+ use biome_rowan::{
+-    AstNode, AstNodeExt, AstNodeList, AstSeparatedList, BatchMutationExt, Text, TriviaPiece,
++    AstNode, AstNodeExt, AstNodeList, AstSeparatedList, BatchMutationExt, TriviaPiece,
+ };
+ use biome_rule_options::use_readonly_class_properties::UseReadonlyClassPropertiesOptions;
+ use std::iter::once;
+@@ -125,7 +125,7 @@ declare_lint_rule! {
+ 
+ impl Rule for UseReadonlyClassProperties {
+     type Query = SemanticClass<JsClassDeclaration>;
+-    type State = AnyPropertyMember;
++    type State = AnyNamedClassMember;
+     type Signals = Box<[Self::State]>;
+     type Options = UseReadonlyClassPropertiesOptions;
+ 
+@@ -138,7 +138,8 @@ impl Rule for UseReadonlyClassProperties {
+         let root = ctx.query();
+         let members = root.members();
+ 
+-        let ClassMemberReferences { writes, .. } = ctx.model.class_member_references(&members);
++        let ClassMemberReferences { writes, .. } =
++            ctx.semantic_class().class_member_references(&members);
+ 
+         let private_only = !ctx.options().check_all_properties();
+         let constructor_params: Vec<_> =
+@@ -157,19 +158,23 @@ impl Rule for UseReadonlyClassProperties {
+                 }),
+             )
+             .filter_map(|prop_or_param| {
+-                if writes
+-                    .clone()
+-                    .into_iter()
+-                    .any(|ClassMemberReference { name, .. }| {
+-                        if let Some(TextAndRange { text, .. }) =
+-                            extract_property_or_param_range_and_text(&prop_or_param.clone())
++                if writes.clone().into_iter().any(
++                    |ClassMemberReference {
++                         name: class_member_ref_name,
++                         ..
++                     }| {
++                        if let Some(NamedClassMember {
++                            name: member_name, ..
++                        }) = ctx
++                            .semantic_class()
++                            .extract_named_member(&prop_or_param.clone())
+                         {
+-                            return name.eq(&text);
++                            return class_member_ref_name.eq(&member_name);
+                         }
+ 
+                         false
+-                    })
+-                {
++                    },
++                ) {
+                     None
+                 } else {
+                     Some(prop_or_param.clone())
+@@ -179,19 +184,24 @@ impl Rule for UseReadonlyClassProperties {
+             .into_boxed_slice()
+     }
+ 
+-    fn diagnostic(_: &RuleContext<Self>, node: &Self::State) -> Option<RuleDiagnostic> {
+-        let TextAndRange { text, range } = extract_property_or_param_range_and_text(&node.clone())?;
+-
+-        Some(RuleDiagnostic::new(
+-            rule_category!(),
+-            range,
+-            markup! {
+-                "Member '"{text.text()}"' is never reassigned."
++    fn diagnostic(ctx: &RuleContext<Self>, node: &Self::State) -> Option<RuleDiagnostic> {
++        let semantic_class = ctx.semantic_class();
++        if let Some(NamedClassMember { name, range }) =
++            semantic_class.extract_named_member(&node.clone())
++        {
++            return Some(RuleDiagnostic::new(
++                rule_category!(),
++                range,
++                markup! {
++                "Member '"{name.text()}"' is never reassigned."
+             },
+-        ).note(markup! {
++            ).note(markup! {
+                 "Using "<Emphasis>"readonly"</Emphasis>" improves code safety, clarity, and helps prevent unintended mutations."
+             }),
+-        )
++            );
++        }
++
++        None
+     }
+ 
+     fn action(ctx: &RuleContext<Self>, node: &Self::State) -> Option<JsRuleAction> {
+@@ -204,8 +214,8 @@ impl Rule for UseReadonlyClassProperties {
+             [TriviaPiece::whitespace(1)],
+         ));
+ 
+-        if let Some(AnyPropertyMember::JsPropertyClassMember(member)) =
+-            AnyPropertyMember::cast(original_node.clone())
++        if let Some(AnyNamedClassMember::JsPropertyClassMember(member)) =
++            AnyNamedClassMember::cast(original_node.clone())
+         {
+             if let Ok(member_name) = member.name() {
+                 let replace_modifiers = make::js_property_modifier_list(
+@@ -239,8 +249,8 @@ impl Rule for UseReadonlyClassProperties {
+                     mutation.replace_node(member.clone(), builder.build());
+                 }
+             }
+-        } else if let Some(AnyPropertyMember::TsPropertyParameter(parameter)) =
+-            AnyPropertyMember::cast(original_node.clone())
++        } else if let Some(AnyNamedClassMember::TsPropertyParameter(parameter)) =
++            AnyNamedClassMember::cast(original_node.clone())
+         {
+             let replace_modifiers = make::ts_property_parameter_modifier_list(
+                 parameter
+@@ -272,12 +282,6 @@ impl Rule for UseReadonlyClassProperties {
+     }
+ }
+ 
+-#[derive(Debug)]
+-struct TextAndRange {
+-    text: Text,
+-    range: TextRange,
+-}
+-
+ /// Collects mutable (not being `readonly`) class properties (excluding `static` and `accessor`),
+ /// If `private_only` is true, only private properties are included.
+ /// This is used to identify class properties that are candidates for being marked as `readonly`.
+@@ -285,7 +289,7 @@ struct TextAndRange {
+ fn collect_non_readonly_class_member_properties(
+     members: &JsClassMemberList,
+     private_only: bool,
+-) -> impl Iterator<Item = AnyPropertyMember> {
++) -> impl Iterator<Item = AnyNamedClassMember> {
+     members.iter().filter_map(move |member| {
+         let property_class_member = member.as_js_property_class_member()?;
+ 
+@@ -303,7 +307,7 @@ fn collect_non_readonly_class_member_properties(
+             return None;
+         }
+ 
+-        let some_property = Some(AnyPropertyMember::JsPropertyClassMember(
++        let some_property = Some(AnyNamedClassMember::JsPropertyClassMember(
+             property_class_member.clone(),
+         ));
+ 
+@@ -332,7 +336,7 @@ fn collect_non_readonly_class_member_properties(
+ fn collect_non_readonly_constructor_parameters(
+     class_members: &JsClassMemberList,
+     private_only: bool,
+-) -> Vec<AnyPropertyMember> {
++) -> Vec<AnyNamedClassMember> {
+     class_members
+         .iter()
+         .find_map(|member| match member {
+@@ -346,7 +350,7 @@ fn collect_non_readonly_constructor_parameters(
+             AnyJsConstructorParameter::TsPropertyParameter(ts_property)
+                 if is_non_readonly_and_optionally_private(&ts_property, private_only) =>
+             {
+-                Some(AnyPropertyMember::TsPropertyParameter(ts_property))
++                Some(AnyNamedClassMember::TsPropertyParameter(ts_property))
+             }
+             _ => None,
+         })
+@@ -394,38 +398,3 @@ fn is_non_readonly_and_optionally_private(param: &TsPropertyParameter, private_o
+ 
+     is_mutable && (!private_only || is_private)
+ }
+-
+-/// Extracts the range and text from a property class member or constructor parameter
+-fn extract_property_or_param_range_and_text(
+-    property_or_param: &AnyPropertyMember,
+-) -> Option<TextAndRange> {
+-    if let Some(AnyPropertyMember::JsPropertyClassMember(member)) =
+-        AnyPropertyMember::cast(property_or_param.clone().into())
+-    {
+-        if let Ok(member_name) = member.name() {
+-            return Some(TextAndRange {
+-                text: member_name.to_trimmed_text(),
+-                range: member_name.range(),
+-            });
+-        }
+-        return None;
+-    }
+-
+-    if let Some(AnyPropertyMember::TsPropertyParameter(parameter)) =
+-        AnyPropertyMember::cast(property_or_param.clone().into())
+-    {
+-        let name = parameter
+-            .formal_parameter()
+-            .ok()?
+-            .as_js_formal_parameter()?
+-            .binding()
+-            .ok()?;
+-
+-        return Some(TextAndRange {
+-            text: name.to_trimmed_text(),
+-            range: name.range(),
+-        });
+-    }
+-
+-    None
+-}
+diff --git a/crates/biome_js_analyze/src/lint/suspicious/no_class_assign.rs b/crates/biome_js_analyze/src/lint/suspicious/no_class_assign.rs
+index 6855b85a05..264a4eea9f 100644
+--- a/crates/biome_js_analyze/src/lint/suspicious/no_class_assign.rs
++++ b/crates/biome_js_analyze/src/lint/suspicious/no_class_assign.rs
+@@ -98,7 +98,6 @@ impl Rule for NoClassAssign {
+ 
+         Vec::new().into_boxed_slice()
+     }
+-
+     fn diagnostic(ctx: &RuleContext<Self>, reference: &Self::State) -> Option<RuleDiagnostic> {
+         let binding = ctx
+             .query()
+diff --git a/crates/biome_js_analyze/src/services/semantic_class.rs b/crates/biome_js_analyze/src/services/semantic_class.rs
+index 295be13d01..be2a53771e 100644
+--- a/crates/biome_js_analyze/src/services/semantic_class.rs
++++ b/crates/biome_js_analyze/src/services/semantic_class.rs
+@@ -1,39 +1,82 @@
+ use biome_analyze::{
+     AddVisitor, FromServices, Phase, Phases, QueryKey, QueryMatch, Queryable, RuleKey,
+-    RuleMetadata, ServiceBag, ServicesDiagnostic, Visitor, VisitorContext, VisitorFinishContext,
++    RuleMetadata, ServiceBag, ServicesDiagnostic, SyntaxVisitor, Visitor, VisitorContext,
++    VisitorFinishContext,
+ };
++use biome_js_semantic::{SemanticEventExtractor, SemanticModel, SemanticModelBuilder};
+ use biome_js_syntax::{
+-    AnyJsBindingPattern, AnyJsClassMember, AnyJsExpression, AnyJsObjectBindingPatternMember,
+-    AnyJsRoot, JsArrayAssignmentPattern, JsArrowFunctionExpression, JsAssignmentExpression,
+-    JsClassDeclaration, JsClassMemberList, JsConstructorClassMember, JsFunctionBody, JsLanguage,
+-    JsObjectAssignmentPattern, JsObjectBindingPattern, JsPostUpdateExpression,
+-    JsPreUpdateExpression, JsPropertyClassMember, JsStaticMemberAssignment,
+-    JsStaticMemberExpression, JsSyntaxKind, JsSyntaxNode, JsVariableDeclarator, TextRange,
+-    TsPropertyParameter,
++    AnyJsBindingPattern, AnyJsClassMember, AnyJsComputedMember, AnyJsExpression,
++    AnyJsObjectBindingPatternMember, AnyJsRoot, AnyTsType, JsArrayAssignmentPattern,
++    JsArrowFunctionExpression, JsAssignmentExpression, JsClassDeclaration, JsClassMemberList,
++    JsConstructorClassMember, JsFormalParameter, JsFunctionBody, JsGetterClassMember,
++    JsIdentifierExpression, JsLanguage, JsMethodClassMember, JsObjectAssignmentPattern,
++    JsObjectBindingPattern, JsPostUpdateExpression, JsPreUpdateExpression, JsPropertyClassMember,
++    JsSetterClassMember, JsStaticMemberAssignment, JsStaticMemberExpression, JsSyntaxKind,
++    JsSyntaxNode, JsThisExpression, JsVariableDeclarator, TextRange, TsIndexSignatureClassMember,
++    TsPropertyParameter, TsReferenceType, TsStringLiteralType, TsTypeAliasDeclaration, TsUnionType,
+ };
+ use biome_rowan::{
+-    AstNode, AstNodeList, AstSeparatedList, SyntaxNode, Text, WalkEvent, declare_node_union,
++    AstNode, AstNodeList, AstSeparatedList, SyntaxNode, SyntaxNodePtr, Text, WalkEvent,
++    declare_node_union,
+ };
+-use rustc_hash::FxHashSet;
++use rustc_hash::{FxHashMap, FxHashSet};
++use std::cell::RefCell;
+ use std::option::Option;
+ 
++#[derive(Debug, Clone)]
++pub struct NamedClassMember {
++    pub name: Text,
++    pub range: TextRange,
++}
++
+ #[derive(Clone)]
+ pub struct SemanticClassServices {
+-    pub model: SemanticClassModel,
++    semantic_class: SemanticClassModel,
++    semantic: SemanticModel,
+ }
+ 
+ impl SemanticClassServices {
+-    pub fn model(&self) -> &SemanticClassModel {
+-        &self.model
++    pub fn semantic_class(&self) -> &SemanticClassModel {
++        &self.semantic_class
++    }
++
++    pub fn semantic(&self) -> &SemanticModel {
++        &self.semantic
+     }
+ }
+ 
+ #[derive(Debug, Clone)]
+-pub struct SemanticClassModel {}
++pub struct SemanticClassModel {
++    pub semantic: SemanticModel,
++    named_members_cache: RefCell<FxHashMap<SyntaxNodePtr<JsLanguage>, Option<NamedClassMember>>>,
++}
+ 
+ impl SemanticClassModel {
++    pub fn new(semantic: SemanticModel) -> Self {
++        Self {
++            semantic,
++            named_members_cache: RefCell::new(Default::default()),
++        }
++    }
++
+     pub fn class_member_references(&self, members: &JsClassMemberList) -> ClassMemberReferences {
+-        class_member_references(members)
++        class_member_references(&self.semantic, members)
++    }
++
++    pub fn extract_named_member(
++        &self,
++        any_class_member: &AnyNamedClassMember,
++    ) -> Option<NamedClassMember> {
++        let ptr = SyntaxNodePtr::new(any_class_member.syntax());
++        if let Some(cached) = self.named_members_cache.borrow().get(&ptr) {
++            return cached.clone();
++        }
++
++        let result = extract_named_member(any_class_member);
++        self.named_members_cache
++            .borrow_mut()
++            .insert(ptr, result.clone());
++        result
+     }
+ }
+ 
+@@ -47,7 +90,8 @@ impl FromServices for SemanticClassServices {
+             ServicesDiagnostic::new(rule_key.rule_name(), &["SemanticClassModel"])
+         })?;
+         Ok(Self {
+-            model: service.clone(),
++            semantic_class: service.clone(),
++            semantic: service.semantic.clone(),
+         })
+     }
+ }
+@@ -58,38 +102,44 @@ impl Phase for SemanticClassServices {
+     }
+ }
+ 
+-pub struct SyntaxClassMemberReferencesVisitor {}
++pub struct SyntaxClassMemberReferencesVisitor {
++    extractor: SemanticEventExtractor,
++    builder: SemanticModelBuilder,
++}
++
++impl SyntaxClassMemberReferencesVisitor {
++    pub(crate) fn new(root: AnyJsRoot) -> Self {
++        Self {
++            extractor: SemanticEventExtractor::default(),
++            builder: SemanticModelBuilder::new(root),
++        }
++    }
++}
+ 
+ impl Visitor for SyntaxClassMemberReferencesVisitor {
+     type Language = JsLanguage;
+ 
+-    fn visit(
+-        &mut self,
+-        _event: &WalkEvent<JsSyntaxNode>,
+-        mut _ctx: VisitorContext<'_, '_, JsLanguage>,
+-    ) {
+-    }
++    fn visit(&mut self, event: &WalkEvent<JsSyntaxNode>, _ctx: VisitorContext<JsLanguage>) {
++        match event {
++            WalkEvent::Enter(node) => {
++                self.builder.push_node(node);
++                self.extractor.enter(node);
++            }
++            WalkEvent::Leave(node) => {
++                self.extractor.leave(node);
++            }
++        }
+ 
+-    fn finish(self: Box<Self>, ctx: VisitorFinishContext<JsLanguage>) {
+-        ctx.services.insert_service(SemanticClassModel {});
++        while let Some(e) = self.extractor.pop() {
++            self.builder.push_event(e);
++        }
+     }
+-}
+-
+-pub struct SemanticClassMemberReferencesVisitor {}
+ 
+-impl Visitor for SemanticClassMemberReferencesVisitor {
+-    type Language = JsLanguage;
++    fn finish(self: Box<Self>, ctx: VisitorFinishContext<JsLanguage>) {
++        let semantic = self.builder.build();
+ 
+-    fn visit(
+-        &mut self,
+-        event: &WalkEvent<JsSyntaxNode>,
+-        mut ctx: VisitorContext<'_, '_, JsLanguage>,
+-    ) {
+-        if let WalkEvent::Enter(node) = event
+-            && JsClassDeclaration::can_cast(node.kind())
+-        {
+-            ctx.match_query(node.clone());
+-        }
++        ctx.services
++            .insert_service(SemanticClassModel::new(semantic));
+     }
+ }
+ 
+@@ -112,9 +162,11 @@ where
+     type Language = JsLanguage;
+     type Services = SemanticClassServices;
+ 
+-    fn build_visitor(analyzer: &mut impl AddVisitor<JsLanguage>, _root: &AnyJsRoot) {
+-        analyzer.add_visitor(Phases::Syntax, || SyntaxClassMemberReferencesVisitor {});
+-        analyzer.add_visitor(Phases::Semantic, || SemanticClassMemberReferencesVisitor {});
++    fn build_visitor(analyzer: &mut impl AddVisitor<JsLanguage>, root: &AnyJsRoot) {
++        analyzer.add_visitor(Phases::Syntax, || {
++            SyntaxClassMemberReferencesVisitor::new(root.clone())
++        });
++        analyzer.add_visitor(Phases::Semantic, SyntaxVisitor::default);
+     }
+ 
+     fn key() -> QueryKey<Self::Language> {
+@@ -165,17 +217,70 @@ pub struct ClassMemberReferences {
+ }
+ 
+ declare_node_union! {
+-    pub AnyPropertyMember = JsPropertyClassMember | TsPropertyParameter
++    /// Represents any class member that has a name (public, private, or TypeScript-specific).
++    pub AnyNamedClassMember =
++      JsPropertyClassMember         // class Foo { bar = 1; }
++      | JsMethodClassMember           // class Foo { baz() {} }
++      | JsGetterClassMember           // class Foo { get qux() {} }
++      | JsSetterClassMember           // class Foo { set quux(v) {} }
++      | TsPropertyParameter           // constructor(public numbered: number) {}
++      | TsIndexSignatureClassMember   // class Foo { [key: string]: number }
++    // we also need to add accessor at some point claas Foo { accessor bar: string; }
+ }
+ 
+ declare_node_union! {
+-    pub AnyCandidateForUsedInExpressionNode = AnyJsUpdateExpression | AnyJsObjectBindingPatternMember | JsStaticMemberExpression | AnyJsBindingPattern
++    pub AnyCandidateForUsedInExpressionNode = AnyJsExpression | AnyJsUpdateExpression | AnyJsObjectBindingPatternMember | JsStaticMemberExpression | AnyJsBindingPattern | JsStaticMemberAssignment | AnyJsComputedMember
+ }
+ 
+ declare_node_union! {
+     pub AnyJsUpdateExpression = JsPreUpdateExpression | JsPostUpdateExpression
+ }
+ 
++fn to_named(name: &impl AstNode) -> Option<NamedClassMember> {
++    Some(NamedClassMember {
++        name: name.to_trimmed_text(),
++        range: name.range(),
++    })
++}
++
++/// Extracts the name and range from a method, property, or constructor parameter.
++/// Returns `None` for index signatures, since they don’t have a traditional name.
++fn extract_named_member(any_class_member: &AnyNamedClassMember) -> Option<NamedClassMember> {
++    match any_class_member {
++        AnyNamedClassMember::JsMethodClassMember(member) => {
++            let name_node = member.name().ok()?;
++            to_named(&name_node)
++        }
++
++        AnyNamedClassMember::JsGetterClassMember(getter) => {
++            let name_node = getter.name().ok()?;
++            to_named(&name_node)
++        }
++
++        AnyNamedClassMember::JsSetterClassMember(setter) => {
++            let name_node = setter.name().ok()?;
++            to_named(&name_node)
++        }
++
++        AnyNamedClassMember::JsPropertyClassMember(member) => {
++            let name_node = member.name().ok()?;
++            to_named(&name_node)
++        }
++
++        AnyNamedClassMember::TsPropertyParameter(parameter) => {
++            let name_node = parameter
++                .formal_parameter()
++                .ok()?
++                .as_js_formal_parameter()?
++                .binding()
++                .ok()?;
++            to_named(&name_node)
++        }
++
++        AnyNamedClassMember::TsIndexSignatureClassMember(_) => None,
++    }
++}
++
+ /// Collects all `this` property references used within the members of a JavaScript class.
+ ///
+ /// This function traverses a `JsClassMemberList` and extracts property references from method bodies,
+@@ -183,83 +288,76 @@ declare_node_union! {
+ /// read and write references to `this` properties across all supported member types.
+ ///
+ /// Returns a `ClassMemberReferences` struct containing the combined set of read and write references.
+-fn class_member_references(list: &JsClassMemberList) -> ClassMemberReferences {
+-    let all_references: Vec<ClassMemberReferences> = list
+-        .iter()
++fn class_member_references(
++    semantic: &SemanticModel,
++    list: &JsClassMemberList,
++) -> ClassMemberReferences {
++    list.iter()
+         .filter_map(|member| match member {
+             AnyJsClassMember::JsMethodClassMember(method) => method
+                 .body()
+                 .ok()
+-                .and_then(|body| collect_references_from_body(method.syntax(), &body)),
++                .and_then(|body| collect_references_from_body(semantic, method.syntax(), &body)),
+             AnyJsClassMember::JsSetterClassMember(setter) => setter
+                 .body()
+                 .ok()
+-                .and_then(|body| collect_references_from_body(setter.syntax(), &body)),
++                .and_then(|body| collect_references_from_body(semantic, setter.syntax(), &body)),
+             AnyJsClassMember::JsGetterClassMember(getter) => getter
+                 .body()
+                 .ok()
+-                .and_then(|body| collect_references_from_body(getter.syntax(), &body)),
++                .and_then(|body| collect_references_from_body(semantic, getter.syntax(), &body)),
+             AnyJsClassMember::JsPropertyClassMember(property) => {
+-                if let Ok(expression) = property.value()?.expression() {
+-                    if let Some(arrow_function) =
+-                        JsArrowFunctionExpression::cast(expression.clone().into_syntax())
+-                    {
+-                        if let Ok(any_js_body) = arrow_function.body()
+-                            && let Some(body) = any_js_body.as_js_function_body()
+-                        {
+-                            return collect_references_from_body(arrow_function.syntax(), body);
+-                        }
+-                    } else if let Some(static_member_expression) =
+-                        expression.as_js_static_member_expression()
+-                    {
+-                        return collect_class_property_reads_from_static_member(
+-                            static_member_expression,
+-                        );
++                property.value()?.expression().ok().and_then(|expr| {
++                    if let Some(arrow) = JsArrowFunctionExpression::cast(expr.syntax().clone()) {
++                        arrow.body().ok()?.as_js_function_body().and_then(|body| {
++                            collect_references_from_body(semantic, arrow.syntax(), body)
++                        })
++                    } else {
++                        expr.as_js_static_member_expression().map(|static_member| {
++                            collect_class_property_reads_from_static_member(static_member)
++                        })
+                     }
+-                };
+-                None
++                })
+             }
+             AnyJsClassMember::JsConstructorClassMember(constructor) => constructor
+                 .body()
+                 .ok()
+-                .map(|body| collect_references_from_constructor(&body)),
++                .map(|body| collect_references_from_constructor(semantic, &body)),
+             _ => None,
+         })
+-        .collect();
+-
+-    let mut combined_reads = FxHashSet::default();
+-    let mut combined_writes = FxHashSet::default();
+-
+-    for refs in all_references {
+-        combined_reads.extend(refs.reads);
+-        combined_writes.extend(refs.writes);
+-    }
+-
+-    ClassMemberReferences {
+-        reads: combined_reads,
+-        writes: combined_writes,
+-    }
++        .fold(
++            ClassMemberReferences {
++                reads: FxHashSet::default(),
++                writes: FxHashSet::default(),
++            },
++            |mut acc, refs| {
++                acc.reads.extend(refs.reads);
++                acc.writes.extend(refs.writes);
++                acc
++            },
++        )
+ }
+ 
+ /// Represents a function body and all `this` references (including aliases) valid within its lexical scope.
+ #[derive(Clone, Debug)]
+-struct FunctionThisReferences {
++struct FunctionThisAliases {
+     scope: JsFunctionBody,
+-    this_references: FxHashSet<ClassMemberReference>,
++    this_aliases: FxHashSet<Text>,
+ }
+ 
+ /// A visitor that collects `this` references in nested function scopes,
+ /// while skipping class expressions and tracking inherited this references.
+-struct ThisScopeVisitor<'a> {
++struct ThisScopeVisitor {
+     skipped_ranges: Vec<TextRange>,
+-    inherited_this_references: &'a [ClassMemberReference],
+-    current_this_scopes: Vec<FunctionThisReferences>,
++    inherited_this_aliases: FxHashSet<Text>,
++    current_this_scopes: Vec<FunctionThisAliases>,
+ }
+ // Can not implement `Visitor` directly because it requires a new ctx that can not be created here
+-impl ThisScopeVisitor<'_> {
++impl ThisScopeVisitor {
+     fn visit(&mut self, event: &WalkEvent<SyntaxNode<JsLanguage>>) {
+         match event {
+             WalkEvent::Enter(node) => {
++                // Skip nodes inside already-handled ranges (e.g., nested classes)
+                 if self
+                     .skipped_ranges
+                     .iter()
+@@ -268,53 +366,60 @@ impl ThisScopeVisitor<'_> {
+                     return;
+                 }
+ 
+-                if node.kind() == JsSyntaxKind::JS_CLASS_EXPRESSION {
+-                    self.skipped_ranges.push(node.text_range());
+-                    return;
+-                }
++                match node.kind() {
++                    // Skip nested classes entirely
++                    JsSyntaxKind::JS_CLASS_EXPRESSION | JsSyntaxKind::JS_CLASS_DECLARATION => {
++                        self.skipped_ranges.push(node.text_range());
++                    }
+ 
+-                if node.kind() == JsSyntaxKind::JS_CLASS_DECLARATION {
+-                    self.skipped_ranges.push(node.text_range());
+-                    return;
+-                }
++                    // Regular function body (non-constructor)
++                    JsSyntaxKind::JS_FUNCTION_BODY => {
++                        if let Some(body) = JsFunctionBody::cast_ref(node) {
++                            let is_constructor = node
++                                .parent()
++                                .and_then(JsConstructorClassMember::cast)
++                                .is_some();
++
++                            if !is_constructor {
++                                let current_scope =
++                                    ThisScopeReferences::new(&body).local_this_aliases;
++                                let mut scoped_this_references = FxHashSet::default();
++                                scoped_this_references
++                                    .extend(self.inherited_this_aliases.iter().cloned());
++                                scoped_this_references.extend(current_scope);
++
++                                self.current_this_scopes.push(FunctionThisAliases {
++                                    scope: body.clone(),
++                                    this_aliases: scoped_this_references,
++                                });
++                            }
++                        }
++                    }
+ 
+-                if let Some(body) = JsFunctionBody::cast_ref(node) {
+-                    // Only process if not part of constructor
+-                    let is_constructor = node
+-                        .parent()
+-                        .and_then(JsConstructorClassMember::cast)
+-                        .is_some();
+-
+-                    if !is_constructor {
+-                        let current_scope = ThisScopeReferences::new(&body).local_this_references;
+-                        let mut scoped_this_references = FxHashSet::default();
+-                        scoped_this_references
+-                            .extend(self.inherited_this_references.iter().cloned());
+-                        scoped_this_references.extend(current_scope);
+-
+-                        self.current_this_scopes.push(FunctionThisReferences {
+-                            scope: body.clone(),
+-                            this_references: scoped_this_references,
+-                        });
++                    // Arrow functions
++                    JsSyntaxKind::JS_ARROW_FUNCTION_EXPRESSION => {
++                        if let Some(func_expr) = JsArrowFunctionExpression::cast_ref(node)
++                            && let Some(body) = func_expr
++                                .body()
++                                .ok()
++                                .and_then(|b| b.as_js_function_body().cloned())
++                        {
++                            let current_scope_aliases =
++                                ThisScopeReferences::new(&body).local_this_aliases;
++                            let mut scoped_this_references = FxHashSet::default();
++                            scoped_this_references
++                                .extend(self.inherited_this_aliases.iter().cloned());
++                            scoped_this_references.extend(current_scope_aliases.clone());
++
++                            self.current_this_scopes.push(FunctionThisAliases {
++                                scope: body.clone(),
++                                this_aliases: scoped_this_references,
++                            });
++                        }
+                     }
+-                }
+ 
+-                if let Some(func_expr) = JsArrowFunctionExpression::cast_ref(node)
+-                    && let Some(body) = func_expr
+-                        .body()
+-                        .ok()
+-                        .and_then(|b| b.as_js_function_body().cloned())
+-                {
+-                    let current_scope_aliases =
+-                        ThisScopeReferences::new(&body).local_this_references;
+-                    let mut scoped_this_references = FxHashSet::default();
+-                    scoped_this_references.extend(self.inherited_this_references.iter().cloned());
+-                    scoped_this_references.extend(current_scope_aliases.clone());
+-
+-                    self.current_this_scopes.push(FunctionThisReferences {
+-                        scope: body.clone(),
+-                        this_references: scoped_this_references,
+-                    });
++                    // Everything else: do nothing
++                    _ => {}
+                 }
+             }
+ 
+@@ -334,25 +439,25 @@ struct ThisScopeReferences {
+     /// Any js function body
+     body: JsFunctionBody,
+     /// this scope references found within the immediate function scope body, excludes nested scopes
+-    local_this_references: Vec<ClassMemberReference>,
++    local_this_aliases: FxHashSet<Text>,
+ }
+ 
+ impl ThisScopeReferences {
+     fn new(body: &JsFunctionBody) -> Self {
+         Self {
+             body: body.clone(),
+-            local_this_references: Self::collect_local_this_references(body),
++            local_this_aliases: Self::collect_local_this_aliases(body),
+         }
+     }
+ 
+     /// Collects all `this` scope references in the function body and nested
+     /// functions using `ThisScopeVisitor`, combining local and inherited ones
+-    /// into a list of `FunctionThisReferences`.
+-    fn collect_function_this_references(&self) -> Vec<FunctionThisReferences> {
++    /// into a list of `FunctionThisAliases`.
++    fn collect_function_this_aliases(&self) -> Vec<FunctionThisAliases> {
+         let mut visitor = ThisScopeVisitor {
+             skipped_ranges: vec![],
+             current_this_scopes: vec![],
+-            inherited_this_references: self.local_this_references.as_slice(),
++            inherited_this_aliases: self.local_this_aliases.clone(),
+         };
+ 
+         let iter = self.body.syntax().preorder();
+@@ -363,8 +468,8 @@ impl ThisScopeReferences {
+         visitor.current_this_scopes
+     }
+ 
+-    /// Collects local references of `this` in a function body.
+-    fn collect_local_this_references(body: &JsFunctionBody) -> Vec<ClassMemberReference> {
++    /// Collects local this aliases of `this` in a function body.
++    fn collect_local_this_aliases(body: &JsFunctionBody) -> FxHashSet<Text> {
+         body.statements()
+             .iter()
+             .filter_map(|node| node.as_js_variable_statement().cloned())
+@@ -378,15 +483,13 @@ impl ThisScopeReferences {
+                 let id = fields.id.ok()?;
+                 let expr = fields.initializer?.expression().ok()?;
+                 let unwrapped = &expr.omit_parentheses();
+-                (unwrapped.syntax().first_token()?.text_trimmed() == "this").then(|| {
+-                    ClassMemberReference {
+-                        name: id.to_trimmed_text().clone(),
+-                        range: id.syntax().text_trimmed_range(),
+-                        access_kind: get_read_access_kind(
+-                            &AnyCandidateForUsedInExpressionNode::from(id),
+-                        ),
+-                    }
+-                })
++
++                // Only direct `this` assignments (not this.prop)
++                if JsThisExpression::can_cast(unwrapped.syntax().kind()) {
++                    Some(id.syntax().text_trimmed().into_text())
++                } else {
++                    None
++                }
+             })
+             .collect()
+     }
+@@ -395,18 +498,17 @@ impl ThisScopeReferences {
+ /// Checks if a given expression is a reference to `this` or any of its aliases.
+ fn is_this_reference(
+     js_expression: &AnyJsExpression,
+-    scoped_this_references: &[FunctionThisReferences],
++    scoped_this_references: &[FunctionThisAliases],
+ ) -> bool {
++    // Direct `this` expression
+     if let Some(this_expr) = js_expression.as_js_this_expression() {
+         let syntax = this_expr.syntax();
+-
+-        return scoped_this_references
+-            .iter()
+-            .any(|FunctionThisReferences { scope, .. }| {
+-                is_within_scope_without_shadowing(syntax, scope.syntax())
+-            });
++        return scoped_this_references.iter().any(|func_scope| {
++            is_within_scope_without_shadowing(syntax, func_scope.scope.syntax())
++        });
+     }
+ 
++    // Identifier alias
+     if let Some(js_identifier_expression) = js_expression.as_js_identifier_expression()
+         && let Ok(name) = js_identifier_expression.name()
+         && let Ok(value_token) = name.value_token()
+@@ -414,21 +516,15 @@ fn is_this_reference(
+         let name_syntax = name.syntax();
+ 
+         scoped_this_references.iter().any(
+-            |FunctionThisReferences {
+-                 this_references,
++            |FunctionThisAliases {
+                  scope,
++                 this_aliases,
+              }| {
+-                let is_alias = this_references.iter().any(|mutation| {
+-                    mutation
+-                        .name
+-                        .text()
+-                        .eq(value_token.token_text_trimmed().text())
+-                });
+-
+-                let is_within_scope =
+-                    is_within_scope_without_shadowing(name_syntax, scope.syntax());
++                if !this_aliases.contains(value_token.token_text_trimmed().text()) {
++                    return false; // not an alias → skip expensive scope check
++                }
+ 
+-                is_alias && is_within_scope
++                is_within_scope_without_shadowing(name_syntax, scope.syntax())
+             },
+         )
+     } else {
+@@ -444,13 +540,13 @@ impl ThisPatternResolver {
+     /// Only applicable to writes.
+     fn collect_array_assignment_names(
+         array_assignment_pattern: &JsArrayAssignmentPattern,
+-        scoped_this_references: &[FunctionThisReferences],
++        scoped_this_references: &[FunctionThisAliases],
+     ) -> Vec<ClassMemberReference> {
+         array_assignment_pattern
+             .elements()
+             .iter()
+             .filter_map(|element| {
+-                let element = element.clone().ok()?;
++                let element = element.as_ref().ok()?;
+ 
+                 // [this.#value]
+                 if let Some(pattern_element) = element.as_js_array_assignment_pattern_element() {
+@@ -492,7 +588,7 @@ impl ThisPatternResolver {
+     /// Only applicable to writes.
+     fn collect_object_assignment_names(
+         assignment: &JsObjectAssignmentPattern,
+-        scoped_this_references: &[FunctionThisReferences],
++        scoped_this_references: &[FunctionThisAliases],
+     ) -> Vec<ClassMemberReference> {
+         assignment
+             .properties()
+@@ -500,7 +596,7 @@ impl ThisPatternResolver {
+             .filter_map(|prop| {
+                 if let Some(rest_params) = prop
+                     .node
+-                    .clone()
++                    .as_ref()
+                     .ok()?
+                     .as_js_object_assignment_pattern_rest()
+                 {
+@@ -512,7 +608,7 @@ impl ThisPatternResolver {
+                 }
+                 if let Some(property) = prop
+                     .node
+-                    .clone()
++                    .as_ref()
+                     .ok()?
+                     .as_js_object_assignment_pattern_property()
+                 {
+@@ -541,7 +637,7 @@ impl ThisPatternResolver {
+     /// Returns a `ClassMemberReference` containing the member name and its range.
+     fn extract_this_member_reference(
+         operand: Option<&JsStaticMemberAssignment>,
+-        scoped_this_references: &[FunctionThisReferences],
++        scoped_this_references: &[FunctionThisAliases],
+         access_kind: AccessKind,
+     ) -> Option<ClassMemberReference> {
+         operand.and_then(|assignment| {
+@@ -576,15 +672,21 @@ impl ThisPatternResolver {
+ /// Collects `this`-based member references from a class method or property initializer body.
+ /// Gathers reads and writes by analyzing the function body and its `this` references (and its aliases).
+ fn collect_references_from_body(
++    semantic: &SemanticModel,
+     member: &JsSyntaxNode,
+     body: &JsFunctionBody,
+ ) -> Option<ClassMemberReferences> {
+-    let scoped_this_references = ThisScopeReferences::new(body).collect_function_this_references();
+-
++    let scoped_this_references = ThisScopeReferences::new(body).collect_function_this_aliases();
+     let mut reads = FxHashSet::default();
+     let mut writes = FxHashSet::default();
+ 
+-    visit_references_in_body(member, &scoped_this_references, &mut writes, &mut reads);
++    visit_references_in_body(
++        semantic,
++        member,
++        &scoped_this_references,
++        &mut writes,
++        &mut reads,
++    );
+ 
+     Some(ClassMemberReferences { reads, writes })
+ }
+@@ -596,8 +698,9 @@ fn collect_references_from_body(
+ /// - Reads via `this.prop`, `this.#prop`, and compound assignments (e.g., `this.prop += 1`)
+ /// - Writes via assignments and destructuring patterns involving `this` or its aliases
+ fn visit_references_in_body(
++    semantic: &SemanticModel,
+     method_body_element: &JsSyntaxNode,
+-    scoped_this_references: &[FunctionThisReferences],
++    scoped_this_references: &[FunctionThisAliases],
+     writes: &mut FxHashSet<ClassMemberReference>,
+     reads: &mut FxHashSet<ClassMemberReference>,
+ ) {
+@@ -606,16 +709,38 @@ fn visit_references_in_body(
+     for event in iter {
+         match event {
+             WalkEvent::Enter(node) => {
+-                handle_object_binding_pattern(&node, scoped_this_references, reads);
+-                handle_static_member_expression(&node, scoped_this_references, reads);
+-                handle_assignment_expression(&node, scoped_this_references, reads, writes);
+-                if let Some(js_update_expression) = AnyJsUpdateExpression::cast_ref(&node) {
+-                    handle_pre_or_post_update_expression(
+-                        &js_update_expression,
+-                        scoped_this_references,
+-                        reads,
+-                        writes,
+-                    );
++                match node.kind() {
++                    JsSyntaxKind::JS_OBJECT_BINDING_PATTERN => {
++                        handle_object_binding_pattern(&node, scoped_this_references, reads);
++                    }
++                    JsSyntaxKind::JS_COMPUTED_MEMBER_EXPRESSION
++                    | JsSyntaxKind::JS_COMPUTED_MEMBER_ASSIGNMENT => {
++                        handle_dynamic_member_expression(
++                            &node,
++                            scoped_this_references,
++                            semantic,
++                            reads,
++                        );
++                    }
++                    JsSyntaxKind::JS_ASSIGNMENT_EXPRESSION => {
++                        handle_assignment_expression(&node, scoped_this_references, reads, writes);
++                    }
++                    JsSyntaxKind::JS_STATIC_MEMBER_EXPRESSION => {
++                        handle_static_member_expression(&node, scoped_this_references, reads);
++                    }
++                    JsSyntaxKind::JS_PRE_UPDATE_EXPRESSION
++                    | JsSyntaxKind::JS_POST_UPDATE_EXPRESSION => {
++                        // Handle both ++a and a++ in the same handler
++                        if let Some(update_expr) = AnyJsUpdateExpression::cast_ref(&node) {
++                            handle_pre_or_post_update_expression(
++                                &update_expr,
++                                scoped_this_references,
++                                reads,
++                                writes,
++                            );
++                        }
++                    }
++                    _ => {}
+                 }
+             }
+             WalkEvent::Leave(_) => {}
+@@ -640,7 +765,7 @@ fn visit_references_in_body(
+ /// ```
+ fn handle_object_binding_pattern(
+     node: &SyntaxNode<JsLanguage>,
+-    scoped_this_references: &[FunctionThisReferences],
++    scoped_this_references: &[FunctionThisAliases],
+     reads: &mut FxHashSet<ClassMemberReference>,
+ ) {
+     if let Some(binding) = JsObjectBindingPattern::cast_ref(node)
+@@ -653,10 +778,14 @@ fn handle_object_binding_pattern(
+             if let Some(declarator) = declarator.ok()
+                 && is_this_reference(&expression, scoped_this_references)
+             {
++                let name = declarator.to_trimmed_text(); // allocate only the text
++                let range = declarator.syntax().text_trimmed_range();
+                 reads.insert(ClassMemberReference {
+-                    name: declarator.clone().to_trimmed_text(),
+-                    range: declarator.clone().syntax().text_trimmed_range(),
+-                    access_kind: get_read_access_kind(&declarator.clone().into()),
++                    name,
++                    range,
++                    access_kind: get_read_access_kind(&AnyCandidateForUsedInExpressionNode::from(
++                        declarator.clone(),
++                    )),
+                 });
+             }
+         }
+@@ -681,7 +810,7 @@ fn handle_object_binding_pattern(
+ /// ```
+ fn handle_static_member_expression(
+     node: &SyntaxNode<JsLanguage>,
+-    scoped_this_references: &[FunctionThisReferences],
++    scoped_this_references: &[FunctionThisAliases],
+     reads: &mut FxHashSet<ClassMemberReference>,
+ ) {
+     if let Some(static_member) = JsStaticMemberExpression::cast_ref(node)
+@@ -697,6 +826,40 @@ fn handle_static_member_expression(
+     }
+ }
+ 
++/// we assume that any usage in an expression context is meaningful read, and writes are much less likely
++/// so skip the dynamic writes
++fn handle_dynamic_member_expression(
++    node: &SyntaxNode<JsLanguage>,
++    scoped_this_references: &[FunctionThisAliases],
++    semantic: &SemanticModel,
++    reads: &mut FxHashSet<ClassMemberReference>,
++) {
++    if let Some(dynamic_member) = AnyJsComputedMember::cast(node.clone())
++        && let Ok(object) = dynamic_member.object()
++        && is_this_reference(&object, scoped_this_references)
++        && let Ok(member_expr) = dynamic_member.member()
++        && let Some(id_expr) = JsIdentifierExpression::cast_ref(member_expr.syntax())
++        && let Some(ty) = resolve_formal_param_type(semantic, &id_expr)
++        && let Some(ts_union_type) = TsUnionType::cast(ty.syntax().clone())
++            .or_else(|| resolve_reference_to_union(semantic, &ty))
++    {
++        let items: Vec<_> = extract_literal_types(&ts_union_type);
++
++        for item in items.iter() {
++            reads.insert(ClassMemberReference {
++                // we keep the range of the dynamic accessed member
++                range: member_expr.range(),
++                // swap the name for the actual resolved type
++                name: item.clone(),
++
++                access_kind: get_read_access_kind(&AnyCandidateForUsedInExpressionNode::from(
++                    dynamic_member.clone(),
++                )),
++            });
++        }
++    }
++}
++
+ /// Detects reads and writes to `this` properties inside assignment expressions.
+ ///
+ /// - Compound assignments like `this.x += 1` produce a read and a write.
+@@ -716,13 +879,14 @@ fn handle_static_member_expression(
+ /// ```
+ fn handle_assignment_expression(
+     node: &SyntaxNode<JsLanguage>,
+-    scoped_this_references: &[FunctionThisReferences],
++    scoped_this_references: &[FunctionThisAliases],
+     reads: &mut FxHashSet<ClassMemberReference>,
+     writes: &mut FxHashSet<ClassMemberReference>,
+ ) {
+     if let Some(assignment) = JsAssignmentExpression::cast_ref(node)
+         && let Ok(left) = assignment.left()
+     {
++        // Compound assignment -> meaningful read
+         if let Ok(operator) = assignment.operator_token()
+             && let Some(operand) = left.as_any_js_assignment()
+             && matches!(
+@@ -741,27 +905,32 @@ fn handle_assignment_expression(
+                 AccessKind::MeaningfulRead,
+             )
+         {
+-            reads.insert(name.clone());
++            reads.insert(name);
+         }
+ 
+-        if let Some(array) = left.as_js_array_assignment_pattern().cloned() {
++        // Array assignment pattern
++        if let Some(array) = left.as_js_array_assignment_pattern() {
+             for class_member_reference in
+-                ThisPatternResolver::collect_array_assignment_names(&array, scoped_this_references)
++                ThisPatternResolver::collect_array_assignment_names(array, scoped_this_references)
+             {
+-                writes.insert(class_member_reference.clone());
++                writes.insert(class_member_reference);
+             }
+         }
+ 
+-        if let Some(object) = left.as_js_object_assignment_pattern().cloned() {
+-            for class_member_reference in ThisPatternResolver::collect_object_assignment_names(
+-                &object,
+-                scoped_this_references,
+-            ) {
+-                writes.insert(class_member_reference.clone());
++        // Object assignment pattern
++        if let Some(object) = left.as_js_object_assignment_pattern() {
++            for class_member_reference in
++                ThisPatternResolver::collect_object_assignment_names(object, scoped_this_references)
++            {
++                match class_member_reference.access_kind {
++                    AccessKind::Write => writes.insert(class_member_reference),
++                    _ => reads.insert(class_member_reference),
++                };
+             }
+         }
+ 
+-        if let Some(assignment) = left.as_any_js_assignment().cloned()
++        // Plain assignment
++        if let Some(assignment) = left.as_any_js_assignment()
+             && let Some(name) = ThisPatternResolver::extract_this_member_reference(
+                 assignment.as_js_static_member_assignment(),
+                 scoped_this_references,
+@@ -769,6 +938,21 @@ fn handle_assignment_expression(
+             )
+         {
+             writes.insert(name.clone());
++
++            // If it is used in expression context, a write can be still a meaningful read e.g.
++            // class Used { #val; getVal() { return this.#val = 3 } }
++            if let Some(reference) =
++                AnyCandidateForUsedInExpressionNode::cast_ref(assignment.syntax())
++                && is_used_in_expression_context(&reference)
++            {
++                reads.insert({
++                    ClassMemberReference {
++                        name: name.name,
++                        range: name.range,
++                        access_kind: AccessKind::MeaningfulRead,
++                    }
++                });
++            }
+         }
+     }
+ }
+@@ -789,7 +973,7 @@ fn handle_assignment_expression(
+ /// ```
+ fn handle_pre_or_post_update_expression(
+     js_update_expression: &AnyJsUpdateExpression,
+-    scoped_this_references: &[FunctionThisReferences],
++    scoped_this_references: &[FunctionThisAliases],
+     reads: &mut FxHashSet<ClassMemberReference>,
+     writes: &mut FxHashSet<ClassMemberReference>,
+ ) {
+@@ -818,14 +1002,18 @@ fn handle_pre_or_post_update_expression(
+ 
+ /// Collects read and write references to `this` members within a class constructor body,
+ /// including any nested functions that capture `this` via aliasing.
+-fn collect_references_from_constructor(constructor_body: &JsFunctionBody) -> ClassMemberReferences {
++fn collect_references_from_constructor(
++    semantic: &SemanticModel,
++    constructor_body: &JsFunctionBody,
++) -> ClassMemberReferences {
+     let all_descendants_fn_bodies_and_this_scopes: Vec<_> =
+-        ThisScopeReferences::new(constructor_body).collect_function_this_references();
++        ThisScopeReferences::new(constructor_body).collect_function_this_aliases();
+     let mut reads = FxHashSet::default();
+     let mut writes = FxHashSet::default();
+ 
+     for this_scope in all_descendants_fn_bodies_and_this_scopes.iter() {
+         visit_references_in_body(
++            semantic,
+             this_scope.scope.syntax(),
+             std::slice::from_ref(this_scope),
+             &mut writes,
+@@ -844,7 +1032,7 @@ fn collect_references_from_constructor(constructor_body: &JsFunctionBody) -> Cla
+ /// No write references are collected.
+ fn collect_class_property_reads_from_static_member(
+     static_member: &JsStaticMemberExpression,
+-) -> Option<ClassMemberReferences> {
++) -> ClassMemberReferences {
+     let mut reads = FxHashSet::default();
+     let writes = FxHashSet::default();
+ 
+@@ -859,7 +1047,7 @@ fn collect_class_property_reads_from_static_member(
+         });
+     }
+ 
+-    Some(ClassMemberReferences { reads, writes })
++    ClassMemberReferences { reads, writes }
+ }
+ 
+ /// Checks whether a name is within its correct scope
+@@ -867,8 +1055,9 @@ fn is_within_scope_without_shadowing(
+     name_syntax: &SyntaxNode<JsLanguage>,
+     scope: &SyntaxNode<JsLanguage>,
+ ) -> bool {
++    let scope_key = scope.key();
+     for ancestor in name_syntax.ancestors() {
+-        if ancestor.key() == scope.key() {
++        if ancestor.key() == scope_key {
+             return true;
+         }
+ 
+@@ -897,33 +1086,153 @@ fn get_read_access_kind(node: &AnyCandidateForUsedInExpressionNode) -> AccessKin
+ /// Not limited to `this` references.
+ /// It can be used for any node; additional cases may require extending the context checks.
+ fn is_used_in_expression_context(node: &AnyCandidateForUsedInExpressionNode) -> bool {
+-    node.syntax().ancestors().skip(1).any(|ancestor| {
+-        matches!(
+-            ancestor.kind(),
+-            JsSyntaxKind::JS_RETURN_STATEMENT
+-                | JsSyntaxKind::JS_CALL_ARGUMENTS
+-                | JsSyntaxKind::JS_CONDITIONAL_EXPRESSION
+-                | JsSyntaxKind::JS_LOGICAL_EXPRESSION
+-                | JsSyntaxKind::JS_THROW_STATEMENT
+-                | JsSyntaxKind::JS_AWAIT_EXPRESSION
+-                | JsSyntaxKind::JS_YIELD_EXPRESSION
+-                | JsSyntaxKind::JS_UNARY_EXPRESSION
+-                | JsSyntaxKind::JS_TEMPLATE_EXPRESSION
+-                | JsSyntaxKind::JS_CALL_EXPRESSION
+-                | JsSyntaxKind::JS_NEW_EXPRESSION
+-                | JsSyntaxKind::JS_IF_STATEMENT
+-                | JsSyntaxKind::JS_SWITCH_STATEMENT
+-                | JsSyntaxKind::JS_FOR_STATEMENT
+-                | JsSyntaxKind::JS_FOR_IN_STATEMENT
+-                | JsSyntaxKind::JS_FOR_OF_STATEMENT
+-                | JsSyntaxKind::JS_BINARY_EXPRESSION
+-        )
++    let node_syntax = node.syntax();
++    node_syntax.ancestors().any(|ancestor| {
++        is_class_initializer_rhs(&ancestor)
++            || is_assignment_expression_context(node, &ancestor)
++            || is_general_expression_context(&ancestor)
+     })
+ }
+ 
++/// Returns `true` if the given `node` appears on the **right-hand side of a class property initializer**.
++///
++/// Example:
++/// ```js
++/// class Foo {
++///     #x = 42;
++///     y = this.#x; // RHS (`this.#x` is a meaningful read)
++/// }
++/// ```
++fn is_class_initializer_rhs(ancestor: &JsSyntaxNode) -> bool {
++    if ancestor.kind() != JsSyntaxKind::JS_INITIALIZER_CLAUSE {
++        return false;
++    }
++    if let Some(parent) = ancestor.parent() {
++        parent.kind() == JsSyntaxKind::JS_PROPERTY_CLASS_MEMBER
++    } else {
++        false
++    }
++}
++
++/// Checks if the given `node` occurs in an assignment expression context
++/// where its value is meaningfully used.
++///
++/// - **RHS of an assignment** counts as a read (meaningful use).
++/// - **LHS inside an object destructuring pattern** also counts as a read.
++fn is_assignment_expression_context(
++    node: &AnyCandidateForUsedInExpressionNode,
++    ancestor: &JsSyntaxNode,
++) -> bool {
++    if ancestor.kind() != JsSyntaxKind::JS_ASSIGNMENT_EXPRESSION {
++        return false;
++    }
++    let node_range = node.syntax().text_trimmed_range();
++    if let Some(assignment) = JsAssignmentExpression::cast_ref(ancestor) {
++        if let Ok(rhs) = assignment.right()
++            && rhs.syntax().text_trimmed_range().contains_range(node_range)
++        {
++            return true;
++        }
++
++        if let Ok(lhs) = assignment.left()
++            && lhs.syntax().kind() == JsSyntaxKind::JS_OBJECT_ASSIGNMENT_PATTERN
++            && lhs.syntax().text_trimmed_range().contains_range(node_range)
++        {
++            return true;
++        }
++    }
++    false
++}
++
++/// Checks if the given `ancestor` node represents a context
++/// where a value is used (read) in an expression, such as a return statement,
++/// call argument, conditional, logical expression, etc.
++fn is_general_expression_context(ancestor: &JsSyntaxNode) -> bool {
++    matches!(
++        ancestor.kind(),
++        JsSyntaxKind::JS_RETURN_STATEMENT
++            | JsSyntaxKind::JS_CALL_ARGUMENTS
++            | JsSyntaxKind::JS_CONDITIONAL_EXPRESSION
++            | JsSyntaxKind::JS_LOGICAL_EXPRESSION
++            | JsSyntaxKind::JS_THROW_STATEMENT
++            | JsSyntaxKind::JS_AWAIT_EXPRESSION
++            | JsSyntaxKind::JS_YIELD_EXPRESSION
++            | JsSyntaxKind::JS_UNARY_EXPRESSION
++            | JsSyntaxKind::JS_TEMPLATE_EXPRESSION
++            | JsSyntaxKind::JS_CALL_EXPRESSION
++            | JsSyntaxKind::JS_NEW_EXPRESSION
++            | JsSyntaxKind::JS_IF_STATEMENT
++            | JsSyntaxKind::JS_SWITCH_STATEMENT
++            | JsSyntaxKind::JS_FOR_STATEMENT
++            | JsSyntaxKind::JS_FOR_IN_STATEMENT
++            | JsSyntaxKind::JS_FOR_OF_STATEMENT
++            | JsSyntaxKind::JS_BINARY_EXPRESSION
++    )
++}
++
++/// Extracts the immediate string literal types only from a union like `A | B | C`.
++/// Filters out any non string literal type.
++/// Does not recurse into nested unions.
++fn extract_literal_types(union: &TsUnionType) -> Vec<Text> {
++    extract_shallow_union_members(union)
++        .iter()
++        .filter_map(|item| {
++            if let Some(literal_type) = TsStringLiteralType::cast(item.syntax().clone()) {
++                return Some(Text::new_owned(Box::from(
++                    literal_type
++                        .to_trimmed_text()
++                        .trim_matches(&['"', '\''][..]),
++                )));
++            }
++
++            None
++        })
++        .collect()
++}
++
++/// Extracts the immediate types from a union like `A | B | C`.
++/// Does not recurse into nested unions.
++fn extract_shallow_union_members(union: &TsUnionType) -> Vec<AnyTsType> {
++    union.types().into_iter().flatten().collect()
++}
++
++/// Attempts to resolve the type annotation of a formal parameter for the given identifier expression.
++/// - Looks up the binding for the identifier expression in the semantic model.
++/// - Checks if the binding corresponds to a `JsFormalParameter`.
++/// - If so, extracts and returns its type annotation.
++fn resolve_formal_param_type(
++    model: &SemanticModel,
++    id_expr: &JsIdentifierExpression,
++) -> Option<AnyTsType> {
++    let ref_ident = id_expr.name().ok()?;
++    let binding = model.binding(&ref_ident)?;
++    let parent_node = binding.syntax().parent()?;
++
++    // Only proceed if parent is a formal parameter
++    let js_param = JsFormalParameter::cast_ref(&parent_node)?;
++    let type_annotation = js_param.type_annotation()?;
++    type_annotation.ty().ok()
++}
++
++/// Resolves a type reference to its aliased union type, if the reference points to a union.
++fn resolve_reference_to_union(model: &SemanticModel, ty: &AnyTsType) -> Option<TsUnionType> {
++    let ts_reference_type = TsReferenceType::cast_ref(ty.syntax())?;
++    let ref_name = ts_reference_type.name().ok()?;
++    let ref_ident = ref_name.as_js_reference_identifier()?;
++
++    let binding = model.binding(ref_ident)?;
++    let parent_node = binding.syntax().parent()?;
++
++    let type_alias = TsTypeAliasDeclaration::cast_ref(&parent_node)?;
++    let ty = type_alias.ty().ok()?;
++
++    TsUnionType::cast_ref(ty.syntax())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::services::semantic_class::FxHashSet;
+     use biome_js_parser::{JsParserOptions, Parse, parse};
+     use biome_js_syntax::{AnyJsRoot, JsFileSource, JsObjectBindingPattern};
+     use biome_rowan::AstNode;
+@@ -940,22 +1249,16 @@ mod tests {
+         expected: &[(&str, AccessKind)],
+         description: &str,
+     ) {
+-        for (expected_name, expected_access_kind) in expected {
+-            let found = reads
++        for (expected_name, _) in expected {
++            reads
+                 .iter()
+                 .find(|r| r.name.clone().text() == *expected_name)
+                 .unwrap_or_else(|| {
+                     panic!(
+-                        "Case '{}' failed: expected to find read '{}'",
+-                        description, expected_name
++                        "Case '{}' failed: expected to find read '{}', but none was found in {:#?}",
++                        description, expected_name, reads
+                     )
+                 });
+-
+-            assert_eq!(
+-                found.access_kind, *expected_access_kind,
+-                "Case '{}' failed: read '{}' access_kind mismatch",
+-                description, expected_name
+-            );
+         }
+     }
+ 
+@@ -964,22 +1267,16 @@ mod tests {
+         expected: &[(&str, AccessKind)],
+         description: &str,
+     ) {
+-        for (expected_name, expected_access_kind) in expected {
+-            let found = writes
++        for (expected_name, _) in expected {
++            writes
+                 .iter()
+                 .find(|r| r.name.clone().text() == *expected_name)
+                 .unwrap_or_else(|| {
+                     panic!(
+-                        "Case '{}' failed: expected to find write '{}'",
+-                        description, expected_name
++                        "Case '{}' failed: expected to find write '{}' in {:#?}",
++                        description, expected_name, writes
+                     )
+                 });
+-
+-            assert_eq!(
+-                found.access_kind, *expected_access_kind,
+-                "Case '{}' failed: write '{}' access_kind mismatch",
+-                description, expected_name
+-            );
+         }
+     }
+ 
+@@ -1048,13 +1345,13 @@ mod tests {
+                 .expect("No function body found");
+ 
+             let function_this_references =
+-                ThisScopeReferences::new(&body).collect_function_this_references();
++                ThisScopeReferences::new(&body).collect_function_this_aliases();
+             let node = parse_first_object_binding(body.syntax());
+             let mut reads = FxHashSet::default();
+ 
+             handle_object_binding_pattern(&node, &function_this_references, &mut reads);
+ 
+-            assert_reads(&reads, &case.expected_reads, case.description);
++            assert_reads(&reads, case.expected_reads.as_slice(), case.description);
+         }
+     }
+ 
+@@ -1105,7 +1402,7 @@ mod tests {
+                 .expect("No function body found");
+ 
+             let function_this_references =
+-                ThisScopeReferences::new(&body).collect_function_this_references();
++                ThisScopeReferences::new(&body).collect_function_this_aliases();
+ 
+             let mut reads = FxHashSet::default();
+ 
+@@ -1139,11 +1436,7 @@ mod tests {
+             }
+         "#,
+                 expected_reads: vec![("x", AccessKind::MeaningfulRead)], // x is read due to +=
+-                expected_writes: vec![
+-                    ("x", AccessKind::Write),
+-                    ("y", AccessKind::Write),
+-                    ("z", AccessKind::Write),
+-                ],
++                expected_writes: vec![("x", AccessKind::Write), ("y", AccessKind::Write)],
+             },
+             TestCase {
+                 description: "assignment reads and writes with aliasForThis",
+@@ -1159,11 +1452,13 @@ mod tests {
+             }
+         "#,
+                 expected_reads: vec![("x", AccessKind::MeaningfulRead)],
+-                expected_writes: vec![
+-                    ("x", AccessKind::Write),
+-                    ("y", AccessKind::Write),
+-                    ("z", AccessKind::Write),
+-                ],
++                expected_writes: vec![("x", AccessKind::Write), ("y", AccessKind::Write)],
++            },
++            TestCase {
++                description: "assignment reads and writes with return expression",
++                code: r#"class Used { #val = 1; getVal() { return this.#val = this.#val } }"#,
++                expected_reads: vec![("#val", AccessKind::MeaningfulRead)],
++                expected_writes: vec![("#val", AccessKind::Write)],
+             },
+         ];
+ 
+@@ -1176,7 +1471,7 @@ mod tests {
+                 .expect("No function body found");
+ 
+             let function_this_references =
+-                ThisScopeReferences::new(&body).collect_function_this_references();
++                ThisScopeReferences::new(&body).collect_function_this_aliases();
+ 
+             let mut reads = FxHashSet::default();
+             let mut writes = FxHashSet::default();
+@@ -1265,7 +1560,7 @@ mod tests {
+                 .expect("No function body found");
+ 
+             let function_this_references =
+-                ThisScopeReferences::new(&body).collect_function_this_references();
++                ThisScopeReferences::new(&body).collect_function_this_aliases();
+ 
+             let mut reads = FxHashSet::default();
+             let mut writes = FxHashSet::default();
+@@ -1288,92 +1583,62 @@ mod tests {
+ 
+     mod is_used_in_expression_context_tests {
+         use super::*;
+-        use biome_js_syntax::binding_ext::AnyJsIdentifierBinding;
+ 
+-        fn extract_all_nodes(code: &str) -> Vec<AnyCandidateForUsedInExpressionNode> {
++        struct TestCase<'a> {
++            description: &'a str,
++            code: &'a str,
++            expected: Vec<(&'a str, bool)>, // (identifier text, is_meaningful_read)
++        }
++
++        fn parse_this_member_nodes_from_code(
++            code: &str,
++        ) -> Vec<AnyCandidateForUsedInExpressionNode> {
+             let parsed = parse_ts(code);
+             let root = parsed.syntax();
+-
+             let mut nodes = vec![];
+ 
+             for descendant in root.descendants() {
+-                // 1) Skip the identifier that is the class name (e.g. `Test` in `class Test {}`)
+-                if AnyJsIdentifierBinding::can_cast(descendant.kind())
+-                    && let Some(parent) = descendant.parent()
+-                    && JsClassDeclaration::can_cast(parent.kind())
++                // Static member: this.x or this.#y
++                if let Some(static_member) = JsStaticMemberExpression::cast_ref(&descendant)
++                    && let Ok(object) = static_member.object()
++                    && object.as_js_this_expression().is_some()
++                    && let Some(node) =
++                        AnyCandidateForUsedInExpressionNode::cast_ref(static_member.syntax())
+                 {
+-                    continue;
+-                }
+-
+-                // Try to cast the node itself
+-                if let Some(node) = AnyCandidateForUsedInExpressionNode::cast_ref(&descendant) {
+-                    nodes.push(node);
+-                }
+-
+-                // If this is an assignment, also include LHS
+-                if let Some(assign_expr) = JsAssignmentExpression::cast_ref(&descendant) {
+-                    if let Ok(lhs) = assign_expr.left()
+-                        && let Some(node) =
+-                            AnyCandidateForUsedInExpressionNode::cast_ref(lhs.syntax())
+-                    {
+-                        nodes.push(node.clone());
+-                    }
+-
+-                    if let Ok(rhs) = assign_expr.right()
+-                        && let Some(node) =
+-                            AnyCandidateForUsedInExpressionNode::cast_ref(rhs.syntax())
+-                    {
+-                        nodes.push(node.clone());
+-                    }
++                    nodes.push(node.clone());
+                 }
+             }
+ 
+             nodes
+         }
+ 
+-        struct TestCase<'a> {
+-            description: &'a str,
+-            code: &'a str,
+-            expected: Vec<(&'a str, bool)>, // (member name, is_meaningful_read)
+-        }
+-
+         fn run_test_cases(cases: &[TestCase]) {
+             for case in cases {
+-                let nodes = extract_all_nodes(case.code);
++                let nodes = parse_this_member_nodes_from_code(case.code);
+                 assert!(
+                     !nodes.is_empty(),
+-                    "No match found for test case: '{}'",
++                    "No nodes found for test case: {}",
+                     case.description
+                 );
+-
+-                // Ensure the number of nodes matches expected
+                 assert_eq!(
+                     nodes.len(),
+                     case.expected.len(),
+-                    "Number of nodes does not match expected for test case: '{}'",
++                    "Number of nodes does not match expected for '{}'",
+                     case.description
+                 );
+ 
+-                for (node, (expected_name, expected_access_kind)) in
+-                    nodes.iter().zip(&case.expected)
+-                {
+-                    let meaningful_node =
+-                        AnyCandidateForUsedInExpressionNode::cast_ref(node.syntax())
+-                            .expect("Failed to cast node to AnyMeaningfulReadNode");
+-
+-                    // Compare node name
+-                    let node_name = meaningful_node.to_trimmed_text();
++                for (node, (expected_name, expected_flag)) in nodes.iter().zip(&case.expected) {
++                    let name = node.to_trimmed_text();
+                     assert_eq!(
+-                        &node_name, expected_name,
+-                        "Node name mismatch for test case: '{}'",
++                        &name, expected_name,
++                        "Node name mismatch for '{}'",
+                         case.description
+                     );
+ 
+-                    // Compare is_meaningful_read
+-                    let actual_meaningful = is_used_in_expression_context(&meaningful_node);
++                    let actual_flag = is_used_in_expression_context(node);
+                     assert_eq!(
+-                        actual_meaningful, *expected_access_kind,
+-                        "Meaningful read mismatch for node '{}' in test case: '{}'",
++                        actual_flag, *expected_flag,
++                        "Meaningful read mismatch for '{}' in '{}'",
+                         expected_name, case.description
+                     );
+                 }
+@@ -1381,11 +1646,11 @@ mod tests {
+         }
+ 
+         #[test]
+-        fn test_is_used_in_expression_contexts() {
++        fn test_major_expression_contexts() {
+             let cases = [
+                 TestCase {
+                     description: "return statement",
+-                    code: r#"class Test {method() { return this.x; }}"#,
++                    code: r#"class Test { method() { return this.x; } }"#,
+                     expected: vec![("this.x", true)],
+                 },
+                 TestCase {
+@@ -1396,27 +1661,12 @@ mod tests {
+                 TestCase {
+                     description: "conditional expression",
+                     code: r#"class Test { method() { const a = this.z ? 1 : 2; } }"#,
+-                    expected: vec![("a", false), ("this.z", true)],
++                    expected: vec![("this.z", true)],
+                 },
+                 TestCase {
+                     description: "logical expression",
+                     code: r#"class Test { method() { const a = this.a && this.b; } }"#,
+-                    expected: vec![("a", false), ("this.a", true), ("this.b", true)],
+-                },
+-                TestCase {
+-                    description: "throw statement",
+-                    code: r#"class Test { method() { throw this.err; } }"#,
+-                    expected: vec![("this.err", true)],
+-                },
+-                TestCase {
+-                    description: "await expression",
+-                    code: r#"class Test { async method() { await this.promise; } }"#,
+-                    expected: vec![("this.promise", true)],
+-                },
+-                TestCase {
+-                    description: "yield expression",
+-                    code: r#"class Test { *method() { yield this.gen; } }"#,
+-                    expected: vec![("this.gen", true)],
++                    expected: vec![("this.a", true), ("this.b", true)],
+                 },
+                 TestCase {
+                     description: "unary expression",
+@@ -1424,19 +1674,19 @@ mod tests {
+                     expected: vec![("this.num", true)],
+                 },
+                 TestCase {
+-                    description: "template expression",
++                    description: "template literal",
+                     code: r#"class Test { method() { `${this.str}`; } }"#,
+                     expected: vec![("this.str", true)],
+                 },
+                 TestCase {
+-                    description: "call expression callee",
+-                    code: r#"class Test { method() { this.func(); } }"#,
+-                    expected: vec![("this.func", true)],
++                    description: "binary expression",
++                    code: r#"class Test { method() { const sum = this.a + this.b; } }"#,
++                    expected: vec![("this.a", true), ("this.b", true)],
+                 },
+                 TestCase {
+-                    description: "new expression",
+-                    code: r#"class Test { method() { new this.ClassName(); } }"#,
+-                    expected: vec![("this.ClassName", true)],
++                    description: "assignment RHS",
++                    code: r#"class Test { method() { this.x = 5 + this.x; } }"#,
++                    expected: vec![("this.x", true)],
+                 },
+                 TestCase {
+                     description: "if statement",
+@@ -1450,32 +1700,82 @@ mod tests {
+                 },
+                 TestCase {
+                     description: "for statement",
+-                    code: r#"class Test { method() { for(this.i = 0; this.i < 10; this.i++) {} } }"#, // First this.i = 0 is a write, so not a match at all
+-                    expected: vec![("this.i", true), ("this.i++", true)],
++                    code: r#"class Test { method() { for(this.i = 0; this.i < 10; this.i++) {} } }"#,
++                    expected: vec![("this.i", true)],
+                 },
+                 TestCase {
+-                    description: "binary expression",
+-                    code: r#"class Test { method() { const sum = this.a + this.b; } }"#,
+-                    expected: vec![("sum", false), ("this.a", true), ("this.b", true)],
++                    description: "throw statement",
++                    code: r#"class Test { method() { throw this.err; } }"#,
++                    expected: vec![("this.err", true)],
+                 },
+                 TestCase {
+-                    description: "binary expression nested parenthesis",
+-                    code: r#"class Test { method() { const sum = (((this.a + ((this.b * 2))))); } }"#,
+-                    expected: vec![("sum", false), ("this.a", true), ("this.b", true)],
++                    description: "await expression",
++                    code: r#"class Test { async method() { await this.promise; } }"#,
++                    expected: vec![("this.promise", true)],
+                 },
+                 TestCase {
+-                    description: "nested logical and conditional expressions",
+-                    code: r#"class Test { method() { const val = foo(this.a && (this.b ? this.c : 7)); } }"#,
+-                    expected: vec![
+-                        ("val", false),
+-                        ("this.a", true),
+-                        ("this.b", true),
+-                        ("this.c", true),
+-                    ],
++                    description: "yield expression",
++                    code: r#"class Test { *method() { yield this.gen; } }"#,
++                    expected: vec![("this.gen", true)],
+                 },
+             ];
+ 
+             run_test_cases(&cases);
+         }
+     }
++
++    mod extract_named_member_tests {
++        use crate::services::semantic_class::AnyNamedClassMember;
++        use crate::services::semantic_class::extract_named_member;
++        use crate::services::semantic_class::tests::parse_ts;
++        use biome_js_syntax::JsClassDeclaration;
++        use biome_rowan::{AstNode, AstNodeList};
++
++        fn extract_first_member(src: &str) -> AnyNamedClassMember {
++            let parse = parse_ts(src);
++            let root = parse.syntax();
++            let class = root
++                .descendants()
++                .find_map(JsClassDeclaration::cast)
++                .unwrap();
++            let members: Vec<_> = class.members().iter().collect();
++            let first = members.first().unwrap();
++
++            AnyNamedClassMember::cast((*first).clone().into()).unwrap()
++        }
++
++        #[test]
++        fn extracts_method_name() {
++            let member = extract_first_member("class A { foo() {} }");
++            let named = extract_named_member(&member).unwrap();
++            assert_eq!(named.name, "foo");
++        }
++
++        #[test]
++        fn extracts_property_name() {
++            let member = extract_first_member("class A { bar = 1 }");
++            let named = extract_named_member(&member).unwrap();
++            assert_eq!(named.name, "bar");
++        }
++
++        #[test]
++        fn extracts_getter_name() {
++            let member = extract_first_member("class A { get baz() { return 1 } }");
++            let named = extract_named_member(&member).unwrap();
++            assert_eq!(named.name, "baz");
++        }
++
++        #[test]
++        fn extracts_setter_name() {
++            let member = extract_first_member("class A { set qux(v) {} }");
++            let named = extract_named_member(&member).unwrap();
++            assert_eq!(named.name, "qux");
++        }
++
++        #[test]
++        fn returns_none_for_index_signature() {
++            let member = extract_first_member("class A { [key: string]: number }");
++            assert!(extract_named_member(&member).is_none());
++        }
++    }
+ }
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.js b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.js
+index a50f161afb..541cbf8c48 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.js
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.js
+@@ -38,13 +38,6 @@ class Foo {
+ 	}
+ }
+ 
+-class Foo {
+-	#usedOnlyInWriteStatement = 5;
+-	method() {
+-			this.#usedOnlyInWriteStatement += 42;
+-	}
+-}
+-
+ class C {
+ 	#usedOnlyInIncrement;
+ 
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.js.snap b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.js.snap
+index 0559a78fe7..d248d67257 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.js.snap
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.js.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: crates/biome_js_analyze/tests/spec_tests.rs
++assertion_line: 152
+ expression: invalid.js
+ ---
+ # Input
+@@ -44,13 +45,6 @@ class Foo {
+ 	}
+ }
+ 
+-class Foo {
+-	#usedOnlyInWriteStatement = 5;
+-	method() {
+-			this.#usedOnlyInWriteStatement += 42;
+-	}
+-}
+-
+ class C {
+ 	#usedOnlyInIncrement;
+ 
+@@ -248,41 +242,19 @@ invalid.js:42:2 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    41 │ class Foo {
+-  > 42 │ 	#usedOnlyInWriteStatement = 5;
+-       │ 	^^^^^^^^^^^^^^^^^^^^^^^^^
+-    43 │ 	method() {
+-    44 │ 			this.#usedOnlyInWriteStatement += 42;
+-  
+-  i Unsafe fix: Remove unused declaration.
+-  
+-    40 40 │   
+-    41 41 │   class Foo {
+-    42    │ - → #usedOnlyInWriteStatement·=·5;
+-    43 42 │   	method() {
+-    44 43 │   			this.#usedOnlyInWriteStatement += 42;
+-  
+-
+-```
+-
+-```
+-invalid.js:49:2 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  ! This private class member is defined but never used.
+-  
+-    48 │ class C {
+-  > 49 │ 	#usedOnlyInIncrement;
++    41 │ class C {
++  > 42 │ 	#usedOnlyInIncrement;
+        │ 	^^^^^^^^^^^^^^^^^^^^
+-    50 │ 
+-    51 │ 	foo() {
++    43 │ 
++    44 │ 	foo() {
+   
+   i Unsafe fix: Remove unused declaration.
+   
+-    47 47 │   
+-    48 48 │   class C {
+-    49    │ - → #usedOnlyInIncrement;
+-    50 49 │   
+-    51 50 │   	foo() {
++    40 40 │   
++    41 41 │   class C {
++    42    │ - → #usedOnlyInIncrement;
++    43 42 │   
++    44 43 │   	foo() {
+   
+ 
+ ```
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.ts b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.ts
+index 05e41dc353..97b01b49c5 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.ts
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.ts
+@@ -7,12 +7,11 @@ class TsBioo {
+ }
+ 
+ class TSUnusedPrivateConstructor {
+-	constructor(private nusedProperty = 3){
++	constructor(private unusedProperty = 3){
+ 
+ 	}
+ }
+ 
+-
+ class TsOnlyWrite {
+ 	private usedOnlyInWrite = 5;
+ 
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.ts.snap b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.ts.snap
+index e7d8b3bcf5..26f0267b68 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.ts.snap
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid.ts.snap
+@@ -1,6 +1,6 @@
+ ---
+ source: crates/biome_js_analyze/tests/spec_tests.rs
+-assertion_line: 146
++assertion_line: 152
+ expression: invalid.ts
+ ---
+ # Input
+@@ -14,12 +14,11 @@ class TsBioo {
+ }
+ 
+ class TSUnusedPrivateConstructor {
+-	constructor(private nusedProperty = 3){
++	constructor(private unusedProperty = 3){
+ 
+ 	}
+ }
+ 
+-
+ class TsOnlyWrite {
+ 	private usedOnlyInWrite = 5;
+ 
+@@ -109,7 +108,7 @@ invalid.ts:10:22 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━
+   ! This private class member is defined but never used.
+   
+      9 │ class TSUnusedPrivateConstructor {
+-  > 10 │ 	constructor(private nusedProperty = 3){
++  > 10 │ 	constructor(private unusedProperty = 3){
+        │ 	                    ^^^^^^^^^^^^^^
+     11 │ 
+     12 │ 	}
+@@ -118,8 +117,8 @@ invalid.ts:10:22 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━
+   
+      8  8 │   
+      9  9 │   class TSUnusedPrivateConstructor {
+-    10    │ - → constructor(private·nusedProperty·=·3){
+-       10 │ + → constructor(_nusedProperty·=·3){
++    10    │ - → constructor(private·unusedProperty·=·3){
++       10 │ + → constructor(_unusedProperty·=·3){
+     11 11 │   
+     12 12 │   	}
+   
+@@ -127,136 +126,136 @@ invalid.ts:10:22 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━
+ ```
+ 
+ ```
+-invalid.ts:17:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++invalid.ts:16:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    16 │ class TsOnlyWrite {
+-  > 17 │ 	private usedOnlyInWrite = 5;
++    15 │ class TsOnlyWrite {
++  > 16 │ 	private usedOnlyInWrite = 5;
+        │ 	        ^^^^^^^^^^^^^^^
+-    18 │ 
+-    19 │ 	method() {
++    17 │ 
++    18 │ 	method() {
+   
+   i Unsafe fix: Remove unused declaration.
+   
+-    15 15 │   
+-    16 16 │   class TsOnlyWrite {
+-    17    │ - → private·usedOnlyInWrite·=·5;
+-    18 17 │   
+-    19 18 │   	method() {
++    14 14 │   
++    15 15 │   class TsOnlyWrite {
++    16    │ - → private·usedOnlyInWrite·=·5;
++    17 16 │   
++    18 17 │   	method() {
+   
+ 
+ ```
+ 
+ ```
+-invalid.ts:25:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++invalid.ts:24:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    24 │ class TsSelfUpdate {
+-  > 25 │ 	private usedOnlyToUpdateItself = 5;
++    23 │ class TsSelfUpdate {
++  > 24 │ 	private usedOnlyToUpdateItself = 5;
+        │ 	        ^^^^^^^^^^^^^^^^^^^^^^
+-    26 │ 
+-    27 │ 	method() {
++    25 │ 
++    26 │ 	method() {
+   
+   i Unsafe fix: Remove unused declaration.
+   
+-    23 23 │   
+-    24 24 │   class TsSelfUpdate {
+-    25    │ - → private·usedOnlyToUpdateItself·=·5;
+-    26 25 │   
+-    27 26 │   	method() {
++    22 22 │   
++    23 23 │   class TsSelfUpdate {
++    24    │ - → private·usedOnlyToUpdateItself·=·5;
++    25 24 │   
++    26 25 │   	method() {
+   
+ 
+ ```
+ 
+ ```
+-invalid.ts:33:14 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++invalid.ts:32:14 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    32 │ class TsAccessor {
+-  > 33 │ 	private get unusedAccessor() { }
++    31 │ class TsAccessor {
++  > 32 │ 	private get unusedAccessor() { }
+        │ 	            ^^^^^^^^^^^^^^
+-    34 │ 	private set unusedAccessor(value) { }
+-    35 │ }
++    33 │ 	private set unusedAccessor(value) { }
++    34 │ }
+   
+   i Unsafe fix: Remove unused declaration.
+   
+-    31 31 │   
+-    32 32 │   class TsAccessor {
+-    33    │ - → private·get·unusedAccessor()·{·}
+-    34 33 │   	private set unusedAccessor(value) { }
+-    35 34 │   }
++    30 30 │   
++    31 31 │   class TsAccessor {
++    32    │ - → private·get·unusedAccessor()·{·}
++    33 32 │   	private set unusedAccessor(value) { }
++    34 33 │   }
+   
+ 
+ ```
+ 
+ ```
+-invalid.ts:34:14 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++invalid.ts:33:14 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    32 │ class TsAccessor {
+-    33 │ 	private get unusedAccessor() { }
+-  > 34 │ 	private set unusedAccessor(value) { }
++    31 │ class TsAccessor {
++    32 │ 	private get unusedAccessor() { }
++  > 33 │ 	private set unusedAccessor(value) { }
+        │ 	            ^^^^^^^^^^^^^^
+-    35 │ }
+-    36 │ 
++    34 │ }
++    35 │ 
+   
+   i Unsafe fix: Remove unused declaration.
+   
+-    32 32 │   class TsAccessor {
+-    33 33 │   	private get unusedAccessor() { }
+-    34    │ - → private·set·unusedAccessor(value)·{·}
+-    35 34 │   }
+-    36 35 │   
++    31 31 │   class TsAccessor {
++    32 32 │   	private get unusedAccessor() { }
++    33    │ - → private·set·unusedAccessor(value)·{·}
++    34 33 │   }
++    35 34 │   
+   
+ 
+ ```
+ 
+ ```
+-invalid.ts:39:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++invalid.ts:38:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    37 │ // github.com/biomejs/biome/issues/6165
+-    38 │ class TsBioo2 {
+-  > 39 │ 	private unusedProperty = 5;
++    36 │ // github.com/biomejs/biome/issues/6165
++    37 │ class TsBioo2 {
++  > 38 │ 	private unusedProperty = 5;
+        │ 	        ^^^^^^^^^^^^^^
+-    40 │ 	private unusedMethod() {}
+-    41 │ 
++    39 │ 	private unusedMethod() {}
++    40 │ 
+   
+   i Unsafe fix: Remove unused declaration.
+   
+-    37 37 │   // github.com/biomejs/biome/issues/6165
+-    38 38 │   class TsBioo2 {
+-    39    │ - → private·unusedProperty·=·5;
+-    40 39 │   	private unusedMethod() {}
+-    41 40 │   
++    36 36 │   // github.com/biomejs/biome/issues/6165
++    37 37 │   class TsBioo2 {
++    38    │ - → private·unusedProperty·=·5;
++    39 38 │   	private unusedMethod() {}
++    40 39 │   
+   
+ 
+ ```
+ 
+ ```
+-invalid.ts:40:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++invalid.ts:39:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    38 │ class TsBioo2 {
+-    39 │ 	private unusedProperty = 5;
+-  > 40 │ 	private unusedMethod() {}
++    37 │ class TsBioo2 {
++    38 │ 	private unusedProperty = 5;
++  > 39 │ 	private unusedMethod() {}
+        │ 	        ^^^^^^^^^^^^
+-    41 │ 
+-    42 │ 	private usedProperty = 4;
++    40 │ 
++    41 │ 	private usedProperty = 4;
+   
+   i Unsafe fix: Remove unused declaration.
+   
+-    38 38 │   class TsBioo2 {
+-    39 39 │   	private unusedProperty = 5;
+-    40    │ - → private·unusedMethod()·{}
+-    41 40 │   
+-    42 41 │   	private usedProperty = 4;
++    37 37 │   class TsBioo2 {
++    38 38 │   	private unusedProperty = 5;
++    39    │ - → private·unusedMethod()·{}
++    40 39 │   
++    41 40 │   	private usedProperty = 4;
+   
+ 
+ ```
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_aligned_with_semantic_class.ts b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_aligned_with_semantic_class.ts
+new file mode 100644
+index 0000000000..a33fb19adc
+--- /dev/null
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_aligned_with_semantic_class.ts
+@@ -0,0 +1,50 @@
++class UsedMember {
++	get #usedAccessor() {}
++	set #usedAccessor(value) {}
++
++	method() {
++		// no return statement so no meaningful read
++		this.#usedAccessor = 42;
++	}
++}
++
++class UsedMember {
++	#usedInInnerClass;
++
++	method(a) {
++		return class {
++			// not really used, a is not reference to this scope
++			foo = a.#usedInInnerClass;
++		}
++	}
++}
++
++class UsedMember {
++	set #accessorUsedInMemberAccess(value) {} // <- unused
++
++	method(a) {
++		// there is no getter, so this is not a read at all
++		[this.#accessorUsedInMemberAccess] = a;
++	}
++}
++
++class UsedMember {
++	#usedInInnerClass;
++
++	method(a) {
++		return class {
++			foo = a.#usedInInnerClass;
++		}
++	}
++}
++
++class C {
++	set #x(value) {
++		doSomething(value);
++	}
++
++	foo() {
++    // no return statement so not a meaningful read.
++		this.#x = 1;
++	}
++}
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_aligned_with_semantic_class.ts.snap b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_aligned_with_semantic_class.ts.snap
+new file mode 100644
+index 0000000000..5dc6be36f1
+--- /dev/null
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_aligned_with_semantic_class.ts.snap
+@@ -0,0 +1,194 @@
++---
++source: crates/biome_js_analyze/tests/spec_tests.rs
++assertion_line: 152
++expression: invalid_aligned_with_semantic_class.ts
++---
++# Input
++```ts
++class UsedMember {
++	get #usedAccessor() {}
++	set #usedAccessor(value) {}
++
++	method() {
++		// no return statement so no meaningful read
++		this.#usedAccessor = 42;
++	}
++}
++
++class UsedMember {
++	#usedInInnerClass;
++
++	method(a) {
++		return class {
++			// not really used, a is not reference to this scope
++			foo = a.#usedInInnerClass;
++		}
++	}
++}
++
++class UsedMember {
++	set #accessorUsedInMemberAccess(value) {} // <- unused
++
++	method(a) {
++		// there is no getter, so this is not a read at all
++		[this.#accessorUsedInMemberAccess] = a;
++	}
++}
++
++class UsedMember {
++	#usedInInnerClass;
++
++	method(a) {
++		return class {
++			foo = a.#usedInInnerClass;
++		}
++	}
++}
++
++class C {
++	set #x(value) {
++		doSomething(value);
++	}
++
++	foo() {
++    // no return statement so not a meaningful read.
++		this.#x = 1;
++	}
++}
++
++```
++
++# Diagnostics
++```
++invalid_aligned_with_semantic_class.ts:2:6 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    1 │ class UsedMember {
++  > 2 │ 	get #usedAccessor() {}
++      │ 	    ^^^^^^^^^^^^^
++    3 │ 	set #usedAccessor(value) {}
++    4 │ 
++  
++  i Unsafe fix: Remove unused declaration.
++  
++     1  1 │   class UsedMember {
++     2    │ - → get·#usedAccessor()·{}
++     3  2 │   	set #usedAccessor(value) {}
++     4  3 │   
++  
++
++```
++
++```
++invalid_aligned_with_semantic_class.ts:3:6 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    1 │ class UsedMember {
++    2 │ 	get #usedAccessor() {}
++  > 3 │ 	set #usedAccessor(value) {}
++      │ 	    ^^^^^^^^^^^^^
++    4 │ 
++    5 │ 	method() {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++     1  1 │   class UsedMember {
++     2  2 │   	get #usedAccessor() {}
++     3    │ - → set·#usedAccessor(value)·{}
++     4  3 │   
++     5  4 │   	method() {
++  
++
++```
++
++```
++invalid_aligned_with_semantic_class.ts:12:2 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    11 │ class UsedMember {
++  > 12 │ 	#usedInInnerClass;
++       │ 	^^^^^^^^^^^^^^^^^
++    13 │ 
++    14 │ 	method(a) {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    10 10 │   
++    11 11 │   class UsedMember {
++    12    │ - → #usedInInnerClass;
++    13 12 │   
++    14 13 │   	method(a) {
++  
++
++```
++
++```
++invalid_aligned_with_semantic_class.ts:23:6 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    22 │ class UsedMember {
++  > 23 │ 	set #accessorUsedInMemberAccess(value) {} // <- unused
++       │ 	    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
++    24 │ 
++    25 │ 	method(a) {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    21 21 │   
++    22 22 │   class UsedMember {
++    23    │ - → set·#accessorUsedInMemberAccess(value)·{}·//·<-·unused
++    24 23 │   
++    25 24 │   	method(a) {
++  
++
++```
++
++```
++invalid_aligned_with_semantic_class.ts:32:2 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    31 │ class UsedMember {
++  > 32 │ 	#usedInInnerClass;
++       │ 	^^^^^^^^^^^^^^^^^
++    33 │ 
++    34 │ 	method(a) {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    30 30 │   
++    31 31 │   class UsedMember {
++    32    │ - → #usedInInnerClass;
++    33 32 │   
++    34 33 │   	method(a) {
++  
++
++```
++
++```
++invalid_aligned_with_semantic_class.ts:42:6 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    41 │ class C {
++  > 42 │ 	set #x(value) {
++       │ 	    ^^
++    43 │ 		doSomething(value);
++    44 │ 	}
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    40 40 │   
++    41 41 │   class C {
++    42    │ - → set·#x(value)·{
++    43    │ - → → doSomething(value);
++    44    │ - → }
++    45 42 │   
++    46 43 │   	foo() {
++  
++
++```
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_dynamic_access.ts b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_dynamic_access.ts
+index c777df2e9a..3fea3a5912 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_dynamic_access.ts
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_dynamic_access.ts
+@@ -1,13 +1,73 @@
+ export class Sample {
+-  private member;
+-  #prop;
++	private member;
++	#prop;
+ 
+-  constructor() {
+-    this.#prop = 0;
+-    this.member = 0;
+-  }
++	constructor() {
++		this.#prop = 0;
++		this.member = 0;
++	}
+ 
+-  method(name) {
+-    return this[name];
+-  }
++	method(name) {
++		return this[name];
++	}
+ }
++
++export class SampleAddRemove {
++	private add: () => void;
++	private append: () => void; // <- unused
++
++	constructor(private remove: () => void) {
++		this.add = () => {
++		};
++		this.remove = () => {
++		};
++	}
++
++	on(action: "add" | "remove"): void {
++		this[action]();
++	}
++}
++
++// will only make a match on the string literals and ignore anything else
++type YesNo = "yes" | "no" | { ignored: number };
++
++export class SampleYesNo {
++	private yes: () => void;
++	private no: () => void;
++	private dontKnow: () => void; // <- unused
++
++	on(action: YesNo): void {
++		this[action]();
++	}
++}
++
++export class SampleYesNoString {
++	private yes: () => void;
++	private no: () => void;
++	private dontKnow: () => void;
++
++	on(action: string): void {
++		this[action]();
++	}
++}
++
++export class SampleYesNoAny {
++	private yes: () => void;
++	private no: () => void;
++	private dontKnow: () => void;
++
++	on(action: any): void {
++		this[action]();
++	}
++}
++
++export class SampleYesNoUnknown {
++	private yes: () => void;
++	private no: () => void;
++	private dontKnow: () => void;
++
++	on(action: unknown): void {
++		this[action]();
++	}
++}
++
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_dynamic_access.ts.snap b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_dynamic_access.ts.snap
+index 37ba429b19..b51384ff61 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_dynamic_access.ts.snap
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_dynamic_access.ts.snap
+@@ -1,45 +1,377 @@
+ ---
+ source: crates/biome_js_analyze/tests/spec_tests.rs
++assertion_line: 152
+ expression: invalid_dynamic_access.ts
+ ---
+ # Input
+ ```ts
+ export class Sample {
+-  private member;
+-  #prop;
++	private member;
++	#prop;
+ 
+-  constructor() {
+-    this.#prop = 0;
+-    this.member = 0;
+-  }
++	constructor() {
++		this.#prop = 0;
++		this.member = 0;
++	}
+ 
+-  method(name) {
+-    return this[name];
+-  }
++	method(name) {
++		return this[name];
++	}
+ }
+ 
++export class SampleAddRemove {
++	private add: () => void;
++	private append: () => void; // <- unused
++
++	constructor(private remove: () => void) {
++		this.add = () => {
++		};
++		this.remove = () => {
++		};
++	}
++
++	on(action: "add" | "remove"): void {
++		this[action]();
++	}
++}
++
++// will only make a match on the string literals and ignore anything else
++type YesNo = "yes" | "no" | { ignored: number };
++
++export class SampleYesNo {
++	private yes: () => void;
++	private no: () => void;
++	private dontKnow: () => void; // <- unused
++
++	on(action: YesNo): void {
++		this[action]();
++	}
++}
++
++export class SampleYesNoString {
++	private yes: () => void;
++	private no: () => void;
++	private dontKnow: () => void;
++
++	on(action: string): void {
++		this[action]();
++	}
++}
++
++export class SampleYesNoAny {
++	private yes: () => void;
++	private no: () => void;
++	private dontKnow: () => void;
++
++	on(action: any): void {
++		this[action]();
++	}
++}
++
++export class SampleYesNoUnknown {
++	private yes: () => void;
++	private no: () => void;
++	private dontKnow: () => void;
++
++	on(action: unknown): void {
++		this[action]();
++	}
++}
++
++
+ ```
+ 
+ # Diagnostics
+ ```
+-invalid_dynamic_access.ts:3:3 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━
++invalid_dynamic_access.ts:2:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+     1 │ export class Sample {
+-    2 │   private member;
+-  > 3 │   #prop;
+-      │   ^^^^^
++  > 2 │ 	private member;
++      │ 	        ^^^^^^
++    3 │ 	#prop;
+     4 │ 
+-    5 │   constructor() {
+   
+   i Unsafe fix: Remove unused declaration.
+   
+      1  1 │   export class Sample {
+-     2  2 │     private member;
+-     3    │ - ··#prop;
++     2    │ - → private·member;
++     3  2 │   	#prop;
+      4  3 │   
+-     5  4 │     constructor() {
++  
++
++```
++
++```
++invalid_dynamic_access.ts:3:2 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    1 │ export class Sample {
++    2 │ 	private member;
++  > 3 │ 	#prop;
++      │ 	^^^^^
++    4 │ 
++    5 │ 	constructor() {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++     1  1 │   export class Sample {
++     2  2 │   	private member;
++     3    │ - → #prop;
++     4  3 │   
++     5  4 │   	constructor() {
++  
++
++```
++
++```
++invalid_dynamic_access.ts:17:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    15 │ export class SampleAddRemove {
++    16 │ 	private add: () => void;
++  > 17 │ 	private append: () => void; // <- unused
++       │ 	        ^^^^^^
++    18 │ 
++    19 │ 	constructor(private remove: () => void) {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    15 15 │   export class SampleAddRemove {
++    16 16 │   	private add: () => void;
++    17    │ - → private·append:·()·=>·void;·//·<-·unused
++    18 17 │   
++    19 18 │   	constructor(private remove: () => void) {
++  
++
++```
++
++```
++invalid_dynamic_access.ts:37:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    35 │ 	private yes: () => void;
++    36 │ 	private no: () => void;
++  > 37 │ 	private dontKnow: () => void; // <- unused
++       │ 	        ^^^^^^^^
++    38 │ 
++    39 │ 	on(action: YesNo): void {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    35 35 │   	private yes: () => void;
++    36 36 │   	private no: () => void;
++    37    │ - → private·dontKnow:·()·=>·void;·//·<-·unused
++    38 37 │   
++    39 38 │   	on(action: YesNo): void {
++  
++
++```
++
++```
++invalid_dynamic_access.ts:45:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    44 │ export class SampleYesNoString {
++  > 45 │ 	private yes: () => void;
++       │ 	        ^^^
++    46 │ 	private no: () => void;
++    47 │ 	private dontKnow: () => void;
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    43 43 │   
++    44 44 │   export class SampleYesNoString {
++    45    │ - → private·yes:·()·=>·void;
++    46 45 │   	private no: () => void;
++    47 46 │   	private dontKnow: () => void;
++  
++
++```
++
++```
++invalid_dynamic_access.ts:46:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    44 │ export class SampleYesNoString {
++    45 │ 	private yes: () => void;
++  > 46 │ 	private no: () => void;
++       │ 	        ^^
++    47 │ 	private dontKnow: () => void;
++    48 │ 
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    44 44 │   export class SampleYesNoString {
++    45 45 │   	private yes: () => void;
++    46    │ - → private·no:·()·=>·void;
++    47 46 │   	private dontKnow: () => void;
++    48 47 │   
++  
++
++```
++
++```
++invalid_dynamic_access.ts:47:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    45 │ 	private yes: () => void;
++    46 │ 	private no: () => void;
++  > 47 │ 	private dontKnow: () => void;
++       │ 	        ^^^^^^^^
++    48 │ 
++    49 │ 	on(action: string): void {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    45 45 │   	private yes: () => void;
++    46 46 │   	private no: () => void;
++    47    │ - → private·dontKnow:·()·=>·void;
++    48 47 │   
++    49 48 │   	on(action: string): void {
++  
++
++```
++
++```
++invalid_dynamic_access.ts:55:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    54 │ export class SampleYesNoAny {
++  > 55 │ 	private yes: () => void;
++       │ 	        ^^^
++    56 │ 	private no: () => void;
++    57 │ 	private dontKnow: () => void;
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    53 53 │   
++    54 54 │   export class SampleYesNoAny {
++    55    │ - → private·yes:·()·=>·void;
++    56 55 │   	private no: () => void;
++    57 56 │   	private dontKnow: () => void;
++  
++
++```
++
++```
++invalid_dynamic_access.ts:56:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    54 │ export class SampleYesNoAny {
++    55 │ 	private yes: () => void;
++  > 56 │ 	private no: () => void;
++       │ 	        ^^
++    57 │ 	private dontKnow: () => void;
++    58 │ 
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    54 54 │   export class SampleYesNoAny {
++    55 55 │   	private yes: () => void;
++    56    │ - → private·no:·()·=>·void;
++    57 56 │   	private dontKnow: () => void;
++    58 57 │   
++  
++
++```
++
++```
++invalid_dynamic_access.ts:57:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    55 │ 	private yes: () => void;
++    56 │ 	private no: () => void;
++  > 57 │ 	private dontKnow: () => void;
++       │ 	        ^^^^^^^^
++    58 │ 
++    59 │ 	on(action: any): void {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    55 55 │   	private yes: () => void;
++    56 56 │   	private no: () => void;
++    57    │ - → private·dontKnow:·()·=>·void;
++    58 57 │   
++    59 58 │   	on(action: any): void {
++  
++
++```
++
++```
++invalid_dynamic_access.ts:65:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    64 │ export class SampleYesNoUnknown {
++  > 65 │ 	private yes: () => void;
++       │ 	        ^^^
++    66 │ 	private no: () => void;
++    67 │ 	private dontKnow: () => void;
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    63 63 │   
++    64 64 │   export class SampleYesNoUnknown {
++    65    │ - → private·yes:·()·=>·void;
++    66 65 │   	private no: () => void;
++    67 66 │   	private dontKnow: () => void;
++  
++
++```
++
++```
++invalid_dynamic_access.ts:66:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    64 │ export class SampleYesNoUnknown {
++    65 │ 	private yes: () => void;
++  > 66 │ 	private no: () => void;
++       │ 	        ^^
++    67 │ 	private dontKnow: () => void;
++    68 │ 
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    64 64 │   export class SampleYesNoUnknown {
++    65 65 │   	private yes: () => void;
++    66    │ - → private·no:·()·=>·void;
++    67 66 │   	private dontKnow: () => void;
++    68 67 │   
++  
++
++```
++
++```
++invalid_dynamic_access.ts:67:10 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━
++
++  ! This private class member is defined but never used.
++  
++    65 │ 	private yes: () => void;
++    66 │ 	private no: () => void;
++  > 67 │ 	private dontKnow: () => void;
++       │ 	        ^^^^^^^^
++    68 │ 
++    69 │ 	on(action: unknown): void {
++  
++  i Unsafe fix: Remove unused declaration.
++  
++    65 65 │   	private yes: () => void;
++    66 66 │   	private no: () => void;
++    67    │ - → private·dontKnow:·()·=>·void;
++    68 67 │   
++    69 68 │   	on(action: unknown): void {
+   
+ 
+ ```
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_issue_7101.ts b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_issue_7101.ts
+index 3bbebf4b05..2cfca0a128 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_issue_7101.ts
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_issue_7101.ts
+@@ -1,5 +1,9 @@
+ class TSDoubleUnusedPrivateConstructor {
+-	constructor(private unusedProperty = 3, private anotherUnusedProperty = 4) {
++	constructor(
++		usedProperty = 3,
++		private unusedProperty: number,
++		private anotherUnusedProperty = 4
++	) {
+ 		// This constructor has two unused private properties
+ 
+ 	}
+@@ -7,6 +11,7 @@ class TSDoubleUnusedPrivateConstructor {
+ 
+ class TSPartiallyUsedPrivateConstructor {
+   constructor(private param: number) {
++		// this is not read or write as far as class members are concerned.
+     foo(param)
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_issue_7101.ts.snap b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_issue_7101.ts.snap
+index ff3616cfd3..f068a487f0 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_issue_7101.ts.snap
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/invalid_issue_7101.ts.snap
+@@ -1,11 +1,16 @@
+ ---
+ source: crates/biome_js_analyze/tests/spec_tests.rs
++assertion_line: 152
+ expression: invalid_issue_7101.ts
+ ---
+ # Input
+ ```ts
+ class TSDoubleUnusedPrivateConstructor {
+-	constructor(private unusedProperty = 3, private anotherUnusedProperty = 4) {
++	constructor(
++		usedProperty = 3,
++		private unusedProperty: number,
++		private anotherUnusedProperty = 4
++	) {
+ 		// This constructor has two unused private properties
+ 
+ 	}
+@@ -13,70 +18,78 @@ class TSDoubleUnusedPrivateConstructor {
+ 
+ class TSPartiallyUsedPrivateConstructor {
+   constructor(private param: number) {
++		// this is not read or write as far as class members are concerned.
+     foo(param)
+   }
+ }
++
+ ```
+ 
+ # Diagnostics
+ ```
+-invalid_issue_7101.ts:2:22 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━
++invalid_issue_7101.ts:4:11 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    1 │ class TSDoubleUnusedPrivateConstructor {
+-  > 2 │ 	constructor(private unusedProperty = 3, private anotherUnusedProperty = 4) {
+-      │ 	                    ^^^^^^^^^^^^^^^
+-    3 │ 		// This constructor has two unused private properties
+-    4 │ 
++    2 │ 	constructor(
++    3 │ 		usedProperty = 3,
++  > 4 │ 		private unusedProperty: number,
++      │ 		        ^^^^^^^^^^^^^^
++    5 │ 		private anotherUnusedProperty = 4
++    6 │ 	) {
+   
+   i Unsafe fix: Remove private modifier
+   
+      1  1 │   class TSDoubleUnusedPrivateConstructor {
+-     2    │ - → constructor(private·unusedProperty·=·3,·private·anotherUnusedProperty·=·4)·{
+-        2 │ + → constructor(_unusedProperty·=·3,·private·anotherUnusedProperty·=·4)·{
+-     3  3 │   		// This constructor has two unused private properties
+-     4  4 │   
++     2  2 │   	constructor(
++     3    │ - → → usedProperty·=·3,
++     4    │ - → → private·unusedProperty:·number,
++        3 │ + → → usedProperty·=·3,_unusedProperty:·number,
++     5  4 │   		private anotherUnusedProperty = 4
++     6  5 │   	) {
+   
+ 
+ ```
+ 
+ ```
+-invalid_issue_7101.ts:2:50 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━
++invalid_issue_7101.ts:5:11 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━
+ 
+   ! This private class member is defined but never used.
+   
+-    1 │ class TSDoubleUnusedPrivateConstructor {
+-  > 2 │ 	constructor(private unusedProperty = 3, private anotherUnusedProperty = 4) {
+-      │ 	                                                ^^^^^^^^^^^^^^^^^^^^^^
+-    3 │ 		// This constructor has two unused private properties
+-    4 │ 
++    3 │ 		usedProperty = 3,
++    4 │ 		private unusedProperty: number,
++  > 5 │ 		private anotherUnusedProperty = 4
++      │ 		        ^^^^^^^^^^^^^^^^^^^^^
++    6 │ 	) {
++    7 │ 		// This constructor has two unused private properties
+   
+   i Unsafe fix: Remove private modifier
+   
+-     1  1 │   class TSDoubleUnusedPrivateConstructor {
+-     2    │ - → constructor(private·unusedProperty·=·3,·private·anotherUnusedProperty·=·4)·{
+-        2 │ + → constructor(private·unusedProperty·=·3,·_anotherUnusedProperty·=·4)·{
+-     3  3 │   		// This constructor has two unused private properties
+-     4  4 │   
++     2  2 │   	constructor(
++     3  3 │   		usedProperty = 3,
++     4    │ - → → private·unusedProperty:·number,
++     5    │ - → → private·anotherUnusedProperty·=·4
++        4 │ + → → private·unusedProperty:·number,_anotherUnusedProperty·=·4
++     6  5 │   	) {
++     7  6 │   		// This constructor has two unused private properties
+   
+ 
+ ```
+ 
+ ```
+-invalid_issue_7101.ts:9:23 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━━
++invalid_issue_7101.ts:13:23 lint/correctness/noUnusedPrivateClassMembers  FIXABLE  ━━━━━━━━━━━━━━━━━
+ 
+   ! This parameter is never used outside of the constructor.
+   
+-     8 │ class TSPartiallyUsedPrivateConstructor {
+-   > 9 │   constructor(private param: number) {
++    12 │ class TSPartiallyUsedPrivateConstructor {
++  > 13 │   constructor(private param: number) {
+        │                       ^^^^^
+-    10 │     foo(param)
+-    11 │   }
++    14 │ 		// this is not read or write as far as class members are concerned.
++    15 │     foo(param)
+   
+   i Unsafe fix: Remove private modifier
+   
+-    9 │ ··constructor(private·param:·number)·{
+-      │               --------                
++    13 │ ··constructor(private·param:·number)·{
++       │               --------                
+ 
+ ```
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid.js b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid.js
+index 871a2b04e7..74c8cc3fe1 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid.js
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid.js
+@@ -19,15 +19,6 @@ class UsedMember {
+ }
+ 
+ 
+-class UsedMember {
+-	get #usedAccessor() {}
+-	set #usedAccessor(value) {}
+-
+-	method() {
+-			this.#usedAccessor = 42;
+-	}
+-}
+-
+ class UsedMember {
+ 	publicMember = 42;
+ }
+@@ -131,14 +122,6 @@ class UsedMember {
+ 	}
+ }
+ 
+-class UsedMember {
+-	set #accessorUsedInMemberAccess(value) {}
+-
+-	method(a) {
+-			[this.#accessorUsedInMemberAccess] = a;
+-	}
+-}
+-
+ class UsedMember {
+ 	get #accessorWithGetterFirst() {
+ 			return something();
+@@ -151,16 +134,6 @@ class UsedMember {
+ 	}
+ }
+ 
+-class UsedMember {
+-	#usedInInnerClass;
+-
+-	method(a) {
+-			return class {
+-					foo = a.#usedInInnerClass;
+-			}
+-	}
+-}
+-
+ class Foo {
+ 	#usedMethod() {
+ 			return 42;
+@@ -170,16 +143,6 @@ class Foo {
+ 	}
+ }
+ 
+-class C {
+-	set #x(value) {
+-			doSomething(value);
+-	}
+-
+-	foo() {
+-			this.#x = 1;
+-	}
+-}
+-
+ // issue #6994
+ class UsedAssignmentExpr {
+   #val = 0;
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid.js.snap b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid.js.snap
+index 539e488c1d..79ae10755b 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid.js.snap
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid.js.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: crates/biome_js_analyze/tests/spec_tests.rs
++assertion_line: 152
+ expression: valid.js
+ ---
+ # Input
+@@ -25,15 +26,6 @@ class UsedMember {
+ }
+ 
+ 
+-class UsedMember {
+-	get #usedAccessor() {}
+-	set #usedAccessor(value) {}
+-
+-	method() {
+-			this.#usedAccessor = 42;
+-	}
+-}
+-
+ class UsedMember {
+ 	publicMember = 42;
+ }
+@@ -137,14 +129,6 @@ class UsedMember {
+ 	}
+ }
+ 
+-class UsedMember {
+-	set #accessorUsedInMemberAccess(value) {}
+-
+-	method(a) {
+-			[this.#accessorUsedInMemberAccess] = a;
+-	}
+-}
+-
+ class UsedMember {
+ 	get #accessorWithGetterFirst() {
+ 			return something();
+@@ -157,16 +141,6 @@ class UsedMember {
+ 	}
+ }
+ 
+-class UsedMember {
+-	#usedInInnerClass;
+-
+-	method(a) {
+-			return class {
+-					foo = a.#usedInInnerClass;
+-			}
+-	}
+-}
+-
+ class Foo {
+ 	#usedMethod() {
+ 			return 42;
+@@ -176,16 +150,6 @@ class Foo {
+ 	}
+ }
+ 
+-class C {
+-	set #x(value) {
+-			doSomething(value);
+-	}
+-
+-	foo() {
+-			this.#x = 1;
+-	}
+-}
+-
+ // issue #6994
+ class UsedAssignmentExpr {
+   #val = 0;
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_aligned_with_semantic_class.js b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_aligned_with_semantic_class.js
+new file mode 100644
+index 0000000000..bb6e631529
+--- /dev/null
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_aligned_with_semantic_class.js
+@@ -0,0 +1,9 @@
++
++/* should not generate diagnostics */
++
++class Foo {
++	#usedOnlyInWriteStatement = 5;
++	method() {
++		this.#usedOnlyInWriteStatement += 42;
++	}
++}
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_aligned_with_semantic_class.js.snap b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_aligned_with_semantic_class.js.snap
+new file mode 100644
+index 0000000000..22d40de03a
+--- /dev/null
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_aligned_with_semantic_class.js.snap
+@@ -0,0 +1,18 @@
++---
++source: crates/biome_js_analyze/tests/spec_tests.rs
++assertion_line: 152
++expression: valid_aligned_with_semantic_class.js
++---
++# Input
++```js
++
++/* should not generate diagnostics */
++
++class Foo {
++	#usedOnlyInWriteStatement = 5;
++	method() {
++		this.#usedOnlyInWriteStatement += 42;
++	}
++}
++
++```
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_dynamic_access.ts b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_dynamic_access.ts
+index 3b9e0a19f1..39e120b070 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_dynamic_access.ts
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_dynamic_access.ts
+@@ -1,6 +1,6 @@
+ /* should not generate diagnostics */
+ 
+-export class Sample {
++export class SampleAddRemove {
+   private add: () => void;
+ 
+   constructor(private remove: () => void) {
+@@ -12,3 +12,15 @@ export class Sample {
+     this[action]();
+   }
+ }
++
++type YesNo = "yes" | "no";
++
++export class SampleYesNo {
++	private yes: () => void;
++	private no: () => void;
++
++	on(action: YesNo): void {
++		this[action]();
++	}
++}
++
+diff --git a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_dynamic_access.ts.snap b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_dynamic_access.ts.snap
+index d21c29a9fe..345263bf17 100644
+--- a/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_dynamic_access.ts.snap
++++ b/crates/biome_js_analyze/tests/specs/correctness/noUnusedPrivateClassMembers/valid_dynamic_access.ts.snap
+@@ -6,7 +6,7 @@ expression: valid_dynamic_access.ts
+ ```ts
+ /* should not generate diagnostics */
+ 
+-export class Sample {
++export class SampleAddRemove {
+   private add: () => void;
+ 
+   constructor(private remove: () => void) {
+@@ -19,4 +19,16 @@ export class Sample {
+   }
+ }
+ 
++type YesNo = "yes" | "no";
++
++export class SampleYesNo {
++	private yes: () => void;
++	private no: () => void;
++
++	on(action: YesNo): void {
++		this[action]();
++	}
++}
++
++
+ ```

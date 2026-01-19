@@ -1,0 +1,169 @@
+diff --git a/.changeset/cuddly-melons-work.md b/.changeset/cuddly-melons-work.md
+deleted file mode 100644
+index 394645123..000000000
+--- a/.changeset/cuddly-melons-work.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'@verdaccio/middleware': patch
+----
+-
+-chore(middleware): allow security headers for plugin
+diff --git a/packages/middleware/src/index.ts b/packages/middleware/src/index.ts
+index 89271f590..b8aa953e1 100644
+--- a/packages/middleware/src/index.ts
++++ b/packages/middleware/src/index.ts
+@@ -1,4 +1,5 @@
+ export { match } from './middlewares/match';
++export { setSecurityWebHeaders } from './middlewares/security-headers';
+ export { validateName, validatePackage } from './middlewares/validation';
+ export { media } from './middlewares/media';
+ export { makeURLrelative } from './middlewares/make-url-relative';
+@@ -9,7 +10,7 @@ export { final } from './middlewares/final';
+ export { allow } from './middlewares/allow';
+ export { rateLimit } from './middlewares/rate-limit';
+ export { userAgent } from './middlewares/user-agent';
+-export { webMiddleware, renderWebMiddleware, setSecurityWebHeaders } from './middlewares/web';
++export { webMiddleware, renderWebMiddleware } from './middlewares/web';
+ export { errorReportingMiddleware, handleError } from './middlewares/error';
+ export {
+   log,
+diff --git a/packages/middleware/src/middlewares/security-headers.ts b/packages/middleware/src/middlewares/security-headers.ts
+new file mode 100644
+index 000000000..021f0f1ac
+--- /dev/null
++++ b/packages/middleware/src/middlewares/security-headers.ts
+@@ -0,0 +1,21 @@
++import { HEADERS } from '@verdaccio/core';
++
++import { $NextFunctionVer, $RequestExtend, $ResponseExtend } from '../types';
++
++// TODO: remove, was relocated to web package
++// @ts-deprecated
++export function setSecurityWebHeaders(
++  req: $RequestExtend,
++  res: $ResponseExtend,
++  next: $NextFunctionVer
++): void {
++  // disable loading in frames (clickjacking, etc.)
++  res.header(HEADERS.FRAMES_OPTIONS, 'deny');
++  // avoid stablish connections outside of domain
++  res.header(HEADERS.CSP, "connect-src 'self'");
++  // https://stackoverflow.com/questions/18337630/what-is-x-content-type-options-nosniff
++  res.header(HEADERS.CTO, 'nosniff');
++  // https://stackoverflow.com/questions/9090577/what-is-the-http-header-x-xss-protection
++  res.header(HEADERS.XSS, '1; mode=block');
++  next();
++}
+diff --git a/packages/middleware/src/middlewares/web/security.ts b/packages/middleware/src/middlewares/web/security.ts
+index cb5194e04..1d1ec6274 100644
+--- a/packages/middleware/src/middlewares/web/security.ts
++++ b/packages/middleware/src/middlewares/web/security.ts
+@@ -1,39 +1,13 @@
+-import buildDebug from 'debug';
+-
+ import { HEADERS } from '@verdaccio/core';
+ 
+-const debug = buildDebug('verdaccio:middleware:web:security');
+-
+ export function setSecurityWebHeaders(_req, res, next): void {
+   // disable loading in frames (clickjacking, etc.)
+-  // https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Frame-Options
+-  const framesOptions = res.getHeader(HEADERS.FRAMES_OPTIONS);
+-  if (!framesOptions || !(framesOptions === 'deny' || framesOptions === 'sameorigin')) {
+-    debug('Missing or invalid X-Frame-Options header; setting to "deny"');
+-    res.header(HEADERS.FRAMES_OPTIONS, 'deny');
+-  }
+-
+-  // avoid establishing connections outside of domain
+-  // https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy
+-  if (!res.getHeader(HEADERS.CSP)) {
+-    debug('Missing Content-Security-Policy header; setting to "connect-src \'self\'"');
+-    res.header(HEADERS.CSP, "connect-src 'self'");
+-  }
+-
+-  // respect the content type of the response
+-  // https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options
+-  const cto = res.getHeader(HEADERS.CTO);
+-  if (!cto || cto !== 'nosniff') {
+-    debug('Missing or invalid X-Content-Type-Options header; setting to "nosniff"');
+-    res.header(HEADERS.CTO, 'nosniff');
+-  }
+-
+-  // block rendering of the page in case of XSS attack
+-  // https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-XSS-Protection
+-  const xss = res.getHeader(HEADERS.XSS);
+-  if (!xss || !(xss === '0' || xss.startsWith('1'))) {
+-    debug('Missing or invalid X-XSS-Protection header; setting to "1; mode=block"');
+-    res.header(HEADERS.XSS, '1; mode=block');
+-  }
++  res.header(HEADERS.FRAMES_OPTIONS, 'deny');
++  // avoid stablish connections outside of domain
++  res.header(HEADERS.CSP, "connect-src 'self'");
++  // https://stackoverflow.com/questions/18337630/what-is-x-content-type-options-nosniff
++  res.header(HEADERS.CTO, 'nosniff');
++  // https://stackoverflow.com/questions/9090577/what-is-the-http-header-x-xss-protection
++  res.header(HEADERS.XSS, '1; mode=block');
+   next();
+ }
+diff --git a/packages/middleware/test/security.spec.ts b/packages/middleware/test/security.spec.ts
+index cc2f7b666..8674d52b7 100644
+--- a/packages/middleware/test/security.spec.ts
++++ b/packages/middleware/test/security.spec.ts
+@@ -53,56 +53,3 @@ test('should get xss', async () => {
+   const res = await request(app).get('/sec').expect(HTTP_STATUS.OK);
+   expect(res.get(HEADERS.XSS)).toEqual('1; mode=block');
+ });
+-
+-test('should set own content security policy', async () => {
+-  const csp = 'default "self"; connect-src "self" https://other.example.com';
+-  const app = getApp([]);
+-  // @ts-ignore
+-  app.use((req, res, next) => {
+-    res.header(HEADERS.CSP, csp);
+-    next();
+-  });
+-  // @ts-ignore
+-  app.use(setSecurityWebHeaders);
+-  app.get('/sec', (req, res) => {
+-    res.status(HTTP_STATUS.OK).json({});
+-  });
+-
+-  const res = await request(app).get('/sec').expect(HTTP_STATUS.OK);
+-  expect(res.get(HEADERS.CSP)).toEqual(csp);
+-});
+-
+-test('should overwrite invalid frame options', async () => {
+-  const app = getApp([]);
+-  // @ts-ignore
+-  app.use((req, res, next) => {
+-    res.header(HEADERS.FRAMES_OPTIONS, 'allow something');
+-    next();
+-  });
+-  // @ts-ignore
+-  app.use(setSecurityWebHeaders);
+-  app.get('/sec', (req, res) => {
+-    res.status(HTTP_STATUS.OK).json({});
+-  });
+-
+-  const res = await request(app).get('/sec').expect(HTTP_STATUS.OK);
+-  expect(res.get(HEADERS.FRAMES_OPTIONS)).toEqual('deny');
+-});
+-
+-test('should get changed xss header', async () => {
+-  const xss = '1; report=https://example.com/report';
+-  const app = getApp([]);
+-  // @ts-ignore
+-  app.use((req, res, next) => {
+-    res.header(HEADERS.XSS, xss);
+-    next();
+-  });
+-  // @ts-ignore
+-  app.use(setSecurityWebHeaders);
+-  app.get('/sec', (req, res) => {
+-    res.status(HTTP_STATUS.OK).json({});
+-  });
+-
+-  const res = await request(app).get('/sec').expect(HTTP_STATUS.OK);
+-  expect(res.get(HEADERS.XSS)).toEqual(xss);
+-});

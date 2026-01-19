@@ -1,0 +1,2467 @@
+diff --git a/docs/rtk-query/comparison.md b/docs/rtk-query/comparison.md
+index 96e7a508..7a1a95e4 100644
+--- a/docs/rtk-query/comparison.md
++++ b/docs/rtk-query/comparison.md
+@@ -33,7 +33,7 @@ RTK Query has some unique API design aspects and capabilities that are worth con
+ - You can easily invalidate entities or patch existing query data (via `util.updateQueryData`) from middleware.
+ - RTK Query enables [streaming cache updates](./usage/streaming-updates.mdx), such as updating the initial fetched data as messages are received over a websocket, and has built in support for [optimistic updates](./usage/manual-cache-updates.mdx#optimistic-updates) as well.
+ - RTK Query ships a very tiny and flexible fetch wrapper: [`fetchBaseQuery`](./api/fetchBaseQuery.mdx). It's also very easy to [swap our client with your own](./usage/customizing-queries.mdx), such as using `axios`, `redaxios`, or something custom.
+-- RTK Query has [a (currently experimental) code-gen tool](https://github.com/rtk-incubator/rtk-query-codegen) that will take an OpenAPI spec or GraphQL schema and give you a typed API client, as well as provide methods for enhancing the generated client after the fact.
++- RTK Query has [a (currently experimental) code-gen tool](https://github.com/reduxjs/redux-toolkit/tree/master/packages/rtk-query-codegen-openapi) that will take an OpenAPI spec or GraphQL schema and give you a typed API client, as well as provide methods for enhancing the generated client after the fact.
+ 
+ ## Tradeoffs
+ 
+diff --git a/docs/rtk-query/usage/code-generation.mdx b/docs/rtk-query/usage/code-generation.mdx
+index ddbe0167..355e78e5 100644
+--- a/docs/rtk-query/usage/code-generation.mdx
++++ b/docs/rtk-query/usage/code-generation.mdx
+@@ -49,7 +49,7 @@ import { ConfigFile } from '@rtk-query/codegen-openapi'
+ const config: ConfigFile = {
+   schemaFile: 'https://petstore3.swagger.io/api/v3/openapi.json',
+   apiFile: './src/store/emptyApi.ts',
+-  apiImport: 'emptyApi',
++  apiImport: 'emptySplitApi',
+   outputFile: './src/store/petApi.ts',
+   exportName: 'petApi',
+   hooks: true,
+@@ -141,13 +141,13 @@ const config: ConfigFile = {
+   schemaFile: 'https://petstore3.swagger.io/api/v3/openapi.json',
+   apiFile: './src/store/emptyApi.ts',
+   outputFiles: {
+-    './src/store/user.js': {
++    './src/store/user.ts': {
+       filterEndpoints: [/user/i],
+     },
+-    './src/store/order.js': {
++    './src/store/order.ts': {
+       filterEndpoints: [/order/i],
+     },
+-    './src/store/pet.js': {
++    './src/store/pet.ts': {
+       filterEndpoints: [/pet/i],
+     },
+   },
+diff --git a/packages/action-listener-middleware/src/index.ts b/packages/action-listener-middleware/src/index.ts
+index 7c26d48d..abbb5637 100644
+--- a/packages/action-listener-middleware/src/index.ts
++++ b/packages/action-listener-middleware/src/index.ts
+@@ -30,15 +30,6 @@ import type {
+   ListenerErrorInfo,
+ } from './types'
+ 
+-import {
+-  Job,
+-  SupervisorJob,
+-  JobHandle,
+-  JobCancellationReason,
+-  JobCancellationException,
+-} from './job'
+-import { Outcome } from './outcome'
+-
+ export type {
+   ActionListener,
+   ActionListenerMiddleware,
+@@ -66,76 +57,43 @@ const defaultWhen: MiddlewarePhase = 'afterReducer'
+ const actualMiddlewarePhases = ['beforeReducer', 'afterReducer'] as const
+ 
+ function createTakePattern<S>(
+-  addListener: AddListenerOverloads<Unsubscribe, S, Dispatch<AnyAction>>,
+-  parentJob: Job<any>
++  addListener: AddListenerOverloads<Unsubscribe, S, Dispatch<AnyAction>>
+ ): TakePattern<S> {
+-  /**
+-   * A function that takes an ActionListenerPredicate and an optional timeout,
+-   * and resolves when either the predicate returns `true` based on an action
+-   * state combination or when the timeout expires.
+-   * If the parent listener is canceled while waiting, this will throw a
+-   * JobCancellationException.
+-   */
+   async function take<P extends AnyActionListenerPredicate<S>>(
+     predicate: P,
+     timeout: number | undefined
+   ) {
+-    // Placeholder unsubscribe function until the listener is added
+     let unsubscribe: Unsubscribe = () => {}
+ 
+-    // We'll add an additional nested Job representing this function.
+-    // TODO This is really a duplicate of the other job inside the middleware.
+-    // This behavior requires some additional nesting:
+-    // We're going to create a `Promise` representing the result of the listener,
+-    // but then wrap that in an `Outcome` for consistent error handling.
+-    let job: Job<[AnyAction, S, S]> = parentJob.launch(async (job) =>
+-      Outcome.wrap(
+-        new Promise<[AnyAction, S, S]>((resolve) => {
+-          // Inside the Promise, we synchronously add the listener.
+-          unsubscribe = addListener({
+-            predicate: predicate as any,
+-            listener: (action, listenerApi): void => {
+-              // One-shot listener that cleans up as soon as the predicate passes
+-              listenerApi.unsubscribe()
+-              // Resolve the promise with the same arguments the predicate saw
+-              resolve([
+-                action,
+-                listenerApi.getState(),
+-                listenerApi.getOriginalState(),
+-              ])
+-            },
+-            parentJob,
+-          })
+-        })
+-      )
+-    )
++    const tuplePromise = new Promise<[AnyAction, S, S]>((resolve) => {
++      unsubscribe = addListener({
++        predicate: predicate as any,
++        listener: (action, listenerApi): void => {
++          // One-shot listener that cleans up as soon as the predicate resolves
++          listenerApi.unsubscribe()
++          resolve([
++            action,
++            listenerApi.getState(),
++            listenerApi.getOriginalState(),
++          ])
++        },
++      })
++    })
++
++    if (timeout === undefined) {
++      return tuplePromise
++    }
+ 
+-    let result: Outcome<[AnyAction, S, S]>
++    const timedOutPromise = new Promise<null>((resolve, reject) => {
++      setTimeout(() => {
++        resolve(null)
++      }, timeout)
++    })
+ 
+-    try {
+-      // Run the job and use the timeout if given
+-      result = await (timeout !== undefined
+-        ? job.runWithTimeout(timeout)
+-        : job.run())
++    const result = await Promise.race([tuplePromise, timedOutPromise])
+ 
+-      if (result.isOk()) {
+-        // Resolve the actual `take` promise with the action+states
+-        return result.value
+-      } else {
+-        if (
+-          result.error instanceof JobCancellationException &&
+-          result.error.reason === JobCancellationReason.JobCancelled
+-        ) {
+-          // The `take` job itself was canceled due to timeout.
+-          return null
+-        }
+-        // The parent was canceled - reject this promise with that error
+-        throw result.error
+-      }
+-    } finally {
+-      // Always clean up the listener
+-      unsubscribe()
+-    }
++    unsubscribe()
++    return result
+   }
+ 
+   return take as TakePattern<S>
+@@ -156,12 +114,8 @@ export const createListenerEntry: TypedCreateListenerEntry<unknown> = (
+     predicate = options.actionCreator.match
+   } else if ('matcher' in options) {
+     predicate = options.matcher
+-  } else if ('predicate' in options) {
+-    predicate = options.predicate
+   } else {
+-    throw new Error(
+-      'Creating a listener requires one of the known fields for matching against actions'
+-    )
++    predicate = options.predicate
+   }
+ 
+   const id = nanoid()
+@@ -174,7 +128,6 @@ export const createListenerEntry: TypedCreateListenerEntry<unknown> = (
+     unsubscribe: () => {
+       throw new Error('Unsubscribe not initialized')
+     },
+-    parentJob: new SupervisorJob(),
+   }
+ 
+   return entry
+@@ -334,6 +287,11 @@ export function createActionListenerMiddleware<
+     return true
+   }
+ 
++  const take = createTakePattern(addListener)
++  const condition: ConditionFunction<S> = (predicate, timeout) => {
++    return take(predicate, timeout).then(Boolean)
++  }
++
+   const middleware: Middleware<
+     {
+       (action: Action<'actionListenerMiddleware/add'>): Unsubscribe
+@@ -380,6 +338,7 @@ export function createActionListenerMiddleware<
+             runListener = false
+ 
+             safelyNotifyError(onError, predicateError, {
++              async: false,
+               raisedBy: 'predicate',
+               phase: currentPhase,
+             })
+@@ -390,47 +349,38 @@ export function createActionListenerMiddleware<
+           continue
+         }
+ 
+-        entry.parentJob.launchAndRun(async (jobHandle) => {
+-          const take = createTakePattern(addListener, jobHandle as Job<any>)
+-          const condition: ConditionFunction<S> = (predicate, timeout) => {
+-            return take(predicate, timeout).then(Boolean)
+-          }
++        try {
++          let promiseLikeOrUndefined = entry.listener(action, {
++            ...api,
++            getOriginalState,
++            condition,
++            take,
++            currentPhase,
++            extra,
++            unsubscribe: entry.unsubscribe,
++            subscribe: () => {
++              listenerMap.set(entry.id, entry)
++            },
++          })
+ 
+-          const result = await Outcome.try(async () =>
+-            entry.listener(action, {
+-              ...api,
+-              getOriginalState,
+-              condition,
+-              take,
+-              currentPhase,
+-              extra,
+-              unsubscribe: entry.unsubscribe,
+-              subscribe: () => {
+-                listenerMap.set(entry.id, entry)
+-              },
+-              job: jobHandle,
+-              cancelPrevious: () => {
+-                entry.parentJob.cancelChildren(
+-                  new JobCancellationException(
+-                    JobCancellationReason.JobCancelled
+-                  ),
+-                  [jobHandle]
+-                )
+-              },
+-            })
+-          )
+-          if (
+-            result.isError() &&
+-            !(result.error instanceof JobCancellationException)
+-          ) {
+-            safelyNotifyError(onError, result.error, {
+-              raisedBy: 'listener',
+-              phase: currentPhase,
+-            })
++          if (promiseLikeOrUndefined) {
++            Promise.resolve(promiseLikeOrUndefined).catch(
++              (asyncListenerError) => {
++                safelyNotifyError(onError, asyncListenerError, {
++                  async: true,
++                  raisedBy: 'listener',
++                  phase: currentPhase,
++                })
++              }
++            )
+           }
+-
+-          return Outcome.ok(1)
+-        })
++        } catch (syncListenerError) {
++          safelyNotifyError(onError, syncListenerError, {
++            async: false,
++            raisedBy: 'listener',
++            phase: currentPhase,
++          })
++        }
+       }
+       if (currentPhase === 'beforeReducer') {
+         result = next(action)
+diff --git a/packages/action-listener-middleware/src/job.ts b/packages/action-listener-middleware/src/job.ts
+deleted file mode 100644
+index e182b2f2..00000000
+--- a/packages/action-listener-middleware/src/job.ts
++++ /dev/null
+@@ -1,324 +0,0 @@
+-// Source: https://github.com/ethossoftworks/job-ts
+-
+-import { Outcome } from './outcome'
+-import type { Error as OutcomeError } from './outcome'
+-
+-/**
+- * The block of work a [Job] executes. The [job] parameter is a handle of the job's instance to allow
+- * launching of new jobs or pausing the job.
+- */
+-export type JobFunc<T> = (job: JobHandle) => Promise<Outcome<T>>
+-
+-/**
+- * A handle for the current job used in [JobFunc]. This interface is equivalent to [Job]'s interface with the exception
+- * of [run] and [runWithTimeout] to prevent recursive running of the [Job] inside its [JobFunc].
+- */
+-export interface JobHandle {
+-  isActive: boolean
+-  isCompleted: boolean
+-  isCancelled: boolean
+-  childCount: number
+-  ensureActive(): void
+-  launch<R>(func: JobFunc<R>): Job<R>
+-  launchAndRun<R>(func: JobFunc<R>): Promise<Outcome<R>>
+-  pause<R>(func: Promise<R>): Promise<R>
+-  delay(milliseconds: number): Promise<void>
+-  cancel(reason?: JobCancellationException): void
+-  cancelChildren(
+-    reason?: JobCancellationException,
+-    skipChildren?: JobHandle[]
+-  ): void
+-}
+-
+-/**
+- * Thrown when a job or its parent is cancelled or if a job is run more than once.
+- */
+-export class JobCancellationException implements Error {
+-  reason: JobCancellationReason
+-  name: string
+-  message: string
+-  constructor(reason: JobCancellationReason) {
+-    this.name = 'JobCancellationException'
+-    this.reason = reason
+-    this.message = `${this.reason}`
+-  }
+-}
+-
+-/**
+- * The reason a job was cancelled.
+- *
+- * [ParentJobCancelled]: The parent job was cancelled
+- * [ParentJobCompleted]: The parent job completed
+- * [JobCancelled]: The current job was cancelled
+- * [JobCompleted]: The current job was already completed. This only happens if the same job is run more than once.
+- */
+-export enum JobCancellationReason {
+-  ParentJobCancelled = 'ParentJobCancelled',
+-  ParentJobCompleted = 'ParentJobCompleted',
+-  JobCancelled = 'JobCancelled',
+-  JobCompleted = 'JobCompleted',
+-}
+-
+-/**
+- * A cancellable unit of work with optional cancellation hierarchy.
+- *
+- * Cancellation is cooperative, meaning the user has to define pause/suspension points in the task via the [pause] or
+- * [ensureActive] methods or by checking [isActive].
+- *
+- * Cancelling a parent Job will cancel all children Jobs launched with the job defined as its parent. All children must
+- * also cooperatively check for cancellation.
+- *
+- * A parent job will not wait for any children jobs unless explicitly awaited on in the provided [JobFunc]. In this
+- * instance, if the parent completes before its child has completed, the parent will be marked as completed and the
+- * children will be cancelled at the next pause point.
+- *
+- * If an exception is thrown during a JobFunc, the job will cancel itself and its children and then rethrow the
+- * exception to be handled by the user.
+- *
+- * Running a job more than once will result in a [JobCancellationException].
+- *
+- * Note: When adding a try/catch mechanism inside of a [JobFunc], make sure to rethrow any [JobCancellationException]
+- * exceptions, otherwise job cancellation will not work as intended.
+- *
+- * Example:
+- * ```
+- const job = Job(async (job) => {
+- *     // This creates a pause point. If the job is cancelled while this operation is running,
+- *     // the job will immediately return [Error] with a [JobCancellationException] as its result.
+- *     const result = await job.pause(someLongRunningTask());
+- *
+- *     if (result.error != null) {
+- *         return Outcome.error("Problem");
+- *     }
+- *     return Outcome.ok("All good!");
+- * });
+- *
+- * const jobResult = await job.run();
+- * ```
+- */
+-export class Job<T> implements JobHandle {
+-  private _parent: Job<any> | undefined
+-  private _children: Job<any>[] = []
+-  private _func: JobFunc<T>
+-  private _cancelResolver: (value: Outcome<T>) => void = () => {}
+-  private _isCancelled = false
+-  private _isCompleted = false
+-
+-  private _cancelPromise: Promise<Outcome<T>> = new Promise<Outcome<T>>(
+-    (resolve) => (this._cancelResolver = resolve)
+-  )
+-
+-  constructor(func: JobFunc<T>, options?: { parent?: Job<any> }) {
+-    this._func = func
+-    this._parent = options?.parent
+-    this._parent?._addChild(this)
+-  }
+-
+-  /**
+-   * Returns true if the given outcome was cancelled
+-   */
+-  static isCancelled = (
+-    outcome: Outcome<unknown>
+-  ): outcome is OutcomeError<JobCancellationException> =>
+-    outcome.isError() && outcome.error instanceof JobCancellationException
+-
+-  /**
+-   * Returns true if both the parent job (if one exists) and the current job are both active. A job is active at
+-   * creation and remains active until it has completed or been cancelled.
+-   */
+-  get isActive(): boolean {
+-    return (
+-      !this._isCompleted &&
+-      !this._isCancelled &&
+-      (this._parent?.isActive ?? true)
+-    )
+-  }
+-
+-  /**
+-   * Returns true if the job was completed successfully
+-   */
+-  get isCompleted(): boolean {
+-    return !this.isActive && !this.isCancelled
+-  }
+-
+-  /**
+-   * Returns true if the job was cancelled for any reason, either by explicit invocation of cancel or because its
+-   * parent was cancelled. This does not imply that the job has fully completed because it may still be finishing
+-   * whatever it was doing and waiting for its children to complete.
+-   */
+-  get isCancelled(): boolean {
+-    return this._isCancelled || !(this._parent?.isCancelled ?? true)
+-  }
+-
+-  /**
+-   * Checks if the parent job and current job are active and throws [JobCancellationException] if either are inactive.
+-   *
+-   * Note: This should only be used inside of a [JobFunc].
+-   */
+-  ensureActive() {
+-    if (this._isCompleted)
+-      throw new JobCancellationException(JobCancellationReason.JobCompleted)
+-    if (this._isCancelled)
+-      throw new JobCancellationException(JobCancellationReason.JobCancelled)
+-
+-    // Check parent
+-    if (this._parent === undefined) return
+-    if (!this._parent.isActive) {
+-      if (this._parent.isCompleted)
+-        throw new JobCancellationException(
+-          JobCancellationReason.ParentJobCompleted
+-        )
+-      throw new JobCancellationException(
+-        JobCancellationReason.ParentJobCancelled
+-      )
+-    }
+-  }
+-
+-  /**
+-   * The current number of active children jobs.
+-   */
+-  get childCount(): number {
+-    return this._children.length
+-  }
+-
+-  /**
+-   * Creates and returns a new job with the current job as the parent.
+-   */
+-  launch<R>(func: JobFunc<R>): Job<R> {
+-    return new Job(func, { parent: this })
+-  }
+-
+-  /**
+-   * Creates a new job with the current job as the parent and executes it returning its result.
+-   *
+-   * Note: This should only be used inside of a [JobFunc].
+-   */
+-  launchAndRun<R>(func: JobFunc<R>): Promise<Outcome<R>> {
+-    return this.launch(func).run()
+-  }
+-
+-  /**
+-   * Execute the job and return its result.
+-   *
+-   * [run] handles all [JobCancellationException] and will return an [Error] if a cancellation occurs.
+-   */
+-  async run(): Promise<Outcome<T>> {
+-    try {
+-      this.ensureActive()
+-      const result = this._validateResult(
+-        await Promise.race([this._func(this), this._cancelPromise])
+-      )
+-      this.ensureActive()
+-      this._isCompleted = true
+-      return result
+-    } catch (e) {
+-      if (e instanceof JobCancellationException) {
+-        return Outcome.error(e)
+-      } else {
+-        this.cancel(
+-          new JobCancellationException(JobCancellationReason.JobCancelled)
+-        )
+-        throw e
+-      }
+-    } finally {
+-      this._parent?._removeChild(this)
+-    }
+-  }
+-
+-  /**
+-   * Executes the job and cancels the job if it takes longer than the timeout to complete/cancel.
+-   */
+-  async runWithTimeout(milliseconds: number): Promise<Outcome<T>> {
+-    setTimeout(() => this.cancel(), milliseconds)
+-    return this.run()
+-  }
+-
+-  private _validateResult(result: Outcome<T>): Outcome<T> {
+-    if (result.isError() && result.error instanceof JobCancellationException)
+-      throw result.error
+-    return result
+-  }
+-
+-  /**
+-   * Await a given [func] and ensures the job is active before and after [func] execution. This effectively
+-   * creates a pause/suspend point for the job and prevents returning a result or performing an action on a result
+-   * if the job has been completed/cancelled.
+-   *
+-   * Note: This should only be used inside of a [JobFunc].
+-   */
+-  async pause<R>(func: Promise<R>): Promise<R> {
+-    this.ensureActive()
+-    const result = await func
+-    this.ensureActive()
+-    return result
+-  }
+-
+-  /**
+-   * Delays a job for the specified amount of time and checks for cancellation before and after the delay.
+-   */
+-  async delay(milliseconds: number): Promise<void> {
+-    return await this.pause(
+-      new Promise((resolve) => setTimeout(resolve, milliseconds))
+-    )
+-  }
+-
+-  /**
+-   * Cancels the current job and all children jobs.
+-   */
+-  cancel(reason?: JobCancellationException) {
+-    this._parent?._removeChild(this)
+-    this.cancelChildren(
+-      new JobCancellationException(JobCancellationReason.ParentJobCancelled)
+-    )
+-
+-    if (this._isCancelled || this._isCompleted) return
+-    this._isCancelled = true
+-    this._cancelResolver(
+-      Outcome.error(
+-        reason ??
+-          new JobCancellationException(JobCancellationReason.JobCancelled)
+-      )
+-    )
+-  }
+-
+-  /**
+-   * Cancels all children jobs without cancelling the current job.
+-   */
+-  cancelChildren(
+-    reason?: JobCancellationException,
+-    skipChildren: JobHandle[] = []
+-  ) {
+-    const childrenCopy = [...this._children]
+-    const skipSet = new Set(skipChildren)
+-    const remainingChildren: typeof this._children = []
+-    childrenCopy.forEach((job) => {
+-      if (skipSet.has(job)) {
+-        remainingChildren.push(job)
+-      } else {
+-        job.cancel(
+-          reason ??
+-            new JobCancellationException(JobCancellationReason.JobCancelled)
+-        )
+-      }
+-    })
+-    this._children = remainingChildren
+-  }
+-
+-  private _addChild(child: Job<any>) {
+-    if (this.isActive) this._children.push(child)
+-  }
+-
+-  private _removeChild(child: Job<any>) {
+-    this._children.splice(this._children.indexOf(child), 1)
+-  }
+-}
+-
+-/**
+- * A helper extension of [Job] that never completes until it is cancelled. This effectively provides a long-running
+- * context to launch children jobs in.
+- */
+-export class SupervisorJob extends Job<void> {
+-  constructor(parent?: Job<any>) {
+-    super(() => new Promise<Outcome<void>>(() => {}), { parent: parent })
+-  }
+-}
+diff --git a/packages/action-listener-middleware/src/outcome.ts b/packages/action-listener-middleware/src/outcome.ts
+deleted file mode 100644
+index d2e017a0..00000000
+--- a/packages/action-listener-middleware/src/outcome.ts
++++ /dev/null
+@@ -1,58 +0,0 @@
+-// Source: https://github.com/ethossoftworks/outcome-ts
+-
+-const outcomeSymbol = Symbol()
+-
+-export class Ok<T> {
+-  private outcomeSymbol = outcomeSymbol
+-
+-  constructor(public value: T) {}
+-
+-  isError(): this is Error<T> {
+-    return false
+-  }
+-
+-  isOk(): this is Ok<T> {
+-    return true
+-  }
+-}
+-
+-export class Error<E = unknown> {
+-  private outcomeSymbol = outcomeSymbol
+-
+-  constructor(public error: E) {}
+-
+-  isError(): this is Error {
+-    return true
+-  }
+-
+-  isOk(): this is Ok<any> {
+-    return false
+-  }
+-}
+-
+-export const Outcome = {
+-  ok: <T>(value: T) => new Ok(value),
+-  error: <E>(error: E) => new Error(error),
+-
+-  wrap: async <T>(promise: Promise<T>): Promise<Outcome<T>> => {
+-    try {
+-      return new Ok(await promise)
+-    } catch (e) {
+-      return new Error(e)
+-    }
+-  },
+-
+-  try: async <T>(block: () => Promise<T>): Promise<Outcome<T>> => {
+-    try {
+-      return new Ok(await block())
+-    } catch (e) {
+-      return new Error(e)
+-    }
+-  },
+-
+-  isOutcome: (other: any): other is Outcome<any> => {
+-    return other !== undefined && other.outcomeSymbol === outcomeSymbol
+-  },
+-}
+-
+-export type Outcome<T, E = unknown> = Ok<T> | Error<E>
+diff --git a/packages/action-listener-middleware/src/tests/effectScenarios.test.ts b/packages/action-listener-middleware/src/tests/effectScenarios.test.ts
+deleted file mode 100644
+index e3096735..00000000
+--- a/packages/action-listener-middleware/src/tests/effectScenarios.test.ts
++++ /dev/null
+@@ -1,382 +0,0 @@
+-import {
+-  configureStore,
+-  createAction,
+-  createSlice,
+-  isAnyOf,
+-} from '@reduxjs/toolkit'
+-
+-import type { AnyAction, PayloadAction, Action } from '@reduxjs/toolkit'
+-
+-import {
+-  createActionListenerMiddleware,
+-  createListenerEntry,
+-  addListenerAction,
+-  removeListenerAction,
+-} from '../index'
+-
+-import type {
+-  When,
+-  ActionListenerMiddlewareAPI,
+-  TypedAddListenerAction,
+-  TypedAddListener,
+-  Unsubscribe,
+-} from '../index'
+-import { JobCancellationException } from '../job'
+-import { Outcome } from '../outcome'
+-
+-describe('Saga-style Effects Scenarios', () => {
+-  interface CounterState {
+-    value: number
+-  }
+-
+-  const counterSlice = createSlice({
+-    name: 'counter',
+-    initialState: { value: 0 } as CounterState,
+-    reducers: {
+-      increment(state) {
+-        state.value += 1
+-      },
+-      decrement(state) {
+-        state.value -= 1
+-      },
+-      // Use the PayloadAction type to declare the contents of `action.payload`
+-      incrementByAmount: (state, action: PayloadAction<number>) => {
+-        state.value += action.payload
+-      },
+-    },
+-  })
+-  const { increment, decrement, incrementByAmount } = counterSlice.actions
+-
+-  let { reducer } = counterSlice
+-  let middleware: ReturnType<typeof createActionListenerMiddleware>
+-
+-  let store = configureStore({
+-    reducer,
+-    middleware: (gDM) => gDM().prepend(createActionListenerMiddleware()),
+-  })
+-  // let middleware: ActionListenerMiddleware<CounterState> //: ReturnType<typeof createActionListenerMiddleware>
+-
+-  const testAction1 = createAction<string>('testAction1')
+-  type TestAction1 = ReturnType<typeof testAction1>
+-  const testAction2 = createAction<string>('testAction2')
+-  type TestAction2 = ReturnType<typeof testAction2>
+-  const testAction3 = createAction<string>('testAction3')
+-  type TestAction3 = ReturnType<typeof testAction3>
+-
+-  type RootState = ReturnType<typeof store.getState>
+-
+-  let addListener: TypedAddListener<RootState>
+-
+-  function delay(ms: number) {
+-    return new Promise((resolve) => setTimeout(resolve, ms))
+-  }
+-
+-  beforeAll(() => {
+-    const noop = () => {}
+-    jest.spyOn(console, 'error').mockImplementation(noop)
+-  })
+-
+-  beforeEach(() => {
+-    middleware = createActionListenerMiddleware()
+-    addListener = middleware.addListener as TypedAddListener<RootState>
+-    store = configureStore({
+-      reducer,
+-      middleware: (gDM) => gDM().prepend(middleware),
+-    })
+-  })
+-
+-  test('throttle', async () => {
+-    // Ignore incoming actions for a given period of time while processing a task.
+-    // Ref: https://redux-saga.js.org/docs/api#throttlems-pattern-saga-args
+-
+-    let listenerCalls = 0
+-    let workPerformed = 0
+-
+-    addListener({
+-      actionCreator: increment,
+-      listener: (action, listenerApi) => {
+-        listenerCalls++
+-
+-        // Stop listening until further notice
+-        listenerApi.unsubscribe()
+-
+-        // Queue to start listening again after a delay
+-        setTimeout(listenerApi.subscribe, 15)
+-        workPerformed++
+-      },
+-    })
+-
+-    // Dispatch 3 actions. First triggers listener, next two ignored.
+-    store.dispatch(increment())
+-    store.dispatch(increment())
+-    store.dispatch(increment())
+-
+-    // Wait for resubscription
+-    await delay(25)
+-
+-    // Dispatch 2 more actions, first triggers, second ignored
+-    store.dispatch(increment())
+-    store.dispatch(increment())
+-
+-    // Wait for work
+-    await delay(5)
+-
+-    // Both listener calls completed
+-    expect(listenerCalls).toBe(2)
+-    expect(workPerformed).toBe(2)
+-  })
+-
+-  test('debounce / takeLatest', async () => {
+-    // Repeated calls cancel previous ones, no work performed
+-    // until the specified delay elapses without another call
+-    // NOTE: This is also basically identical to `takeLatest`.
+-    // Ref: https://redux-saga.js.org/docs/api#debouncems-pattern-saga-args
+-    // Ref: https://redux-saga.js.org/docs/api#takelatestpattern-saga-args
+-
+-    let listenerCalls = 0
+-    let workPerformed = 0
+-
+-    addListener({
+-      actionCreator: increment,
+-      listener: async (action, listenerApi) => {
+-        listenerCalls++
+-
+-        // Cancel any in-progress instances of this listener
+-        listenerApi.cancelPrevious()
+-
+-        // Delay before starting actual work
+-        await listenerApi.job.delay(15)
+-
+-        workPerformed++
+-      },
+-    })
+-
+-    // First action, listener 1 starts, nothing to cancel
+-    store.dispatch(increment())
+-    // Second action, listener 2 starts, cancels 1
+-    store.dispatch(increment())
+-    // Third action, listener 3 starts, cancels 2
+-    store.dispatch(increment())
+-
+-    // 3 listeners started, third is still paused
+-    expect(listenerCalls).toBe(3)
+-    expect(workPerformed).toBe(0)
+-
+-    await delay(25)
+-
+-    // All 3 started
+-    expect(listenerCalls).toBe(3)
+-    // First two canceled, `delay()` threw JobCanceled and skipped work.
+-    // Third actually completed.
+-    expect(workPerformed).toBe(1)
+-  })
+-
+-  test('takeEvery', async () => {
+-    // Runs the listener on every action match
+-    // Ref: https://redux-saga.js.org/docs/api#takeeverypattern-saga-args
+-
+-    // NOTE: This is already the default behavior - nothing special here!
+-
+-    let listenerCalls = 0
+-    addListener({
+-      actionCreator: increment,
+-      listener: (action, listenerApi) => {
+-        listenerCalls++
+-      },
+-    })
+-
+-    store.dispatch(increment())
+-    expect(listenerCalls).toBe(1)
+-
+-    store.dispatch(increment())
+-    expect(listenerCalls).toBe(2)
+-  })
+-
+-  test('takeLeading', async () => {
+-    // Starts listener on first action, ignores others until task completes
+-    // Ref: https://redux-saga.js.org/docs/api#takeleadingpattern-saga-args
+-
+-    let listenerCalls = 0
+-    let workPerformed = 0
+-
+-    addListener({
+-      actionCreator: increment,
+-      listener: async (action, listenerApi) => {
+-        listenerCalls++
+-
+-        // Stop listening for this action
+-        listenerApi.unsubscribe()
+-
+-        // Pretend we're doing expensive work
+-        await listenerApi.job.delay(15)
+-
+-        workPerformed++
+-
+-        // Re-enable the listener
+-        listenerApi.subscribe()
+-      },
+-    })
+-
+-    // First action starts the listener, which unsubscribes
+-    store.dispatch(increment())
+-    // Second action is ignored
+-    store.dispatch(increment())
+-
+-    // One instance in progress, but not complete
+-    expect(listenerCalls).toBe(1)
+-    expect(workPerformed).toBe(0)
+-
+-    await delay(5)
+-
+-    // In-progress listener not done yet
+-    store.dispatch(increment())
+-
+-    // No changes in status
+-    expect(listenerCalls).toBe(1)
+-    expect(workPerformed).toBe(0)
+-
+-    await delay(20)
+-
+-    // Work finished, should have resubscribed
+-    expect(workPerformed).toBe(1)
+-
+-    // Listener is re-subscribed, will trigger again
+-    store.dispatch(increment())
+-
+-    expect(listenerCalls).toBe(2)
+-    expect(workPerformed).toBe(1)
+-
+-    await delay(20)
+-
+-    expect(workPerformed).toBe(2)
+-  })
+-
+-  test('fork + join', async () => {
+-    // fork starts a child job, join waits for the child to complete and return a value
+-    // Ref: https://redux-saga.js.org/docs/api#forkfn-args
+-    // Ref: https://redux-saga.js.org/docs/api#jointask
+-
+-    let childResult = 0
+-
+-    addListener({
+-      actionCreator: increment,
+-      listener: async (action, listenerApi) => {
+-        // Spawn a child job and start it immediately
+-        const childJobPromise = listenerApi.job.launchAndRun(
+-          async (jobHandle) => {
+-            // Artificially wait a bit inside the child
+-            await jobHandle.delay(5)
+-            // Complete the child by returning an Outcome-wrapped value
+-            return Outcome.ok(42)
+-          }
+-        )
+-
+-        const result = await childJobPromise
+-        // Unwrap the child result in the listener
+-        if (result.isOk()) {
+-          childResult = result.value
+-        }
+-      },
+-    })
+-
+-    store.dispatch(increment())
+-
+-    await delay(10)
+-    expect(childResult).toBe(42)
+-  })
+-
+-  test('fork + cancel', async () => {
+-    // fork starts a child job, cancel will raise an exception if the
+-    // child is paused in the middle of an effect
+-    // Ref: https://redux-saga.js.org/docs/api#forkfn-args
+-
+-    let childResult = 0
+-    let listenerCompleted = false
+-
+-    addListener({
+-      actionCreator: increment,
+-      listener: async (action, listenerApi) => {
+-        // Spawn a child job and start it immediately
+-        const childJob = listenerApi.job.launch(async (jobHandle) => {
+-          // Artificially wait a bit inside the child
+-          await jobHandle.delay(15)
+-          // Complete the child by returning an Outcome-wrapped value
+-          childResult = 42
+-
+-          return Outcome.ok(0)
+-        })
+-
+-        childJob.run()
+-        await listenerApi.job.delay(5)
+-        childJob.cancel()
+-        listenerCompleted = true
+-      },
+-    })
+-
+-    // Starts listener, which starts child
+-    store.dispatch(increment())
+-
+-    // Wait for child to have maybe completed
+-    await delay(20)
+-
+-    // Listener finished, but the child was canceled and threw an exception, so it never finished
+-    expect(listenerCompleted).toBe(true)
+-    expect(childResult).toBe(0)
+-  })
+-
+-  test('canceled', async () => {
+-    // canceled allows checking if the current task was canceled
+-    // Ref: https://redux-saga.js.org/docs/api#cancelled
+-
+-    let canceledAndCaught = false
+-    let canceledCheck = false
+-
+-    addListener({
+-      matcher: isAnyOf(increment, decrement, incrementByAmount),
+-      listener: async (action, listenerApi) => {
+-        if (increment.match(action)) {
+-          // Have this branch wait around to be canceled by the other
+-          try {
+-            await listenerApi.job.delay(10)
+-          } catch (err) {
+-            // Can check cancelation based on the exception and its reason
+-            if (err instanceof JobCancellationException) {
+-              canceledAndCaught = true
+-            }
+-          }
+-        } else if (incrementByAmount.match(action)) {
+-          // do a non-cancelation-aware wait
+-          await delay(15)
+-          // Or can check based on `job.isCancelled`
+-          if (listenerApi.job.isCancelled) {
+-            canceledCheck = true
+-          }
+-        } else if (decrement.match(action)) {
+-          listenerApi.cancelPrevious()
+-        }
+-      },
+-    })
+-
+-    // Start first branch
+-    store.dispatch(increment())
+-    // Cancel first listener
+-    store.dispatch(decrement())
+-
+-    // Have to wait for the delay to resolve
+-    // TODO Can we make ``Job.delay()` be a race?
+-    await delay(15)
+-
+-    expect(canceledAndCaught).toBe(true)
+-
+-    // Start second branch
+-    store.dispatch(incrementByAmount(42))
+-    // Cancel second listener, although it won't know about that until later
+-    store.dispatch(decrement())
+-
+-    expect(canceledCheck).toBe(false)
+-
+-    await delay(20)
+-
+-    expect(canceledCheck).toBe(true)
+-  })
+-})
+diff --git a/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts b/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
+index 195d24e5..aa951cbd 100644
+--- a/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
++++ b/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
+@@ -21,7 +21,6 @@ import type {
+   TypedAddListener,
+   Unsubscribe,
+ } from '../index'
+-import { JobCancellationException } from '../job'
+ 
+ const middlewareApi = {
+   getState: expect.any(Function),
+@@ -33,8 +32,6 @@ const middlewareApi = {
+   currentPhase: expect.stringMatching(/beforeReducer|afterReducer/),
+   unsubscribe: expect.any(Function),
+   subscribe: expect.any(Function),
+-  cancelPrevious: expect.any(Function),
+-  job: expect.any(Object),
+ }
+ 
+ const noop = () => {}
+@@ -94,16 +91,13 @@ describe('createActionListenerMiddleware', () => {
+       increment(state) {
+         state.value += 1
+       },
+-      decrement(state) {
+-        state.value -= 1
+-      },
+       // Use the PayloadAction type to declare the contents of `action.payload`
+       incrementByAmount: (state, action: PayloadAction<number>) => {
+         state.value += action.payload
+       },
+     },
+   })
+-  const { increment, decrement, incrementByAmount } = counterSlice.actions
++  const { increment, incrementByAmount } = counterSlice.actions
+ 
+   function delay(ms: number) {
+     return new Promise((resolve) => setTimeout(resolve, ms))
+@@ -133,762 +127,709 @@ describe('createActionListenerMiddleware', () => {
+     })
+   })
+ 
+-  describe('Middleware setup', () => {
+-    test('Allows passing an extra argument on middleware creation', () => {
+-      const originalExtra = 42
+-      middleware = createActionListenerMiddleware({
+-        extra: originalExtra,
+-      })
+-      reducer = jest.fn(() => ({}))
+-      store = configureStore({
+-        reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
+-
+-      let foundExtra = null
+-
+-      middleware.addListener({
+-        matcher: (action: AnyAction): action is AnyAction => true,
+-        listener: (action, listenerApi) => {
+-          foundExtra = listenerApi.extra
+-        },
+-      })
+-
+-      store.dispatch(testAction1('a'))
+-      expect(foundExtra).toBe(originalExtra)
++  test('Allows passing an extra argument on middleware creation', () => {
++    const originalExtra = 42
++    middleware = createActionListenerMiddleware({
++      extra: originalExtra,
+     })
+-
+-    test('Passes through if there are no listeners', () => {
+-      const originalAction = testAction1('a')
+-      const resultAction = store.dispatch(originalAction)
+-      expect(resultAction).toBe(originalAction)
++    reducer = jest.fn(() => ({}))
++    store = configureStore({
++      reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
+     })
+-  })
+-
+-  describe('Subscription and unsubscription', () => {
+-    test('directly subscribing', () => {
+-      const listener = jest.fn((_: TestAction1) => {})
+-
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener: listener,
+-      })
+ 
+-      store.dispatch(testAction1('a'))
+-      store.dispatch(testAction2('b'))
+-      store.dispatch(testAction1('c'))
++    let foundExtra = null
+ 
+-      expect(listener.mock.calls).toEqual([
+-        [testAction1('a'), middlewareApi],
+-        [testAction1('c'), middlewareApi],
+-      ])
++    middleware.addListener({
++      matcher: (action: AnyAction): action is AnyAction => true,
++      listener: (action, listenerApi) => {
++        foundExtra = listenerApi.extra
++      },
+     })
+ 
+-    test('can subscribe with a string action type', () => {
+-      const listener = jest.fn((_: AnyAction) => {})
+-
+-      store.dispatch(
+-        addListenerAction({
+-          type: testAction2.type,
+-          listener,
+-        })
+-      )
++    store.dispatch(testAction1('a'))
++    expect(foundExtra).toBe(originalExtra)
++  })
+ 
+-      store.dispatch(testAction2('b'))
+-      expect(listener.mock.calls).toEqual([[testAction2('b'), middlewareApi]])
++  test('Passes through if there are no listeners', () => {
++    const originalAction = testAction1('a')
++    const resultAction = store.dispatch(originalAction)
++    expect(resultAction).toBe(originalAction)
++  })
+ 
+-      store.dispatch(removeListenerAction(testAction2.type, listener))
++  test('directly subscribing', () => {
++    const listener = jest.fn((_: TestAction1) => {})
+ 
+-      store.dispatch(testAction2('b'))
+-      expect(listener.mock.calls).toEqual([[testAction2('b'), middlewareApi]])
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener: listener,
+     })
+ 
+-    test('can subscribe with a matcher function', () => {
+-      const listener = jest.fn((_: AnyAction) => {})
+-
+-      const isAction1Or2 = isAnyOf(testAction1, testAction2)
+-
+-      const unsubscribe = middleware.addListener({
+-        matcher: isAction1Or2,
+-        listener: listener,
+-      })
+-
+-      store.dispatch(testAction1('a'))
+-      store.dispatch(testAction2('b'))
+-      store.dispatch(testAction3('c'))
+-      expect(listener.mock.calls).toEqual([
+-        [testAction1('a'), middlewareApi],
+-        [testAction2('b'), middlewareApi],
+-      ])
++    store.dispatch(testAction1('a'))
++    store.dispatch(testAction2('b'))
++    store.dispatch(testAction1('c'))
+ 
+-      unsubscribe()
++    expect(listener.mock.calls).toEqual([
++      [testAction1('a'), middlewareApi],
++      [testAction1('c'), middlewareApi],
++    ])
++  })
+ 
+-      store.dispatch(testAction2('b'))
+-      expect(listener.mock.calls).toEqual([
+-        [testAction1('a'), middlewareApi],
+-        [testAction2('b'), middlewareApi],
+-      ])
+-    })
++  test('can subscribe with a string action type', () => {
++    const listener = jest.fn((_: AnyAction) => {})
+ 
+-    test('Can subscribe with an action predicate function', () => {
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
++    store.dispatch(
++      addListenerAction({
++        type: testAction2.type,
++        listener,
+       })
++    )
+ 
+-      let listener1Calls = 0
++    store.dispatch(testAction2('b'))
++    expect(listener.mock.calls).toEqual([[testAction2('b'), middlewareApi]])
+ 
+-      middleware.addListener({
+-        predicate: (action, state, previousState) => {
+-          return (state as CounterState).value > 1
+-        },
+-        listener: (action, listenerApi) => {
+-          listener1Calls++
+-        },
+-      })
++    store.dispatch(removeListenerAction(testAction2.type, listener))
+ 
+-      let listener2Calls = 0
++    store.dispatch(testAction2('b'))
++    expect(listener.mock.calls).toEqual([[testAction2('b'), middlewareApi]])
++  })
+ 
+-      middleware.addListener({
+-        predicate: (action, state, prevState) => {
+-          return (
+-            (state as CounterState).value > 1 &&
+-            (prevState as CounterState).value % 2 === 0
+-          )
+-        },
+-        listener: (action, listenerApi) => {
+-          listener2Calls++
+-        },
+-      })
++  test('can subscribe with a matcher function', () => {
++    const listener = jest.fn((_: AnyAction) => {})
+ 
+-      store.dispatch(increment())
+-      store.dispatch(increment())
+-      store.dispatch(increment())
+-      store.dispatch(increment())
++    const isAction1Or2 = isAnyOf(testAction1, testAction2)
+ 
+-      expect(listener1Calls).toBe(3)
+-      expect(listener2Calls).toBe(1)
++    const unsubscribe = middleware.addListener({
++      matcher: isAction1Or2,
++      listener: listener,
+     })
+ 
+-    test('subscribing with the same listener will not make it trigger twice (like EventTarget.addEventListener())', () => {
+-      const listener = jest.fn((_: TestAction1) => {})
++    store.dispatch(testAction1('a'))
++    store.dispatch(testAction2('b'))
++    store.dispatch(testAction3('c'))
++    expect(listener.mock.calls).toEqual([
++      [testAction1('a'), middlewareApi],
++      [testAction2('b'), middlewareApi],
++    ])
++
++    unsubscribe()
++
++    store.dispatch(testAction2('b'))
++    expect(listener.mock.calls).toEqual([
++      [testAction1('a'), middlewareApi],
++      [testAction2('b'), middlewareApi],
++    ])
++  })
+ 
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener,
+-      })
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener,
+-      })
++  test('Can subscribe with an action predicate function', () => {
++    const store = configureStore({
++      reducer: counterSlice.reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
++    })
+ 
+-      store.dispatch(testAction1('a'))
+-      store.dispatch(testAction2('b'))
+-      store.dispatch(testAction1('c'))
++    let listener1Calls = 0
+ 
+-      expect(listener.mock.calls).toEqual([
+-        [testAction1('a'), middlewareApi],
+-        [testAction1('c'), middlewareApi],
+-      ])
++    middleware.addListener({
++      predicate: (action, state, previousState) => {
++        return (state as CounterState).value > 1
++      },
++      listener: (action, listenerApi) => {
++        listener1Calls++
++      },
+     })
+ 
+-    test('unsubscribing via callback', () => {
+-      const listener = jest.fn((_: TestAction1) => {})
++    let listener2Calls = 0
+ 
+-      const unsubscribe = middleware.addListener({
+-        actionCreator: testAction1,
+-        listener,
+-      })
++    middleware.addListener({
++      predicate: (action, state, prevState) => {
++        return (
++          (state as CounterState).value > 1 &&
++          (prevState as CounterState).value % 2 === 0
++        )
++      },
++      listener: (action, listenerApi) => {
++        listener2Calls++
++      },
++    })
+ 
+-      store.dispatch(testAction1('a'))
+-      unsubscribe()
+-      store.dispatch(testAction2('b'))
+-      store.dispatch(testAction1('c'))
++    store.dispatch(increment())
++    store.dispatch(increment())
++    store.dispatch(increment())
++    store.dispatch(increment())
+ 
+-      expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
+-    })
++    expect(listener1Calls).toBe(3)
++    expect(listener2Calls).toBe(1)
++  })
+ 
+-    test('directly unsubscribing', () => {
+-      const listener = jest.fn((_: TestAction1) => {})
++  test('subscribing with the same listener will not make it trigger twice (like EventTarget.addEventListener())', () => {
++    const listener = jest.fn((_: TestAction1) => {})
+ 
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener,
+-      })
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener,
++    })
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener,
++    })
+ 
+-      store.dispatch(testAction1('a'))
++    store.dispatch(testAction1('a'))
++    store.dispatch(testAction2('b'))
++    store.dispatch(testAction1('c'))
+ 
+-      middleware.removeListener(testAction1, listener)
+-      store.dispatch(testAction2('b'))
+-      store.dispatch(testAction1('c'))
++    expect(listener.mock.calls).toEqual([
++      [testAction1('a'), middlewareApi],
++      [testAction1('c'), middlewareApi],
++    ])
++  })
+ 
+-      expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
+-    })
++  test('unsubscribing via callback', () => {
++    const listener = jest.fn((_: TestAction1) => {})
+ 
+-    test('unsubscribing without any subscriptions does not trigger an error', () => {
+-      middleware.removeListener(testAction1, noop)
++    const unsubscribe = middleware.addListener({
++      actionCreator: testAction1,
++      listener,
+     })
+ 
+-    test('subscribing via action', () => {
+-      const listener = jest.fn((_: TestAction1) => {})
++    store.dispatch(testAction1('a'))
++    unsubscribe()
++    store.dispatch(testAction2('b'))
++    store.dispatch(testAction1('c'))
+ 
+-      store.dispatch(
+-        addListenerAction({
+-          actionCreator: testAction1,
+-          listener,
+-        })
+-      )
++    expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
++  })
+ 
+-      store.dispatch(testAction1('a'))
+-      store.dispatch(testAction2('b'))
+-      store.dispatch(testAction1('c'))
++  test('directly unsubscribing', () => {
++    const listener = jest.fn((_: TestAction1) => {})
+ 
+-      expect(listener.mock.calls).toEqual([
+-        [testAction1('a'), middlewareApi],
+-        [testAction1('c'), middlewareApi],
+-      ])
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener,
+     })
+ 
+-    test('unsubscribing via callback from dispatch', () => {
+-      const listener = jest.fn((_: TestAction1) => {})
++    store.dispatch(testAction1('a'))
+ 
+-      const unsubscribe = store.dispatch(
+-        addListenerAction({
+-          actionCreator: testAction1,
+-          listener,
+-        })
+-      )
+-      // TODO Fix this type error - return type isn't getting picked up right
+-      // @ts-expect-error
+-      expectType<Unsubscribe>(unsubscribe)
++    middleware.removeListener(testAction1, listener)
++    store.dispatch(testAction2('b'))
++    store.dispatch(testAction1('c'))
+ 
+-      store.dispatch(testAction1('a'))
+-      // TODO This return type isn't correct
+-      // @ts-expect-error
+-      unsubscribe()
+-      store.dispatch(testAction2('b'))
+-      store.dispatch(testAction1('c'))
++    expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
++  })
+ 
+-      expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
+-    })
++  test('unsubscribing without any subscriptions does not trigger an error', () => {
++    middleware.removeListener(testAction1, noop)
++  })
+ 
+-    test('unsubscribing via action', () => {
+-      const listener = jest.fn((_: TestAction1) => {})
++  test('subscribing via action', () => {
++    const listener = jest.fn((_: TestAction1) => {})
+ 
+-      middleware.addListener({
++    store.dispatch(
++      addListenerAction({
+         actionCreator: testAction1,
+         listener,
+       })
++    )
+ 
+-      store.dispatch(testAction1('a'))
+-
+-      store.dispatch(removeListenerAction(testAction1, listener))
+-      store.dispatch(testAction2('b'))
+-      store.dispatch(testAction1('c'))
+-
+-      expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
+-    })
++    store.dispatch(testAction1('a'))
++    store.dispatch(testAction2('b'))
++    store.dispatch(testAction1('c'))
+ 
+-    const unforwardedActions: [string, AnyAction][] = [
+-      [
+-        'addListenerAction',
+-        addListenerAction({ actionCreator: testAction1, listener: noop }),
+-      ],
+-      ['removeListenerAction', removeListenerAction(testAction1, noop)],
+-    ]
+-    test.each(unforwardedActions)(
+-      '"%s" is not forwarded to the reducer',
+-      (_, action) => {
+-        reducer.mockClear()
+-
+-        store.dispatch(testAction1('a'))
+-        store.dispatch(action)
+-        store.dispatch(testAction2('b'))
+-
+-        expect(reducer.mock.calls).toEqual([
+-          [{}, testAction1('a')],
+-          [{}, testAction2('b')],
+-        ])
+-      }
+-    )
++    expect(listener.mock.calls).toEqual([
++      [testAction1('a'), middlewareApi],
++      [testAction1('c'), middlewareApi],
++    ])
++  })
+ 
+-    test('"can unsubscribe via middleware api', () => {
+-      const listener = jest.fn(
+-        (action: TestAction1, api: ActionListenerMiddlewareAPI<any, any>) => {
+-          if (action.payload === 'b') {
+-            api.unsubscribe()
+-          }
+-        }
+-      )
++  test('unsubscribing via callback from dispatch', () => {
++    const listener = jest.fn((_: TestAction1) => {})
+ 
+-      middleware.addListener({
++    const unsubscribe = store.dispatch(
++      addListenerAction({
+         actionCreator: testAction1,
+         listener,
+       })
++    )
++    // TODO Fix this type error - return type isn't getting picked up right
++    // @ts-expect-error
++    expectType<Unsubscribe>(unsubscribe)
++
++    store.dispatch(testAction1('a'))
++    // TODO This return type isn't correct
++    // @ts-expect-error
++    unsubscribe()
++    store.dispatch(testAction2('b'))
++    store.dispatch(testAction1('c'))
++
++    expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
++  })
+ 
+-      store.dispatch(testAction1('a'))
+-      store.dispatch(testAction1('b'))
+-      store.dispatch(testAction1('c'))
++  test('unsubscribing via action', () => {
++    const listener = jest.fn((_: TestAction1) => {})
+ 
+-      expect(listener.mock.calls).toEqual([
+-        [testAction1('a'), middlewareApi],
+-        [testAction1('b'), middlewareApi],
+-      ])
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener,
+     })
+ 
+-    test('Can re-subscribe via middleware api', async () => {
+-      let numListenerRuns = 0
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener: async (action, listenerApi) => {
+-          numListenerRuns++
+-
+-          listenerApi.unsubscribe()
++    store.dispatch(testAction1('a'))
+ 
+-          await listenerApi.condition(testAction2.match)
++    store.dispatch(removeListenerAction(testAction1, listener))
++    store.dispatch(testAction2('b'))
++    store.dispatch(testAction1('c'))
+ 
+-          listenerApi.subscribe()
+-        },
+-      })
++    expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
++  })
+ 
+-      store.dispatch(testAction1('a'))
+-      expect(numListenerRuns).toBe(1)
++  const unforwardedActions: [string, AnyAction][] = [
++    [
++      'addListenerAction',
++      addListenerAction({ actionCreator: testAction1, listener: noop }),
++    ],
++    ['removeListenerAction', removeListenerAction(testAction1, noop)],
++  ]
++  test.each(unforwardedActions)(
++    '"%s" is not forwarded to the reducer',
++    (_, action) => {
++      reducer.mockClear()
+ 
+       store.dispatch(testAction1('a'))
+-      expect(numListenerRuns).toBe(1)
+-
++      store.dispatch(action)
+       store.dispatch(testAction2('b'))
+-      expect(numListenerRuns).toBe(1)
+ 
+-      await delay(5)
++      expect(reducer.mock.calls).toEqual([
++        [{}, testAction1('a')],
++        [{}, testAction2('b')],
++      ])
++    }
++  )
++
++  test('"can unsubscribe via middleware api', () => {
++    const listener = jest.fn(
++      (action: TestAction1, api: ActionListenerMiddlewareAPI<any, any>) => {
++        if (action.payload === 'b') {
++          api.unsubscribe()
++        }
++      }
++    )
+ 
+-      store.dispatch(testAction1('b'))
+-      expect(numListenerRuns).toBe(2)
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener,
+     })
+-  })
+ 
+-  describe('Middleware phases and listener API', () => {
+-    const whenMap: [When, string, string, number][] = [
+-      [undefined, 'reducer', 'listener', 1],
+-      ['beforeReducer', 'listener', 'reducer', 1],
+-      ['afterReducer', 'reducer', 'listener', 1],
+-      ['both', 'reducer', 'listener', 2],
+-    ]
+-    test.each(whenMap)(
+-      'with "when" set to %s, %s runs before %s',
+-      (when, _, shouldRunLast, listenerCalls) => {
+-        let whoRanLast = ''
+-
+-        reducer.mockClear()
+-        reducer.mockImplementationOnce(() => {
+-          whoRanLast = 'reducer'
+-        })
+-        const listener = jest.fn(() => {
+-          whoRanLast = 'listener'
+-        })
++    store.dispatch(testAction1('a'))
++    store.dispatch(testAction1('b'))
++    store.dispatch(testAction1('c'))
+ 
+-        middleware.addListener({
+-          actionCreator: testAction1,
+-          listener,
+-          when,
+-        })
++    expect(listener.mock.calls).toEqual([
++      [testAction1('a'), middlewareApi],
++      [testAction1('b'), middlewareApi],
++    ])
++  })
+ 
+-        store.dispatch(testAction1('a'))
+-        expect(reducer).toHaveBeenCalledTimes(1)
+-        expect(listener).toHaveBeenCalledTimes(listenerCalls)
+-        expect(whoRanLast).toBe(shouldRunLast)
+-      }
+-    )
++  test('Can re-subscribe via middleware api', async () => {
++    let numListenerRuns = 0
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener: async (action, listenerApi) => {
++        numListenerRuns++
+ 
+-    test('Passes both getState and getOriginalState in the API', () => {
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
++        listenerApi.unsubscribe()
+ 
+-      let listener1Calls = 0
+-      middleware.addListener({
+-        actionCreator: increment,
+-        listener: (action, listenerApi) => {
+-          const stateBefore = listenerApi.getOriginalState() as CounterState
+-          const currentState = listenerApi.getOriginalState() as CounterState
++        await listenerApi.condition(testAction2.match)
+ 
+-          listener1Calls++
+-          // In the "before" phase, we pass the same state
+-          expect(currentState).toBe(stateBefore)
+-        },
+-        when: 'beforeReducer',
+-      })
++        listenerApi.subscribe()
++      },
++    })
+ 
+-      let listener2Calls = 0
+-      middleware.addListener({
+-        actionCreator: increment,
+-        listener: (action, listenerApi) => {
+-          // TODO getState functions aren't typed right here
+-          const stateBefore = listenerApi.getOriginalState() as CounterState
+-          const currentState = listenerApi.getOriginalState() as CounterState
++    store.dispatch(testAction1('a'))
++    expect(numListenerRuns).toBe(1)
+ 
+-          listener2Calls++
+-          // In the "after" phase, we pass the new state for `getState`, and still have original state too
+-          expect(currentState.value).toBe(stateBefore.value + 1)
+-        },
+-        when: 'afterReducer',
+-      })
++    store.dispatch(testAction1('a'))
++    expect(numListenerRuns).toBe(1)
+ 
+-      store.dispatch(increment())
++    store.dispatch(testAction2('b'))
++    expect(numListenerRuns).toBe(1)
+ 
+-      expect(listener1Calls).toBe(1)
+-      expect(listener2Calls).toBe(1)
+-    })
++    await delay(5)
+ 
+-    test('mixing "before" and "after"', () => {
+-      const calls: Function[] = []
+-      function before1() {
+-        calls.push(before1)
+-      }
+-      function before2() {
+-        calls.push(before2)
+-      }
+-      function after1() {
+-        calls.push(after1)
+-      }
+-      function after2() {
+-        calls.push(after2)
+-      }
++    store.dispatch(testAction1('b'))
++    expect(numListenerRuns).toBe(2)
++  })
+ 
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener: before1,
+-        when: 'beforeReducer',
+-      })
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener: before2,
+-        when: 'beforeReducer',
++  const whenMap: [When, string, string, number][] = [
++    [undefined, 'reducer', 'listener', 1],
++    ['beforeReducer', 'listener', 'reducer', 1],
++    ['afterReducer', 'reducer', 'listener', 1],
++    ['both', 'reducer', 'listener', 2],
++  ]
++  test.each(whenMap)(
++    'with "when" set to %s, %s runs before %s',
++    (when, _, shouldRunLast, listenerCalls) => {
++      let whoRanLast = ''
++
++      reducer.mockClear()
++      reducer.mockImplementationOnce(() => {
++        whoRanLast = 'reducer'
+       })
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener: after1,
+-        when: 'afterReducer',
++      const listener = jest.fn(() => {
++        whoRanLast = 'listener'
+       })
++
+       middleware.addListener({
+         actionCreator: testAction1,
+-        listener: after2,
+-        when: 'afterReducer',
++        listener,
++        when,
+       })
+ 
+       store.dispatch(testAction1('a'))
+-      store.dispatch(testAction2('a'))
++      expect(reducer).toHaveBeenCalledTimes(1)
++      expect(listener).toHaveBeenCalledTimes(listenerCalls)
++      expect(whoRanLast).toBe(shouldRunLast)
++    }
++  )
+ 
+-      expect(calls).toEqual([before1, before2, after1, after2])
++  test('Passes both getState and getOriginalState in the API', () => {
++    const store = configureStore({
++      reducer: counterSlice.reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
+     })
+ 
+-    test('by default, actions are forwarded to the store', () => {
+-      reducer.mockClear()
++    let listener1Calls = 0
++    middleware.addListener({
++      actionCreator: increment,
++      listener: (action, listenerApi) => {
++        const stateBefore = listenerApi.getOriginalState() as CounterState
++        const currentState = listenerApi.getOriginalState() as CounterState
+ 
+-      const listener = jest.fn((_: TestAction1) => {})
++        listener1Calls++
++        // In the "before" phase, we pass the same state
++        expect(currentState).toBe(stateBefore)
++      },
++      when: 'beforeReducer',
++    })
+ 
+-      middleware.addListener({
+-        actionCreator: testAction1,
+-        listener,
+-      })
++    let listener2Calls = 0
++    middleware.addListener({
++      actionCreator: increment,
++      listener: (action, listenerApi) => {
++        // TODO getState functions aren't typed right here
++        const stateBefore = listenerApi.getOriginalState() as CounterState
++        const currentState = listenerApi.getOriginalState() as CounterState
++
++        listener2Calls++
++        // In the "after" phase, we pass the new state for `getState`, and still have original state too
++        expect(currentState.value).toBe(stateBefore.value + 1)
++      },
++      when: 'afterReducer',
++    })
+ 
+-      store.dispatch(testAction1('a'))
++    store.dispatch(increment())
+ 
+-      expect(reducer.mock.calls).toEqual([[{}, testAction1('a')]])
+-    })
++    expect(listener1Calls).toBe(1)
++    expect(listener2Calls).toBe(1)
+   })
+ 
+-  describe('Error handling', () => {
+-    test('Continues running other listeners if one of them raises an error', () => {
+-      const matcher = (action: any): action is any => true
++  test('mixing "before" and "after"', () => {
++    const calls: Function[] = []
++    function before1() {
++      calls.push(before1)
++    }
++    function before2() {
++      calls.push(before2)
++    }
++    function after1() {
++      calls.push(after1)
++    }
++    function after2() {
++      calls.push(after2)
++    }
++
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener: before1,
++      when: 'beforeReducer',
++    })
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener: before2,
++      when: 'beforeReducer',
++    })
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener: after1,
++      when: 'afterReducer',
++    })
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener: after2,
++      when: 'afterReducer',
++    })
+ 
+-      middleware.addListener({
+-        matcher,
+-        listener: () => {
+-          throw new Error('Panic!')
+-        },
+-      })
++    store.dispatch(testAction1('a'))
++    store.dispatch(testAction2('a'))
+ 
+-      const listener = jest.fn(() => {})
+-      middleware.addListener({ matcher, listener })
++    expect(calls).toEqual([before1, before2, after1, after2])
++  })
+ 
+-      store.dispatch(testAction1('a'))
+-      expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
+-    })
++  test('by default, actions are forwarded to the store', () => {
++    reducer.mockClear()
+ 
+-    test('Continues running other listeners if a predicate raises an error', () => {
+-      const matcher = (action: any): action is any => true
+-      const firstListener = jest.fn(() => {})
+-      const secondListener = jest.fn(() => {})
++    const listener = jest.fn((_: TestAction1) => {})
+ 
+-      middleware.addListener({
+-        // @ts-expect-error
+-        matcher: (arg: unknown): arg is unknown => {
+-          throw new Error('Predicate Panic!')
+-        },
+-        listener: firstListener,
+-      })
++    middleware.addListener({
++      actionCreator: testAction1,
++      listener,
++    })
+ 
+-      middleware.addListener({ matcher, listener: secondListener })
++    store.dispatch(testAction1('a'))
+ 
+-      store.dispatch(testAction1('a'))
+-      expect(firstListener).not.toHaveBeenCalled()
+-      expect(secondListener.mock.calls).toEqual([
+-        [testAction1('a'), middlewareApi],
+-      ])
+-    })
++    expect(reducer.mock.calls).toEqual([[{}, testAction1('a')]])
++  })
+ 
+-    test('Notifies sync listener errors to `onError`, if provided', async () => {
+-      const onError = jest.fn()
+-      middleware = createActionListenerMiddleware({
+-        onError,
+-      })
+-      reducer = jest.fn(() => ({}))
+-      store = configureStore({
+-        reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
++  test('Continues running other listeners if one of them raises an error', () => {
++    const matcher = (action: any): action is any => true
+ 
+-      const listenerError = new Error('Boom!')
++    middleware.addListener({
++      matcher,
++      listener: () => {
++        throw new Error('Panic!')
++      },
++    })
+ 
+-      const matcher = (action: any): action is any => true
++    const listener = jest.fn(() => {})
++    middleware.addListener({ matcher, listener })
+ 
+-      middleware.addListener({
+-        matcher,
+-        listener: () => {
+-          throw listenerError
+-        },
+-      })
++    store.dispatch(testAction1('a'))
++    expect(listener.mock.calls).toEqual([[testAction1('a'), middlewareApi]])
++  })
+ 
+-      store.dispatch(testAction1('a'))
+-      await delay(100)
++  test('Continues running other listeners if a predicate raises an error', () => {
++    const matcher = (action: any): action is any => true
++    const firstListener = jest.fn(() => {})
++    const secondListener = jest.fn(() => {})
+ 
+-      expect(onError).toBeCalledWith(listenerError, {
+-        raisedBy: 'listener',
+-        phase: 'afterReducer',
+-      })
++    middleware.addListener({
++      // @ts-expect-error
++      matcher: (arg: unknown): arg is unknown => {
++        throw new Error('Predicate Panic!')
++      },
++      listener: firstListener,
+     })
+ 
+-    test('Notifies async listeners errors to `onError`, if provided', async () => {
+-      const onError = jest.fn()
+-      middleware = createActionListenerMiddleware({
+-        onError,
+-      })
+-      reducer = jest.fn(() => ({}))
+-      store = configureStore({
+-        reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
++    middleware.addListener({ matcher, listener: secondListener })
+ 
+-      const listenerError = new Error('Boom!')
+-      const matcher = (action: any): action is any => true
++    store.dispatch(testAction1('a'))
++    expect(firstListener).not.toHaveBeenCalled()
++    expect(secondListener.mock.calls).toEqual([
++      [testAction1('a'), middlewareApi],
++    ])
++  })
+ 
+-      middleware.addListener({
+-        matcher,
+-        listener: async () => {
+-          throw listenerError
+-        },
+-      })
++  test('Notifies sync listener errors to `onError`, if provided', () => {
++    const onError = jest.fn()
++    middleware = createActionListenerMiddleware({
++      onError,
++    })
++    reducer = jest.fn(() => ({}))
++    store = configureStore({
++      reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
++    })
+ 
+-      store.dispatch(testAction1('a'))
++    const listenerError = new Error('Boom!')
+ 
+-      await delay(100)
++    const matcher = (action: any): action is any => true
+ 
+-      expect(onError).toBeCalledWith(listenerError, {
+-        raisedBy: 'listener',
+-        phase: 'afterReducer',
+-      })
++    middleware.addListener({
++      matcher,
++      listener: () => {
++        throw listenerError
++      },
+     })
+-  })
+ 
+-  describe('take and condition methods', () => {
+-    test('take resolves to the tuple [A, CurrentState, PreviousState] when the predicate matches the action', (done) => {
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
++    store.dispatch(testAction1('a'))
++    expect(onError).toBeCalledWith(listenerError, {
++      async: false,
++      raisedBy: 'listener',
++      phase: 'afterReducer',
++    })
++  })
+ 
+-      middleware.addListener({
+-        predicate: incrementByAmount.match,
+-        listener: async (_, listenerApi) => {
+-          const stateBefore = listenerApi.getState()
+-          const result = await listenerApi.take(increment.match)
+-
+-          expect(result).toEqual([
+-            increment(),
+-            listenerApi.getState(),
+-            stateBefore,
+-          ])
+-          done()
+-        },
+-      })
+-      store.dispatch(incrementByAmount(1))
+-      store.dispatch(increment())
++  test('Notifies async listeners errors to `onError`, if provided', async () => {
++    const onError = jest.fn()
++    middleware = createActionListenerMiddleware({
++      onError,
++    })
++    reducer = jest.fn(() => ({}))
++    store = configureStore({
++      reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
+     })
+ 
+-    test('take resolves to null if the timeout expires', async () => {
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
++    const listenerError = new Error('Boom!')
++    const matcher = (action: any): action is any => true
++
++    middleware.addListener({
++      matcher,
++      listener: async () => {
++        throw listenerError
++      },
++    })
+ 
+-      let takeResult: any = undefined
++    store.dispatch(testAction1('a'))
+ 
+-      middleware.addListener({
+-        predicate: incrementByAmount.match,
+-        listener: async (_, listenerApi) => {
+-          takeResult = await listenerApi.take(increment.match, 15)
+-        },
+-      })
+-      store.dispatch(incrementByAmount(1))
+-      await delay(25)
++    await Promise.resolve()
+ 
+-      expect(takeResult).toBe(null)
++    expect(onError).toBeCalledWith(listenerError, {
++      async: true,
++      raisedBy: 'listener',
++      phase: 'afterReducer',
+     })
++  })
+ 
+-    test("take resolves to [A, CurrentState, PreviousState] if the timeout is provided but doesn't expires", async () => {
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
+-      let takeResult: any = undefined
+-      let stateBefore: any = undefined
+-      let stateCurrent: any = undefined
++  test('take resolves to the tuple [A, CurrentState, PreviousState] when the predicate matches the action', (done) => {
++    const store = configureStore({
++      reducer: counterSlice.reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
++    })
+ 
+-      middleware.addListener({
+-        predicate: incrementByAmount.match,
+-        listener: async (_, listenerApi) => {
+-          stateBefore = listenerApi.getState()
+-          takeResult = await listenerApi.take(increment.match, 50)
+-          stateCurrent = listenerApi.getState()
+-        },
+-      })
+-      store.dispatch(incrementByAmount(1))
+-      store.dispatch(increment())
++    middleware.addListener({
++      predicate: incrementByAmount.match,
++      listener: async (_, listenerApi) => {
++        const stateBefore = listenerApi.getState()
++        const result = await listenerApi.take(increment.match)
+ 
+-      await delay(25)
+-      expect(takeResult).toEqual([increment(), stateCurrent, stateBefore])
++        expect(result).toEqual([
++          increment(),
++          listenerApi.getState(),
++          stateBefore,
++        ])
++        done()
++      },
+     })
++    store.dispatch(incrementByAmount(1))
++    store.dispatch(increment())
++  })
+ 
+-    test('condition method resolves promise when the predicate succeeds', async () => {
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
++  test('take resolves to null if the timeout expires', async () => {
++    const store = configureStore({
++      reducer: counterSlice.reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
++    })
+ 
+-      let finalCount = 0
+-      let listenerStarted = false
++    middleware.addListener({
++      predicate: incrementByAmount.match,
++      listener: async (_, listenerApi) => {
++        const result = await listenerApi.take(increment.match, 50)
+ 
+-      middleware.addListener({
+-        predicate: (action, currentState) => {
+-          return (
+-            increment.match(action) &&
+-            (currentState as CounterState).value === 0
+-          )
+-        },
+-        listener: async (action, listenerApi) => {
+-          listenerStarted = true
+-          const result = await listenerApi.condition((action, currentState) => {
+-            return (currentState as CounterState).value === 3
+-          })
++        expect(result).toBe(null)
++      },
++    })
++    store.dispatch(incrementByAmount(1))
++    await delay(200)
++  })
+ 
+-          expect(result).toBe(true)
+-          const latestState = listenerApi.getState() as CounterState
+-          finalCount = latestState.value
+-        },
+-        when: 'beforeReducer',
+-      })
++  test("take resolves to [A, CurrentState, PreviousState] if the timeout is provided but doesn't expires", (done) => {
++    const store = configureStore({
++      reducer: counterSlice.reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
++    })
+ 
+-      store.dispatch(increment())
+-      expect(listenerStarted).toBe(true)
+-      await delay(25)
+-      store.dispatch(increment())
+-      store.dispatch(increment())
++    middleware.addListener({
++      predicate: incrementByAmount.match,
++      listener: async (_, listenerApi) => {
++        const stateBefore = listenerApi.getState()
++        const result = await listenerApi.take(increment.match, 50)
+ 
+-      await delay(25)
++        expect(result).toEqual([
++          increment(),
++          listenerApi.getState(),
++          stateBefore,
++        ])
++        done()
++      },
++    })
++    store.dispatch(incrementByAmount(1))
++    store.dispatch(increment())
++  })
+ 
+-      expect(finalCount).toBe(3)
++  test('condition method resolves promise when the predicate succeeds', async () => {
++    const store = configureStore({
++      reducer: counterSlice.reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
+     })
+ 
+-    test('condition method resolves promise when there is a timeout', async () => {
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
++    let finalCount = 0
++    let listenerStarted = false
+ 
+-      let finalCount = 0
+-      let listenerStarted = false
++    middleware.addListener({
++      predicate: (action, currentState) => {
++        return (
++          increment.match(action) && (currentState as CounterState).value === 0
++        )
++      },
++      listener: async (action, listenerApi) => {
++        listenerStarted = true
++        const result = await listenerApi.condition((action, currentState) => {
++          return (currentState as CounterState).value === 3
++        })
+ 
+-      middleware.addListener({
+-        predicate: (action, currentState) => {
+-          return (
+-            increment.match(action) &&
+-            (currentState as CounterState).value === 0
+-          )
+-        },
+-        listener: async (action, listenerApi) => {
+-          listenerStarted = true
+-          const result = await listenerApi.condition((action, currentState) => {
+-            return (currentState as CounterState).value === 3
+-          }, 25)
+-
+-          expect(result).toBe(false)
+-          const latestState = listenerApi.getState() as CounterState
+-          finalCount = latestState.value
+-        },
+-        when: 'beforeReducer',
+-      })
++        expect(result).toBe(true)
++        const latestState = listenerApi.getState() as CounterState
++        finalCount = latestState.value
++      },
++      when: 'beforeReducer',
++    })
++
++    store.dispatch(increment())
++    expect(listenerStarted).toBe(true)
++    await delay(50)
++    store.dispatch(increment())
++    store.dispatch(increment())
+ 
+-      store.dispatch(increment())
+-      expect(listenerStarted).toBe(true)
++    await delay(50)
+ 
+-      store.dispatch(increment())
++    expect(finalCount).toBe(3)
++  })
++
++  test('condition method resolves promise when there is a timeout', async () => {
++    const store = configureStore({
++      reducer: counterSlice.reducer,
++      middleware: (gDM) => gDM().prepend(middleware),
++    })
+ 
+-      await delay(50)
+-      store.dispatch(increment())
++    let finalCount = 0
++    let listenerStarted = false
+ 
+-      expect(finalCount).toBe(2)
++    middleware.addListener({
++      predicate: (action, currentState) => {
++        return (
++          increment.match(action) && (currentState as CounterState).value === 0
++        )
++      },
++      listener: async (action, listenerApi) => {
++        listenerStarted = true
++        const result = await listenerApi.condition((action, currentState) => {
++          return (currentState as CounterState).value === 3
++        }, 50)
++
++        expect(result).toBe(false)
++        const latestState = listenerApi.getState() as CounterState
++        finalCount = latestState.value
++      },
++      when: 'beforeReducer',
+     })
+-  })
+ 
+-  describe('Job API', () => {
+-    test('Allows canceling previous jobs', async () => {
+-      let jobsStarted = 0
+-      let jobsContinued = 0
+-      let jobsCanceled = 0
++    store.dispatch(increment())
++    expect(listenerStarted).toBe(true)
+ 
+-      middleware.addListener({
+-        actionCreator: increment,
+-        listener: async (action, listenerApi) => {
+-          jobsStarted++
+-
+-          if (jobsStarted < 3) {
+-            try {
+-              await listenerApi.condition(decrement.match)
+-              // Cancelation _should_ cause `condition()` to throw so we never
+-              // end up hitting this next line
+-              jobsContinued++
+-            } catch (err) {
+-              if (err instanceof JobCancellationException) {
+-                jobsCanceled++
+-              }
+-            }
+-          } else {
+-            listenerApi.cancelPrevious()
+-          }
+-        },
+-      })
++    store.dispatch(increment())
+ 
+-      store.dispatch(increment())
+-      store.dispatch(increment())
+-      store.dispatch(increment())
++    await delay(150)
++    store.dispatch(increment())
+ 
+-      await delay(10)
+-      expect(jobsStarted).toBe(3)
+-      expect(jobsContinued).toBe(0)
+-      expect(jobsCanceled).toBe(2)
+-    })
++    expect(finalCount).toBe(2)
+   })
+ 
+   describe('Type tests', () => {
+diff --git a/packages/action-listener-middleware/src/types.ts b/packages/action-listener-middleware/src/types.ts
+index dfe62c20..ccb42183 100644
+--- a/packages/action-listener-middleware/src/types.ts
++++ b/packages/action-listener-middleware/src/types.ts
+@@ -8,8 +8,6 @@ import type {
+   ThunkDispatch,
+ } from '@reduxjs/toolkit'
+ 
+-import type { JobHandle, Job } from './job'
+-
+ /**
+  * Types copied from RTK
+  */
+@@ -73,8 +71,6 @@ export interface ActionListenerMiddlewareAPI<S, D extends Dispatch<AnyAction>>
+   subscribe(): void
+   condition: ConditionFunction<S>
+   take: TakePattern<S>
+-  cancelPrevious: () => void
+-  job: JobHandle
+   currentPhase: MiddlewarePhase
+   // TODO Figure out how to pass this through the other types correctly
+   extra: unknown
+@@ -100,7 +96,6 @@ export interface ActionListenerOptions {
+    * Defaults to 'before'.
+    */
+   when?: When
+-  parentJob?: JobHandle
+ }
+ 
+ export interface CreateListenerMiddlewareOptions<ExtraArgument = unknown> {
+@@ -287,7 +282,6 @@ export type ListenerEntry<
+   unsubscribe: () => void
+   type?: string
+   predicate: ListenerPredicate<AnyAction, S>
+-  parentJob: JobHandle
+ }
+ 
+ const declaredMiddlewareType: unique symbol = undefined as any
+@@ -328,6 +322,7 @@ export type ListenerPredicateGuardedActionType<T> = T extends ListenerPredicate<
+  * Additional infos regarding the error raised.
+  */
+ export interface ListenerErrorInfo {
++  async: boolean
+   /**
+    * Which function has generated the exception.
+    */

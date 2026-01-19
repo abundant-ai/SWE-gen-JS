@@ -1,0 +1,134 @@
+diff --git a/.changeset/brave-llamas-hammer.md b/.changeset/brave-llamas-hammer.md
+new file mode 100644
+index 0000000000..188c6aa498
+--- /dev/null
++++ b/.changeset/brave-llamas-hammer.md
+@@ -0,0 +1,9 @@
++---
++'xstate': patch
++---
++
++State IDs that have periods in them are now supported if those periods are escaped.
++
++The motivation is that external tools, such as [Stately Studio](https://stately.ai/studio), may allow users to enter any text into the state ID field. This change allows those tools to escape periods in state IDs, so that they don't conflict with the internal path-based state IDs.
++
++E.g. if a state ID of `"Loading..."` is entered into the state ID field, instead of crashing either the external tool and/or the XState state machine, it should be converted by the tool to `"Loading\\.\\.\\."`, and those periods will be ignored by XState.
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 28b3531c94..3ceaa78350 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -1,6 +1,5 @@
+ import isDevelopment from '#is-development';
+ import { assign } from './actions.ts';
+-import { STATE_DELIMITER } from './constants.ts';
+ import { $$ACTOR_TYPE, createActor } from './createActor.ts';
+ import { createInitEvent } from './eventUtils.ts';
+ import {
+@@ -49,7 +48,7 @@ import type {
+   TODO,
+   TransitionDefinition
+ } from './types.ts';
+-import { resolveReferencedActor } from './utils.ts';
++import { resolveReferencedActor, toStatePath } from './utils.ts';
+ 
+ export const STATE_IDENTIFIER = '#';
+ export const WILDCARD = '*';
+@@ -401,7 +400,7 @@ export class StateMachine<
+   }
+ 
+   public getStateNodeById(stateId: string): StateNode<TContext, TEvent> {
+-    const fullPath = stateId.split(STATE_DELIMITER);
++    const fullPath = toStatePath(stateId);
+     const relativePath = fullPath.slice(1);
+     const resolvedStateId = isStateId(fullPath[0])
+       ? fullPath[0].slice(STATE_IDENTIFIER.length)
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 5360a1da34..a97563d6f0 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -216,24 +216,24 @@ export function getCandidates<TEvent extends EventObject>(
+   const candidates =
+     stateNode.transitions.get(receivedEventType) ||
+     [...stateNode.transitions.keys()]
+-      .filter((descriptor) => {
++      .filter((eventDescriptor) => {
+         // check if transition is a wildcard transition,
+         // which matches any non-transient events
+-        if (descriptor === WILDCARD) {
++        if (eventDescriptor === WILDCARD) {
+           return true;
+         }
+ 
+-        if (!descriptor.endsWith('.*')) {
++        if (!eventDescriptor.endsWith('.*')) {
+           return false;
+         }
+ 
+-        if (isDevelopment && /.*\*.+/.test(descriptor)) {
++        if (isDevelopment && /.*\*.+/.test(eventDescriptor)) {
+           console.warn(
+-            `Wildcards can only be the last token of an event descriptor (e.g., "event.*") or the entire event descriptor ("*"). Check the "${descriptor}" event.`
++            `Wildcards can only be the last token of an event descriptor (e.g., "event.*") or the entire event descriptor ("*"). Check the "${eventDescriptor}" event.`
+           );
+         }
+ 
+-        const partialEventTokens = descriptor.split('.');
++        const partialEventTokens = eventDescriptor.split('.');
+         const eventTokens = receivedEventType.split('.');
+ 
+         for (
+@@ -249,7 +249,7 @@ export function getCandidates<TEvent extends EventObject>(
+ 
+             if (isDevelopment && !isLastToken) {
+               console.warn(
+-                `Infix wildcards in transition events are not allowed. Check the "${descriptor}" transition.`
++                `Infix wildcards in transition events are not allowed. Check the "${eventDescriptor}" transition.`
+               );
+             }
+ 
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index f1ee0a0d2a..d30acabfd2 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -1,7 +1,7 @@
+ import isDevelopment from '#is-development';
+ import { isMachineSnapshot } from './State.ts';
+ import type { StateNode } from './StateNode.ts';
+-import { STATE_DELIMITER, TARGETLESS_KEY } from './constants.ts';
++import { TARGETLESS_KEY } from './constants.ts';
+ import type {
+   ActorLogic,
+   AnyActorRef,
+@@ -56,7 +56,31 @@ export function toStatePath(stateId: string | string[]): string[] {
+     return stateId;
+   }
+ 
+-  return stateId.split(STATE_DELIMITER);
++  let result: string[] = [];
++  let segment = '';
++
++  for (let i = 0; i < stateId.length; i++) {
++    const char = stateId.charCodeAt(i);
++    switch (char) {
++      // \
++      case 92:
++        // consume the next character
++        segment += stateId[i + 1];
++        // and skip over it
++        i++;
++        continue;
++      // .
++      case 46:
++        result.push(segment);
++        segment = '';
++        continue;
++    }
++    segment += stateId[i];
++  }
++
++  result.push(segment);
++
++  return result;
+ }
+ 
+ export function toStateValue(

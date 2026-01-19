@@ -1,0 +1,273 @@
+diff --git a/changelog_unreleased/css/16570.md b/changelog_unreleased/css/16570.md
+new file mode 100644
+index 000000000..401bf5a5c
+--- /dev/null
++++ b/changelog_unreleased/css/16570.md
+@@ -0,0 +1,30 @@
++#### Resolve some types of overrun in CSS (#16570 by @seiyab)
++
++<!-- prettier-ignore -->
++```css
++/* Input */
++@media (prefers-reduced-data: no-preference) {
++  @font-face {
++    unicode-range: U+0000-00FF, U+0131,
++U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
++  }
++}
++
++/* Prettier stable */
++@media (prefers-reduced-data: no-preference) {
++  @font-face {
++    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
++      U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212,
++      U+2215, U+FEFF, U+FFFD;
++  }
++}
++
++/* Prettier main */
++@media (prefers-reduced-data: no-preference) {
++  @font-face {
++    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6,
++      U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193,
++      U+2212, U+2215, U+FEFF, U+FFFD;
++  }
++}
++```
+diff --git a/src/language-css/print/comma-separated-value-group.js b/src/language-css/print/comma-separated-value-group.js
+index 3f18c97a8..c52ad4279 100644
+--- a/src/language-css/print/comma-separated-value-group.js
++++ b/src/language-css/print/comma-separated-value-group.js
+@@ -38,6 +38,10 @@ import {
+   isWordNode,
+ } from "../utils/index.js";
+ 
++/**
++ * @typedef {import("../../document/builders.js").Doc} Doc
++ */
++
+ function printCommaSeparatedValueGroup(path, options, print) {
+   const { node } = path;
+   const parentNode = path.parent;
+@@ -59,14 +63,23 @@ function printCommaSeparatedValueGroup(path, options, print) {
+   );
+ 
+   const printed = path.map(print, "groups");
+-  const parts = [];
++  /*
++   * We assume parts always meet following conditions:
++   * - parts.length is odd
++   * - odd (0-indexed) elements are line-like doc
++   * We can achieve this by following way:
++   * - if we push line-like doc, we push empty string after it
++   * - if we push non-line-like doc, push [parts.pop(), doc] instead
++   */
++  /** @type {Doc[]} */
++  let parts = [""];
+   const insideURLFunction = insideValueFunctionNode(path, "url");
+ 
+   let insideSCSSInterpolationInString = false;
+   let didBreak = false;
+ 
+   for (let i = 0; i < node.groups.length; ++i) {
+-    parts.push(printed[i]);
++    parts.push([parts.pop(), printed[i]]);
+ 
+     const iPrevNode = node.groups[i - 1];
+     const iNode = node.groups[i];
+@@ -75,11 +88,24 @@ function printCommaSeparatedValueGroup(path, options, print) {
+ 
+     if (insideURLFunction) {
+       if ((iNextNode && isAdditionNode(iNextNode)) || isAdditionNode(iNode)) {
+-        parts.push(" ");
++        parts.push([parts.pop(), " "]);
+       }
+       continue;
+     }
+ 
++    // Align key after comment in SCSS map
++    if (
++      isColonNode(iNextNode) &&
++      iNode.type === "value-word" &&
++      parts.length > 2 &&
++      node.groups
++        .slice(0, i)
++        .every((group) => group.type === "value-comment") &&
++      !isInlineValueCommentNode(iPrevNode)
++    ) {
++      parts[parts.length - 2] = dedent(parts.at(-2));
++    }
++
+     // Ignore SCSS @forward wildcard suffix
+     if (
+       insideAtRuleNode(path, "forward") &&
+@@ -272,7 +298,7 @@ function printCommaSeparatedValueGroup(path, options, print) {
+       iNextNode.type === "value-func" &&
+       locEnd(iNode) !== locStart(iNextNode)
+     ) {
+-      parts.push(" ");
++      parts.push([parts.pop(), " "]);
+       continue;
+     }
+ 
+@@ -309,10 +335,10 @@ function printCommaSeparatedValueGroup(path, options, print) {
+     // Add `hardline` after inline comment (i.e. `// comment\n foo: bar;`)
+     if (isInlineValueCommentNode(iNode)) {
+       if (parentNode.type === "value-paren_group") {
+-        parts.push(dedent(hardline));
++        parts.push(dedent(hardline), "");
+         continue;
+       }
+-      parts.push(hardline);
++      parts.push(hardline, "");
+       continue;
+     }
+ 
+@@ -325,7 +351,7 @@ function printCommaSeparatedValueGroup(path, options, print) {
+         isEachKeywordNode(iNode) ||
+         isForKeywordNode(iNode))
+     ) {
+-      parts.push(" ");
++      parts.push([parts.pop(), " "]);
+ 
+       continue;
+     }
+@@ -335,7 +361,7 @@ function printCommaSeparatedValueGroup(path, options, print) {
+       atRuleAncestorNode &&
+       atRuleAncestorNode.name.toLowerCase() === "namespace"
+     ) {
+-      parts.push(" ");
++      parts.push([parts.pop(), " "]);
+ 
+       continue;
+     }
+@@ -347,11 +373,11 @@ function printCommaSeparatedValueGroup(path, options, print) {
+         iNextNode.source &&
+         iNode.source.start.line !== iNextNode.source.start.line
+       ) {
+-        parts.push(hardline);
++        parts.push(hardline, "");
+ 
+         didBreak = true;
+       } else {
+-        parts.push(" ");
++        parts.push([parts.pop(), " "]);
+       }
+ 
+       continue;
+@@ -361,7 +387,7 @@ function printCommaSeparatedValueGroup(path, options, print) {
+     // Note: `grip` property have `/` delimiter and it is not math operation, so
+     // `grid` property handles above
+     if (isNextMathOperator) {
+-      parts.push(" ");
++      parts.push([parts.pop(), " "]);
+ 
+       continue;
+     }
+@@ -383,12 +409,12 @@ function printCommaSeparatedValueGroup(path, options, print) {
+       isParenGroupNode(iNextNode) &&
+       locEnd(iNode) === locStart(iNextNode.open)
+     ) {
+-      parts.push(softline);
++      parts.push(softline, "");
+       continue;
+     }
+ 
+     if (iNode.value === "with" && isParenGroupNode(iNextNode)) {
+-      parts.push(" ");
++      parts = [[fill(parts), " "]];
+       continue;
+     }
+ 
+@@ -401,15 +427,15 @@ function printCommaSeparatedValueGroup(path, options, print) {
+     }
+ 
+     // Be default all values go through `line`
+-    parts.push(line);
++    parts.push(line, "");
+   }
+ 
+   if (hasInlineComment) {
+-    parts.push(breakParent);
++    parts.push([parts.pop(), breakParent]);
+   }
+ 
+   if (didBreak) {
+-    parts.unshift(hardline);
++    parts.unshift("", hardline);
+   }
+ 
+   if (isControlDirective) {
+diff --git a/src/language-css/print/parenthesized-value-group.js b/src/language-css/print/parenthesized-value-group.js
+index 427b96968..58bec9ed2 100644
+--- a/src/language-css/print/parenthesized-value-group.js
++++ b/src/language-css/print/parenthesized-value-group.js
+@@ -15,6 +15,7 @@ import {
+   DOC_TYPE_INDENT,
+ } from "../../document/constants.js";
+ import { getDocType } from "../../document/utils.js";
++import { assertDocArray } from "../../document/utils/assert-doc.js";
+ import isNextLineEmpty from "../../utils/is-next-line-empty.js";
+ import isNonEmptyArray from "../../utils/is-non-empty-array.js";
+ import { locEnd, locStart } from "../loc.js";
+@@ -84,7 +85,9 @@ function printParenthesizedValueGroup(path, options, print) {
+ 
+   if (!node.open) {
+     const forceHardLine = shouldBreakList(path);
+-    const parts = join([",", forceHardLine ? hardline : line], groupDocs);
++    assertDocArray(groupDocs);
++    const withComma = chunk(join(",", groupDocs), 2);
++    const parts = join(forceHardLine ? hardline : line, withComma);
+     return indent(forceHardLine ? [hardline, parts] : group(fill(parts)));
+   }
+ 
+@@ -102,8 +105,6 @@ function printParenthesizedValueGroup(path, options, print) {
+       getDocType(doc.contents) === DOC_TYPE_INDENT &&
+       getDocType(doc.contents.contents) === DOC_TYPE_FILL
+     ) {
+-      const { parts } = doc.contents.contents;
+-      parts[1] = group(parts[1]);
+       doc = group(dedent(doc));
+     }
+ 
+@@ -164,4 +165,18 @@ function shouldBreakList(path) {
+   );
+ }
+ 
++/**
++ * @template {*} T
++ * @param {T[]} array
++ * @param {number} size
++ * @returns {T[][]}
++ */
++function chunk(array, size) {
++  const result = [];
++  for (let i = 0; i < array.length; i += size) {
++    result.push(array.slice(i, i + size));
++  }
++  return result;
++}
++
+ export { printParenthesizedValueGroup, shouldBreakList };
+diff --git a/src/language-css/printer-postcss.js b/src/language-css/printer-postcss.js
+index 21642e09d..25b5ecb0c 100644
+--- a/src/language-css/printer-postcss.js
++++ b/src/language-css/printer-postcss.js
+@@ -534,7 +534,7 @@ function genericPrint(path, options, print) {
+ 
+     case "value-colon": {
+       const { previous } = path;
+-      return [
++      return group([
+         node.value,
+         // Don't add spaces on escaped colon `:`, e.g: grid-template-rows: [row-1-00\:00] auto;
+         (typeof previous?.value === "string" &&
+@@ -543,7 +543,7 @@ function genericPrint(path, options, print) {
+         insideValueFunctionNode(path, "url")
+           ? ""
+           : line,
+-      ];
++      ]);
+     }
+     case "value-string":
+       return printString(

@@ -1,0 +1,220 @@
+diff --git a/changelog_unreleased/javascript/16116.md b/changelog_unreleased/javascript/16116.md
+new file mode 100644
+index 000000000..31673dfa1
+--- /dev/null
++++ b/changelog_unreleased/javascript/16116.md
+@@ -0,0 +1,19 @@
++#### Allow linebreaks in member expressions in template interpolations (#16116 by @bakkot)
++
++When there is already a linebreak in a template interpolation, allow it to stay there even if it is a member expression. Note that (as of [#15209](https://github.com/prettier/prettier/pull/15209)) Prettier will not insert a linebreak inside an interpolation when one is not already present.
++
++<!-- prettier-ignore -->
++```jsx
++// Input
++`template with ${
++    very.very.very.very.very.very.very.very.very.very.very.long.chain
++}`;
++
++// Prettier stable
++`template with ${very.very.very.very.very.very.very.very.very.very.very.long.chain}`;
++
++// Prettier main
++`template with ${
++  very.very.very.very.very.very.very.very.very.very.very.long.chain
++}`;
++```
+diff --git a/src/language-js/print/template-literal.js b/src/language-js/print/template-literal.js
+index d4b1db9cc..effab7f88 100644
+--- a/src/language-js/print/template-literal.js
++++ b/src/language-js/print/template-literal.js
+@@ -20,7 +20,6 @@ import {
+   isBinaryCastExpression,
+   isBinaryish,
+   isMemberExpression,
+-  isSimpleTemplateLiteral,
+ } from "../utils/index.js";
+ 
+ function printTemplateLiteral(path, print, options) {
+@@ -39,18 +38,7 @@ function printTemplateLiteral(path, print, options) {
+   }
+   const parts = [];
+ 
+-  let expressionDocs = path.map(print, expressionsKey);
+-  const isSimple = isSimpleTemplateLiteral(node);
+-
+-  if (isSimple) {
+-    expressionDocs = expressionDocs.map(
+-      (doc) =>
+-        printDocToString(doc, {
+-          ...options,
+-          printWidth: Number.POSITIVE_INFINITY,
+-        }).formatted,
+-    );
+-  }
++  const expressionDocs = path.map(print, expressionsKey);
+ 
+   parts.push(lineSuffixBoundary, "`");
+ 
+@@ -82,44 +70,43 @@ function printTemplateLiteral(path, print, options) {
+ 
+     let expressionDoc = expressionDocs[index];
+ 
+-    if (!isSimple) {
+-      const expression = node[expressionsKey][index];
++    const expression = node[expressionsKey][index];
+ 
+-      let interpolationHasNewline = hasNewlineInRange(
+-        options.originalText,
+-        locEnd(quasi),
+-        locStart(node.quasis[index + 1]),
+-      );
++    let interpolationHasNewline = hasNewlineInRange(
++      options.originalText,
++      locEnd(quasi),
++      locStart(node.quasis[index + 1]),
++    );
+ 
+-      if (!interpolationHasNewline) {
+-        // Never add a newline to an interpolation which didn't already have one...
+-        const renderedExpression = printDocToString(expressionDoc, {
+-          ...options,
+-          printWidth: Number.POSITIVE_INFINITY,
+-        }).formatted;
+-
+-        // ... unless one will be introduced anyway, e.g. by a nested function.
+-        // This case is rare, so we can pay the cost of re-rendering.
+-        if (renderedExpression.includes("\n")) {
+-          interpolationHasNewline = true;
+-        } else {
+-          expressionDoc = renderedExpression;
+-        }
++    if (!interpolationHasNewline) {
++      // Never add a newline to an interpolation which didn't already have one...
++      const renderedExpression = printDocToString(expressionDoc, {
++        ...options,
++        printWidth: Number.POSITIVE_INFINITY,
++      }).formatted;
++
++      // ... unless one will be introduced anyway, e.g. by a nested function.
++      // This case is rare, so we can pay the cost of re-rendering.
++      if (renderedExpression.includes("\n")) {
++        interpolationHasNewline = true;
++      } else {
++        expressionDoc = renderedExpression;
+       }
++    }
+ 
+-      // Breaks at the template element boundaries (${ and }) are preferred to breaking
+-      // in the middle of a MemberExpression
+-      if (
+-        interpolationHasNewline &&
+-        (hasComment(expression) ||
+-          isMemberExpression(expression) ||
+-          expression.type === "ConditionalExpression" ||
+-          expression.type === "SequenceExpression" ||
+-          isBinaryCastExpression(expression) ||
+-          isBinaryish(expression))
+-      ) {
+-        expressionDoc = [indent([softline, expressionDoc]), softline];
+-      }
++    // Breaks at the template element boundaries (${ and }) are preferred to breaking
++    // in the middle of a MemberExpression
++    if (
++      interpolationHasNewline &&
++      (hasComment(expression) ||
++        expression.type === "Identifier" ||
++        isMemberExpression(expression) ||
++        expression.type === "ConditionalExpression" ||
++        expression.type === "SequenceExpression" ||
++        isBinaryCastExpression(expression) ||
++        isBinaryish(expression))
++    ) {
++      expressionDoc = [indent([softline, expressionDoc]), softline];
+     }
+ 
+     const aligned =
+diff --git a/src/language-js/utils/index.js b/src/language-js/utils/index.js
+index 369e0c381..f0c385da5 100644
+--- a/src/language-js/utils/index.js
++++ b/src/language-js/utils/index.js
+@@ -418,68 +418,6 @@ const isMemberExpression = skipChainExpression(
+   createTypeCheckFunction(["MemberExpression", "OptionalMemberExpression"]),
+ );
+ 
+-/**
+- *
+- * @param {any} node
+- * @returns {boolean}
+- */
+-function isSimpleTemplateLiteral(node) {
+-  let expressionsKey = "expressions";
+-  if (node.type === "TSTemplateLiteralType") {
+-    expressionsKey = "types";
+-  }
+-  const expressions = node[expressionsKey];
+-
+-  if (expressions.length === 0) {
+-    return false;
+-  }
+-
+-  return expressions.every((expr) => {
+-    if (isSimpleAtomicExpression(expr) || isSimpleMemberExpression(expr)) {
+-      return true;
+-    }
+-  });
+-}
+-
+-function isSimpleMemberExpression(
+-  node,
+-  { maxDepth = Number.POSITIVE_INFINITY } = {},
+-) {
+-  if (hasComment(node)) {
+-    return false;
+-  }
+-  if (node.type === "ChainExpression") {
+-    return isSimpleMemberExpression(node.expression, { maxDepth });
+-  }
+-  if (!isMemberExpression(node)) {
+-    return false;
+-  }
+-
+-  let head = node;
+-  let depth = 0;
+-  while (isMemberExpression(head) && depth++ <= maxDepth) {
+-    if (!isSimpleAtomicExpression(head.property)) {
+-      return false;
+-    }
+-    head = head.object;
+-    if (hasComment(head)) {
+-      return false;
+-    }
+-  }
+-  return isSimpleAtomicExpression(head);
+-}
+-
+-/**
+- * This is intended to return true for small expressions
+- * which cannot be broken.
+- */
+-function isSimpleAtomicExpression(node) {
+-  if (hasComment(node)) {
+-    return false;
+-  }
+-  return isLiteral(node) || isSingleWordType(node);
+-}
+-
+ /**
+  * Attempts to gauge the rough complexity of a node, for example
+  * to detect deeply-nested booleans, call expressions with lots of arguments, etc.
+@@ -1207,11 +1145,8 @@ export {
+   isPrettierIgnoreComment,
+   isRegExpLiteral,
+   isSignedNumericLiteral,
+-  isSimpleAtomicExpression,
+   isSimpleCallArgument,
+   isSimpleExpressionByNodeCount,
+-  isSimpleMemberExpression,
+-  isSimpleTemplateLiteral,
+   isSimpleType,
+   isStringLiteral,
+   isTemplateOnItsOwnLine,

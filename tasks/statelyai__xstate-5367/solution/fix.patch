@@ -1,0 +1,304 @@
+diff --git a/.changeset/dry-cows-stare.md b/.changeset/dry-cows-stare.md
+new file mode 100644
+index 0000000000..13453efa83
+--- /dev/null
++++ b/.changeset/dry-cows-stare.md
+@@ -0,0 +1,44 @@
++---
++'xstate': minor
++---
++
++Add type-bound action helpers to `setup()`:
++
++- `createAction(fn)` – create type-safe custom actions
++- `setup().assign(...)`, `setup().sendTo(...)`, `setup().raise(...)`, `setup().log(...)`, `setup().cancel(...)`, `setup().stopChild(...)`, `setup().enqueueActions(...)`, `setup().emit(...)`, `setup().spawnChild(...)` – setup-scoped helpers that are fully typed to the setup's context/events/actors/guards/delays/emitted.
++
++These helpers return actions that are bound to the specific `setup()` they were created from and can be used directly in the machine produced by that setup.
++
++```ts
++const machineSetup = setup({
++  types: {} as {
++    context: {
++      count: number;
++    };
++    events: { type: 'inc'; value: number } | { type: 'TEST' };
++    emitted: { type: 'PING' };
++  }
++});
++
++// Custom action
++const action = machineSetup.createAction(({ context, event }) => {
++  console.log(context.count, event.value);
++});
++
++// Type-bound built-ins (no wrapper needed)
++const increment = machineSetup.assign({
++  count: ({ context }) => context.count + 1
++});
++const raiseTest = machineSetup.raise({ type: 'TEST' });
++const ping = machineSetup.emit({ type: 'PING' });
++const batch = machineSetup.enqueueActions(({ enqueue, check }) => {
++  if (check(() => true)) {
++    enqueue(increment);
++  }
++});
++
++const machine = machineSetup.createMachine({
++  context: { count: 0 },
++  entry: [action, increment, raiseTest, ping, batch]
++});
++```
+diff --git a/README.md b/README.md
+index 1b8afacce4..cf02a98ad6 100644
+--- a/README.md
++++ b/README.md
+@@ -31,29 +31,6 @@ It uses event-driven programming, state machines, statecharts, and the actor mod
+ 
+ ✍️ Browse through the many [XState examples](https://github.com/statelyai/xstate/tree/main/examples)
+ 
+-## Sponsors
+-
+-Special thanks to the sponsors who support this open-source project:
+-
+-<img src="https://opencollective.com/xstate/tiers/backer/badge.svg?label=sponsors&color=brightgreen" />
+-
+- <a href="https://go.warp.dev/xstate">
+-    <img alt="Warp sponsorship" width="400" src="https://github.com/warpdotdev/brand-assets/blob/main/Github/Sponsor/Warp-Github-LG-04.png?raw=true](https://github.com/warpdotdev/brand-assets/blob/main/Github/Sponsor/Warp-Github-LG-03.png?raw=true)">
+- </a>
+-
+-### [Warp, the intelligent terminal for developers](https://go.warp.dev/xstate)
+-
+-<small><a href="https://go.warp.dev/xstate">Warp is built for coding with multiple AI agents</a></small>
+-
+-<a href="https://transloadit.com/?utm_source=xstate&utm_medium=referral&utm_campaign=sponsorship&utm_content=github">
+-  <picture>
+-    <source media="(prefers-color-scheme: dark)" srcset="https://assets.transloadit.com/assets/images/sponsorships/logo-dark.svg">
+-    <source media="(prefers-color-scheme: light)" srcset="https://assets.transloadit.com/assets/images/sponsorships/logo-default.svg">
+-    <img src="https://assets.transloadit.com/assets/images/sponsorships/logo-default.svg" alt="Transloadit Logo">
+-  </picture>
+-</a>
+-
+-
+ ## Templates
+ 
+ Get started by forking one of these templates on CodeSandbox:
+@@ -565,6 +542,19 @@ actor.send({ type: 'PREVIOUS' });
+ </tbody>
+ </table>
+ 
++## Sponsors
++
++Special thanks to the sponsors who support this open-source project:
++
++<img src="https://opencollective.com/xstate/tiers/backer/badge.svg?label=sponsors&color=brightgreen" />
++
++<a href="https://transloadit.com/?utm_source=xstate&utm_medium=referral&utm_campaign=sponsorship&utm_content=github">
++  <picture>
++    <source media="(prefers-color-scheme: dark)" srcset="https://assets.transloadit.com/assets/images/sponsorships/logo-dark.svg">
++    <source media="(prefers-color-scheme: light)" srcset="https://assets.transloadit.com/assets/images/sponsorships/logo-default.svg">
++    <img src="https://assets.transloadit.com/assets/images/sponsorships/logo-default.svg" alt="Transloadit Logo">
++  </picture>
++</a>
+ 
+ ## SemVer Policy
+ 
+diff --git a/packages/core/src/actions/send.ts b/packages/core/src/actions/send.ts
+index 3d5c3917a7..35b2aa4f02 100644
+--- a/packages/core/src/actions/send.ts
++++ b/packages/core/src/actions/send.ts
+@@ -214,13 +214,13 @@ export function sendTo<
+   TDelay extends string = never,
+   TUsedDelay extends TDelay = never
+ >(
+-  to:
+-    | TTargetActor
+-    | string
+-    | ((
+-        args: ActionArgs<TContext, TExpressionEvent, TEvent>,
+-        params: TParams
+-      ) => TTargetActor | string),
++  to: SendToActionTarget<
++    TContext,
++    TExpressionEvent,
++    TParams,
++    TTargetActor,
++    TEvent
++  >,
+   eventOrExpr:
+     | EventFrom<TTargetActor>
+     | SendExpr<
+@@ -313,18 +313,19 @@ export function sendParent<
+   >(SpecialTargets.Parent, event, options as any);
+ }
+ 
+-type Target<
++type SendToActionTarget<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject,
+   TParams extends ParameterizedObject['params'] | undefined,
++  TTargetActor extends AnyActorRef,
+   TEvent extends EventObject
+ > =
+   | string
+-  | AnyActorRef
++  | TTargetActor
+   | ((
+       args: ActionArgs<TContext, TExpressionEvent, TEvent>,
+       params: TParams
+-    ) => string | AnyActorRef);
++    ) => string | TTargetActor);
+ 
+ /**
+  * Forwards (sends) an event to the `target` actor.
+@@ -340,7 +341,13 @@ export function forwardTo<
+   TDelay extends string = never,
+   TUsedDelay extends TDelay = never
+ >(
+-  target: Target<TContext, TExpressionEvent, TParams, TEvent>,
++  target: SendToActionTarget<
++    TContext,
++    TExpressionEvent,
++    TParams,
++    AnyActorRef,
++    TEvent
++  >,
+   options?: SendToActionOptions<
+     TContext,
+     TExpressionEvent,
+diff --git a/packages/core/src/setup.ts b/packages/core/src/setup.ts
+index 1af397f266..0d45d721ef 100644
+--- a/packages/core/src/setup.ts
++++ b/packages/core/src/setup.ts
+@@ -1,4 +1,13 @@
+ import { StateMachine } from './StateMachine';
++import { assign } from './actions/assign';
++import { cancel } from './actions/cancel';
++import { emit } from './actions/emit';
++import { enqueueActions } from './actions/enqueueActions';
++import { log } from './actions/log';
++import { raise } from './actions/raise';
++import { sendTo } from './actions/send';
++import { spawnChild } from './actions/spawnChild';
++import { stopChild } from './actions/stopChild';
+ import { createMachine } from './createMachine';
+ import { GuardPredicate } from './guards';
+ 
+@@ -191,6 +200,44 @@ export function setup<
+   >(
+     config: TStateConfig
+   ) => TStateConfig;
++  /**
++   * Creates a type-safe action.
++   *
++   * @example
++   *
++   * ```ts
++   * const machineSetup = setup({
++   *   // ...
++   * });
++   *
++   * const action = machineSetup.createAction(({ context, event }) => {
++   *   console.log(context.count, event.value);
++   * });
++   *
++   * const incrementAction = machineSetup.createAction(
++   *   assign({ count: ({ context }) => context.count + 1 })
++   * );
++   *
++   * const machine = machineSetup.createMachine({
++   *   context: { count: 0 },
++   *   entry: [action, incrementAction]
++   * });
++   * ```
++   */
++  createAction: (
++    action: ActionFunction<
++      TContext,
++      TEvent,
++      TEvent,
++      unknown,
++      ToProvidedActor<TChildrenMap, TActors>,
++      ToParameterizedObject<TActions>,
++      ToParameterizedObject<TGuards>,
++      TDelay,
++      TEmitted
++    >
++  ) => typeof action;
++
+   createMachine: <
+     const TConfig extends MachineConfig<
+       TContext,
+@@ -226,9 +273,73 @@ export function setup<
+     TMeta,
+     TConfig
+   >;
++
++  assign: typeof assign<
++    TContext,
++    TEvent,
++    undefined,
++    TEvent,
++    ToProvidedActor<TChildrenMap, TActors>
++  >;
++  sendTo: <TTargetActor extends AnyActorRef>(
++    ...args: Parameters<
++      typeof sendTo<
++        TContext,
++        TEvent,
++        undefined,
++        TTargetActor,
++        TEvent,
++        TDelay,
++        TDelay
++      >
++    >
++  ) => ReturnType<
++    typeof sendTo<
++      TContext,
++      TEvent,
++      undefined,
++      TTargetActor,
++      TEvent,
++      TDelay,
++      TDelay
++    >
++  >;
++  raise: typeof raise<TContext, TEvent, TEvent, undefined, TDelay, TDelay>;
++  log: typeof log<TContext, TEvent, undefined, TEvent>;
++  cancel: typeof cancel<TContext, TEvent, undefined, TEvent>;
++  stopChild: typeof stopChild<TContext, TEvent, undefined, TEvent>;
++  enqueueActions: typeof enqueueActions<
++    TContext,
++    TEvent,
++    undefined,
++    TEvent,
++    ToProvidedActor<TChildrenMap, TActors>,
++    ToParameterizedObject<TActions>,
++    ToParameterizedObject<TGuards>,
++    TDelay,
++    TEmitted
++  >;
++  emit: typeof emit<TContext, TEvent, undefined, TEvent, TEmitted>;
++  spawnChild: typeof spawnChild<
++    TContext,
++    TEvent,
++    undefined,
++    TEvent,
++    ToProvidedActor<TChildrenMap, TActors>
++  >;
+ } {
+   return {
++    assign,
++    sendTo,
++    raise,
++    log,
++    cancel,
++    stopChild,
++    enqueueActions,
++    emit,
++    spawnChild,
+     createStateConfig: (config) => config,
++    createAction: (fn) => fn,
+     createMachine: (config) =>
+       (createMachine as any)(
+         { ...config, schemas },

@@ -1,0 +1,207 @@
+diff --git a/packages/query-broadcast-client-experimental/package.json b/packages/query-broadcast-client-experimental/package.json
+index 7f352fd1e..2aa4aa273 100644
+--- a/packages/query-broadcast-client-experimental/package.json
++++ b/packages/query-broadcast-client-experimental/package.json
+@@ -28,6 +28,8 @@
+     "test:types:ts56": "node ../../node_modules/typescript56/lib/tsc.js --build",
+     "test:types:ts57": "node ../../node_modules/typescript57/lib/tsc.js --build",
+     "test:types:tscurrent": "tsc --build",
++    "test:lib": "vitest",
++    "test:lib:dev": "pnpm run test:lib --watch",
+     "test:build": "publint --strict && attw --pack",
+     "build": "tsup --tsconfig tsconfig.prod.json"
+   },
+@@ -60,6 +62,8 @@
+     "broadcast-channel": "^7.0.0"
+   },
+   "devDependencies": {
++    "@testing-library/react": "^16.1.0",
++    "@vitejs/plugin-react": "^4.3.4",
+     "npm-run-all2": "^5.0.0"
+   }
+ }
+diff --git a/packages/query-broadcast-client-experimental/src/index.ts b/packages/query-broadcast-client-experimental/src/index.ts
+index f49a09b7e..e102b3c0b 100644
+--- a/packages/query-broadcast-client-experimental/src/index.ts
++++ b/packages/query-broadcast-client-experimental/src/index.ts
+@@ -12,7 +12,7 @@ export function broadcastQueryClient({
+   queryClient,
+   broadcastChannel = 'tanstack-query',
+   options,
+-}: BroadcastQueryClientOptions) {
++}: BroadcastQueryClientOptions): () => void {
+   let transaction = false
+   const tx = (cb: () => void) => {
+     transaction = true
+@@ -27,13 +27,13 @@ export function broadcastQueryClient({
+ 
+   const queryCache = queryClient.getQueryCache()
+ 
+-  queryClient.getQueryCache().subscribe((queryEvent) => {
++  const unsubscribe = queryClient.getQueryCache().subscribe((queryEvent) => {
+     if (transaction) {
+       return
+     }
+ 
+     const {
+-      query: { queryHash, queryKey, state },
++      query: { queryHash, queryKey, state, observers },
+     } = queryEvent
+ 
+     if (queryEvent.type === 'updated' && queryEvent.action.type === 'success') {
+@@ -45,13 +45,21 @@ export function broadcastQueryClient({
+       })
+     }
+ 
+-    if (queryEvent.type === 'removed') {
++    if (queryEvent.type === 'removed' && observers.length > 0) {
+       channel.postMessage({
+         type: 'removed',
+         queryHash,
+         queryKey,
+       })
+     }
++
++    if (queryEvent.type === 'added') {
++      channel.postMessage({
++        type: 'added',
++        queryHash,
++        queryKey,
++      })
++    }
+   })
+ 
+   channel.onmessage = (action) => {
+@@ -62,9 +70,9 @@ export function broadcastQueryClient({
+     tx(() => {
+       const { type, queryHash, queryKey, state } = action
+ 
+-      if (type === 'updated') {
+-        const query = queryCache.get(queryHash)
++      const query = queryCache.get(queryHash)
+ 
++      if (type === 'updated') {
+         if (query) {
+           query.setState(state)
+           return
+@@ -79,12 +87,27 @@ export function broadcastQueryClient({
+           state,
+         )
+       } else if (type === 'removed') {
+-        const query = queryCache.get(queryHash)
+-
+         if (query) {
+           queryCache.remove(query)
+         }
++      } else if (type === 'added') {
++        if (query) {
++          query.setState(state)
++          return
++        }
++        queryCache.build(
++          queryClient,
++          {
++            queryKey,
++            queryHash,
++          },
++          state,
++        )
+       }
+     })
+   }
++  return () => {
++    unsubscribe()
++    channel.close()
++  }
+ }
+diff --git a/packages/query-broadcast-client-experimental/test-setup.ts b/packages/query-broadcast-client-experimental/test-setup.ts
+new file mode 100644
+index 000000000..d82b1a4f8
+--- /dev/null
++++ b/packages/query-broadcast-client-experimental/test-setup.ts
+@@ -0,0 +1,14 @@
++import '@testing-library/jest-dom/vitest'
++import { act, cleanup as cleanupRTL } from '@testing-library/react'
++import { afterEach } from 'vitest'
++import { notifyManager } from '@tanstack/query-core'
++
++// https://testing-library.com/docs/react-testing-library/api#cleanup
++afterEach(() => {
++  cleanupRTL()
++})
++
++// Wrap notifications with act to make sure React knows about React Query updates
++notifyManager.setNotifyFunction((fn) => {
++  act(fn)
++})
+diff --git a/packages/query-broadcast-client-experimental/vite.config.ts b/packages/query-broadcast-client-experimental/vite.config.ts
+new file mode 100644
+index 000000000..01ab3b00d
+--- /dev/null
++++ b/packages/query-broadcast-client-experimental/vite.config.ts
+@@ -0,0 +1,30 @@
++import { defineConfig } from 'vitest/config'
++import react from '@vitejs/plugin-react'
++
++import packageJson from './package.json'
++
++export default defineConfig({
++  plugins: [react()],
++  // fix from https://github.com/vitest-dev/vitest/issues/6992#issuecomment-2509408660
++  resolve: {
++    conditions: ['@tanstack/custom-condition'],
++  },
++  environments: {
++    ssr: {
++      resolve: {
++        conditions: ['@tanstack/custom-condition'],
++      },
++    },
++  },
++  test: {
++    name: packageJson.name,
++    dir: './src',
++    watch: false,
++    environment: 'jsdom',
++    setupFiles: ['test-setup.ts'],
++    coverage: { enabled: true, provider: 'istanbul', include: ['src/**/*'] },
++    typecheck: { enabled: true },
++    restoreMocks: true,
++    retry: process.env.CI ? 3 : 0,
++  },
++})
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index ed65e1846..2664e0fc8 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -1224,7 +1224,7 @@ importers:
+         version: 6.1.18(react-native@0.76.3(@babel/core@7.26.10)(@babel/preset-env@7.26.9(@babel/core@7.26.10))(@react-native-community/cli-server-api@13.6.9(encoding@0.1.13))(@types/react@19.0.1)(encoding@0.1.13)(react@19.0.0))(react@19.0.0)
+       '@react-navigation/stack':
+         specifier: ^6.4.1
+-        version: 6.4.1(e9c097e00fee89f3cf54c317dda4adb5)
++        version: 6.4.1(44i6xs33lapt7cl2pkawmwjtru)
+       '@tanstack/react-query':
+         specifier: workspace:*
+         version: link:../../../packages/react-query
+@@ -2400,6 +2400,12 @@ importers:
+         specifier: ^7.0.0
+         version: 7.0.0
+     devDependencies:
++      '@testing-library/react':
++        specifier: ^16.1.0
++        version: 16.1.0(@testing-library/dom@10.4.0)(@types/react-dom@19.0.2(@types/react@19.0.1))(@types/react@19.0.1)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
++      '@vitejs/plugin-react':
++        specifier: ^4.3.4
++        version: 4.3.4(vite@6.3.4(@types/node@22.15.3)(jiti@2.4.2)(less@4.2.2)(lightningcss@1.29.2)(sass@1.86.0)(terser@5.39.0)(yaml@2.6.1))
+       npm-run-all2:
+         specifier: ^5.0.0
+         version: 5.0.2
+@@ -19767,7 +19773,7 @@ snapshots:
+     dependencies:
+       nanoid: 3.3.8
+ 
+-  '@react-navigation/stack@6.4.1(e9c097e00fee89f3cf54c317dda4adb5)':
++  '@react-navigation/stack@6.4.1(44i6xs33lapt7cl2pkawmwjtru)':
+     dependencies:
+       '@react-navigation/elements': 1.3.31(@react-navigation/native@6.1.18(react-native@0.76.3(@babel/core@7.26.10)(@babel/preset-env@7.26.9(@babel/core@7.26.10))(@react-native-community/cli-server-api@13.6.9(encoding@0.1.13))(@types/react@19.0.1)(encoding@0.1.13)(react@19.0.0))(react@19.0.0))(react-native-safe-area-context@4.12.0(react-native@0.76.3(@babel/core@7.26.10)(@babel/preset-env@7.26.9(@babel/core@7.26.10))(@react-native-community/cli-server-api@13.6.9(encoding@0.1.13))(@types/react@19.0.1)(encoding@0.1.13)(react@19.0.0))(react@19.0.0))(react-native@0.76.3(@babel/core@7.26.10)(@babel/preset-env@7.26.9(@babel/core@7.26.10))(@react-native-community/cli-server-api@13.6.9(encoding@0.1.13))(@types/react@19.0.1)(encoding@0.1.13)(react@19.0.0))(react@19.0.0)
+       '@react-navigation/native': 6.1.18(react-native@0.76.3(@babel/core@7.26.10)(@babel/preset-env@7.26.9(@babel/core@7.26.10))(@react-native-community/cli-server-api@13.6.9(encoding@0.1.13))(@types/react@19.0.1)(encoding@0.1.13)(react@19.0.0))(react@19.0.0)

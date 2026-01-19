@@ -1,0 +1,451 @@
+diff --git a/crates/turbo-trace/src/import_finder.rs b/crates/turbo-trace/src/import_finder.rs
+index 79543c7185..ddfbf83875 100644
+--- a/crates/turbo-trace/src/import_finder.rs
++++ b/crates/turbo-trace/src/import_finder.rs
+@@ -2,21 +2,12 @@ use swc_common::{Span, Spanned};
+ use swc_ecma_ast::{Decl, ModuleDecl, Stmt};
+ use swc_ecma_visit::{Visit, VisitWith};
+ 
+-use crate::tracer::ImportType;
+-
++#[derive(Default)]
+ pub struct ImportFinder {
+-    import_type: ImportType,
+     imports: Vec<(String, Span)>,
+ }
+ 
+ impl ImportFinder {
+-    pub fn new(import_type: ImportType) -> Self {
+-        Self {
+-            import_type,
+-            imports: Vec::new(),
+-        }
+-    }
+-
+     pub fn imports(&self) -> &[(String, Span)] {
+         &self.imports
+     }
+@@ -25,21 +16,8 @@ impl ImportFinder {
+ impl Visit for ImportFinder {
+     fn visit_module_decl(&mut self, decl: &ModuleDecl) {
+         if let ModuleDecl::Import(import) = decl {
+-            match self.import_type {
+-                ImportType::All => {
+-                    self.imports
+-                        .push((import.src.value.to_string(), import.span));
+-                }
+-                ImportType::Types if import.type_only => {
+-                    self.imports
+-                        .push((import.src.value.to_string(), import.span));
+-                }
+-                ImportType::Values if !import.type_only => {
+-                    self.imports
+-                        .push((import.src.value.to_string(), import.span));
+-                }
+-                _ => {}
+-            }
++            self.imports
++                .push((import.src.value.to_string(), import.span));
+         }
+     }
+ 
+diff --git a/crates/turbo-trace/src/lib.rs b/crates/turbo-trace/src/lib.rs
+index e0b38cd1bd..c37074f75f 100644
+--- a/crates/turbo-trace/src/lib.rs
++++ b/crates/turbo-trace/src/lib.rs
+@@ -2,4 +2,4 @@
+ mod import_finder;
+ mod tracer;
+ 
+-pub use tracer::{ImportType, TraceError, TraceResult, Tracer};
++pub use tracer::{TraceError, TraceResult, Tracer};
+diff --git a/crates/turbo-trace/src/tracer.rs b/crates/turbo-trace/src/tracer.rs
+index 27e0602387..24db1d2baa 100644
+--- a/crates/turbo-trace/src/tracer.rs
++++ b/crates/turbo-trace/src/tracer.rs
+@@ -28,7 +28,6 @@ pub struct Tracer {
+     source_map: Arc<SourceMap>,
+     cwd: AbsoluteSystemPathBuf,
+     errors: Vec<TraceError>,
+-    import_type: ImportType,
+ }
+ 
+ #[derive(Debug, Error, Diagnostic)]
+@@ -58,17 +57,6 @@ pub struct TraceResult {
+     pub files: HashMap<AbsoluteSystemPathBuf, SeenFile>,
+ }
+ 
+-/// The type of imports to trace.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-pub enum ImportType {
+-    /// Trace all imports.
+-    All,
+-    /// Trace only `import type` imports
+-    Types,
+-    /// Trace only `import` imports and not `import type` imports
+-    Values,
+-}
+-
+ impl Tracer {
+     pub fn new(
+         cwd: AbsoluteSystemPathBuf,
+@@ -84,23 +72,17 @@ impl Tracer {
+             files,
+             ts_config,
+             cwd,
+-            import_type: ImportType::All,
+             errors: Vec::new(),
+             source_map: Arc::new(SourceMap::default()),
+         }
+     }
+ 
+-    pub fn set_import_type(&mut self, import_type: ImportType) {
+-        self.import_type = import_type;
+-    }
+-
+     #[tracing::instrument(skip(resolver, source_map))]
+     pub async fn get_imports_from_file(
+         source_map: &SourceMap,
+         errors: &mut Vec<TraceError>,
+         resolver: &Resolver,
+         file_path: &AbsoluteSystemPath,
+-        import_type: ImportType,
+     ) -> Option<(Vec<AbsoluteSystemPathBuf>, SeenFile)> {
+         // Read the file content
+         let Ok(file_content) = tokio::fs::read_to_string(&file_path).await else {
+@@ -148,7 +130,7 @@ impl Tracer {
+         };
+ 
+         // Visit the AST and find imports
+-        let mut finder = ImportFinder::new(import_type);
++        let mut finder = ImportFinder::default();
+         module.visit_with(&mut finder);
+         // Convert found imports/requires to absolute paths and add them to files to
+         // visit
+@@ -214,7 +196,6 @@ impl Tracer {
+             &mut self.errors,
+             file_resolver.as_ref().unwrap_or(resolver),
+             &file_path,
+-            self.import_type,
+         )
+         .await
+         else {
+@@ -325,7 +306,6 @@ impl Tracer {
+                     &mut errors,
+                     file_resolver.as_ref().unwrap_or(&resolver),
+                     &file,
+-                    shared_self.import_type,
+                 )
+                 .await
+                 else {
+diff --git a/crates/turborepo-lib/src/query/file.rs b/crates/turborepo-lib/src/query/file.rs
+index c1893d396a..5fdd280e6a 100644
+--- a/crates/turborepo-lib/src/query/file.rs
++++ b/crates/turborepo-lib/src/query/file.rs
+@@ -1,6 +1,6 @@
+ use std::sync::Arc;
+ 
+-use async_graphql::{Enum, Object, SimpleObject};
++use async_graphql::{Object, SimpleObject};
+ use camino::Utf8PathBuf;
+ use itertools::Itertools;
+ use swc_ecma_ast::EsVersion;
+@@ -146,27 +146,6 @@ impl TraceResult {
+     }
+ }
+ 
+-/// The type of imports to trace.
+-#[derive(Copy, Clone, Debug, PartialEq, Eq, Enum)]
+-pub enum ImportType {
+-    /// Trace all imports.
+-    All,
+-    /// Trace only `import type` imports
+-    Types,
+-    /// Trace only `import` imports and not `import type` imports
+-    Values,
+-}
+-
+-impl From<ImportType> for turbo_trace::ImportType {
+-    fn from(import_type: ImportType) -> Self {
+-        match import_type {
+-            ImportType::All => turbo_trace::ImportType::All,
+-            ImportType::Types => turbo_trace::ImportType::Types,
+-            ImportType::Values => turbo_trace::ImportType::Values,
+-        }
+-    }
+-}
+-
+ #[Object]
+ impl File {
+     async fn contents(&self) -> Result<String, Error> {
+@@ -190,39 +169,26 @@ impl File {
+         &self,
+         depth: Option<usize>,
+         ts_config: Option<String>,
+-        import_type: Option<ImportType>,
+     ) -> Result<TraceResult, Error> {
+-        let mut tracer = Tracer::new(
++        let tracer = Tracer::new(
+             self.run.repo_root().to_owned(),
+             vec![self.path.clone()],
+             ts_config.map(Utf8PathBuf::from),
+         );
+ 
+-        if let Some(import_type) = import_type {
+-            tracer.set_import_type(import_type.into());
+-        }
+-
+         let mut result = tracer.trace(depth).await;
+         // Remove the file itself from the result
+         result.files.remove(&self.path);
+         TraceResult::new(result, self.run.clone())
+     }
+ 
+-    async fn dependents(
+-        &self,
+-        ts_config: Option<String>,
+-        import_type: Option<ImportType>,
+-    ) -> Result<TraceResult, Error> {
+-        let mut tracer = Tracer::new(
++    async fn dependents(&self, ts_config: Option<String>) -> Result<TraceResult, Error> {
++        let tracer = Tracer::new(
+             self.run.repo_root().to_owned(),
+             vec![self.path.clone()],
+             ts_config.map(Utf8PathBuf::from),
+         );
+ 
+-        if let Some(import_type) = import_type {
+-            tracer.set_import_type(import_type.into());
+-        }
+-
+         let mut result = tracer.reverse_trace().await;
+         // Remove the file itself from the result
+         result.files.remove(&self.path);
+diff --git a/crates/turborepo/tests/query.rs b/crates/turborepo/tests/query.rs
+index fdaf7ec855..18308f173a 100644
+--- a/crates/turborepo/tests/query.rs
++++ b/crates/turborepo/tests/query.rs
+@@ -47,12 +47,6 @@ fn test_trace() -> Result<(), anyhow::Error> {
+             "get `invalid.ts` with dependencies" => "query { file(path: \"invalid.ts\") { path dependencies { files { items { path } } errors { items { message } } } } }",
+             "get `main.ts` with depth = 0" => "query { file(path: \"main.ts\") { path dependencies(depth: 1) { files { items { path } } } } }",
+             "get `with_prefix.ts` with dependencies" => "query { file(path: \"with_prefix.ts\") { path dependencies { files { items { path } } } } }",
+-            "get `import_value_and_type.ts` with all dependencies" => "query { file(path: \"import_value_and_type.ts\") { path dependencies(importType: ALL) { files { items { path } } } } }",
+-            "get `import_value_and_type.ts` with type dependencies" => "query { file(path: \"import_value_and_type.ts\") { path dependencies(importType: TYPES) { files { items { path } } } } }",
+-            "get `import_value_and_type.ts` with value dependencies" => "query { file(path: \"import_value_and_type.ts\") { path dependencies(importType: VALUES) { files { items { path } } } } }",
+-            "get `link.tsx` with all dependents" => "query { file(path: \"link.tsx\") { path dependents(importType: ALL) { files { items { path } } } } }",
+-            "get `link.tsx` with type dependents" => "query { file(path: \"link.tsx\") { path dependents(importType: TYPES) { files { items { path } } } } }",
+-            "get `link.tsx` with value dependents" => "query { file(path: \"link.tsx\") { path dependents(importType: VALUES) { files { items { path } } } } }",
+         );
+ 
+         Ok(())
+diff --git a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_all_dependencies_(npm@10.5.0).snap b/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_all_dependencies_(npm@10.5.0).snap
+deleted file mode 100644
+index 46eabec764..0000000000
+--- a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_all_dependencies_(npm@10.5.0).snap
++++ /dev/null
+@@ -1,23 +0,0 @@
+----
+-source: crates/turborepo/tests/query.rs
+-expression: query_output
+----
+-{
+-  "data": {
+-    "file": {
+-      "path": "import_value_and_type.ts",
+-      "dependencies": {
+-        "files": {
+-          "items": [
+-            {
+-              "path": "link.tsx"
+-            },
+-            {
+-              "path": "types.ts"
+-            }
+-          ]
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_type_dependencies_(npm@10.5.0).snap b/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_type_dependencies_(npm@10.5.0).snap
+deleted file mode 100644
+index 04f12c8b15..0000000000
+--- a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_type_dependencies_(npm@10.5.0).snap
++++ /dev/null
+@@ -1,20 +0,0 @@
+----
+-source: crates/turborepo/tests/query.rs
+-expression: query_output
+----
+-{
+-  "data": {
+-    "file": {
+-      "path": "import_value_and_type.ts",
+-      "dependencies": {
+-        "files": {
+-          "items": [
+-            {
+-              "path": "types.ts"
+-            }
+-          ]
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_value_dependencies_(npm@10.5.0).snap b/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_value_dependencies_(npm@10.5.0).snap
+deleted file mode 100644
+index 1cc31c9e9f..0000000000
+--- a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`import_value_and_type.ts`_with_value_dependencies_(npm@10.5.0).snap
++++ /dev/null
+@@ -1,20 +0,0 @@
+----
+-source: crates/turborepo/tests/query.rs
+-expression: query_output
+----
+-{
+-  "data": {
+-    "file": {
+-      "path": "import_value_and_type.ts",
+-      "dependencies": {
+-        "files": {
+-          "items": [
+-            {
+-              "path": "link.tsx"
+-            }
+-          ]
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_all_dependents_(npm@10.5.0).snap b/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_all_dependents_(npm@10.5.0).snap
+deleted file mode 100644
+index c4355ebb18..0000000000
+--- a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_all_dependents_(npm@10.5.0).snap
++++ /dev/null
+@@ -1,26 +0,0 @@
+----
+-source: crates/turborepo/tests/query.rs
+-expression: query_output
+----
+-{
+-  "data": {
+-    "file": {
+-      "path": "link.tsx",
+-      "dependents": {
+-        "files": {
+-          "items": [
+-            {
+-              "path": "import_just_type.ts"
+-            },
+-            {
+-              "path": "import_just_value.ts"
+-            },
+-            {
+-              "path": "import_value_and_type.ts"
+-            }
+-          ]
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_type_dependents_(npm@10.5.0).snap b/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_type_dependents_(npm@10.5.0).snap
+deleted file mode 100644
+index 5549ac43b4..0000000000
+--- a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_type_dependents_(npm@10.5.0).snap
++++ /dev/null
+@@ -1,20 +0,0 @@
+----
+-source: crates/turborepo/tests/query.rs
+-expression: query_output
+----
+-{
+-  "data": {
+-    "file": {
+-      "path": "link.tsx",
+-      "dependents": {
+-        "files": {
+-          "items": [
+-            {
+-              "path": "import_just_type.ts"
+-            }
+-          ]
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_value_dependents_(npm@10.5.0).snap b/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_value_dependents_(npm@10.5.0).snap
+deleted file mode 100644
+index e25a771e6f..0000000000
+--- a/crates/turborepo/tests/snapshots/query__turbo_trace_get_`link.tsx`_with_value_dependents_(npm@10.5.0).snap
++++ /dev/null
+@@ -1,23 +0,0 @@
+----
+-source: crates/turborepo/tests/query.rs
+-expression: query_output
+----
+-{
+-  "data": {
+-    "file": {
+-      "path": "link.tsx",
+-      "dependents": {
+-        "files": {
+-          "items": [
+-            {
+-              "path": "import_just_value.ts"
+-            },
+-            {
+-              "path": "import_value_and_type.ts"
+-            }
+-          ]
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/turborepo-tests/integration/fixtures/turbo_trace/import_just_type.ts b/turborepo-tests/integration/fixtures/turbo_trace/import_just_type.ts
+deleted file mode 100644
+index 6f29b3cb73..0000000000
+--- a/turborepo-tests/integration/fixtures/turbo_trace/import_just_type.ts
++++ /dev/null
+@@ -1 +0,0 @@
+-import type { LinkProps } from "./link";
+diff --git a/turborepo-tests/integration/fixtures/turbo_trace/import_just_value.ts b/turborepo-tests/integration/fixtures/turbo_trace/import_just_value.ts
+deleted file mode 100644
+index e1b79a7059..0000000000
+--- a/turborepo-tests/integration/fixtures/turbo_trace/import_just_value.ts
++++ /dev/null
+@@ -1 +0,0 @@
+-import { Link } from "./link";
+diff --git a/turborepo-tests/integration/fixtures/turbo_trace/import_value_and_type.ts b/turborepo-tests/integration/fixtures/turbo_trace/import_value_and_type.ts
+deleted file mode 100644
+index c4d9493d9b..0000000000
+--- a/turborepo-tests/integration/fixtures/turbo_trace/import_value_and_type.ts
++++ /dev/null
+@@ -1,2 +0,0 @@
+-import type { LinkProps } from "./types";
+-import { Link } from "./link";
+diff --git a/turborepo-tests/integration/fixtures/turbo_trace/link.tsx b/turborepo-tests/integration/fixtures/turbo_trace/link.tsx
+deleted file mode 100644
+index 8654121b50..0000000000
+--- a/turborepo-tests/integration/fixtures/turbo_trace/link.tsx
++++ /dev/null
+@@ -1,8 +0,0 @@
+-export interface LinkProps {
+-  children: React.ReactNode;
+-  href: string;
+-}
+-
+-export const Link = ({ children, href }: LinkProps) => {
+-  return <a href={href}>{children}</a>;
+-};
+diff --git a/turborepo-tests/integration/fixtures/turbo_trace/types.ts b/turborepo-tests/integration/fixtures/turbo_trace/types.ts
+deleted file mode 100644
+index c3a0137b0d..0000000000
+--- a/turborepo-tests/integration/fixtures/turbo_trace/types.ts
++++ /dev/null
+@@ -1 +0,0 @@
+-export type LinkProps = string;

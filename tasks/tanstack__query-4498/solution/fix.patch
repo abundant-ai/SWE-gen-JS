@@ -1,0 +1,217 @@
+diff --git a/packages/query-core/src/queriesObserver.ts b/packages/query-core/src/queriesObserver.ts
+index 1e0062a07..c9fbc5e16 100644
+--- a/packages/query-core/src/queriesObserver.ts
++++ b/packages/query-core/src/queriesObserver.ts
+@@ -117,6 +117,10 @@ export class QueriesObserver extends Subscribable<QueriesObserverListener> {
+     return this.observers.map((observer) => observer.getCurrentQuery())
+   }
+ 
++  getObservers() {
++    return this.observers
++  }
++
+   getOptimisticResult(queries: QueryObserverOptions[]): QueryObserverResult[] {
+     return this.findMatchingObservers(queries).map((match) =>
+       match.observer.getOptimisticResult(match.defaultedQueryOptions),
+diff --git a/packages/react-query/src/suspense.ts b/packages/react-query/src/suspense.ts
+new file mode 100644
+index 000000000..682409e75
+--- /dev/null
++++ b/packages/react-query/src/suspense.ts
+@@ -0,0 +1,59 @@
++import type { DefaultedQueryObserverOptions } from '@tanstack/query-core'
++import type { QueryObserver } from '@tanstack/query-core'
++import type { QueryErrorResetBoundaryValue } from './QueryErrorResetBoundary'
++import type { QueryObserverResult } from '@tanstack/query-core'
++import type { QueryKey } from '@tanstack/query-core'
++
++export const ensureStaleTime = (
++  defaultedOptions: DefaultedQueryObserverOptions<any, any, any, any, any>,
++) => {
++  if (defaultedOptions.suspense) {
++    // Always set stale time when using suspense to prevent
++    // fetching again when directly mounting after suspending
++    if (typeof defaultedOptions.staleTime !== 'number') {
++      defaultedOptions.staleTime = 1000
++    }
++  }
++}
++
++export const willFetch = (
++  result: QueryObserverResult<any, any>,
++  isRestoring: boolean,
++) => result.isLoading && result.isFetching && !isRestoring
++
++export const shouldSuspend = (
++  defaultedOptions:
++    | DefaultedQueryObserverOptions<any, any, any, any, any>
++    | undefined,
++  result: QueryObserverResult<any, any>,
++  isRestoring: boolean,
++) => defaultedOptions?.suspense && willFetch(result, isRestoring)
++
++export const fetchOptimistic = <
++  TQueryFnData,
++  TError,
++  TData,
++  TQueryData,
++  TQueryKey extends QueryKey,
++>(
++  defaultedOptions: DefaultedQueryObserverOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryData,
++    TQueryKey
++  >,
++  observer: QueryObserver<TQueryFnData, TError, TData, TQueryData, TQueryKey>,
++  errorResetBoundary: QueryErrorResetBoundaryValue,
++) =>
++  observer
++    .fetchOptimistic(defaultedOptions)
++    .then(({ data }) => {
++      defaultedOptions.onSuccess?.(data as TData)
++      defaultedOptions.onSettled?.(data, null)
++    })
++    .catch((error) => {
++      errorResetBoundary.clearReset()
++      defaultedOptions.onError?.(error)
++      defaultedOptions.onSettled?.(undefined, error)
++    })
+diff --git a/packages/react-query/src/useBaseQuery.ts b/packages/react-query/src/useBaseQuery.ts
+index 607ee1f74..df537ab74 100644
+--- a/packages/react-query/src/useBaseQuery.ts
++++ b/packages/react-query/src/useBaseQuery.ts
+@@ -12,6 +12,7 @@ import {
+   getHasError,
+   useClearResetErrorBoundary,
+ } from './errorBoundaryUtils'
++import { ensureStaleTime, shouldSuspend, fetchOptimistic } from './suspense'
+ 
+ export function useBaseQuery<
+   TQueryFnData,
+@@ -58,14 +59,7 @@ export function useBaseQuery<
+     )
+   }
+ 
+-  if (defaultedOptions.suspense) {
+-    // Always set stale time when using suspense to prevent
+-    // fetching again when directly mounting after suspending
+-    if (typeof defaultedOptions.staleTime !== 'number') {
+-      defaultedOptions.staleTime = 1000
+-    }
+-  }
+-
++  ensureStaleTime(defaultedOptions)
+   ensurePreventErrorBoundaryRetry(defaultedOptions, errorResetBoundary)
+ 
+   useClearResetErrorBoundary(errorResetBoundary)
+@@ -99,23 +93,8 @@ export function useBaseQuery<
+   }, [defaultedOptions, observer])
+ 
+   // Handle suspense
+-  if (
+-    defaultedOptions.suspense &&
+-    result.isLoading &&
+-    result.isFetching &&
+-    !isRestoring
+-  ) {
+-    throw observer
+-      .fetchOptimistic(defaultedOptions)
+-      .then(({ data }) => {
+-        defaultedOptions.onSuccess?.(data as TData)
+-        defaultedOptions.onSettled?.(data, null)
+-      })
+-      .catch((error) => {
+-        errorResetBoundary.clearReset()
+-        defaultedOptions.onError?.(error)
+-        defaultedOptions.onSettled?.(undefined, error)
+-      })
++  if (shouldSuspend(defaultedOptions, result, isRestoring)) {
++    throw fetchOptimistic(defaultedOptions, observer, errorResetBoundary)
+   }
+ 
+   // Handle error boundary
+diff --git a/packages/react-query/src/useQueries.ts b/packages/react-query/src/useQueries.ts
+index ab9a98ab1..0682d30f1 100644
+--- a/packages/react-query/src/useQueries.ts
++++ b/packages/react-query/src/useQueries.ts
+@@ -12,6 +12,12 @@ import {
+   getHasError,
+   useClearResetErrorBoundary,
+ } from './errorBoundaryUtils'
++import {
++  ensureStaleTime,
++  shouldSuspend,
++  fetchOptimistic,
++  willFetch,
++} from './suspense'
+ 
+ // This defines the `UseQueryOptions` that are accepted in `QueriesOptions` & `GetOptions`.
+ // - `context` is omitted as it is passed as a root-level option to `useQueries` instead.
+@@ -170,7 +176,7 @@ export function useQueries<T extends any[]>({
+     () => new QueriesObserver(queryClient, defaultedQueries),
+   )
+ 
+-  const result = observer.getOptimisticResult(defaultedQueries)
++  const optimisticResult = observer.getOptimisticResult(defaultedQueries)
+ 
+   useSyncExternalStore(
+     React.useCallback(
+@@ -194,22 +200,48 @@ export function useQueries<T extends any[]>({
+ 
+   defaultedQueries.forEach((query) => {
+     ensurePreventErrorBoundaryRetry(query, errorResetBoundary)
++    ensureStaleTime(query)
+   })
+ 
+   useClearResetErrorBoundary(errorResetBoundary)
+ 
+-  const firstSingleResultWhichShouldThrow = result.find((singleResult, index) =>
+-    getHasError({
+-      result: singleResult,
+-      errorResetBoundary,
+-      useErrorBoundary: defaultedQueries[index]?.useErrorBoundary ?? false,
+-      query: observer.getQueries()[index]!,
+-    }),
++  const shouldAtLeastOneSuspend = optimisticResult.some((result, index) =>
++    shouldSuspend(defaultedQueries[index], result, isRestoring),
++  )
++
++  const suspensePromises = shouldAtLeastOneSuspend
++    ? optimisticResult.flatMap((result, index) => {
++        const options = defaultedQueries[index]
++        const queryObserver = observer.getObservers()[index]
++
++        if (options && queryObserver) {
++          if (shouldSuspend(options, result, isRestoring)) {
++            return fetchOptimistic(options, queryObserver, errorResetBoundary)
++          } else if (willFetch(result, isRestoring)) {
++            void fetchOptimistic(options, queryObserver, errorResetBoundary)
++          }
++        }
++        return []
++      })
++    : []
++
++  if (suspensePromises.length > 0) {
++    throw Promise.all(suspensePromises)
++  }
++
++  const firstSingleResultWhichShouldThrow = optimisticResult.find(
++    (result, index) =>
++      getHasError({
++        result,
++        errorResetBoundary,
++        useErrorBoundary: defaultedQueries[index]?.useErrorBoundary ?? false,
++        query: observer.getQueries()[index]!,
++      }),
+   )
+ 
+   if (firstSingleResultWhichShouldThrow?.error) {
+     throw firstSingleResultWhichShouldThrow.error
+   }
+ 
+-  return result as QueriesResults<T>
++  return optimisticResult as QueriesResults<T>
+ }

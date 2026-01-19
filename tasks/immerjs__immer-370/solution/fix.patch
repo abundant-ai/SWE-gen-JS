@@ -1,0 +1,615 @@
+diff --git a/readme.md b/readme.md
+index ba4fcd6..993c520 100644
+--- a/readme.md
++++ b/readme.md
+@@ -715,6 +715,10 @@ Make sure you don't return any promises as state, because `produce` will actuall
+ 
+ When using TypeScript, for curried reducers that are typed in the form `produce<Type>((arg) => { })`, rewrite this to `produce((arg: Type) => { })` or `produce((arg: Draft<Type>) => { })` for correct inference.
+ 
++**Immer 3.\* -> 4.0**
++
++`Maps` and `Sets` are now supported by `immer` and, therefore, immutable. Your current code, where you kept immutability of `Maps` and `Sets` on your own, should keep working as before in simple cases. However, consider covering it with a sufficient number of unit tests to avoid any unexpected outcome.
++
+ ## FAQ
+ 
+ _(for those who skimmed the above instead of actually reading)_
+diff --git a/src/common.js b/src/common.js
+index 7f70d6b..4919b46 100644
+--- a/src/common.js
++++ b/src/common.js
+@@ -33,42 +33,31 @@ export function original(value) {
+ 
+ // We use Maps as `drafts` for Sets, not Objects
+ // See proxy.js
+-export function assignSet(target, ...mapOverrides) {
+-    mapOverrides.forEach(override => {
+-        for (const value of override.values()) {
+-            // When we add new drafts we have to remove their originals if present
+-            const originalValue = original(value)
+-            if (originalValue) {
+-                target.delete(originalValue)
+-            }
+-            target.add(value)
+-        }
++export function assignSet(target, override) {
++    override.forEach(value => {
++        // When we add new drafts we have to remove their originals if present
++        const prev = original(value)
++        if (prev) target.delete(prev)
++        target.add(value)
+     })
+     return target
+ }
+ 
+-export function assignMap(target, ...objOverrides) {
+-    objOverrides.forEach(override => {
+-        for (let key in override) {
+-            if (has(override, key)) {
+-                target.set(key, override[key])
+-            }
+-        }
+-    })
++// We use Maps as `drafts` for Maps, not Objects
++// See proxy.js
++export function assignMap(target, override) {
++    override.forEach((value, key) => target.set(key, value))
+     return target
+ }
+ 
+-function assignObjectLegacy(target, ...objOverrides) {
+-    objOverrides.forEach(function(override) {
+-        for (let key in override) {
+-            if (has(override, key)) {
+-                target[key] = override[key]
+-            }
+-        }
++export const assign =
++    Object.assign ||
++    ((target, ...overrides) => {
++        overrides.forEach(override =>
++            Object.keys(override).forEach(key => (target[key] = override[key]))
++        )
++        return target
+     })
+-    return target
+-}
+-export const assign = Object.assign || assignObjectLegacy
+ 
+ export const ownKeys =
+     typeof Reflect !== "undefined" && Reflect.ownKeys
+@@ -110,12 +99,12 @@ export function shallowCopy(base, invokeGetters = false) {
+     return clone
+ }
+ 
+-export function each(value, cb) {
+-    if (Array.isArray(value) || isMap(value) || isSet(value)) {
+-        value.forEach((entry, index) => cb(index, entry, value))
+-        return
++export function each(obj, iter) {
++    if (Array.isArray(obj) || isMap(obj) || isSet(obj)) {
++        obj.forEach((entry, index) => iter(index, entry, obj))
++    } else {
++        ownKeys(obj).forEach(key => iter(key, obj[key], obj))
+     }
+-    ownKeys(value).forEach(key => cb(key, value[key], value))
+ }
+ 
+ export function isEnumerable(base, prop) {
+@@ -124,7 +113,13 @@ export function isEnumerable(base, prop) {
+ }
+ 
+ export function has(thing, prop) {
+-    return Object.prototype.hasOwnProperty.call(thing, prop)
++    return isMap(thing)
++        ? thing.has(prop)
++        : Object.prototype.hasOwnProperty.call(thing, prop)
++}
++
++export function get(thing, prop) {
++    return isMap(thing) ? thing.get(prop) : thing[prop]
+ }
+ 
+ export function is(x, y) {
+diff --git a/src/es5.js b/src/es5.js
+index c6a6f5d..fab25f2 100644
+--- a/src/es5.js
++++ b/src/es5.js
+@@ -64,7 +64,7 @@ function revoke() {
+     this.revoked = true
+ }
+ 
+-function source(state) {
++function latest(state) {
+     return state.copy || state.base
+ }
+ 
+@@ -82,7 +82,7 @@ function peek(draft, prop) {
+ 
+ function get(state, prop) {
+     assertUnrevoked(state)
+-    const value = peek(source(state), prop)
++    const value = peek(latest(state), prop)
+     if (state.finalizing) return value
+     // Create a draft if the value is unmodified.
+     if (value === peek(state.base, prop) && isDraftable(value)) {
+@@ -96,7 +96,7 @@ function set(state, prop, value) {
+     assertUnrevoked(state)
+     state.assigned[prop] = true
+     if (!state.modified) {
+-        if (is(value, peek(source(state), prop))) return
++        if (is(value, peek(latest(state), prop))) return
+         markChanged(state)
+         prepareCopy(state)
+     }
+@@ -148,7 +148,7 @@ function assertUnrevoked(state) {
+     if (state.revoked === true)
+         throw new Error(
+             "Cannot use a proxy that has been revoked. Did you pass an object from inside an immer function to an async process? " +
+-                JSON.stringify(source(state))
++                JSON.stringify(latest(state))
+         )
+ }
+ 
+diff --git a/src/immer.js b/src/immer.js
+index 7cfece7..c2437f2 100644
+--- a/src/immer.js
++++ b/src/immer.js
+@@ -4,6 +4,7 @@ import {applyPatches, generatePatches} from "./patches"
+ import {
+     assign,
+     each,
++    get,
+     has,
+     is,
+     isDraft,
+@@ -13,7 +14,8 @@ import {
+     shallowCopy,
+     DRAFT_STATE,
+     NOTHING,
+-    isSet
++    isSet,
++    original
+ } from "./common"
+ import {ImmerScope} from "./scope"
+ 
+@@ -188,14 +190,14 @@ export class Immer {
+             state.finalized = true
+             this.finalizeTree(state.draft, path, scope)
+ 
+-            // TODO: It won't fire for Sets because they don't use `assigned`. Is it an issue?
+-            if (this.onDelete) {
++            // We cannot really delete anything inside of a Set. We can only replace the whole Set.
++            if (this.onDelete && !isSet(state.base)) {
+                 // The `assigned` object is unreliable with ES5 drafts.
+                 if (this.useProxies) {
+                     const {assigned} = state
+-                    for (const prop in assigned) {
+-                        if (!assigned[prop]) this.onDelete(state, prop)
+-                    }
++                    each(assigned, (prop, exists) => {
++                        if (!exists) this.onDelete(state, prop)
++                    })
+                 } else {
+                     // TODO: Figure it out for Maps and Sets if we need to support ES5
+                     const {base, copy} = state
+@@ -247,32 +249,31 @@ export class Immer {
+ 
+             // In the `finalizeTree` method, only the `root` object may be a draft.
+             const isDraftProp = !!state && parent === root
++            const isSetMember = isSet(parent)
+ 
+             if (isDraft(value)) {
+                 const path =
+                     isDraftProp &&
+                     needPatches &&
+-                    !isSet(parent) &&
+-                    !state.assigned[prop]
++                    !isSetMember && // Set objects are atomic since they have no keys.
++                    !has(state.assigned, prop) // Skip deep patches for assigned keys.
+                         ? rootPath.concat(prop)
+                         : null
+ 
+                 // Drafts owned by `scope` are finalized here.
+                 value = this.finalize(value, path, scope)
++                replace(parent, prop, value)
+ 
+                 // Drafts from another scope must prevent auto-freezing.
+                 if (isDraft(value)) {
+                     scope.canAutoFreeze = false
+                 }
+ 
+-                setProperty(parent, prop, value)
+-
+                 // Unchanged drafts are never passed to the `onAssign` hook.
+-                // TODO: Add tests and support for Maps and Sets
+-                if (isDraftProp && value === state.base[prop]) return
++                if (isDraftProp && value === get(state.base, prop)) return
+             }
+             // Unchanged draft properties are ignored.
+-            else if (isDraftProp && is(value, state.base[prop])) {
++            else if (isDraftProp && is(value, get(state.base, prop))) {
+                 return
+             }
+             // Search new objects for unfinalized drafts. Frozen objects should never contain drafts.
+@@ -280,7 +281,8 @@ export class Immer {
+                 each(value, finalizeProperty)
+             }
+ 
+-            if (isDraftProp && this.onAssign) {
++            // We cannot really assign anything inside of a Set. We can only replace the whole Set.
++            if (isDraftProp && this.onAssign && !isSetMember) {
+                 this.onAssign(state, prop, value)
+             }
+         }
+@@ -290,21 +292,21 @@ export class Immer {
+     }
+ }
+ 
+-function setProperty(parent, prop, value) {
+-    // Preserve non-enumerable properties.
+-    if (Array.isArray(parent) || isEnumerable(parent, prop)) {
+-        parent[prop] = value
+-        return
+-    }
++function replace(parent, prop, value) {
+     if (isMap(parent)) {
+         parent.set(prop, value)
+-        return
+-    }
+-    if (isSet(parent)) {
+-        // Here prop is a proxied value
++    } else if (isSet(parent)) {
++        // In this case, the `prop` is actually a draft.
+         parent.delete(prop)
+         parent.add(value)
+-        return
++    } else if (Array.isArray(parent) || isEnumerable(parent, prop)) {
++        // Preserve non-enumerable properties.
++        parent[prop] = value
++    } else {
++        Object.defineProperty(parent, prop, {
++            value,
++            writable: true,
++            configurable: true
++        })
+     }
+-    Object.defineProperty(parent, prop, {value})
+ }
+diff --git a/src/patches.js b/src/patches.js
+index 91b336b..dd89767 100644
+--- a/src/patches.js
++++ b/src/patches.js
+@@ -1,19 +1,11 @@
+-import {each, isMap, isSet} from "./common"
++import {get, each, isMap, isSet, has} from "./common"
+ 
+ export function generatePatches(state, basePath, patches, inversePatches) {
+     const generatePatchesFn = Array.isArray(state.base)
+         ? generateArrayPatches
+-        : isMap(state.base)
+-        ? generatePatchesFromAssigned(
+-              (map, key) => map.get(key),
+-              (map, key) => map.has(key)
+-          )
+         : isSet(state.base)
+         ? generateSetPatches
+-        : generatePatchesFromAssigned(
+-              (obj, key) => obj[key],
+-              (obj, key) => key in obj
+-          )
++        : generatePatchesFromAssigned
+ 
+     generatePatchesFn(state, basePath, patches, inversePatches)
+ }
+@@ -87,29 +79,28 @@ function generateArrayPatches(state, basePath, patches, inversePatches) {
+     }
+ }
+ 
+-function generatePatchesFromAssigned(getValueByKey, hasKey) {
+-    return function(state, basePath, patches, inversePatches) {
+-        const {base, copy} = state
+-        each(state.assigned, (key, assignedValue) => {
+-            const origValue = getValueByKey(base, key)
+-            const value = getValueByKey(copy, key)
+-            const op = !assignedValue
+-                ? "remove"
+-                : hasKey(base, key)
+-                ? "replace"
+-                : "add"
+-            if (origValue === value && op === "replace") return
+-            const path = basePath.concat(key)
+-            patches.push(op === "remove" ? {op, path} : {op, path, value})
+-            inversePatches.push(
+-                op === "add"
+-                    ? {op: "remove", path}
+-                    : op === "remove"
+-                    ? {op: "add", path, value: origValue}
+-                    : {op: "replace", path, value: origValue}
+-            )
+-        })
+-    }
++// This is used for both Map objects and normal objects.
++function generatePatchesFromAssigned(state, basePath, patches, inversePatches) {
++    const {base, copy} = state
++    each(state.assigned, (key, assignedValue) => {
++        const origValue = get(base, key)
++        const value = get(copy, key)
++        const op = !assignedValue
++            ? "remove"
++            : has(base, key)
++            ? "replace"
++            : "add"
++        if (origValue === value && op === "replace") return
++        const path = basePath.concat(key)
++        patches.push(op === "remove" ? {op, path} : {op, path, value})
++        inversePatches.push(
++            op === "add"
++                ? {op: "remove", path}
++                : op === "remove"
++                ? {op: "add", path, value: origValue}
++                : {op: "replace", path, value: origValue}
++        )
++    })
+ }
+ 
+ function generateSetPatches(state, basePath, patches, inversePatches) {
+@@ -160,11 +151,7 @@ export function applyPatches(draft, patches) {
+         } else {
+             let base = draft
+             for (let i = 0; i < path.length - 1; i++) {
+-                if (isMap(base)) {
+-                    base = base.get(path[i])
+-                } else {
+-                    base = base[path[i]]
+-                }
++                base = get(base, path[i])
+                 if (!base || typeof base !== "object")
+                     throw new Error("Cannot apply patch, path doesn't resolve: " + path.join("/")) // prettier-ignore
+             }
+diff --git a/src/proxy.js b/src/proxy.js
+index faec0a4..e1e312b 100644
+--- a/src/proxy.js
++++ b/src/proxy.js
+@@ -49,20 +49,26 @@ export function createProxy(base, parent) {
+         revoke: null
+     }
+ 
+-    let proxyTarget = state
++    let target = state
+     let traps = objectTraps
+     if (Array.isArray(base)) {
+-        proxyTarget = [state]
++        target = [state]
+         traps = arrayTraps
+-    } else if (isMap(base)) {
++    }
++    // Map drafts must support object keys, so we use Map objects to track changes.
++    else if (isMap(base)) {
+         traps = mapTraps
+-    } else if (isSet(base)) {
++        state.drafts = new Map()
++        state.assigned = new Map()
++    }
++    // Set drafts use a Map object to track which of its values are drafted.
++    // And we don't need the "assigned" property, because Set objects have no keys.
++    else if (isSet(base)) {
+         traps = setTraps
+-        // We use values of a Set as keys and objects do not support other objects as keys
+         state.drafts = new Map()
+     }
+ 
+-    const {revoke, proxy} = Proxy.revocable(proxyTarget, traps)
++    const {revoke, proxy} = Proxy.revocable(target, traps)
+ 
+     state.draft = proxy
+     state.revoke = revoke
+@@ -85,7 +91,7 @@ const objectTraps = {
+             return drafts[prop]
+         }
+ 
+-        const value = source(state)[prop]
++        const value = latest(state)[prop]
+         if (state.finalized || !isDraftable(value)) {
+             return value
+         }
+@@ -101,10 +107,10 @@ const objectTraps = {
+         return (drafts[prop] = createProxy(value, state))
+     },
+     has(state, prop) {
+-        return prop in source(state)
++        return prop in latest(state)
+     },
+     ownKeys(state) {
+-        return Reflect.ownKeys(source(state))
++        return Reflect.ownKeys(latest(state))
+     },
+     set(state, prop, value) {
+         if (!state.modified) {
+@@ -134,7 +140,7 @@ const objectTraps = {
+     // Note: We never coerce `desc.value` into an Immer draft, because we can't make
+     // the same guarantee in ES5 mode.
+     getOwnPropertyDescriptor(state, prop) {
+-        const owner = source(state)
++        const owner = latest(state)
+         const desc = Reflect.getOwnPropertyDescriptor(owner, prop)
+         if (desc) {
+             desc.writable = true
+@@ -196,64 +202,54 @@ const reflectTraps = makeReflectTraps([
+ 
+ const mapTraps = makeTrapsForGetters({
+     [DRAFT_STATE]: state => state,
+-    size: state => source(state).size,
+-    has(state, prop) {
+-        state = source(state)
+-        return state.has.bind(state)
+-    },
++    size: state => latest(state).size,
++    has: state => key => latest(state).has(key),
+     set: state => (key, value) => {
+-        const stateSource = source(state)
+-        if (!stateSource.has(key) || stateSource.get(key) !== value) {
++        const values = latest(state)
++        if (!values.has(key) || values.get(key) !== value) {
+             markChanged(state)
+-            state.assigned[key] = true
++            state.assigned.set(key, true)
+             state.copy.set(key, value)
+         }
+         return state.draft
+     },
+     delete: state => key => {
+-        markChanged(state)
+-        state.assigned[key] = false
+-        return state.copy.delete(key)
++        if (latest(state).has(key)) {
++            markChanged(state)
++            state.assigned.set(key, false)
++            return state.copy.delete(key)
++        }
++        return false
+     },
+     clear: state => () => {
+         markChanged(state)
+-        state.assigned = {}
+-        for (const key of source(state).keys()) {
+-            state.assigned[key] = false
++        state.assigned = new Map()
++        for (const key of latest(state).keys()) {
++            state.assigned.set(key, false)
+         }
+         return state.copy.clear()
+     },
+     forEach: (state, _, receiver) => (cb, thisArg) =>
+-        source(state).forEach((_, key, map) => {
++        latest(state).forEach((_, key, map) => {
+             const value = receiver.get(key)
+             cb.call(thisArg, value, key, map)
+         }),
+     get: state => key => {
+-        if (!state.modified && has(state.drafts, key)) {
+-            return state.drafts[key]
+-        }
+-
+-        if (state.modified && state.copy.has(key)) {
+-            return state.copy.get(key)
++        const drafts = state[state.modified ? "copy" : "drafts"]
++        if (drafts.has(key)) {
++            return drafts.get(key)
+         }
+ 
+-        const value = source(state).get(key)
+-
++        const value = latest(state).get(key)
+         if (state.finalized || !isDraftable(value)) {
+             return value
+         }
+ 
+         const draft = createProxy(value, state)
+-
+-        if (!state.modified) {
+-            state.drafts[key] = draft
+-        } else {
+-            state.copy.set(key, draft)
+-        }
+-
++        drafts.set(key, draft)
+         return draft
+     },
+-    keys: state => () => source(state).keys(),
++    keys: state => () => latest(state).keys(),
+     values: iterateMapValues,
+     entries: iterateMapValues,
+     [Symbol.iterator]: iterateMapValues
+@@ -261,17 +257,15 @@ const mapTraps = makeTrapsForGetters({
+ 
+ /** Map.prototype.values _-or-_ Map.prototype.entries */
+ function iterateMapValues(state, prop, receiver) {
+-    const getYieldable =
+-        prop === "values" ? (key, value) => value : (key, value) => [key, value]
+-
++    const isEntries = prop !== "values"
+     return () => {
+-        const iterator = source(state)[Symbol.iterator]()
++        const iterator = latest(state)[Symbol.iterator]()
+         return makeIterable(() => {
+             const result = iterator.next()
+             if (!result.done) {
+                 const [key] = result.value
+                 const value = receiver.get(key)
+-                result.value = getYieldable(key, value)
++                result.value = isEntries ? [key, value] : value
+             }
+             return result
+         })
+@@ -284,13 +278,10 @@ function iterateMapValues(state, prop, receiver) {
+ 
+ const setTraps = makeTrapsForGetters({
+     [DRAFT_STATE]: state => state,
+-    size: state => source(state).size,
+-    has(state, prop) {
+-        state = source(state)
+-        return state.has.bind(state)
+-    },
++    size: state => latest(state).size,
++    has: state => key => latest(state).has(key),
+     add: state => value => {
+-        if (!source(state).has(value)) {
++        if (!latest(state).has(value)) {
+             markChanged(state)
+             state.copy.add(value)
+         }
+@@ -319,17 +310,14 @@ const setTraps = makeTrapsForGetters({
+ })
+ 
+ function iterateSetValues(state, prop) {
++    const isEntries = prop === "entries"
+     return () => {
+-        const iterator = source(state)[Symbol.iterator]()
+-
++        const iterator = latest(state)[Symbol.iterator]()
+         return makeIterable(() => {
+             const result = iterator.next()
+             if (!result.done) {
+-                const valueWrapped = wrapSetValue(state, result.value)
+-                result.value = valueWrapped
+-                if (prop === "entries") {
+-                    result.value = [valueWrapped, valueWrapped]
+-                }
++                const value = wrapSetValue(state, result.value)
++                result.value = isEntries ? [value, value] : value
+             }
+             return result
+         })
+@@ -356,8 +344,8 @@ function wrapSetValue(state, value) {
+  * Helpers
+  */
+ 
+-// returns the object we should be reading the current value from, which is base, until some change has been made
+-function source(state) {
++// Retrieve the latest values of the draft.
++function latest(state) {
+     return state.copy || state.base
+ }
+ 
+@@ -365,7 +353,7 @@ function source(state) {
+ function peek(draft, prop) {
+     const state = draft[DRAFT_STATE]
+     const desc = Reflect.getOwnPropertyDescriptor(
+-        state ? source(state) : draft,
++        state ? latest(state) : draft,
+         prop
+     )
+     return desc && desc.value
+@@ -404,10 +392,10 @@ function makeIterable(next) {
+     })
+ }
+ 
+-/** Create traps that all use the `Reflect` API on the `source(state)` */
++/** Create traps that all use the `Reflect` API on the `latest(state)` */
+ function makeReflectTraps(names) {
+     return names.reduce((traps, name) => {
+-        traps[name] = (state, ...args) => Reflect[name](source(state), ...args)
++        traps[name] = (state, ...args) => Reflect[name](latest(state), ...args)
+         return traps
+     }, {})
+ }

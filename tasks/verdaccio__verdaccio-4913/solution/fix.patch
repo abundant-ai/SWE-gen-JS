@@ -1,0 +1,180 @@
+diff --git a/.changeset/lucky-crabs-enjoy.md b/.changeset/lucky-crabs-enjoy.md
+new file mode 100644
+index 000000000..bf64d9f35
+--- /dev/null
++++ b/.changeset/lucky-crabs-enjoy.md
+@@ -0,0 +1,8 @@
++---
++'@verdaccio/api': patch
++'@verdaccio/core': patch
++'@verdaccio/middleware': patch
++'@verdaccio/proxy': patch
++---
++
++fix(middleware): error 404 when getting scoped tarballs
+diff --git a/packages/api/src/index.ts b/packages/api/src/index.ts
+index 0be74b836..ec854e708 100644
+--- a/packages/api/src/index.ts
++++ b/packages/api/src/index.ts
+@@ -4,6 +4,7 @@ import { Auth } from '@verdaccio/auth';
+ import {
+   antiLoop,
+   encodeScopePackage,
++  makeURLrelative,
+   match,
+   validateName,
+   validatePackage,
+@@ -45,6 +46,7 @@ export default function (config: Config, auth: Auth, storage: Storage): Router {
+   app.use(auth.apiJWTmiddleware());
+   app.use(express.json({ strict: false, limit: config.max_body_size || '10mb' }));
+   app.use(antiLoop(config));
++  app.use(makeURLrelative);
+   // encode / in a scoped package name to be matched as a single parameter in routes
+   app.use(encodeScopePackage);
+   // for "npm whoami"
+diff --git a/packages/core/core/src/constants.ts b/packages/core/core/src/constants.ts
+index 6c9da44a6..e7de7fbb0 100644
+--- a/packages/core/core/src/constants.ts
++++ b/packages/core/core/src/constants.ts
+@@ -54,6 +54,7 @@ export const HEADERS = {
+   TEXT_CHARSET: 'text/plain; charset=utf-8',
+   WWW_AUTH: 'WWW-Authenticate',
+   GZIP: 'gzip',
++  HOST: 'host',
+ };
+ 
+ export const HTTP_STATUS = {
+diff --git a/packages/middleware/src/index.ts b/packages/middleware/src/index.ts
+index 8aaec3786..19f659ecd 100644
+--- a/packages/middleware/src/index.ts
++++ b/packages/middleware/src/index.ts
+@@ -2,6 +2,7 @@ export { match } from './middlewares/match';
+ export { setSecurityWebHeaders } from './middlewares/security-headers';
+ export { validateName, validatePackage } from './middlewares/validation';
+ export { media } from './middlewares/media';
++export { makeURLrelative } from './middlewares/make-url-relative';
+ export { encodeScopePackage } from './middlewares/encode-pkg';
+ export { expectJson } from './middlewares/json';
+ export { antiLoop } from './middlewares/antiLoop';
+diff --git a/packages/middleware/src/middlewares/encode-pkg.ts b/packages/middleware/src/middlewares/encode-pkg.ts
+index ba5ecac35..d70bd92a3 100644
+--- a/packages/middleware/src/middlewares/encode-pkg.ts
++++ b/packages/middleware/src/middlewares/encode-pkg.ts
+@@ -1,5 +1,7 @@
+ import buildDebug from 'debug';
+ 
++import { errorUtils } from '@verdaccio/core';
++
+ import { $NextFunctionVer, $RequestExtend, $ResponseExtend } from '../types';
+ 
+ const debug = buildDebug('verdaccio:middleware:encode');
+@@ -16,15 +18,22 @@ export function encodeScopePackage(
+   next: $NextFunctionVer
+ ): void {
+   const original = req.url;
++
++  // Expect relative URLs i.e. should call makeURLrelative before this middleware
++  if (!req.url.startsWith('/')) {
++    return next(errorUtils.getBadRequest(`Invalid URL: ${req.url} (must be relative)`));
++  }
++
+   // If the @ sign is encoded, we need to decode it first
+   // e.g.: /%40org/pkg/1.2.3 -> /@org/pkg/1.2.3
+-  if (req.url.indexOf('%40') !== -1) {
+-    req.url = req.url.replace(/^\/%40/, '/@');
+-  }
+-  if (req.url.indexOf('@') !== -1) {
+-    // e.g.: /@org/pkg/1.2.3 -> /@org%2Fpkg/1.2.3, /@org%2Fpkg/1.2.3 -> /@org%2Fpkg/1.2.3
+-    req.url = req.url.replace(/^(\/@[^\/%]+)\/(?!$)/, '$1%2F');
++  // For scoped packages, encode the slash to make it a single path segment/parameter
++  // e.g.: /@org/pkg/1.2.3 -> /@org%2Fpkg/1.2.3, /@org%2Fpkg/1.2.3 -> /@org%2Fpkg/1.2.3
++  req.url = req.url.replace(/^\/%40/, '/@').replace(/^(\/@[^\/%]+)\/(?!$)/, '$1%2F');
++
++  if (original !== req.url) {
++    debug('encodeScopePackage: %o -> %o', original, req.url);
++  } else {
++    debug('encodeScopePackage: %o (unchanged)', original);
+   }
+-  debug('encodeScopePackage: %o -> %o', original, req.url);
+   next();
+ }
+diff --git a/packages/middleware/src/middlewares/make-url-relative.ts b/packages/middleware/src/middlewares/make-url-relative.ts
+new file mode 100644
+index 000000000..5f1d9290b
+--- /dev/null
++++ b/packages/middleware/src/middlewares/make-url-relative.ts
+@@ -0,0 +1,46 @@
++import buildDebug from 'debug';
++import { URL } from 'node:url';
++
++import { errorUtils } from '@verdaccio/core';
++
++import { $NextFunctionVer, $RequestExtend, $ResponseExtend } from '../types';
++
++const debug = buildDebug('verdaccio:middleware:make-url-relative');
++
++/**
++ * Removes the host from the URL and turns it into a relative URL.
++ * @param req
++ * @param res
++ * @param next
++ */
++export function makeURLrelative(
++  req: $RequestExtend,
++  res: $ResponseExtend,
++  next: $NextFunctionVer
++): void {
++  const original = req.url;
++
++  // npm requests can contain the full URL, including the hostname, for example:
++  // tarball downloads. Removing the hostname makes the URL relative and allows
++  // the application to handle requests in a more consistent way.
++
++  let url;
++  try {
++    // In productive use, the URL is absolute (and base will be ignored)
++    // In tests, the URL might brelative (and base will be used)
++    // https://nodejs.org/docs/latest/api/url.html#new-urlinput-base
++    url = new URL(req.url, `${req.protocol}://${req.headers.host}/`);
++  } catch (error) {
++    return next(errorUtils.getBadRequest(`Invalid URL: ${req.url} (${error})`));
++  }
++
++  // Rebuild the URL without hostname
++  req.url = url.pathname + url.search + url.hash;
++
++  if (original !== req.url) {
++    debug('makeURLrelative: %o -> %o', original, req.url);
++  } else {
++    debug('makeURLrelative: %o (unchanged)', original);
++  }
++  next();
++}
+diff --git a/packages/proxy/src/proxy.ts b/packages/proxy/src/proxy.ts
+index 44108ceca..9da818131 100644
+--- a/packages/proxy/src/proxy.ts
++++ b/packages/proxy/src/proxy.ts
+@@ -503,11 +503,10 @@ class ProxyStorage implements IProxy {
+    */
+   public async search({ url, abort, retry }: ProxySearchParams): Promise<Stream.Readable> {
+     try {
+-      const fullURL = new URL(`${this.url}${url}`);
+-      // FIXME: a better way to remove duplicate slashes?
+-      const uri = fullURL.href.replace(/([^:]\/)\/+/g, '$1');
++      // Incoming URL is relative ie /-/v1/search...
++      const uri = new URL(url, this.url).href;
+       this.logger.http({ uri, uplink: this.upname }, 'search request to uplink @{uplink} - @{uri}');
+-      debug('searching on %s', uri);
++      debug('searching on %o', uri);
+       const response = got(uri, {
+         signal: abort ? abort.signal : {},
+         agent: this.agent,
+@@ -516,6 +515,8 @@ class ProxyStorage implements IProxy {
+       });
+ 
+       const res = await response.text();
++      const total = JSON.parse(res).total;
++      debug('number of packages found: %o', total);
+       const streamSearch = new PassThrough({ objectMode: true });
+       const streamResponse = Readable.from(res);
+       // objects is one of the properties on the body, it ignores date and total

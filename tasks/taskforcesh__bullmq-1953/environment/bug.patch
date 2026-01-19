@@ -1,0 +1,561 @@
+diff --git a/docs/gitbook/guide/flows/remove-dependency.md b/docs/gitbook/guide/flows/remove-dependency.md
+deleted file mode 100644
+index 4e90ae6207..0000000000
+--- a/docs/gitbook/guide/flows/remove-dependency.md
++++ /dev/null
+@@ -1,48 +0,0 @@
+-# Remove Dependency
+-
+-In some situations, you may have a parent job and need to ignore when one of its children fail.
+-
+-The pattern to solve this requirement consists on using the **removeDependencyOnFailure** option. This option will make sure that when a job fails, the dependency is removed from the parent, so the parent will complete without waiting for the failed children.
+-
+-```typescript
+-const flow = new FlowProducer({ connection });
+-
+-const originalTree = await flow.add({
+-  name: 'root-job',
+-  queueName: 'topQueueName',
+-  data: {},
+-  children: [
+-    {
+-      name,
+-      data: { idx: 0, foo: 'bar' },
+-      queueName: 'childrenQueueName',
+-      opts: { removeDependencyOnFailure: true },
+-      children: [
+-        {
+-          name,
+-          data: { idx: 1, foo: 'bah' },
+-          queueName: 'grandChildrenQueueName',
+-        },
+-        {
+-          name,
+-          data: { idx: 2, foo: 'baz' },
+-          queueName: 'grandChildrenQueueName',
+-        },
+-      ],
+-    },
+-    {
+-      name,
+-      data: { idx: 3, foo: 'foo' },
+-      queueName: 'childrenQueueName',
+-    },
+-  ],
+-});
+-```
+-
+-{% hint style="info" %}
+-As soon as a **child** with this option fails, the parent job will be moved to a waiting state only if there are no more pending children.
+-{% endhint %}
+-
+-## Read more:
+-
+-- 💡 [Add Flow API Reference](https://api.docs.bullmq.io/classes/FlowProducer.html#add)
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index d0552c26bf..5f33b73b33 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -40,7 +40,6 @@ const logger = debuglog('bull');
+ const optsDecodeMap = {
+   fpof: 'failParentOnFailure',
+   kl: 'keepLogs',
+-  rdof: 'removeDependencyOnFailure',
+ };
+ 
+ const optsEncodeMap = invert(optsDecodeMap);
+@@ -1079,12 +1078,6 @@ export class Job<
+       throw new Error(`Delay and repeat options could not be used together`);
+     }
+ 
+-    if (this.opts.removeDependencyOnFailure && this.opts.failParentOnFailure) {
+-      throw new Error(
+-        `RemoveDependencyOnFailure and failParentOnFailure options can not be used together`,
+-      );
+-    }
+-
+     if (`${parseInt(this.id, 10)}` === this.id) {
+       //TODO: throw an error in next breaking change
+       console.warn(
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 80ea3106ca..ed6ada91db 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -91,9 +91,8 @@ export class Scripts {
+       queueKeys.pc,
+     ];
+ 
+-    const parent: Record<string, any> = job.parent
+-      ? { ...job.parent, fpof: opts.fpof, rdof: opts.rdof }
+-      : null;
++    const fpof = opts.fpof ? { fpof: true } : {};
++    const parent = job.parent ? { ...job.parent, ...fpof } : null;
+ 
+     const args = [
+       queueKeys[''],
+@@ -285,7 +284,6 @@ export class Scripts {
+           ? opts.metrics?.maxDataPoints
+           : '',
+         fpof: !!job.opts?.failParentOnFailure,
+-        rdof: !!job.opts?.removeDependencyOnFailure,
+       }),
+     ];
+ 
+diff --git a/src/commands/includes/moveParentFromWaitingChildrenToFailed.lua b/src/commands/includes/moveParentFromWaitingChildrenToFailed.lua
+index bd6a148a6a..b576fbd9fd 100644
+--- a/src/commands/includes/moveParentFromWaitingChildrenToFailed.lua
++++ b/src/commands/includes/moveParentFromWaitingChildrenToFailed.lua
+@@ -2,9 +2,6 @@
+   Function to recursively move from waitingChildren to failed.
+ ]]
+ 
+--- Includes
+---- @include "moveParentToWaitIfNeeded"
+-
+ local function moveParentFromWaitingChildrenToFailed( parentQueueKey, parentKey, parentId, jobIdKey, timestamp)
+   if rcall("ZREM", parentQueueKey .. ":waiting-children", parentId) == 1 then
+     rcall("ZADD", parentQueueKey .. ":failed", timestamp, parentId)
+@@ -25,13 +22,6 @@ local function moveParentFromWaitingChildrenToFailed( parentQueueKey, parentKey,
+           parentKey,
+           timestamp
+         )
+-      elseif parentData['rdof'] then
+-        local grandParentKey = parentData['queueKey'] .. ':' .. parentData['id']
+-        local grandParentDependenciesSet = grandParentKey .. ":dependencies"
+-        if rcall("SREM", grandParentDependenciesSet, parentKey) == 1 then
+-          moveParentToWaitIfNeeded(parentData['queueKey'], grandParentDependenciesSet,
+-            grandParentKey, parentData['id'], timestamp)
+-        end
+       end
+     end
+   end
+diff --git a/src/commands/includes/moveParentToWaitIfNeeded.lua b/src/commands/includes/moveParentToWaitIfNeeded.lua
+deleted file mode 100644
+index 42054c7a11..0000000000
+--- a/src/commands/includes/moveParentToWaitIfNeeded.lua
++++ /dev/null
+@@ -1,42 +0,0 @@
+---[[
+-  Validate and move parent to active if needed.
+-]]
+-
+--- Includes
+---- @include "addDelayMarkerIfNeeded"
+---- @include "addJobWithPriority"
+---- @include "getTargetQueueList"
+-
+-local function moveParentToWaitIfNeeded(parentQueueKey, parentDependenciesKey, parentKey, parentId, timestamp)
+-  local isParentActive = rcall("ZSCORE", parentQueueKey .. ":waiting-children", parentId)
+-  if rcall("SCARD", parentDependenciesKey) == 0 and isParentActive then 
+-    rcall("ZREM", parentQueueKey .. ":waiting-children", parentId)
+-    local parentWaitKey = parentQueueKey .. ":wait"
+-    local parentTarget, paused = getTargetQueueList(parentQueueKey .. ":meta", parentWaitKey,
+-      parentQueueKey .. ":paused")
+-    local jobAttributes = rcall("HMGET", parentKey, "priority", "delay")
+-    local priority = tonumber(jobAttributes[1]) or 0
+-    local delay = tonumber(jobAttributes[2]) or 0
+-
+-    if delay > 0 then
+-      local delayedTimestamp = tonumber(timestamp) + delay 
+-      local score = delayedTimestamp * 0x1000
+-      local parentDelayedKey = parentQueueKey .. ":delayed" 
+-      rcall("ZADD", parentDelayedKey, score, parentId)
+-      rcall("XADD", parentQueueKey .. ":events", "*", "event", "delayed", "jobId", parentId,
+-        "delay", delayedTimestamp)
+-
+-      addDelayMarkerIfNeeded(parentTarget, parentDelayedKey)
+-    else
+-      if priority == 0 then
+-        rcall("RPUSH", parentTarget, parentId)
+-      else
+-        addJobWithPriority(parentWaitKey, parentQueueKey .. ":prioritized", priority, paused,
+-          parentId, parentQueueKey .. ":pc")
+-      end
+-  
+-      rcall("XADD", parentQueueKey .. ":events", "*", "event", "waiting", "jobId", parentId,
+-        "prev", "waiting-children")
+-    end
+-  end
+-end
+diff --git a/src/commands/includes/updateParentDepsIfNeeded.lua b/src/commands/includes/updateParentDepsIfNeeded.lua
+index feaf01963d..590776d4ae 100644
+--- a/src/commands/includes/updateParentDepsIfNeeded.lua
++++ b/src/commands/includes/updateParentDepsIfNeeded.lua
+@@ -3,11 +3,40 @@
+ ]]
+ 
+ -- Includes
+---- @include "moveParentToWaitIfNeeded"
++--- @include "addDelayMarkerIfNeeded"
++--- @include "addJobWithPriority"
++--- @include "getTargetQueueList"
+ 
+ local function updateParentDepsIfNeeded(parentKey, parentQueueKey, parentDependenciesKey,
+   parentId, jobIdKey, returnvalue, timestamp )
+   local processedSet = parentKey .. ":processed"
+   rcall("HSET", processedSet, jobIdKey, returnvalue)
+-  moveParentToWaitIfNeeded(parentQueueKey, parentDependenciesKey, parentKey, parentId, timestamp)
++  local activeParent = rcall("ZSCORE", parentQueueKey .. ":waiting-children", parentId)
++  if rcall("SCARD", parentDependenciesKey) == 0 and activeParent then 
++    rcall("ZREM", parentQueueKey .. ":waiting-children", parentId)
++    local parentWaitKey = parentQueueKey .. ":wait"
++    local parentTarget, paused = getTargetQueueList(parentQueueKey .. ":meta", parentWaitKey,
++      parentQueueKey .. ":paused")
++    local jobAttributes = rcall("HMGET", parentKey, "priority", "delay")
++    local priority = tonumber(jobAttributes[1]) or 0
++    local delay = tonumber(jobAttributes[2]) or 0
++    if delay > 0 then
++      local delayedTimestamp = tonumber(timestamp) + delay 
++      local score = delayedTimestamp * 0x1000
++      local parentDelayedKey = parentQueueKey .. ":delayed" 
++      rcall("ZADD", parentDelayedKey, score, parentId)
++
++      rcall("XADD", parentQueueKey .. ":events", "*", "event", "delayed", "jobId", parentId,
++        "delay", delayedTimestamp)
++      addDelayMarkerIfNeeded(parentTarget, parentDelayedKey)
++    else
++      if priority == 0 then
++        rcall("RPUSH", parentTarget, parentId)
++      else
++        addJobWithPriority(parentWaitKey, parentQueueKey .. ":prioritized", priority, paused,
++          parentId, parentQueueKey .. ":pc")
++      end
++      rcall("XADD", parentQueueKey .. ":events", "*", "event", "waiting", "jobId", parentId, "prev", "waiting-children")
++    end
++  end
+ end
+diff --git a/src/commands/moveToFinished-13.lua b/src/commands/moveToFinished-13.lua
+index a984f1662b..62371ad4b0 100644
+--- a/src/commands/moveToFinished-13.lua
++++ b/src/commands/moveToFinished-13.lua
+@@ -40,7 +40,6 @@
+       opts - attemptsMade
+       opts - maxMetricsSize
+       opts - fpof - fail parent on fail
+-      opts - rdof - remove dependency on fail
+ 
+     Output:
+       0 OK
+@@ -61,7 +60,6 @@ local rcall = redis.call
+ --- @include "includes/moveJobFromPriorityToActive"
+ --- @include "includes/prepareJobForProcessing"
+ --- @include "includes/moveParentFromWaitingChildrenToFailed"
+---- @include "includes/moveParentToWaitIfNeeded"
+ --- @include "includes/promoteDelayedJobs"
+ --- @include "includes/removeJobsByMaxAge"
+ --- @include "includes/removeJobsByMaxCount"
+@@ -132,7 +130,6 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+         parentId = getJobIdFromKey(parentKey)
+         parentQueueKey = getJobKeyPrefix(parentKey, ":" .. parentId)
+     end
+-
+     if parentId ~= "" then
+         if ARGV[5] == "completed" then
+             local dependenciesSet = parentKey .. ":dependencies"
+@@ -141,17 +138,9 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+                                          dependenciesSet, parentId, jobIdKey,
+                                          ARGV[4], timestamp)
+             end
+-        else
+-            if opts['fpof'] then
+-                moveParentFromWaitingChildrenToFailed(parentQueueKey, parentKey,
+-                                            parentId, jobIdKey, timestamp)
+-            elseif opts['rdof'] then
+-                local dependenciesSet = parentKey .. ":dependencies"
+-                if rcall("SREM", dependenciesSet, jobIdKey) == 1 then
+-                    moveParentToWaitIfNeeded(parentQueueKey, dependenciesSet,
+-                        parentKey, parentId, timestamp)
+-                end 
+-            end
++        elseif opts['fpof'] then
++            moveParentFromWaitingChildrenToFailed(parentQueueKey, parentKey,
++                                                  parentId, jobIdKey, timestamp)
+         end
+     end
+ 
+diff --git a/src/types/job-options.ts b/src/types/job-options.ts
+index 9a88d7e604..3d615fdb98 100644
+--- a/src/types/job-options.ts
++++ b/src/types/job-options.ts
+@@ -5,11 +5,6 @@ export type JobsOptions = BaseJobOptions & {
+    * If true, moves parent to failed.
+    */
+   failParentOnFailure?: boolean;
+-
+-  /**
+-   * If true, removes the job from its parent dependencies when it fails after all attempts.
+-   */
+-  removeDependencyOnFailure?: boolean;
+ };
+ 
+ /**
+@@ -25,9 +20,4 @@ export type RedisJobOptions = BaseJobOptions & {
+    * Maximum amount of log entries that will be preserved
+    */
+   kl?: number;
+-
+-  /**
+-   * If true, removes the job from its parent dependencies when it fails after all attempts.
+-   */
+-  rdof?: boolean;
+ };
+diff --git a/tests/test_flow.ts b/tests/test_flow.ts
+index bb86661def..56b99b1741 100644
+--- a/tests/test_flow.ts
++++ b/tests/test_flow.ts
+@@ -350,101 +350,6 @@ describe('flows', () => {
+     await removeAllQueueData(new IORedis(), parentQueueName);
+   });
+ 
+-  describe('when removeDependencyOnFailure is provided', async () => {
+-    it('moves parent to wait after children fail', async () => {
+-      const parentQueueName = `parent-queue-${v4()}`;
+-      const parentQueue = new Queue(parentQueueName, { connection });
+-      const name = 'child-job';
+-
+-      const parentProcessor = async (job: Job) => {
+-        const values = await job.getDependencies({
+-          processed: {},
+-        });
+-        expect(values).to.deep.equal({
+-          processed: {},
+-          nextProcessedCursor: 0,
+-        });
+-      };
+-
+-      const parentWorker = new Worker(parentQueueName, parentProcessor, {
+-        connection,
+-      });
+-      const childrenWorker = new Worker(
+-        queueName,
+-        async () => {
+-          await delay(10);
+-          throw new Error('error');
+-        },
+-        {
+-          connection,
+-        },
+-      );
+-      await parentWorker.waitUntilReady();
+-      await childrenWorker.waitUntilReady();
+-
+-      const completed = new Promise<void>(resolve => {
+-        parentWorker.on('completed', async (job: Job) => {
+-          expect(job.finishedOn).to.be.string;
+-          const counts = await parentQueue.getJobCounts('completed');
+-          expect(counts.completed).to.be.equal(1);
+-          resolve();
+-        });
+-      });
+-
+-      const flow = new FlowProducer({ connection });
+-      const tree = await flow.add({
+-        name: 'parent-job',
+-        queueName: parentQueueName,
+-        data: {},
+-        children: [
+-          {
+-            name,
+-            data: { idx: 0, foo: 'bar' },
+-            queueName,
+-            opts: { removeDependencyOnFailure: true },
+-          },
+-          {
+-            name,
+-            data: { idx: 1, foo: 'baz' },
+-            queueName,
+-            opts: { removeDependencyOnFailure: true },
+-          },
+-          {
+-            name,
+-            data: { idx: 2, foo: 'qux' },
+-            queueName,
+-            opts: { removeDependencyOnFailure: true },
+-          },
+-        ],
+-      });
+-
+-      expect(tree).to.have.property('job');
+-      expect(tree).to.have.property('children');
+-
+-      const { children, job } = tree;
+-      const parentState = await job.getState();
+-
+-      expect(parentState).to.be.eql('waiting-children');
+-      expect(children).to.have.length(3);
+-
+-      expect(children[0].job.id).to.be.ok;
+-      expect(children[0].job.data.foo).to.be.eql('bar');
+-      expect(children[1].job.id).to.be.ok;
+-      expect(children[1].job.data.foo).to.be.eql('baz');
+-      expect(children[2].job.id).to.be.ok;
+-      expect(children[2].job.data.foo).to.be.eql('qux');
+-
+-      await completed;
+-      await childrenWorker.close();
+-
+-      await parentWorker.close();
+-
+-      await flow.close();
+-
+-      await removeAllQueueData(new IORedis(), parentQueueName);
+-    });
+-  });
+-
+   describe('when chaining flows at runtime using step jobs', () => {
+     it('should wait children as one step of the parent job', async function () {
+       this.timeout(8000);
+@@ -1573,129 +1478,6 @@ describe('flows', () => {
+       await removeAllQueueData(new IORedis(), parentQueueName);
+       await removeAllQueueData(new IORedis(), grandChildrenQueueName);
+     });
+-
+-    describe('when removeDependencyOnFailure is provided', async () => {
+-      it('moves parent to wait after children fail', async () => {
+-        const name = 'child-job';
+-
+-        const parentQueueName = `parent-queue-${v4()}`;
+-        const grandChildrenQueueName = `grand-children-queue-${v4()}`;
+-
+-        const parentQueue = new Queue(parentQueueName, {
+-          connection,
+-        });
+-        const grandChildrenQueue = new Queue(grandChildrenQueueName, {
+-          connection,
+-        });
+-        const queueEvents = new QueueEvents(queueName, { connection });
+-        await queueEvents.waitUntilReady();
+-
+-        let grandChildrenProcessor,
+-          processedGrandChildren = 0;
+-        const processingChildren = new Promise<void>(resolve => {
+-          grandChildrenProcessor = async job => {
+-            processedGrandChildren++;
+-
+-            if (processedGrandChildren === 2) {
+-              return resolve();
+-            }
+-
+-            if (job.data.foo === 'bar') {throw new Error('failed');}
+-          };
+-        });
+-
+-        const grandChildrenWorker = new Worker(
+-          grandChildrenQueueName,
+-          grandChildrenProcessor,
+-          { connection },
+-        );
+-
+-        await grandChildrenWorker.waitUntilReady();
+-
+-        const flow = new FlowProducer({ connection });
+-        const tree = await flow.add({
+-          name: 'parent-job',
+-          queueName: parentQueueName,
+-          data: {},
+-          children: [
+-            {
+-              name,
+-              data: { foo: 'qux' },
+-              queueName,
+-              opts: { removeDependencyOnFailure: true },
+-              children: [
+-                {
+-                  name,
+-                  data: { foo: 'bar' },
+-                  queueName: grandChildrenQueueName,
+-                  opts: { failParentOnFailure: true },
+-                },
+-                {
+-                  name,
+-                  data: { foo: 'baz' },
+-                  queueName: grandChildrenQueueName,
+-                },
+-              ],
+-            },
+-          ],
+-        });
+-
+-        const failed = new Promise<void>(resolve => {
+-          queueEvents.on('failed', async ({ jobId, failedReason, prev }) => {
+-            if (jobId === tree!.children![0].job.id) {
+-              expect(prev).to.be.equal('waiting-children');
+-              expect(failedReason).to.be.equal(
+-                `child bull:${grandChildrenQueueName}:${
+-                  tree!.children![0].children![0].job.id
+-                } failed`,
+-              );
+-              resolve();
+-            }
+-          });
+-        });
+-
+-        expect(tree).to.have.property('job');
+-        expect(tree).to.have.property('children');
+-
+-        const { children, job } = tree;
+-        const parentState = await job.getState();
+-
+-        expect(parentState).to.be.eql('waiting-children');
+-
+-        await processingChildren;
+-        await failed;
+-
+-        const { children: grandChildren } = children[0];
+-        const updatedGrandchildJob = await grandChildrenQueue.getJob(
+-          grandChildren[0].job.id,
+-        );
+-        const grandChildState = await updatedGrandchildJob.getState();
+-
+-        expect(grandChildState).to.be.eql('failed');
+-        expect(updatedGrandchildJob.failedReason).to.be.eql('failed');
+-
+-        const updatedParentJob = await queue.getJob(children[0].job.id);
+-        const updatedParentState = await updatedParentJob.getState();
+-
+-        expect(updatedParentState).to.be.eql('failed');
+-        expect(updatedParentJob.failedReason).to.be.eql(
+-          `child bull:${grandChildrenQueueName}:${updatedGrandchildJob.id} failed`,
+-        );
+-
+-        const updatedGrandparentJob = await parentQueue.getJob(job.id);
+-        const updatedGrandparentState = await updatedGrandparentJob.getState();
+-
+-        expect(updatedGrandparentState).to.be.eql('waiting');
+-
+-        await parentQueue.close();
+-        await grandChildrenWorker.close();
+-        await flow.close();
+-        await queueEvents.close();
+-
+-        await removeAllQueueData(new IORedis(), parentQueueName);
+-        await removeAllQueueData(new IORedis(), grandChildrenQueueName);
+-      });
+-    });
+   });
+ 
+   it('should get paginated processed dependencies keys', async () => {
+diff --git a/tests/test_job.ts b/tests/test_job.ts
+index f9bc85bb94..3ff83d7a65 100644
+--- a/tests/test_job.ts
++++ b/tests/test_job.ts
+@@ -120,19 +120,6 @@ describe('Job', function () {
+       });
+     });
+ 
+-    describe('when removeDependencyOnFailure and failParentOnFailure options are provided', () => {
+-      it('throws an error', async () => {
+-        const data = { foo: 'bar' };
+-        const opts = {
+-          removeDependencyOnFailure: true,
+-          failParentOnFailure: true,
+-        };
+-        await expect(Job.create(queue, 'test', data, opts)).to.be.rejectedWith(
+-          'RemoveDependencyOnFailure and failParentOnFailure options can not be used together',
+-        );
+-      });
+-    });
+-
+     describe('when priority option is provided as float', () => {
+       it('throws an error', async () => {
+         const data = { foo: 'bar' };

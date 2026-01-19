@@ -1,0 +1,161 @@
+diff --git a/package-lock.json b/package-lock.json
+index f5297885a..ead67f753 100644
+Binary files a/package-lock.json and b/package-lock.json differ
+diff --git a/package.json b/package.json
+index 4a6fd0e3a..5d5f399d6 100644
+--- a/package.json
++++ b/package.json
+@@ -67,6 +67,7 @@
+     "express": "5.1.0",
+     "fast-json-stringify": "6.0.1",
+     "fast-safe-stringify": "2.1.1",
++    "file-type": "20.4.1",
+     "iterare": "1.2.1",
+     "object-hash": "3.0.0",
+     "path-to-regexp": "8.2.0",
+diff --git a/packages/common/package.json b/packages/common/package.json
+index 6111d9bec..90c5134fc 100644
+--- a/packages/common/package.json
++++ b/packages/common/package.json
+@@ -26,7 +26,8 @@
+     "class-transformer": "*",
+     "class-validator": "*",
+     "reflect-metadata": "^0.1.12 || ^0.2.0",
+-    "rxjs": "^7.1.0"
++    "rxjs": "^7.1.0",
++    "file-type": "20.4.1"
+   },
+   "peerDependenciesMeta": {
+     "class-validator": {
+diff --git a/packages/common/pipes/file/file-type.validator.ts b/packages/common/pipes/file/file-type.validator.ts
+index a47f134e9..47139064f 100644
+--- a/packages/common/pipes/file/file-type.validator.ts
++++ b/packages/common/pipes/file/file-type.validator.ts
+@@ -3,14 +3,19 @@ import { IFile } from './interfaces';
+ 
+ export type FileTypeValidatorOptions = {
+   fileType: string | RegExp;
++
++  /**
++   * If `true`, the validator will skip the magic numbers validation.
++   * This can be useful when you can't identify some files as there are no common magic numbers available for some file types.
++   * @default false
++   */
++  skipMagicNumbersValidation?: boolean;
+ };
+ 
+ /**
+- * Defines the built-in FileType File Validator. It validates incoming files mime-type
+- * matching a string or a regular expression. Note that this validator uses a naive strategy
+- * to check the mime-type and could be fooled if the client provided a file with renamed extension.
+- * (for instance, renaming a 'malicious.bat' to 'malicious.jpeg'). To handle such security issues
+- * with more reliability, consider checking against the file's [magic-numbers](https://en.wikipedia.org/wiki/Magic_number_%28programming%29)
++ * Defines the built-in FileTypeValidator. It validates incoming files by examining
++ * their magic numbers using the file-type package, providing more reliable file type validation
++ * than just checking the mimetype string.
+  *
+  * @see [File Validators](https://docs.nestjs.com/techniques/file-upload#validators)
+  *
+@@ -27,15 +32,35 @@ export class FileTypeValidator extends FileValidator<
+     return `Validation failed (expected type is ${this.validationOptions.fileType})`;
+   }
+ 
+-  isValid(file?: IFile): boolean {
++  async isValid(file?: IFile): Promise<boolean> {
+     if (!this.validationOptions) {
+       return true;
+     }
+ 
+-    return (
+-      !!file &&
+-      'mimetype' in file &&
+-      !!file.mimetype.match(this.validationOptions.fileType)
+-    );
++    const isFileValid = !!file && 'mimetype' in file;
++
++    if (this.validationOptions.skipMagicNumbersValidation) {
++      return (
++        isFileValid && !!file.mimetype.match(this.validationOptions.fileType)
++      );
++    }
++
++    if (!isFileValid || !file.buffer) {
++      return false;
++    }
++
++    try {
++      const { fileTypeFromBuffer } = (await eval(
++        'import ("file-type")',
++      )) as typeof import('file-type');
++
++      const fileType = await fileTypeFromBuffer(file.buffer);
++
++      return (
++        !!fileType && !!fileType.mime.match(this.validationOptions.fileType)
++      );
++    } catch {
++      return false;
++    }
+   }
+ }
+diff --git a/packages/common/pipes/file/interfaces/file.interface.ts b/packages/common/pipes/file/interfaces/file.interface.ts
+index 37218734f..418fd8be8 100644
+--- a/packages/common/pipes/file/interfaces/file.interface.ts
++++ b/packages/common/pipes/file/interfaces/file.interface.ts
+@@ -1,4 +1,5 @@
+ export interface IFile {
+   mimetype: string;
+   size: number;
++  buffer?: Buffer;
+ }
+diff --git a/sample/29-file-upload/e2e/app/app.e2e-spec.ts b/sample/29-file-upload/e2e/app/app.e2e-spec.ts
+index 6f8bc9034..415bf033b 100644
+--- a/sample/29-file-upload/e2e/app/app.e2e-spec.ts
++++ b/sample/29-file-upload/e2e/app/app.e2e-spec.ts
+@@ -32,14 +32,14 @@ describe('E2E FileTest', () => {
+   it('should allow for file uploads that pass validation', async () => {
+     return request(app.getHttpServer())
+       .post('/file/pass-validation')
+-      .attach('file', './package.json')
++      .attach('file', './resources/nestjs.jpg')
+       .field('name', 'test')
+       .expect(201)
+       .expect({
+         body: {
+           name: 'test',
+         },
+-        file: readFileSync('./package.json').toString(),
++        file: readFileSync('./resources/nestjs.jpg').toString(),
+       });
+   });
+ 
+diff --git a/sample/29-file-upload/package.json b/sample/29-file-upload/package.json
+index 0faefaf8a..85a1e16ed 100644
+--- a/sample/29-file-upload/package.json
++++ b/sample/29-file-upload/package.json
+@@ -16,7 +16,7 @@
+     "test:watch": "jest --watch",
+     "test:cov": "jest --coverage",
+     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
+-    "test:e2e": "jest --config ./e2e/jest-e2e.json"
++    "test:e2e": "NODE_OPTIONS=\"$NODE_OPTIONS --experimental-vm-modules\" jest --config ./e2e/jest-e2e.json"
+   },
+   "dependencies": {
+     "@nestjs/common": "11.0.14",
+diff --git a/sample/29-file-upload/resources/nestjs.jpg b/sample/29-file-upload/resources/nestjs.jpg
+new file mode 100644
+index 000000000..f538ad571
+Binary files /dev/null and b/sample/29-file-upload/resources/nestjs.jpg differ
+diff --git a/sample/29-file-upload/src/app.controller.ts b/sample/29-file-upload/src/app.controller.ts
+index 371a1fd69..130fb407e 100644
+--- a/sample/29-file-upload/src/app.controller.ts
++++ b/sample/29-file-upload/src/app.controller.ts
+@@ -40,7 +40,7 @@ export class AppController {
+     @UploadedFile(
+       new ParseFilePipeBuilder()
+         .addFileTypeValidator({
+-          fileType: 'json',
++          fileType: 'jpeg',
+         })
+         .build({
+           fileIsRequired: false,

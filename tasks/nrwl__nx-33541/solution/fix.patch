@@ -1,0 +1,1000 @@
+diff --git a/jest.config.cts b/jest.config.cts
+index a9a0d88f7e..c38efd92d4 100644
+--- a/jest.config.cts
++++ b/jest.config.cts
+@@ -1,5 +1,5 @@
+ import type { Config } from 'jest';
+-const { getJestProjectsAsync } = require('@nx/jest');
++import { getJestProjectsAsync } from '@nx/jest';
+ 
+ module.exports = async (): Promise<Config> => ({
+   projects: await getJestProjectsAsync(),
+diff --git a/nx-dev/nx-dev/jest.config.cts b/nx-dev/nx-dev/jest.config.cts
+index 156b935d12..b28aa750ac 100644
+--- a/nx-dev/nx-dev/jest.config.cts
++++ b/nx-dev/nx-dev/jest.config.cts
+@@ -1,7 +1,7 @@
+ /* eslint-disable */
+ // Ignore @nx/jest dependency since it is the installed version not the one in the workspace
+ // nx-ignore-next-line
+-const { default: nxPreset } = require('@nx/jest/preset');
++import nxPreset from '@nx/jest/preset';
+ 
+ module.exports = {
+   ...nxPreset,
+diff --git a/packages/eslint-plugin/src/index.ts b/packages/eslint-plugin/src/index.ts
+index 7b362c55a3..40ba0b5458 100644
+--- a/packages/eslint-plugin/src/index.ts
++++ b/packages/eslint-plugin/src/index.ts
+@@ -22,7 +22,7 @@ import dependencyChecks, {
+ } from './rules/dependency-checks';
+ 
+ // Resolve any custom rules that might exist in the current workspace
+-import { workspaceRules, loadWorkspaceRules } from './resolve-workspace-rules';
++import { workspaceRules } from './resolve-workspace-rules';
+ 
+ const configs = {
+   // eslintrc configs
+@@ -72,4 +72,4 @@ const rules = {
+ };
+ 
+ export default { configs, rules };
+-export { configs, rules, loadWorkspaceRules };
++export { configs, rules };
+diff --git a/packages/eslint-plugin/src/resolve-workspace-rules.ts b/packages/eslint-plugin/src/resolve-workspace-rules.ts
+index 19a195ee5b..707f93fccc 100644
+--- a/packages/eslint-plugin/src/resolve-workspace-rules.ts
++++ b/packages/eslint-plugin/src/resolve-workspace-rules.ts
+@@ -1,173 +1,11 @@
+-import { workspaceRoot } from '@nx/devkit';
+-import { loadConfigFile } from '@nx/devkit/src/utils/config-utils';
+-import { registerTsProject } from '@nx/js/src/internal';
+ import type { TSESLint } from '@typescript-eslint/utils';
+ import { existsSync } from 'fs';
+-import { dirname, isAbsolute, join, normalize, resolve, sep } from 'path';
++import { registerTsProject } from '@nx/js/src/internal';
+ import { WORKSPACE_PLUGIN_DIR, WORKSPACE_RULE_PREFIX } from './constants';
++import { join } from 'path';
+ 
+ type ESLintRules = Record<string, TSESLint.RuleModule<string, unknown[]>>;
+ 
+-// ESM import() cannot resolve directories to index files like require() can
+-const INDEX_FILE_EXTENSIONS = [
+-  '.ts',
+-  '.mts',
+-  '.cts',
+-  '.js',
+-  '.mjs',
+-  '.cjs',
+-] as const;
+-
+-function resolveDirectoryEntryFile(directory: string): string {
+-  for (const ext of INDEX_FILE_EXTENSIONS) {
+-    const candidatePath = join(directory, `index${ext}`);
+-    if (existsSync(candidatePath)) {
+-      return candidatePath;
+-    }
+-  }
+-
+-  throw new Error(
+-    `No index file found in directory: ${directory}. ` +
+-      `Expected one of: ${INDEX_FILE_EXTENSIONS.map(
+-        (ext) => `index${ext}`
+-      ).join(', ')}`
+-  );
+-}
+-
+-function normalizePath(path: string): string {
+-  return `${normalize(path).replace(/[\/\\]$/g, '')}${sep}`;
+-}
+-
+-function findTsConfig(
+-  directory: string,
+-  tsConfigPath?: string
+-): string | undefined {
+-  let effectiveTsConfigPath = tsConfigPath;
+-  const normalizedWorkspaceRoot = normalizePath(workspaceRoot);
+-
+-  if (effectiveTsConfigPath) {
+-    if (!isAbsolute(effectiveTsConfigPath)) {
+-      effectiveTsConfigPath = resolve(workspaceRoot, effectiveTsConfigPath);
+-    }
+-
+-    if (!effectiveTsConfigPath.startsWith(normalizedWorkspaceRoot)) {
+-      console.warn(
+-        `TypeScript config "${effectiveTsConfigPath}" is outside the workspace root "${workspaceRoot}". Falling back to automatic tsconfig detection.`
+-      );
+-      effectiveTsConfigPath = undefined;
+-    }
+-  }
+-
+-  if (!effectiveTsConfigPath) {
+-    let currentDir = directory;
+-
+-    while (currentDir.startsWith(normalizedWorkspaceRoot)) {
+-      const candidatePath = join(currentDir, 'tsconfig.json');
+-      if (existsSync(candidatePath)) {
+-        effectiveTsConfigPath = candidatePath;
+-        break;
+-      }
+-
+-      const parentDir = dirname(currentDir);
+-      if (normalizePath(parentDir) === normalizedWorkspaceRoot) {
+-        break;
+-      }
+-      currentDir = parentDir;
+-    }
+-  }
+-
+-  if (!tsConfigPath && !effectiveTsConfigPath) {
+-    console.warn(
+-      `No TypeScript config found. Crawled up to workspace root "${workspaceRoot}" ` +
+-        `from directory "${directory}" without finding a tsconfig.json file. Provide ` +
+-        `a tsconfig.json file path to the loadWorkspaceRules function.`
+-    );
+-  }
+-
+-  return effectiveTsConfigPath;
+-}
+-
+-/**
+- * Load ESLint rules from a directory.
+- *
+- * This utility allows loading custom ESLint rules from any directory within the workspace,
+- * not just the default `tools/eslint-rules` location. It's useful for:
+- * - Loading rules from a custom directory structure
+- * - Loading rules from npm workspace packages (e.g., linked packages via npm/yarn/pnpm workspaces)
+- * - Loading rules from multiple directories with different configurations
+- *
+- * The directory must contain an index file (index.ts, index.js, etc.) that exports the rules.
+- *
+- * @param directory - The directory path to load rules from. Can be absolute or relative to workspace root.
+- * @param tsConfigPath - Optional path to tsconfig.json for TypeScript compilation.
+- *                       If not provided, will search for tsconfig.json starting from
+- *                       the directory and traversing up to the workspace root.
+- * @returns An object containing the loaded ESLint rules (without any prefix).
+- *          Returns an empty object if the directory doesn't exist or loading fails.
+- *
+- * @example
+- * ```typescript
+- * // Load rules from a custom directory (relative to workspace root)
+- * const customRules = await loadWorkspaceRules('packages/my-eslint-plugin/rules');
+- *
+- * // Load rules with a specific tsconfig
+- * const customRules = await loadWorkspaceRules(
+- *   'packages/my-eslint-plugin/rules',
+- *   'packages/my-eslint-plugin/tsconfig.json'
+- * );
+- *
+- * // Or use absolute paths
+- * const customRules = loadWorkspaceRules('/absolute/path/to/rules');
+- * ```
+- */
+-export async function loadWorkspaceRules(
+-  directory: string,
+-  tsConfigPath?: string
+-): Promise<ESLintRules> {
+-  const resolvedDirectory = isAbsolute(directory)
+-    ? directory
+-    : resolve(workspaceRoot, directory);
+-
+-  if (!resolvedDirectory.startsWith(normalizePath(workspaceRoot))) {
+-    console.warn(
+-      `Directory "${resolvedDirectory}" is outside the workspace root "${workspaceRoot}". ESLint rules can only be loaded from within the workspace.`
+-    );
+-    return {};
+-  }
+-
+-  if (!existsSync(resolvedDirectory)) {
+-    console.warn(
+-      `Directory "${resolvedDirectory}" does not exist. Skipping loading ESLint rules from this directory.`
+-    );
+-    return {};
+-  }
+-
+-  let registrationCleanup: (() => void) | null = null;
+-
+-  try {
+-    const effectiveTsConfigPath = findTsConfig(resolvedDirectory, tsConfigPath);
+-
+-    if (effectiveTsConfigPath) {
+-      registrationCleanup = registerTsProject(effectiveTsConfigPath);
+-    }
+-
+-    const entryFile = resolveDirectoryEntryFile(resolvedDirectory);
+-
+-    // Only rules are supported (not configs, processors, etc.)
+-    const module = await loadConfigFile(entryFile);
+-    const rules = module.rules || module;
+-
+-    return rules as ESLintRules;
+-  } catch (err) {
+-    console.error(err);
+-    return {};
+-  } finally {
+-    if (registrationCleanup) {
+-      registrationCleanup();
+-    }
+-  }
+-}
+-
+ export const workspaceRules = ((): ESLintRules => {
+   // If `tools/eslint-rules` folder doesn't exist, there is no point trying to register and load it
+   if (!existsSync(WORKSPACE_PLUGIN_DIR)) {
+diff --git a/packages/nx/src/command-line/daemon/command-object.ts b/packages/nx/src/command-line/daemon/command-object.ts
+index b3614d1052..3ee5ccb713 100644
+--- a/packages/nx/src/command-line/daemon/command-object.ts
++++ b/packages/nx/src/command-line/daemon/command-object.ts
+@@ -1,24 +1,14 @@
+ import { CommandModule, Argv } from 'yargs';
+ import { linkToNxDevAndExamples } from '../yargs-utils/documentation';
+-import { handleErrors } from '../../utils/handle-errors';
+-import { withVerbose } from '../yargs-utils/shared-options';
+-import { makeCommandModule } from '../yargs-utils/arguments-of';
+ 
+-const builder = (yargs: Argv) =>
+-  linkToNxDevAndExamples(withVerbose(withDaemonOptions(yargs)), 'daemon');
+-
+-export const yargsDaemonCommand = makeCommandModule({
++export const yargsDaemonCommand: CommandModule = {
+   command: 'daemon',
+   describe:
+     'Prints information about the Nx Daemon process or starts a daemon process.',
+-  builder,
+-  handler: async (args) => {
+-    const exitCode = await handleErrors(args.verbose, async () =>
+-      (await import('./daemon')).daemonHandler(args)
+-    );
+-    process.exit(exitCode);
+-  },
+-});
++  builder: (yargs) =>
++    linkToNxDevAndExamples(withDaemonOptions(yargs), 'daemon'),
++  handler: async (args) => (await import('./daemon')).daemonHandler(args),
++};
+ 
+ function withDaemonOptions(yargs: Argv): Argv {
+   return yargs
+diff --git a/packages/nx/src/command-line/yargs-utils/arguments-of.ts b/packages/nx/src/command-line/yargs-utils/arguments-of.ts
+deleted file mode 100644
+index e5a5a3063f..0000000000
+--- a/packages/nx/src/command-line/yargs-utils/arguments-of.ts
++++ /dev/null
+@@ -1,24 +0,0 @@
+-import type { Argv, CommandModule as YargsCommandModule } from 'yargs';
+-
+-export type Builder<InitialArgs, FinalArgs> = (
+-  yargs: Argv<InitialArgs>
+-) => Argv<FinalArgs>;
+-
+-export type Handler<B extends Builder<any, any>> = (
+-  args: Awaited<ReturnType<B>['argv']>
+-) => void | Promise<void>;
+-
+-export interface CommandModule<T, U>
+-  extends Omit<YargsCommandModule<T, U>, 'handler'> {
+-  builder: Builder<T, U>;
+-  handler: Handler<Builder<T, U>>;
+-}
+-
+-/**
+- * Helper function to define a Yargs CommandModule with proper typing and not sacrifice inference.
+- */
+-export function makeCommandModule<T, U>(
+-  module: CommandModule<T, U>
+-): CommandModule<T, U> {
+-  return module;
+-}
+diff --git a/packages/nx/src/daemon/client/client.ts b/packages/nx/src/daemon/client/client.ts
+index 829e80fa6e..de591fac3d 100644
+--- a/packages/nx/src/daemon/client/client.ts
++++ b/packages/nx/src/daemon/client/client.ts
+@@ -111,6 +111,7 @@ import {
+ import { deserialize } from 'node:v8';
+ import { isJsonMessage } from '../../utils/consume-messages-from-socket';
+ import { isV8SerializerEnabled } from '../is-v8-serializer-enabled';
++import { preventRecursionInGraphConstruction } from '../../project-graph/project-graph';
+ 
+ const DAEMON_ENV_SETTINGS = {
+   NX_PROJECT_GLOB_CACHE: 'false',
+@@ -231,6 +232,7 @@ export class DaemonClient {
+     projectGraph: ProjectGraph;
+     sourceMaps: ConfigurationSourceMaps;
+   }> {
++    preventRecursionInGraphConstruction();
+     let spinner: DelayedSpinner;
+     // If the graph takes a while to load, we want to show a spinner.
+     spinner = new DelayedSpinner(
+diff --git a/packages/nx/src/project-graph/error-types.ts b/packages/nx/src/project-graph/error-types.ts
+index 2f81d53cb6..17641be1ca 100644
+--- a/packages/nx/src/project-graph/error-types.ts
++++ b/packages/nx/src/project-graph/error-types.ts
+@@ -35,13 +35,7 @@ export class ProjectGraphError extends Error {
+     const messageFragments = ['Failed to process project graph.'];
+     const mergeNodesErrors = [];
+     const unknownErrors = [];
+-    // Lets us throw aggregate errors without special handling,
+-    // to avoid cases where users fix an error and get hit with another one
+-    // which was already there but not reported.
+-    let flat = errors.flatMap((e) =>
+-      e instanceof AggregateError ? e.errors : e
+-    );
+-    for (const e of flat) {
++    for (const e of errors) {
+       if (
+         // Known errors that are self-explanatory
+         isAggregateCreateNodesError(e) ||
+@@ -205,7 +199,6 @@ export class ProjectConfigurationsError extends Error {
+       | AggregateCreateNodesError
+       | ProjectsWithNoNameError
+       | MultipleProjectsWithSameNameError
+-      | WorkspaceValidityError
+     >,
+     public readonly partialProjectConfigurationsResult: ConfigurationResult
+   ) {
+@@ -417,14 +410,10 @@ function isProcessDependenciesError(e: unknown): e is ProcessDependenciesError {
+ 
+ export class WorkspaceValidityError extends Error {
+   constructor(public message: string) {
++    message = `Configuration Error\n${message}`;
+     super(message);
+-    this.message = `[Configuration Error]:\n${message}`;
+     this.name = this.constructor.name;
+   }
+-
+-  toString() {
+-    return this.message;
+-  }
+ }
+ 
+ export function isWorkspaceValidityError(
+diff --git a/packages/nx/src/project-graph/plugins/get-plugins.ts b/packages/nx/src/project-graph/plugins/get-plugins.ts
+index 9eaf6361ea..a5ca79caca 100644
+--- a/packages/nx/src/project-graph/plugins/get-plugins.ts
++++ b/packages/nx/src/project-graph/plugins/get-plugins.ts
+@@ -20,7 +20,9 @@ import { isIsolationEnabled } from './isolation/enabled';
+  */
+ let currentPluginsConfigurationHash: string;
+ let loadedPlugins: LoadedNxPlugin[];
+-let pendingPluginsPromise: Promise<LoadedNxPlugin[]> | undefined;
++let pendingPluginsPromise:
++  | Promise<readonly [LoadedNxPlugin[], () => void]>
++  | undefined;
+ let cleanupSpecifiedPlugins: () => void | undefined;
+ 
+ const loadingMethod = (
+@@ -46,16 +48,24 @@ export async function getPlugins(
+     return loadedPlugins;
+   }
+ 
++  // Cleanup current plugins before loading new ones
++  cleanupSpecifiedPlugins?.();
++
++  pendingPluginsPromise ??= loadSpecifiedNxPlugins(pluginsConfiguration, root);
++
+   currentPluginsConfigurationHash = pluginsConfigurationHash;
+-  const [defaultPlugins, specifiedPlugins] = await Promise.all([
++  const [[result, cleanupFn], defaultPlugins] = await Promise.all([
++    pendingPluginsPromise,
+     getOnlyDefaultPlugins(root),
+-    (pendingPluginsPromise ??= loadSpecifiedNxPlugins(
+-      pluginsConfiguration,
+-      root
+-    )),
+   ]);
+ 
+-  loadedPlugins = specifiedPlugins.concat(defaultPlugins);
++  cleanupSpecifiedPlugins = () => {
++    loadedPlugins = undefined;
++    pendingPluginsPromise = undefined;
++    cleanupFn();
++  };
++
++  loadedPlugins = result.concat(defaultPlugins);
+ 
+   return loadedPlugins;
+ }
+@@ -101,8 +111,6 @@ export async function getOnlyDefaultPlugins(root = workspaceRoot) {
+ export function cleanupPlugins() {
+   cleanupSpecifiedPlugins?.();
+   cleanupDefaultPlugins?.();
+-  pendingPluginsPromise = undefined;
+-  pendingDefaultPluginPromise = undefined;
+ }
+ 
+ /**
+@@ -156,62 +164,55 @@ async function loadDefaultNxPlugins(root = workspaceRoot) {
+ }
+ 
+ async function loadSpecifiedNxPlugins(
+-  pluginsConfigurations: PluginConfiguration[],
++  plugins: PluginConfiguration[],
+   root = workspaceRoot
+-): Promise<LoadedNxPlugin[]> {
+-  // Returning existing plugins is handled by getPlugins,
+-  // so, if we are here and there are existing plugins, they are stale
+-  if (cleanupSpecifiedPlugins) {
+-    cleanupSpecifiedPlugins();
+-  }
+-
++): Promise<readonly [LoadedNxPlugin[], () => void]> {
+   performance.mark('loadSpecifiedNxPlugins:start');
+ 
+-  pluginsConfigurations ??= [];
++  plugins ??= [];
+ 
+   const cleanupFunctions: Array<() => void> = [];
+-  const plugins = await Promise.all(
+-    pluginsConfigurations.map(async (plugin, index) => {
+-      const pluginPath = typeof plugin === 'string' ? plugin : plugin.plugin;
+-      performance.mark(`Load Nx Plugin: ${pluginPath} - start`);
+-
+-      const [loadedPluginPromise, cleanup] = await loadingMethod(
+-        plugin,
+-        root,
+-        index
+-      );
+-
+-      cleanupFunctions.push(cleanup);
+-      const res = await loadedPluginPromise;
+-      res.index = index;
+-      performance.mark(`Load Nx Plugin: ${pluginPath} - end`);
+-      performance.measure(
+-        `Load Nx Plugin: ${pluginPath}`,
+-        `Load Nx Plugin: ${pluginPath} - start`,
+-        `Load Nx Plugin: ${pluginPath} - end`
+-      );
+-
+-      return res;
+-    })
+-  );
++  const ret = [
++    await Promise.all(
++      plugins.map(async (plugin, index) => {
++        const pluginPath = typeof plugin === 'string' ? plugin : plugin.plugin;
++        performance.mark(`Load Nx Plugin: ${pluginPath} - start`);
++
++        const [loadedPluginPromise, cleanup] = await loadingMethod(
++          plugin,
++          root,
++          index
++        );
++
++        cleanupFunctions.push(cleanup);
++        const res = await loadedPluginPromise;
++        res.index = index;
++        performance.mark(`Load Nx Plugin: ${pluginPath} - end`);
++        performance.measure(
++          `Load Nx Plugin: ${pluginPath}`,
++          `Load Nx Plugin: ${pluginPath} - start`,
++          `Load Nx Plugin: ${pluginPath} - end`
++        );
++
++        return res;
++      })
++    ),
++    () => {
++      for (const fn of cleanupFunctions) {
++        fn();
++      }
++      if (pluginTranspilerIsRegistered()) {
++        cleanupPluginTSTranspiler();
++      }
++    },
++  ] as const;
+   performance.mark('loadSpecifiedNxPlugins:end');
+   performance.measure(
+     'loadSpecifiedNxPlugins',
+     'loadSpecifiedNxPlugins:start',
+     'loadSpecifiedNxPlugins:end'
+   );
+-
+-  cleanupSpecifiedPlugins = () => {
+-    for (const fn of cleanupFunctions) {
+-      fn();
+-    }
+-    if (pluginTranspilerIsRegistered()) {
+-      cleanupPluginTSTranspiler();
+-    }
+-    pendingPluginsPromise = undefined;
+-  };
+-
+-  return plugins;
++  return ret;
+ }
+ 
+ function getDefaultPlugins(root: string) {
+diff --git a/packages/nx/src/project-graph/plugins/in-process-loader.ts b/packages/nx/src/project-graph/plugins/in-process-loader.ts
+index 3fad86a595..684917a443 100644
+--- a/packages/nx/src/project-graph/plugins/in-process-loader.ts
++++ b/packages/nx/src/project-graph/plugins/in-process-loader.ts
+@@ -13,7 +13,6 @@ import type { PluginConfiguration } from '../../config/nx-json';
+ import type { LoadedNxPlugin } from './loaded-nx-plugin';
+ import { LoadPluginError } from '../error-types';
+ import path = require('node:path/posix');
+-import { loadResolvedNxPluginAsync } from './load-resolved-plugin';
+ import { resolveLocalNxPlugin, resolveNxPlugin } from './resolve-plugin';
+ import {
+   pluginTranspilerIsRegistered,
+@@ -78,6 +77,9 @@ export async function loadNxPluginAsync(
+     if (shouldRegisterTSTranspiler) {
+       registerPluginTSTranspiler();
+     }
++    const { loadResolvedNxPluginAsync } = await import(
++      './load-resolved-plugin'
++    );
+     return loadResolvedNxPluginAsync(pluginConfiguration, pluginPath, name);
+   } catch (e) {
+     throw new LoadPluginError(moduleName, e);
+diff --git a/packages/nx/src/project-graph/plugins/isolation/plugin-pool.ts b/packages/nx/src/project-graph/plugins/isolation/plugin-pool.ts
+index af0fe2444a..064a4ac959 100644
+--- a/packages/nx/src/project-graph/plugins/isolation/plugin-pool.ts
++++ b/packages/nx/src/project-graph/plugins/isolation/plugin-pool.ts
+@@ -67,7 +67,7 @@ export async function loadRemoteNxPlugin(
+   const { name, pluginPath, shouldRegisterTSTranspiler } =
+     await resolveNxPlugin(moduleName, root, getNxRequirePaths(root));
+ 
+-  const { worker, socket } = await startPluginWorker(name);
++  const { worker, socket } = await startPluginWorker();
+ 
+   // Register plugin worker as a subprocess of the main CLI
+   // This allows metrics collection when the daemon is not used
+@@ -411,7 +411,7 @@ function registerPendingPromise(
+ 
+ global.nxPluginWorkerCount ??= 0;
+ 
+-async function startPluginWorker(name: string) {
++async function startPluginWorker() {
+   // this should only really be true when running unit tests within
+   // the Nx repo. We still need to start the worker in this case,
+   // but its typescript.
+@@ -441,7 +441,6 @@ async function startPluginWorker(name: string) {
+       ...(isWorkerTypescript ? ['--require', 'ts-node/register'] : []),
+       workerPath,
+       ipcPath,
+-      name,
+     ],
+     {
+       stdio: 'inherit',
+diff --git a/packages/nx/src/project-graph/plugins/isolation/plugin-worker.ts b/packages/nx/src/project-graph/plugins/isolation/plugin-worker.ts
+index ddf6da4444..34e6efc9e2 100644
+--- a/packages/nx/src/project-graph/plugins/isolation/plugin-worker.ts
++++ b/packages/nx/src/project-graph/plugins/isolation/plugin-worker.ts
+@@ -104,7 +104,7 @@ const server = createServer((socket) => {
+             };
+           }
+         },
+-        createNodes: async ({ configFiles, context, tx }) => {
++        createNodes: async function createNodes({ configFiles, context, tx }) {
+           try {
+             const result = await plugin.createNodes[1](configFiles, context);
+             return {
+@@ -122,7 +122,7 @@ const server = createServer((socket) => {
+             };
+           }
+         },
+-        createDependencies: async ({ context, tx }) => {
++        createDependencies: async function createDependencies({ context, tx }) {
+           try {
+             const result = await plugin.createDependencies(context);
+             return {
+@@ -140,7 +140,7 @@ const server = createServer((socket) => {
+             };
+           }
+         },
+-        createMetadata: async ({ graph, context, tx }) => {
++        createMetadata: async function createMetadata({ graph, context, tx }) {
+           try {
+             const result = await plugin.createMetadata(graph, context);
+             return {
+diff --git a/packages/nx/src/project-graph/plugins/loaded-nx-plugin.ts b/packages/nx/src/project-graph/plugins/loaded-nx-plugin.ts
+index aa524eb746..74af0de4b9 100644
+--- a/packages/nx/src/project-graph/plugins/loaded-nx-plugin.ts
++++ b/packages/nx/src/project-graph/plugins/loaded-nx-plugin.ts
+@@ -18,6 +18,11 @@ import type {
+ import { isIsolationEnabled } from './isolation/enabled';
+ import { isDaemonEnabled } from '../../daemon/client/client';
+ 
++/**
++ * NOTE: Avoid using `import type` with this class. It causes issues with
++ * jest's module resolution when running tests in projects that import
++ * the devkit-internals
++ */
+ export class LoadedNxPlugin {
+   index?: number;
+   readonly name: string;
+diff --git a/packages/nx/src/project-graph/project-graph.ts b/packages/nx/src/project-graph/project-graph.ts
+index e4e46104d8..cc423fa024 100644
+--- a/packages/nx/src/project-graph/project-graph.ts
++++ b/packages/nx/src/project-graph/project-graph.ts
+@@ -40,6 +40,7 @@ import { FileLock, IS_WASM } from '../native';
+ import { join } from 'path';
+ import { workspaceDataDirectory } from '../utils/cache-directory';
+ import { DelayedSpinner } from '../utils/delayed-spinner';
++import { getCallSites } from '../utils/call-sites';
+ 
+ /**
+  * Synchronously reads the latest cached copy of the workspace's ProjectGraph.
+@@ -104,6 +105,8 @@ export function readProjectsConfigurationFromProjectGraph(
+ }
+ 
+ export async function buildProjectGraphAndSourceMapsWithoutDaemon() {
++  preventRecursionInGraphConstruction();
++
+   global.NX_GRAPH_CREATION = true;
+   const nxJson = readNxJson();
+ 
+@@ -412,3 +415,31 @@ export async function createProjectGraphAndSourceMapsAsync(
+     }
+   }
+ }
++
++export function preventRecursionInGraphConstruction() {
++  // preventRecursionInGraphConstruction -> callee -> ...
++  // slice removes preventRecursionInGraphConstruction and its caller,
++  // which is useful when using this function to detect recursion in buildProjectGraphAndSourceMapsWithoutDaemon
++  const stackframes = getCallSites().slice(2);
++
++  if (
++    stackframes.some((f) => {
++      const functionName = f.getFunctionName();
++      const fileName = f.getFileName() || '';
++      return (
++        functionName === buildProjectGraphAndSourceMapsWithoutDaemon.name ||
++        (['createNodes', 'createDependencies', 'createMetadata'].includes(
++          functionName || ''
++        ) &&
++          fileName.endsWith('plugin-worker.js'))
++      );
++    })
++  ) {
++    throw new Error(
++      `Project graph construction cannot be performed due to a loop detected in the call stack. This can happen if 'createProjectGraphAsync' is called directly or indirectly during project graph construction.\n` +
++        'To avoid this, you can add a check against "global.NX_GRAPH_CREATION" before calling "createProjectGraphAsync".\n' +
++        'Call stack:\n' +
++        stackframes.join('\n')
++    );
++  }
++}
+diff --git a/packages/nx/src/project-graph/utils/project-configuration-utils.ts b/packages/nx/src/project-graph/utils/project-configuration-utils.ts
+index 230afcd721..fe0b01fe46 100644
+--- a/packages/nx/src/project-graph/utils/project-configuration-utils.ts
++++ b/packages/nx/src/project-graph/utils/project-configuration-utils.ts
+@@ -15,7 +15,7 @@ import { join } from 'path';
+ import { performance } from 'perf_hooks';
+ import { existsSync } from 'node:fs';
+ 
+-import { LoadedNxPlugin } from '../plugins/loaded-nx-plugin';
++import type { LoadedNxPlugin } from '../plugins/loaded-nx-plugin';
+ import {
+   AggregateCreateNodesError,
+   formatAggregateCreateNodesError,
+@@ -24,14 +24,12 @@ import {
+   isProjectsWithNoNameError,
+   isProjectWithExistingNameError,
+   isProjectWithNoNameError,
+-  isWorkspaceValidityError,
+   MergeNodesError,
+   MultipleProjectsWithSameNameError,
+   ProjectConfigurationsError,
+   ProjectsWithNoNameError,
+   ProjectWithExistingNameError,
+   ProjectWithNoNameError,
+-  WorkspaceValidityError,
+ } from '../error-types';
+ import { CreateNodesResult } from '../plugins/public-api';
+ import { isGlobPattern } from '../../utils/globs';
+@@ -399,7 +397,6 @@ export async function createProjectConfigurationsWithPlugins(
+     | MergeNodesError
+     | ProjectsWithNoNameError
+     | MultipleProjectsWithSameNameError
+-    | WorkspaceValidityError
+   > = [];
+ 
+   // We iterate over plugins first - this ensures that plugins specified first take precedence.
+@@ -499,7 +496,6 @@ function mergeCreateNodesResults(
+     | MergeNodesError
+     | ProjectsWithNoNameError
+     | MultipleProjectsWithSameNameError
+-    | WorkspaceValidityError
+   )[]
+ ) {
+   performance.mark('createNodes:merge - start');
+@@ -555,19 +551,14 @@ function mergeCreateNodesResults(
+       nxJsonConfiguration,
+       configurationSourceMaps
+     );
+-  } catch (error) {
+-    const unknownErrors: Error[] = [];
+-    let _errors = error instanceof AggregateError ? error.errors : [error];
+-    for (const e of _errors) {
+-      if (
+-        isProjectsWithNoNameError(e) ||
+-        isMultipleProjectsWithSameNameError(e) ||
+-        isWorkspaceValidityError(e)
+-      ) {
+-        errors.push(e);
+-      } else {
+-        throw e;
+-      }
++  } catch (e) {
++    if (
++      isProjectsWithNoNameError(e) ||
++      isMultipleProjectsWithSameNameError(e)
++    ) {
++      errors.push(e);
++    } else {
++      throw e;
+     }
+   }
+ 
+@@ -672,7 +663,6 @@ function validateAndNormalizeProjectRootMap(
+   // to provide better error messaging.
+   const conflicts = new Map<string, string[]>();
+   const projectRootsWithNoName: string[] = [];
+-  const validityErrors: WorkspaceValidityError[] = [];
+ 
+   for (const root in projectRootMap) {
+     const project = projectRootMap[root];
+@@ -710,36 +700,20 @@ function validateAndNormalizeProjectRootMap(
+ 
+   for (const root in projectRootMap) {
+     const project = projectRootMap[root];
+-    try {
+-      normalizeTargets(
+-        project,
+-        sourceMaps,
+-        nxJsonConfiguration,
+-        workspaceRoot,
+-        projects
+-      );
+-    } catch (e) {
+-      if (e instanceof WorkspaceValidityError) {
+-        validityErrors.push(e);
+-      } else {
+-        throw e;
+-      }
+-    }
++    normalizeTargets(
++      project,
++      sourceMaps,
++      nxJsonConfiguration,
++      workspaceRoot,
++      projects
++    );
+   }
+ 
+-  const errors: Error[] = [];
+-
+   if (conflicts.size > 0) {
+-    errors.push(new MultipleProjectsWithSameNameError(conflicts, projects));
++    throw new MultipleProjectsWithSameNameError(conflicts, projects);
+   }
+   if (projectRootsWithNoName.length > 0) {
+-    errors.push(new ProjectsWithNoNameError(projectRootsWithNoName, projects));
+-  }
+-  if (validityErrors.length > 0) {
+-    errors.push(...validityErrors);
+-  }
+-  if (errors.length > 0) {
+-    throw new AggregateError(errors);
++    throw new ProjectsWithNoNameError(projectRootsWithNoName, projects);
+   }
+   return projectRootMap;
+ }
+@@ -754,8 +728,6 @@ function normalizeTargets(
+    */
+   projects: Record<string, ProjectConfiguration>
+ ) {
+-  const targetErrorMessage: string[] = [];
+-
+   for (const targetName in project.targets) {
+     project.targets[targetName] = normalizeTarget(
+       project.targets[targetName],
+@@ -792,34 +764,23 @@ function normalizeTargets(
+       );
+     }
+ 
+-    const target = project.targets[targetName];
+-
+     if (
+       // If the target has no executor or command, it doesn't do anything
+-      !target.executor &&
+-      !target.command
++      !project.targets[targetName].executor &&
++      !project.targets[targetName].command
+     ) {
+       // But it may have dependencies that do something
+-      if (target.dependsOn && target.dependsOn.length > 0) {
+-        target.executor = 'nx:noop';
++      if (
++        project.targets[targetName].dependsOn &&
++        project.targets[targetName].dependsOn.length > 0
++      ) {
++        project.targets[targetName].executor = 'nx:noop';
+       } else {
+         // If it does nothing, and has no depenencies,
+         // we can remove it.
+         delete project.targets[targetName];
+       }
+     }
+-
+-    if (target.cache && target.continuous) {
+-      targetErrorMessage.push(
+-        `- "${targetName}" has both "cache" and "continuous" set to true. Continuous targets cannot be cached. Please remove the "cache" property.`
+-      );
+-    }
+-  }
+-  if (targetErrorMessage.length > 0) {
+-    targetErrorMessage.unshift(
+-      `Errors detected in targets of project "${project.name}":`
+-    );
+-    throw new WorkspaceValidityError(targetErrorMessage.join('\n'));
+   }
+ }
+ 
+diff --git a/packages/nx/src/project-graph/utils/retrieve-workspace-files.ts b/packages/nx/src/project-graph/utils/retrieve-workspace-files.ts
+index 649d3e5ccb..6978c38f3b 100644
+--- a/packages/nx/src/project-graph/utils/retrieve-workspace-files.ts
++++ b/packages/nx/src/project-graph/utils/retrieve-workspace-files.ts
+@@ -9,7 +9,7 @@ import {
+   ConfigurationResult,
+   createProjectConfigurationsWithPlugins,
+ } from './project-configuration-utils';
+-import { LoadedNxPlugin } from '../plugins/loaded-nx-plugin';
++import type { LoadedNxPlugin } from '../plugins/loaded-nx-plugin';
+ import {
+   getNxWorkspaceFilesFromContext,
+   globWithWorkspaceContext,
+diff --git a/packages/nx/src/tasks-runner/utils.ts b/packages/nx/src/tasks-runner/utils.ts
+index 3105fd4a7a..6edb4a20d0 100644
+--- a/packages/nx/src/tasks-runner/utils.ts
++++ b/packages/nx/src/tasks-runner/utils.ts
+@@ -576,7 +576,7 @@ export function isCacheableTask(
+     cacheableTargets?: string[] | null;
+   }
+ ): boolean {
+-  if (task.cache !== undefined) {
++  if (task.cache !== undefined && !longRunningTask(task)) {
+     return task.cache;
+   }
+ 
+@@ -591,7 +591,6 @@ export function isCacheableTask(
+ function longRunningTask(task: Task) {
+   const t = task.target.target;
+   return (
+-    task.continuous ||
+     (!!task.overrides['watch'] && task.overrides['watch'] !== 'false') ||
+     t.endsWith(':watch') ||
+     t.endsWith('-watch') ||
+diff --git a/packages/nx/src/utils/assert-workspace-validity.ts b/packages/nx/src/utils/assert-workspace-validity.ts
+index 481fad21aa..b9c76b8bd5 100644
+--- a/packages/nx/src/utils/assert-workspace-validity.ts
++++ b/packages/nx/src/utils/assert-workspace-validity.ts
+@@ -37,33 +37,36 @@ export function assertWorkspaceValidity(
+ 
+   const projectsWithNonArrayImplicitDependencies = new Map<string, unknown>();
+ 
+-  projectNames.reduce((map, projectName) => {
+-    const project = projects[projectName];
++  projectNames
++    .filter((projectName) => {
++      const project = projects[projectName];
+ 
+-    if (
+-      !!project.implicitDependencies &&
+-      !Array.isArray(project.implicitDependencies)
+-    ) {
+-      projectsWithNonArrayImplicitDependencies.set(
++      // Report if for whatever reason, a project is configured to use implicitDependencies but it is not an array
++      if (
++        !!project.implicitDependencies &&
++        !Array.isArray(project.implicitDependencies)
++      ) {
++        projectsWithNonArrayImplicitDependencies.set(
++          projectName,
++          project.implicitDependencies
++        );
++      }
++      return (
++        !!project.implicitDependencies &&
++        Array.isArray(project.implicitDependencies)
++      );
++    })
++    .reduce((map, projectName) => {
++      const project = projects[projectName];
++      detectAndSetInvalidProjectGlobValues(
++        map,
+         projectName,
+-        project.implicitDependencies
++        project.implicitDependencies,
++        projects,
++        projectGraphNodes
+       );
+       return map;
+-    }
+-
+-    if (!project.implicitDependencies) {
+-      return map;
+-    }
+-
+-    detectAndSetInvalidProjectGlobValues(
+-      map,
+-      projectName,
+-      project.implicitDependencies,
+-      projects,
+-      projectGraphNodes
+-    );
+-    return map;
+-  }, invalidImplicitDependencies);
++    }, invalidImplicitDependencies);
+ 
+   if (
+     projectsWithNonArrayImplicitDependencies.size === 0 &&
+diff --git a/packages/nx/src/utils/call-sites.ts b/packages/nx/src/utils/call-sites.ts
+new file mode 100644
+index 0000000000..d53c8589f0
+--- /dev/null
++++ b/packages/nx/src/utils/call-sites.ts
+@@ -0,0 +1,26 @@
++/**
++ * Returns an array of CallSite objects representing the current call stack.
++ *
++ * NOTE: The returned CallSite[] does not include the frame for getCallSites itself,
++ * but will include the function that called getCallSites. If you are checking for
++ * things like recursion, you need to make sure to account for that.
++ *
++ * The behavior should match node:util.getCallSites, introduced in Node.js v22.0.0.
++ *
++ * @todo(@AgentEnder) Move this to node:util when we remove support for Node.js versions < 22, around Nx 24
++ *
++ * @returns {NodeJS.CallSite[]} An array of CallSite objects.
++ */
++export function getCallSites() {
++  const prepareStackTraceBackup = Error.prepareStackTrace;
++  Error.prepareStackTrace = (_, stackTraces: NodeJS.CallSite[]) => {
++    return stackTraces;
++  };
++
++  const errorObject = {};
++  Error.captureStackTrace(errorObject);
++  const trace = (errorObject as any).stack as NodeJS.CallSite[];
++  Error.prepareStackTrace = prepareStackTraceBackup;
++  trace.shift(); // remove getCallSites
++  return trace; // return stack up to what called getCallSites
++}
+diff --git a/packages/nx/src/utils/plugins/plugin-capabilities.ts b/packages/nx/src/utils/plugins/plugin-capabilities.ts
+index a870d1b77d..43e253f084 100644
+--- a/packages/nx/src/utils/plugins/plugin-capabilities.ts
++++ b/packages/nx/src/utils/plugins/plugin-capabilities.ts
+@@ -9,7 +9,7 @@ import { getNxRequirePaths } from '../installation-directory';
+ import { readPluginPackageJson } from '../../project-graph/plugins';
+ import { loadNxPlugin } from '../../project-graph/plugins/in-process-loader';
+ import { PackageJson } from '../package-json';
+-import { LoadedNxPlugin } from '../../project-graph/plugins/loaded-nx-plugin';
++import type { LoadedNxPlugin } from '../../project-graph/plugins/loaded-nx-plugin';
+ 
+ export interface PluginCapabilities {
+   name: string;
+diff --git a/packages/vitest/jest.config.ts b/packages/vitest/jest.config.ts
+new file mode 100644
+index 0000000000..63acca695c
+--- /dev/null
++++ b/packages/vitest/jest.config.ts
+@@ -0,0 +1,16 @@
++/* eslint-disable */
++export default {
++  displayName: 'vitest',
++  preset: '../../jest.preset.js',
++  globals: {},
++  transform: {
++    '^.+\\.[tj]s$': [
++      'ts-jest',
++      {
++        tsconfig: '<rootDir>/tsconfig.spec.json',
++      },
++    ],
++  },
++  moduleFileExtensions: ['ts', 'js', 'html'],
++  coverageDirectory: '../../coverage/packages/vitest',
++};

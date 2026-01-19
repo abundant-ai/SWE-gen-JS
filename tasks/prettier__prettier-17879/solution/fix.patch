@@ -1,0 +1,199 @@
+diff --git a/changelog_unreleased/html/17879.md b/changelog_unreleased/html/17879.md
+new file mode 100644
+index 000000000..4374739ac
+--- /dev/null
++++ b/changelog_unreleased/html/17879.md
+@@ -0,0 +1,22 @@
++#### Support format `allow` attribute of iframe element (#17879 by @kovsu)
++
++<!-- prettier-ignore -->
++```html
++<!-- Input -->
++<iframe allow="layout-animations 'none'; unoptimized-images 'none'; oversized-images 'none'; sync-script 'none'; sync-xhr 'none'; unsized-media 'none';"></iframe>
++
++<!-- Prettier stable -->
++<iframe allow="layout-animations 'none'; unoptimized-images 'none'; oversized-images 'none'; sync-script 'none'; sync-xhr 'none'; unsized-media 'none';"></iframe>
++
++<!-- Prettier main -->
++<iframe
++  allow="
++    layout-animations 'none';
++    unoptimized-images 'none';
++    oversized-images 'none';
++    sync-script 'none';
++    sync-xhr 'none';
++    unsized-media 'none';
++  "
++></iframe>
++```
+diff --git a/src/language-html/clean.js b/src/language-html/clean.js
+index 84866990b..07942672a 100644
+--- a/src/language-html/clean.js
++++ b/src/language-html/clean.js
+@@ -23,7 +23,7 @@ const embeddedAngularControlFlowBlocks = new Set([
+   "case",
+ ]);
+ 
+-function clean(original, cloned) {
++function clean(original, cloned, parent) {
+   if (original.type === "text" || original.type === "comment") {
+     return null;
+   }
+@@ -42,7 +42,9 @@ function clean(original, cloned) {
+       // HTML attributes
+       name === "style" ||
+       name === "class" ||
+-      name === "srcset" ||
++      (name === "srcset" &&
++        (parent.fullName === "img" || parent.fullName === "source")) ||
++      (name === "allow" && parent.fullName === "iframe") ||
+       name.startsWith("on") ||
+       // Vue attributes
+       name.startsWith("@") ||
+@@ -50,9 +52,9 @@ function clean(original, cloned) {
+       name.startsWith(".") ||
+       name.startsWith("#") ||
+       name.startsWith("v-") ||
+-      name === "vars" ||
+-      name === "setup" ||
+-      name === "generic" ||
++      (name === "vars" && parent.fullName === "style") ||
++      ((name === "setup" || name === "generic") &&
++        parent.fullName === "script") ||
+       name === "slot-scope" ||
+       // Angular attributes
+       name.startsWith("(") ||
+diff --git a/src/language-html/embed/attribute.js b/src/language-html/embed/attribute.js
+index 7e3d201cb..9aaa8c555 100644
+--- a/src/language-html/embed/attribute.js
++++ b/src/language-html/embed/attribute.js
+@@ -3,6 +3,10 @@ import { mapDoc } from "../../document/utils.js";
+ import angularAttributePrinters from "./angular-attributes.js";
+ import { isClassNames, printClassNames } from "./class-names.js";
+ import { isEventHandler, printEventHandler } from "./event-handler.js";
++import {
++  isPermissionsPolicy,
++  printPermissionsPolicy,
++} from "./permissions-policy.js";
+ import { isSrcset, printSrcset } from "./srcset.js";
+ import { isStyle, printStyle } from "./style.js";
+ import vueAttributePrinters from "./vue-attributes.js";
+@@ -24,6 +28,7 @@ const printers = [
+   { test: isStyle, print: printStyle },
+   { test: isEventHandler, print: printEventHandler },
+   { test: isClassNames, print: printClassNames },
++  { test: isPermissionsPolicy, print: printPermissionsPolicy },
+   ...vueAttributePrinters,
+   ...angularAttributePrinters,
+ ].map(({ test, print }) => ({
+diff --git a/src/language-html/embed/parse-permissions-policy.js b/src/language-html/embed/parse-permissions-policy.js
+new file mode 100644
+index 000000000..9e38a9573
+--- /dev/null
++++ b/src/language-html/embed/parse-permissions-policy.js
+@@ -0,0 +1,64 @@
++/*
++Based on https://github.com/helmetjs/content-security-policy-parser/blob/main/mod.ts with modifications:
++
++1. Emit policy list instead of a `Map`, so we won't remove duplicated directives.
++1. Skip ASCII check, so we won't remove invalid directives.
++1. Skip directive name normalization, so the printer can know what's the original name.
++*/
++import htmlWhitespaceUtils from "../../utils/html-whitespace-utils.js";
++
++/**
++@typedef {{
++  name: string,
++  value: string[],
++}} Directive
++*/
++
++/**
++Parse a serialized Content Security Policy.
++https://w3c.github.io/webappsec-csp/#parse-serialized-policy
++
++@param {string} policy
++@returns {Directive[]}
++*/
++function parsePermissionsPolicy(policy) {
++  const directives = [];
++
++  // "For each token returned by strictly splitting serialized on the
++  // U+003B SEMICOLON character (;):"
++  for (let token of policy.split(";")) {
++    // "1. Strip leading and trailing ASCII whitespace from token."
++    token = htmlWhitespaceUtils.trim(token);
++
++    // "2. If token is an empty string, or if token is not an ASCII string,
++    //     continue."
++    // Prettier: Skipped ASCII check.
++    if (!token) {
++      continue;
++    }
++
++    // We do these at the same time:
++    // "3. Let directive name be the result of collecting a sequence of
++    //     code points from token which are not ASCII whitespace."
++    // "6. Let directive value be the result of splitting token on
++    //     ASCII whitespace."
++    const [name, ...value] = htmlWhitespaceUtils.split(token);
++
++    // "4. Set directive name to be the result of running ASCII lowercase on
++    //     directive name."
++    // Prettier: Skipped directive name normalization.
++
++    // "5. If policy's directive set contains a directive whose name is
++    //     directive name, continue."
++    // Prettier: We preserve duplicated directives.
++
++    // "7. Let directive be a new directive whose name is directive name, and
++    //     value is directive value."
++    // "8. Append directive to policy's directive set."
++    directives.push({ name, value });
++  }
++
++  return directives;
++}
++
++export default parsePermissionsPolicy;
+diff --git a/src/language-html/embed/permissions-policy.js b/src/language-html/embed/permissions-policy.js
+new file mode 100644
+index 000000000..3d780e31c
+--- /dev/null
++++ b/src/language-html/embed/permissions-policy.js
+@@ -0,0 +1,35 @@
++import { ifBreak, line } from "../../document/builders.js";
++import { getUnescapedAttributeValue } from "../utils/index.js";
++import parsePermissionsPolicy from "./parse-permissions-policy.js";
++import { printExpand } from "./utils.js";
++
++/**
++@import {AttributeValuePredicate, AttributeValuePrint} from "./attribute.js"
++*/
++
++/** @type {AttributeValuePredicate} */
++const isPermissionsPolicy = ({ node }, options) =>
++  node.parent.name === "iframe" &&
++  node.fullName === "allow" &&
++  !options.parentParser &&
++  !node.value.includes("{{");
++
++/** @type {AttributeValuePrint} */
++function printPermissionsPolicy(textToDoc, print, path /* , options*/) {
++  const { node } = path;
++  const directives = parsePermissionsPolicy(getUnescapedAttributeValue(node));
++
++  if (directives.length === 0) {
++    // Return a truthy value to bypass the check in `printAttributeWithValuePrinter`
++    return [""];
++  }
++
++  return printExpand(
++    directives.map(({ name, value }, index) => [
++      [name, ...value].join(" "),
++      index === directives.length - 1 ? ifBreak(";") : [";", line],
++    ]),
++  );
++}
++
++export { isPermissionsPolicy, printPermissionsPolicy };

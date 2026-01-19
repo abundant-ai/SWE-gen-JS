@@ -1,0 +1,788 @@
+diff --git a/.changeset/khaki-monkeys-clap.md b/.changeset/khaki-monkeys-clap.md
+deleted file mode 100644
+index d21bd17ab6..0000000000
+--- a/.changeset/khaki-monkeys-clap.md
++++ /dev/null
+@@ -1,30 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-Introduce `getNextSnapshot(...)`, which determines the next snapshot for the given `actorLogic` based on the given `snapshot` and `event`.
+-
+-If the `snapshot` is `undefined`, the initial snapshot of the `actorLogic` is used.
+-
+-```ts
+-import { getNextSnapshot } from 'xstate';
+-import { trafficLightMachine } from './trafficLightMachine.ts';
+-
+-const nextSnapshot = getNextSnapshot(
+-  trafficLightMachine, // actor logic
+-  undefined, // snapshot (or initial state if undefined)
+-  { type: 'TIMER' }
+-); // event object
+-
+-console.log(nextSnapshot.value);
+-// => 'yellow'
+-
+-const nextSnapshot2 = getNextSnapshot(
+-  trafficLightMachine, // actor logic
+-  nextSnapshot, // snapshot
+-  { type: 'TIMER' }
+-); // event object
+-
+-console.log(nextSnapshot2.value);
+-// =>'red'
+-```
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 28b3531c94..9f0e5ee1ff 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -471,7 +471,7 @@ export class StateMachine<
+ 
+       const actorRef = createActor(logic, {
+         id: actorId,
+-        parent: _actorScope.self,
++        parent: _actorScope?.self,
+         syncSnapshot: actorData.syncSnapshot,
+         snapshot: childState,
+         src,
+diff --git a/packages/core/src/actions/assign.ts b/packages/core/src/actions/assign.ts
+index 78e7a08b2b..3a0b9d830f 100644
+--- a/packages/core/src/actions/assign.ts
++++ b/packages/core/src/actions/assign.ts
+@@ -54,8 +54,8 @@ function resolveAssign(
+       actionArgs.event,
+       spawnedChildren
+     ),
+-    self: actorScope.self,
+-    system: actorScope.system
++    self: actorScope?.self,
++    system: actorScope?.system
+   };
+   let partialUpdate: Record<string, unknown> = {};
+   if (typeof assignment === 'function') {
+diff --git a/packages/core/src/actions/send.ts b/packages/core/src/actions/send.ts
+index 26248a8ca0..3d5b27517f 100644
+--- a/packages/core/src/actions/send.ts
++++ b/packages/core/src/actions/send.ts
+@@ -92,9 +92,9 @@ function resolveSendTo(
+ 
+   if (typeof resolvedTarget === 'string') {
+     if (resolvedTarget === SpecialTargets.Parent) {
+-      targetActorRef = actorScope.self._parent;
++      targetActorRef = actorScope?.self._parent;
+     } else if (resolvedTarget === SpecialTargets.Internal) {
+-      targetActorRef = actorScope.self;
++      targetActorRef = actorScope?.self;
+     } else if (resolvedTarget.startsWith('#_')) {
+       // SCXML compatibility: https://www.w3.org/TR/scxml/#SCXMLEventProcessor
+       // #_invokeid. If the target is the special term '#_invokeid', where invokeid is the invokeid of an SCXML session that the sending session has created by <invoke>, the Processor must add the event to the external queue of that session.
+@@ -110,7 +110,7 @@ function resolveSendTo(
+       );
+     }
+   } else {
+-    targetActorRef = resolvedTarget || actorScope.self;
++    targetActorRef = resolvedTarget || actorScope?.self;
+   }
+ 
+   return [
+diff --git a/packages/core/src/actions/spawnChild.ts b/packages/core/src/actions/spawnChild.ts
+index b9f11990d4..d1662832f2 100644
+--- a/packages/core/src/actions/spawnChild.ts
++++ b/packages/core/src/actions/spawnChild.ts
+@@ -61,7 +61,7 @@ function resolveSpawn(
+     actorRef = createActor(logic, {
+       id: resolvedId,
+       src,
+-      parent: actorScope.self,
++      parent: actorScope?.self,
+       syncSnapshot,
+       systemId,
+       input:
+@@ -69,7 +69,7 @@ function resolveSpawn(
+           ? input({
+               context: snapshot.context,
+               event: actionArgs.event,
+-              self: actorScope.self
++              self: actorScope?.self
+             })
+           : input
+     });
+diff --git a/packages/core/src/getNextSnapshot.ts b/packages/core/src/getNextSnapshot.ts
+deleted file mode 100644
+index 0ef191fed0..0000000000
+--- a/packages/core/src/getNextSnapshot.ts
++++ /dev/null
+@@ -1,76 +0,0 @@
+-import { createActor } from './createActor.ts';
+-import {
+-  ActorScope,
+-  AnyActorLogic,
+-  AnyActorScope,
+-  EventFromLogic,
+-  InputFrom,
+-  SnapshotFrom
+-} from './types.ts';
+-
+-/** @internal */
+-export function createInertActorScope<T extends AnyActorLogic>(
+-  actorLogic: T
+-): AnyActorScope {
+-  const self = createActor(actorLogic as AnyActorLogic);
+-  const inertActorScope: ActorScope<SnapshotFrom<T>, EventFromLogic<T>, any> = {
+-    self,
+-    defer: () => {},
+-    id: '',
+-    logger: () => {},
+-    sessionId: '',
+-    stopChild: () => {},
+-    system: self.system
+-  };
+-
+-  return inertActorScope;
+-}
+-
+-export function getInitialSnapshot<T extends AnyActorLogic>(
+-  actorLogic: T,
+-  ...[input]: undefined extends InputFrom<T>
+-    ? [input?: InputFrom<T>]
+-    : [input: InputFrom<T>]
+-): SnapshotFrom<T> {
+-  const actorScope = createInertActorScope(actorLogic);
+-  return actorLogic.getInitialSnapshot(actorScope, input);
+-}
+-
+-/**
+- * Determines the next snapshot for the given `actorLogic` based on
+- * the given `snapshot` and `event`.
+- *
+- * If the `snapshot` is `undefined`, the initial snapshot of the
+- * `actorLogic` is used.
+- *
+- * @example
+-  ```ts
+-  import { getNextSnapshot } from 'xstate';
+-  import { trafficLightMachine } from './trafficLightMachine.ts';
+-
+-  const nextSnapshot = getNextSnapshot(
+-    trafficLightMachine, // actor logic
+-    undefined, // snapshot (or initial state if undefined)
+-    { type: 'TIMER' }); // event object
+-
+-  console.log(nextSnapshot.value);
+-  // => 'yellow'
+-
+-  const nextSnapshot2 = getNextSnapshot(
+-    trafficLightMachine, // actor logic
+-    nextSnapshot, // snapshot
+-    { type: 'TIMER' }); // event object
+-
+-  console.log(nextSnapshot2.value);
+-  // =>'red'
+-  ```
+- */
+-export function getNextSnapshot<T extends AnyActorLogic>(
+-  actorLogic: T,
+-  snapshot: SnapshotFrom<T>,
+-  event: EventFromLogic<T>
+-): SnapshotFrom<T> {
+-  const inertActorScope = createInertActorScope(actorLogic);
+-  (inertActorScope.self as any)._snapshot = snapshot;
+-  return actorLogic.transition(snapshot, event, inertActorScope);
+-}
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index b0177584bb..6537a6cc42 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -9,7 +9,6 @@ export * from './typegenTypes.ts';
+ export * from './types.ts';
+ export { waitFor } from './waitFor.ts';
+ import { createMachine } from './createMachine.ts';
+-export { getNextSnapshot } from './getNextSnapshot.ts';
+ import { Actor, createActor, interpret, Interpreter } from './createActor.ts';
+ import { StateNode } from './StateNode.ts';
+ // TODO: decide from where those should be exported
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 5360a1da34..c98ebf49ce 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1505,8 +1505,8 @@ function resolveActionsAndContextWorker(
+     const actionArgs = {
+       context: intermediateSnapshot.context,
+       event,
+-      self: actorScope.self,
+-      system: actorScope.system
++      self: actorScope?.self,
++      system: actorScope?.system
+     };
+ 
+     const actionParams =
+@@ -1519,10 +1519,10 @@ function resolveActionsAndContextWorker(
+           : undefined;
+ 
+     if (!('resolve' in resolvedAction)) {
+-      if (actorScope.self._processingStatus === ProcessingStatus.Running) {
++      if (actorScope?.self._processingStatus === ProcessingStatus.Running) {
+         resolvedAction(actionArgs, actionParams);
+       } else {
+-        actorScope.defer(() => {
++        actorScope?.defer(() => {
+           resolvedAction(actionArgs, actionParams);
+         });
+       }
+@@ -1546,10 +1546,12 @@ function resolveActionsAndContextWorker(
+     }
+ 
+     if ('execute' in builtinAction) {
+-      if (actorScope.self._processingStatus === ProcessingStatus.Running) {
+-        builtinAction.execute(actorScope, params);
++      if (actorScope?.self._processingStatus === ProcessingStatus.Running) {
++        builtinAction.execute(actorScope!, params);
+       } else {
+-        actorScope.defer(builtinAction.execute.bind(null, actorScope, params));
++        actorScope?.defer(
++          builtinAction.execute.bind(null, actorScope!, params)
++        );
+       }
+     }
+ 
+@@ -1653,7 +1655,7 @@ export function macrostep(
+       snapshot,
+       actorScope,
+       nextEvent,
+-      false, // isInitial
++      false,
+       internalQueue
+     );
+     states.push(nextSnapshot);
+diff --git a/packages/core/test/deterministic.test.ts b/packages/core/test/deterministic.test.ts
+index 753bb7482e..720cfd466a 100644
+--- a/packages/core/test/deterministic.test.ts
++++ b/packages/core/test/deterministic.test.ts
+@@ -1,6 +1,5 @@
+-import { fromCallback, createActor, getNextSnapshot } from '../src/index.ts';
++import { fromCallback, createActor } from '../src/index.ts';
+ import { createMachine } from '../src/createMachine.ts';
+-import { getInitialSnapshot } from '../src/getNextSnapshot.ts';
+ 
+ describe('deterministic machine', () => {
+   const lightMachine = createMachine({
+@@ -62,15 +61,16 @@ describe('deterministic machine', () => {
+     }
+   });
+ 
+-  describe('machine transitions', () => {
++  describe('machine.transition()', () => {
+     it('should properly transition states based on event-like object', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(
+-          lightMachine,
++        lightMachine.transition(
+           lightMachine.resolveState({ value: 'green' }),
+           {
+             type: 'TIMER'
+-          }
++          },
++          actorScope
+         ).value
+       ).toEqual('yellow');
+     });
+@@ -99,81 +99,98 @@ describe('deterministic machine', () => {
+     });
+ 
+     it('should throw an error if not given an event', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(() =>
+-        getNextSnapshot(
+-          lightMachine,
++        lightMachine.transition(
+           testMachine.resolveState({ value: 'red' }),
+-          undefined as any
++          undefined as any,
++          actorScope
+         )
+       ).toThrow();
+     });
+ 
+     it('should transition to nested states as target', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(testMachine, testMachine.resolveState({ value: 'a' }), {
+-          type: 'T'
+-        }).value
++        testMachine.transition(
++          testMachine.resolveState({ value: 'a' }),
++          { type: 'T' },
++          actorScope
++        ).value
+       ).toEqual({
+         b: 'b1'
+       });
+     });
+ 
+     it('should throw an error for transitions from invalid states', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(() =>
+-        getNextSnapshot(
+-          testMachine,
++        testMachine.transition(
+           testMachine.resolveState({ value: 'fake' }),
+-          { type: 'T' }
++          { type: 'T' },
++          actorScope
+         )
+       ).toThrow();
+     });
+ 
+     it('should throw an error for transitions from invalid substates', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(() =>
+-        getNextSnapshot(
+-          testMachine,
++        testMachine.transition(
+           testMachine.resolveState({ value: 'a.fake' }),
+           {
+             type: 'T'
+-          }
++          },
++          actorScope
+         )
+       ).toThrow();
+     });
+ 
+     it('should use the machine.initialState when an undefined state is given', () => {
+-      const init = getInitialSnapshot(lightMachine, undefined);
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(lightMachine, init, { type: 'TIMER' }).value
++        lightMachine.transition(
++          lightMachine.getInitialSnapshot(actorScope),
++          { type: 'TIMER' },
++          actorScope
++        ).value
+       ).toEqual('yellow');
+     });
+ 
+     it('should use the machine.initialState when an undefined state is given (unhandled event)', () => {
+-      const init = getInitialSnapshot(lightMachine, undefined);
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(lightMachine, init, { type: 'TIMER' }).value
++        lightMachine.transition(
++          lightMachine.getInitialSnapshot(actorScope),
++          { type: 'TIMER' },
++          actorScope
++        ).value
+       ).toEqual('yellow');
+     });
+   });
+ 
+-  describe('machine transition with nested states', () => {
++  // TODO: figure out the simulation API
++  describe('machine.transition() with nested states', () => {
+     it('should properly transition a nested state', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(
+-          lightMachine,
++        lightMachine.transition(
+           lightMachine.resolveState({ value: { red: 'walk' } }),
+-          { type: 'PED_COUNTDOWN' }
++          { type: 'PED_COUNTDOWN' },
++          actorScope
+         ).value
+       ).toEqual({ red: 'wait' });
+     });
+ 
+     it('should transition from initial nested states', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(
+-          lightMachine,
++        lightMachine.transition(
+           lightMachine.resolveState({ value: 'red' }),
+           {
+             type: 'PED_COUNTDOWN'
+-          }
++          },
++          actorScope
+         ).value
+       ).toEqual({
+         red: 'wait'
+@@ -181,13 +198,14 @@ describe('deterministic machine', () => {
+     });
+ 
+     it('should transition from deep initial nested states', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(
+-          lightMachine,
++        lightMachine.transition(
+           lightMachine.resolveState({ value: 'red' }),
+           {
+             type: 'PED_COUNTDOWN'
+-          }
++          },
++          actorScope
+         ).value
+       ).toEqual({
+         red: 'wait'
+@@ -195,11 +213,12 @@ describe('deterministic machine', () => {
+     });
+ 
+     it('should bubble up events that nested states cannot handle', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(
+-          lightMachine,
++        lightMachine.transition(
+           lightMachine.resolveState({ value: { red: 'stop' } }),
+-          { type: 'TIMER' }
++          { type: 'TIMER' },
++          actorScope
+         ).value
+       ).toEqual('green');
+     });
+@@ -233,13 +252,14 @@ describe('deterministic machine', () => {
+     });
+ 
+     it('should transition to the deepest initial state', () => {
++      const actorScope = null as any; // TODO: figure out the simulation API
+       expect(
+-        getNextSnapshot(
+-          lightMachine,
++        lightMachine.transition(
+           lightMachine.resolveState({ value: 'yellow' }),
+           {
+             type: 'TIMER'
+-          }
++          },
++          actorScope
+         ).value
+       ).toEqual({
+         red: 'walk'
+@@ -247,13 +267,21 @@ describe('deterministic machine', () => {
+     });
+ 
+     it('should return the same state if no transition occurs', () => {
+-      const init = getInitialSnapshot(lightMachine, undefined);
+-      const initialState = getNextSnapshot(lightMachine, init, {
+-        type: 'NOTHING'
+-      });
+-      const nextState = getNextSnapshot(lightMachine, initialState, {
+-        type: 'NOTHING'
+-      });
++      const actorScope = null as any; // TODO: figure out the simulation API
++      const initialState = lightMachine.transition(
++        lightMachine.getInitialSnapshot(actorScope),
++        {
++          type: 'NOTHING'
++        },
++        actorScope
++      );
++      const nextState = lightMachine.transition(
++        initialState,
++        {
++          type: 'NOTHING'
++        },
++        actorScope
++      );
+ 
+       expect(initialState.value).toEqual(nextState.value);
+       expect(nextState).toBe(initialState);
+@@ -283,19 +311,25 @@ describe('deterministic machine', () => {
+     );
+ 
+     it('should work with substate nodes that have the same key', () => {
+-      const init = getInitialSnapshot(machine, undefined);
+-      expect(getNextSnapshot(machine, init, { type: 'NEXT' }).value).toEqual(
+-        'test'
+-      );
++      const actorScope = null as any; // TODO: figure out the simulation API
++      expect(
++        machine.transition(
++          machine.getInitialSnapshot(actorScope),
++          { type: 'NEXT' },
++          actorScope
++        ).value
++      ).toEqual('test');
+     });
+   });
+ 
+   describe('forbidden events', () => {
+     it('undefined transitions should forbid events', () => {
+-      const walkState = getNextSnapshot(
+-        lightMachine,
++      const actorScope = null as any; // TODO: figure out the simulation API
++
++      const walkState = lightMachine.transition(
+         lightMachine.resolveState({ value: { red: 'walk' } }),
+-        { type: 'TIMER' }
++        { type: 'TIMER' },
++        actorScope
+       );
+ 
+       expect(walkState.value).toEqual({ red: 'walk' });
+diff --git a/packages/core/test/getNextSnapshot.test.ts b/packages/core/test/getNextSnapshot.test.ts
+deleted file mode 100644
+index b5b37309ef..0000000000
+--- a/packages/core/test/getNextSnapshot.test.ts
++++ /dev/null
+@@ -1,79 +0,0 @@
+-import {
+-  createActor,
+-  createMachine,
+-  fromTransition,
+-  getNextSnapshot
+-} from '../src';
+-import { getInitialSnapshot } from '../src/getNextSnapshot';
+-
+-describe('getNextSnapshot', () => {
+-  it('should calculate the next snapshot for transition logic', () => {
+-    const logic = fromTransition(
+-      (state, event) => {
+-        if (event.type === 'next') {
+-          return { count: state.count + 1 };
+-        } else {
+-          return state;
+-        }
+-      },
+-      { count: 0 }
+-    );
+-
+-    const init = getInitialSnapshot(logic, undefined);
+-    const s1 = getNextSnapshot(logic, init, { type: 'next' });
+-    expect(s1.context.count).toEqual(1);
+-    const s2 = getNextSnapshot(logic, s1, { type: 'next' });
+-    expect(s2.context.count).toEqual(2);
+-  });
+-  it('should calculate the next snapshot for machine logic', () => {
+-    const machine = createMachine({
+-      initial: 'a',
+-      states: {
+-        a: {
+-          on: {
+-            NEXT: 'b'
+-          }
+-        },
+-        b: {
+-          on: {
+-            NEXT: 'c'
+-          }
+-        },
+-        c: {}
+-      }
+-    });
+-
+-    const init = getInitialSnapshot(machine, undefined);
+-    const s1 = getNextSnapshot(machine, init, { type: 'NEXT' });
+-
+-    expect(s1.value).toEqual('b');
+-
+-    const s2 = getNextSnapshot(machine, s1, { type: 'NEXT' });
+-
+-    expect(s2.value).toEqual('c');
+-  });
+-  it('should not execute actions', () => {
+-    const fn = jest.fn();
+-
+-    const machine = createMachine({
+-      initial: 'a',
+-      states: {
+-        a: {
+-          on: {
+-            event: {
+-              target: 'b',
+-              actions: fn
+-            }
+-          }
+-        },
+-        b: {}
+-      }
+-    });
+-
+-    const init = getInitialSnapshot(machine, undefined);
+-    const nextSnapshot = getNextSnapshot(machine, init, { type: 'event' });
+-
+-    expect(fn).not.toHaveBeenCalled();
+-    expect(nextSnapshot.value).toEqual('b');
+-  });
+-});
+diff --git a/packages/core/test/invalid.test.ts b/packages/core/test/invalid.test.ts
+index a9150ce6b4..8813657b00 100644
+--- a/packages/core/test/invalid.test.ts
++++ b/packages/core/test/invalid.test.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, getNextSnapshot } from '../src/index.ts';
++import { createMachine } from '../src/index.ts';
+ 
+ describe('invalid or resolved states', () => {
+   it('should resolve a String state', () => {
+@@ -22,9 +22,11 @@ describe('invalid or resolved states', () => {
+       }
+     });
+     expect(
+-      getNextSnapshot(machine, machine.resolveState({ value: 'A' }), {
+-        type: 'E'
+-      }).value
++      machine.transition(
++        machine.resolveState({ value: 'A' }),
++        { type: 'E' },
++        {} as any // TODO: figure out the simulation API
++      ).value
+     ).toEqual({
+       A: 'A1',
+       B: 'B1'
+@@ -52,10 +54,10 @@ describe('invalid or resolved states', () => {
+       }
+     });
+     expect(
+-      getNextSnapshot(
+-        machine,
++      machine.transition(
+         machine.resolveState({ value: { A: {}, B: {} } }),
+-        { type: 'E' }
++        { type: 'E' },
++        {} as any // TODO: figure out the simulation API
+       ).value
+     ).toEqual({
+       A: 'A1',
+@@ -83,10 +85,10 @@ describe('invalid or resolved states', () => {
+         }
+       }
+     });
+-    getNextSnapshot(
+-      machine,
++    machine.transition(
+       machine.resolveState({ value: { A: 'A1', B: 'B1' } }),
+-      { type: 'E' }
++      { type: 'E' },
++      {} as any // TODO: figure out the simulation API
+     );
+   });
+ 
+@@ -111,10 +113,10 @@ describe('invalid or resolved states', () => {
+       }
+     });
+     expect(() =>
+-      getNextSnapshot(
+-        machine,
++      machine.transition(
+         machine.resolveState({ value: { A: 'A3', B: 'B3' } }),
+-        { type: 'E' }
++        { type: 'E' },
++        {} as any // TODO: figure out the simulation API
+       )
+     ).toThrow();
+   });
+@@ -140,10 +142,10 @@ describe('invalid or resolved states', () => {
+       }
+     });
+     expect(
+-      getNextSnapshot(
+-        machine,
++      machine.transition(
+         machine.resolveState({ value: { A: 'A1', B: {} } }),
+-        { type: 'E' }
++        { type: 'E' },
++        {} as any // TODO: figure out the simulation API
+       ).value
+     ).toEqual({
+       A: 'A1',
+diff --git a/packages/core/test/invoke.test.ts b/packages/core/test/invoke.test.ts
+index 5556de749b..234bd71178 100644
+--- a/packages/core/test/invoke.test.ts
++++ b/packages/core/test/invoke.test.ts
+@@ -19,6 +19,7 @@ import {
+   createMachine,
+   createActor,
+   sendParent,
++  EventFrom,
+   Snapshot,
+   ActorRef
+ } from '../src/index.ts';
+diff --git a/packages/core/test/microstep.test.ts b/packages/core/test/microstep.test.ts
+index 5caabb7c5e..0f6261b44a 100644
+--- a/packages/core/test/microstep.test.ts
++++ b/packages/core/test/microstep.test.ts
+@@ -1,6 +1,5 @@
+ import { createMachine } from '../src/index.ts';
+ import { raise } from '../src/actions/raise';
+-import { createInertActorScope } from '../src/getNextSnapshot.ts';
+ 
+ describe('machine.microstep()', () => {
+   it('should return an array of states from all microsteps', () => {
+@@ -31,7 +30,7 @@ describe('machine.microstep()', () => {
+       }
+     });
+ 
+-    const actorScope = createInertActorScope(machine);
++    const actorScope = null as any; // TODO: figure out the simulation API
+     const states = machine.microstep(
+       machine.getInitialSnapshot(actorScope),
+       { type: 'GO' },
+@@ -57,7 +56,7 @@ describe('machine.microstep()', () => {
+       }
+     });
+ 
+-    const actorScope = createInertActorScope(machine);
++    const actorScope = null as any; // TODO: figure out the simulation API
+     const states = machine.microstep(
+       machine.resolveState({ value: 'first' }),
+       { type: 'TRIGGER' },
+@@ -88,7 +87,7 @@ describe('machine.microstep()', () => {
+       }
+     });
+ 
+-    const actorScope = createInertActorScope(machine);
++    const actorScope = null as any; // TODO: figure out the simulation API
+     const states = machine.microstep(
+       machine.resolveState({ value: 'first' }),
+       { type: 'TRIGGER' },
+@@ -111,7 +110,7 @@ describe('machine.microstep()', () => {
+       }
+     });
+ 
+-    const actorScope = createInertActorScope(machine);
++    const actorScope = null as any; // TODO: figure out the simulation API
+     const states = machine.microstep(
+       machine.getInitialSnapshot(actorScope),
+       { type: 'TRIGGER' },
+@@ -154,7 +153,7 @@ describe('machine.microstep()', () => {
+       }
+     });
+ 
+-    const actorScope = createInertActorScope(machine);
++    const actorScope = null as any; // TODO: figure out the simulation API
+     const states = machine.microstep(
+       machine.getInitialSnapshot(actorScope),
+       { type: 'TRIGGER' },
+diff --git a/packages/core/test/utils.ts b/packages/core/test/utils.ts
+index a97ce6cccd..65a590cf2c 100644
+--- a/packages/core/test/utils.ts
++++ b/packages/core/test/utils.ts
+@@ -1,7 +1,6 @@
+ import {
+   AnyMachineSnapshot,
+   AnyStateMachine,
+-  getNextSnapshot,
+   matchesState,
+   StateNode,
+   StateValue
+@@ -27,9 +26,11 @@ export function testMultiTransition(
+     if (typeof state === 'string') {
+       state = resolveSerializedStateValue(machine, state);
+     }
+-    const nextState = getNextSnapshot(machine, state, {
+-      type: eventType
+-    });
++    const nextState = machine.transition(
++      state as any,
++      { type: eventType },
++      {} as any // TODO: figure out the simulation API
++    );
+     return nextState;
+   };
+ 

@@ -1,0 +1,233 @@
+diff --git a/index.js b/index.js
+index 2d34fce..1d00839 100644
+--- a/index.js
++++ b/index.js
+@@ -173,7 +173,7 @@ const handlePromise = async ({spawned, options, stdioStreamsGroups, originalStre
+ 
+ 	const [
+ 		error,
+-		[exitCode, signal],
++		[, exitCode, signal],
+ 		stdioResults,
+ 		allResult,
+ 	] = await getSpawnedResult({spawned, options, context, stdioStreamsGroups, originalStreams, controller});
+diff --git a/lib/kill.js b/lib/kill.js
+index dbe64d3..8d29a6e 100644
+--- a/lib/kill.js
++++ b/lib/kill.js
+@@ -48,8 +48,8 @@ export const normalizeForceKillAfterDelay = forceKillAfterDelay => {
+ 	return forceKillAfterDelay;
+ };
+ 
+-const killAfterTimeout = async (timeout, context, {signal}) => {
+-	await setTimeout(timeout, undefined, {signal});
++const killAfterTimeout = async (timeout, context, controller) => {
++	await setTimeout(timeout, undefined, {signal: controller.signal});
+ 	context.timedOut = true;
+ 	throw new Error('Timed out');
+ };
+diff --git a/lib/stream.js b/lib/stream.js
+index 296d15d..4f95599 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -1,4 +1,4 @@
+-import {once} from 'node:events';
++import {addAbortListener} from 'node:events';
+ import {finished} from 'node:stream/promises';
+ import {setImmediate} from 'node:timers/promises';
+ import getStream, {getStreamAsArrayBuffer, getStreamAsArray} from 'get-stream';
+@@ -115,51 +115,51 @@ const waitForCustomStreamsEnd = (stdioStreamsGroups, waitForStream) => stdioStre
+ 	.filter(({type, value}) => type !== 'native' && !isStandardStream(value))
+ 	.map(({value}) => waitForStream(value));
+ 
++// Like `once()` except it never rejects, especially not on `error` event.
++const pEvent = (eventEmitter, eventName, {signal}) => new Promise(resolve => {
++	const listener = (...payload) => {
++		resolve([eventName, ...payload]);
++	};
++
++	eventEmitter.once(eventName, listener);
++	addAbortListener(signal, () => {
++		eventEmitter.removeListener(eventName, listener);
++	});
++});
++
+ // Wraps `finished(stream)` to handle the following case:
+ //  - When the child process exits, Node.js automatically calls `childProcess.stdin.destroy()`, which we need to ignore.
+ //  - However, we still need to throw if `childProcess.stdin.destroy()` is called before child process exit.
+-const onFinishedStream = async ([originalStdin], exitPromise, stream) => {
+-	await Promise.race([
+-		...(stream === originalStdin ? [exitPromise] : []),
+-		finished(stream, {cleanup: true}),
+-	]);
+-};
+-
+-const throwOnProcessError = async (spawned, {signal}) => {
+-	const [error] = await once(spawned, 'error', {signal});
+-	throw error;
+-};
+-
+-// If `error` is emitted before `spawn`, `exit` will never be emitted.
+-// However, `error` might be emitted after `spawn`, e.g. with the `signal` option.
+-// In that case, `exit` will still be emitted.
+-// Since the `exit` event contains the signal name, we want to make sure we are listening for it.
+-// This function also takes into account the following unlikely cases:
+-//  - `exit` being emitted in the same microtask as `spawn`
+-//  - `error` being emitted multiple times
+-const waitForExit = async spawned => {
+-	const [spawnPayload, exitPayload] = await Promise.allSettled([
+-		once(spawned, 'spawn'),
+-		once(spawned, 'exit'),
+-	]);
+-
+-	if (spawnPayload.status === 'rejected') {
+-		return [];
++const onFinishedStream = async ([originalStdin], processExitPromise, stream) => {
++	const finishedPromise = finished(stream, {cleanup: true});
++	if (stream !== originalStdin) {
++		await finishedPromise;
++		return;
+ 	}
+ 
+-	return exitPayload.status === 'rejected'
+-		? waitForProcessExit(spawned)
+-		: exitPayload.value;
+-};
+-
+-const waitForProcessExit = async spawned => {
+ 	try {
+-		return await once(spawned, 'exit');
++		await finishedPromise;
+ 	} catch {
+-		return waitForProcessExit(spawned);
++		await Promise.race([processExitPromise, finishedPromise]);
+ 	}
+ };
+ 
++const throwOnProcessError = async processErrorPromise => {
++	const [, error] = await processErrorPromise;
++	throw error;
++};
++
++// First the `spawn` event is emitted, then `exit`.
++// If the `error` event is emitted:
++//  - before `spawn`: `exit` is never emitted.
++//  - after `spawn`: `exit` is always emitted.
++// We only want to listen to `exit` if it will be emitted, i.e. if `spawn` has been emitted.
++// Therefore, the arguments order of `Promise.race()` is significant.
++const waitForFailedProcess = async (processSpawnPromise, processErrorPromise, processExitPromise) => {
++	const [eventName] = await Promise.race([processSpawnPromise, processErrorPromise]);
++	return eventName === 'spawn' ? processExitPromise : [];
++};
++
+ // Retrieve result of child process: exit code, signal, error, streams (stdout/stderr/all)
+ export const getSpawnedResult = async ({
+ 	spawned,
+@@ -169,8 +169,10 @@ export const getSpawnedResult = async ({
+ 	originalStreams,
+ 	controller,
+ }) => {
+-	const exitPromise = waitForExit(spawned);
+-	const waitForStream = onFinishedStream.bind(undefined, originalStreams, exitPromise);
++	const processSpawnPromise = pEvent(spawned, 'spawn', controller);
++	const processErrorPromise = pEvent(spawned, 'error', controller);
++	const processExitPromise = pEvent(spawned, 'exit', controller);
++	const waitForStream = onFinishedStream.bind(undefined, originalStreams, processExitPromise);
+ 
+ 	const stdioPromises = waitForChildStreams({spawned, stdioStreamsGroups, encoding, buffer, maxBuffer, waitForStream});
+ 	const allPromise = waitForAllStream({spawned, encoding, buffer, maxBuffer, waitForStream});
+@@ -181,20 +183,20 @@ export const getSpawnedResult = async ({
+ 		return await Promise.race([
+ 			Promise.all([
+ 				undefined,
+-				exitPromise,
++				processExitPromise,
+ 				Promise.all(stdioPromises),
+ 				allPromise,
+ 				...originalPromises,
+ 				...customStreamsEndPromises,
+ 			]),
+-			throwOnProcessError(spawned, controller),
++			throwOnProcessError(processErrorPromise),
+ 			...throwOnTimeout(timeout, context, controller),
+ 		]);
+ 	} catch (error) {
+ 		spawned.kill();
+ 		return Promise.all([
+ 			error,
+-			exitPromise,
++			waitForFailedProcess(processSpawnPromise, processErrorPromise, processExitPromise),
+ 			Promise.all(stdioPromises.map(stdioPromise => getBufferedData(stdioPromise, encoding))),
+ 			getBufferedData(allPromise, encoding),
+ 			Promise.allSettled(originalPromises),
+diff --git a/test/kill.js b/test/kill.js
+index 2fd0168..f473174 100644
+--- a/test/kill.js
++++ b/test/kill.js
+@@ -1,7 +1,7 @@
+ import process from 'node:process';
+ import {once, defaultMaxListeners} from 'node:events';
+ import {constants} from 'node:os';
+-import {setTimeout, setImmediate} from 'node:timers/promises';
++import {setTimeout} from 'node:timers/promises';
+ import test from 'ava';
+ import {pEvent} from 'p-event';
+ import isRunning from 'is-running';
+@@ -383,42 +383,10 @@ test('calling abort on a successfully completed process does not make result.isC
+ 	t.false(result.isCanceled);
+ });
+ 
+-test('child process errors are handled before spawn', async t => {
++test('child process errors are handled', async t => {
+ 	const subprocess = execa('forever.js');
+-	const error = new Error('test');
+-	subprocess.emit('error', error);
+-	const thrownError = await t.throwsAsync(subprocess);
+-	t.is(thrownError, error);
+-	t.is(thrownError.exitCode, undefined);
+-	t.is(thrownError.signal, undefined);
+-	t.false(thrownError.isTerminated);
+-});
+-
+-test('child process errors are handled after spawn', async t => {
+-	const subprocess = execa('forever.js');
+-	await once(subprocess, 'spawn');
+-	const error = new Error('test');
+-	subprocess.emit('error', error);
+-	const thrownError = await t.throwsAsync(subprocess);
+-	t.is(thrownError, error);
+-	t.is(thrownError.exitCode, undefined);
+-	t.is(thrownError.signal, 'SIGTERM');
+-	t.true(thrownError.isTerminated);
+-});
+-
+-test('child process double errors are handled after spawn', async t => {
+-	const abortController = new AbortController();
+-	const subprocess = execa('forever.js', {signal: abortController.signal});
+-	await once(subprocess, 'spawn');
+-	const error = new Error('test');
+-	subprocess.emit('error', error);
+-	await setImmediate();
+-	abortController.abort();
+-	const thrownError = await t.throwsAsync(subprocess);
+-	t.is(thrownError, error);
+-	t.is(thrownError.exitCode, undefined);
+-	t.is(thrownError.signal, 'SIGTERM');
+-	t.true(thrownError.isTerminated);
++	subprocess.emit('error', new Error('test'));
++	await t.throwsAsync(subprocess, {message: 'Command failed: forever.js\ntest'});
+ });
+ 
+ test('child process errors use killSignal', async t => {
+diff --git a/test/stdio/async.js b/test/stdio/async.js
+index 5d837af..a7b83fb 100644
+--- a/test/stdio/async.js
++++ b/test/stdio/async.js
+@@ -65,7 +65,6 @@ const testMaxListeners = async (t, isMultiple, maxListenersCount) => {
+ 			Array.from({length: processesCount}, () => execa('empty.js', getComplexStdio(isMultiple))),
+ 		);
+ 		await setImmediate();
+-		await setImmediate();
+ 		t.true(results.every(({exitCode}) => exitCode === 0));
+ 		t.is(warning, undefined);
+ 	} finally {

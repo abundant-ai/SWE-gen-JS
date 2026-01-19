@@ -1,0 +1,162 @@
+diff --git a/integration/cache/src/custom-ttl/custom-ttl.controller.ts b/integration/cache/src/custom-ttl/custom-ttl.controller.ts
+new file mode 100644
+index 000000000..2c4caac17
+--- /dev/null
++++ b/integration/cache/src/custom-ttl/custom-ttl.controller.ts
+@@ -0,0 +1,20 @@
++import {
++  CacheInterceptor,
++  CacheTTL,
++  Controller,
++  Get,
++  UseInterceptors,
++} from '@nestjs/common';
++
++@Controller()
++export class CustomTtlController {
++  counter = 0;
++  constructor() {}
++
++  @Get()
++  @CacheTTL(500)
++  @UseInterceptors(CacheInterceptor)
++  getNumber() {
++    return this.counter++;
++  }
++}
+diff --git a/integration/cache/src/custom-ttl/custom-ttl.module.ts b/integration/cache/src/custom-ttl/custom-ttl.module.ts
+new file mode 100644
+index 000000000..d44b46e01
+--- /dev/null
++++ b/integration/cache/src/custom-ttl/custom-ttl.module.ts
+@@ -0,0 +1,8 @@
++import { CacheModule, Module } from '@nestjs/common';
++import { CustomTtlController } from './custom-ttl.controller';
++
++@Module({
++  imports: [CacheModule.register()],
++  controllers: [CustomTtlController],
++})
++export class CustomTtlModule {}
+diff --git a/integration/cache/src/custom-ttl/tsconfig.json b/integration/cache/src/custom-ttl/tsconfig.json
+new file mode 100644
+index 000000000..904941e70
+--- /dev/null
++++ b/integration/cache/src/custom-ttl/tsconfig.json
+@@ -0,0 +1,40 @@
++{
++  "compilerOptions": {
++    "module": "commonjs",
++    "declaration": false,
++    "noImplicitAny": false,
++    "removeComments": true,
++    "noLib": false,
++    "emitDecoratorMetadata": true,
++    "experimentalDecorators": true,
++    "target": "es6",
++    "sourceMap": true,
++    "allowJs": true,
++    "outDir": "./dist",
++    "paths": {
++      "@nestjs/common": ["../../packages/common"],
++      "@nestjs/common/*": ["../../packages/common/*"],
++      "@nestjs/core": ["../../packages/core"],
++      "@nestjs/core/*": ["../../packages/core/*"],
++      "@nestjs/microservices": ["../../packages/microservices"],
++      "@nestjs/microservices/*": ["../../packages/microservices/*"],
++      "@nestjs/websockets": ["../../packages/websockets"],
++      "@nestjs/websockets/*": ["../../packages/websockets/*"],
++      "@nestjs/testing": ["../../packages/testing"],
++      "@nestjs/testing/*": ["../../packages/testing/*"],
++      "@nestjs/platform-express": ["../../packages/platform-express"],
++      "@nestjs/platform-express/*": ["../../packages/platform-express/*"],
++      "@nestjs/platform-socket.io": ["../../packages/platform-socket.io"],
++      "@nestjs/platform-socket.io/*": ["../../packages/platform-socket.io/*"],
++      "@nestjs/platform-ws": ["../../packages/platform-ws"],
++      "@nestjs/platform-ws/*": ["../../packages/platform-ws/*"]
++    }
++  },
++  "include": [
++    "src/**/*",
++    "e2e/**/*"
++  ],
++  "exclude": [
++    "node_modules",
++  ]
++}
+diff --git a/package-lock.json b/package-lock.json
+index b04bd6b23..08374a8ff 100644
+Binary files a/package-lock.json and b/package-lock.json differ
+diff --git a/package.json b/package.json
+index ec85596eb..ec0c7e744 100644
+--- a/package.json
++++ b/package.json
+@@ -154,7 +154,7 @@
+     "markdown-table": "2.0.0",
+     "merge-graphql-schemas": "1.7.8",
+     "mocha": "10.2.0",
+-    "mongoose": "6.9.2",
++    "mongoose": "6.9.1",
+     "mqtt": "4.3.7",
+     "multer": "1.4.4",
+     "mysql2": "3.1.2",
+diff --git a/packages/common/cache/interceptors/cache.interceptor.ts b/packages/common/cache/interceptors/cache.interceptor.ts
+index 9e91d4bed..593323970 100644
+--- a/packages/common/cache/interceptors/cache.interceptor.ts
++++ b/packages/common/cache/interceptors/cache.interceptor.ts
+@@ -9,7 +9,8 @@ import {
+   NestInterceptor,
+ } from '../../interfaces';
+ import { Logger } from '../../services/logger.service';
+-import { isFunction, isNil } from '../../utils/shared.utils';
++import { loadPackage } from '../../utils/load-package.util';
++import { isFunction, isNil, isNumber } from '../../utils/shared.utils';
+ import {
+   CACHE_KEY_METADATA,
+   CACHE_MANAGER,
+@@ -35,10 +36,22 @@ export class CacheInterceptor implements NestInterceptor {
+   protected readonly httpAdapterHost: HttpAdapterHost;
+ 
+   protected allowedMethods = ['GET'];
++
++  private cacheManagerIsv5OrGreater: boolean;
++  
+   constructor(
+     @Inject(CACHE_MANAGER) protected readonly cacheManager: any,
+     @Inject(REFLECTOR) protected readonly reflector: any,
+-  ) {}
++  ) {
++    // We need to check if the cache-manager package is v5 or greater
++    // because the set method signature changed in v5
++    const cacheManagerPackage = loadPackage(
++      'cache-manager',
++      'CacheModule',
++      () => require('cache-manager'),
++    );
++    this.cacheManagerIsv5OrGreater = 'memoryStore' in cacheManagerPackage;
++  }
+ 
+   async intercept(
+     context: ExecutionContext,
+@@ -59,13 +72,17 @@ export class CacheInterceptor implements NestInterceptor {
+       const ttl = isFunction(ttlValueOrFactory)
+         ? await ttlValueOrFactory(context)
+         : ttlValueOrFactory;
++
+       return next.handle().pipe(
+         tap(async response => {
+           if (response instanceof StreamableFile) {
+             return;
+           }
+ 
+-          const args = isNil(ttl) ? [key, response] : [key, response, { ttl }];
++          const args = [key, response];
++          if (!isNil(ttl)) {
++            args.push(this.cacheManagerIsv5OrGreater ? ttl : { ttl });
++          }
+ 
+           try {
+             await this.cacheManager.set(...args);
+diff --git a/sample/33-graphql-mercurius/package-lock.json b/sample/33-graphql-mercurius/package-lock.json
+index fc807a843..aee0a7ba4 100644
+Binary files a/sample/33-graphql-mercurius/package-lock.json and b/sample/33-graphql-mercurius/package-lock.json differ

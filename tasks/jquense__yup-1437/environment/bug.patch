@@ -1,0 +1,200 @@
+diff --git a/README.md b/README.md
+index 44d8d4b..5976c7a 100644
+--- a/README.md
++++ b/README.md
+@@ -142,6 +142,7 @@ schema.validate({ name: 'jimmy', age: 11 }).catch(function (err) {
+ <!-- START doctoc generated TOC please keep comment here to allow auto update -->
+ <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+ 
++
+ - [`yup`](#yup)
+   - [`yup.reach(schema: Schema, path: string, value?: object, context?: object): Schema`](#yupreachschema-schema-path-string-value-object-context-object-schema)
+   - [`yup.addMethod(schemaType: Schema, name: string, method: ()=> Schema): void`](#yupaddmethodschematype-schema-name-string-method--schema-void)
+@@ -605,9 +606,7 @@ be used in the `message` argument.
+ #### `mixed.oneOf(arrayOfValues: Array<any>, message?: string | function): Schema` Alias: `equals`
+ 
+ Whitelist a set of values. Values added are automatically removed from any blacklist if they are in it.
+-The `${values}` interpolation can be used in the `message` argument. If a ref or refs are provided,
+-the `${resolved}` interpolation can be used in the message argument to get the resolved values that were checked
+-at validation time.
++The `${values}` interpolation can be used in the `message` argument.
+ 
+ Note that `undefined` does not fail this validator, even when `undefined` is not included in `arrayOfValues`.
+ If you don't want `undefined` to be a valid value, you can use `mixed.required`.
+@@ -623,9 +622,7 @@ await schema.isValid(new Date()); // => false
+ #### `mixed.notOneOf(arrayOfValues: Array<any>, message?: string | function)`
+ 
+ Blacklist a set of values. Values added are automatically removed from any whitelist if they are in it.
+-The `${values}` interpolation can be used in the `message` argument. If a ref or refs are provided,
+-the `${resolved}` interpolation can be used in the message argument to get the resolved values that were checked
+-at validation time.
++The `${values}` interpolation can be used in the `message` argument.
+ 
+ ```js
+ let schema = yup.mixed().notOneOf(['jimmy', 42]);
+@@ -732,7 +729,7 @@ await schema.isValid('john'); // => false
+ ```
+ 
+ Test functions are called with a special context value, as the second argument, that exposes some useful metadata
+-and functions. For non arrow functions, the test context is also set as the function `this`. Watch out, if you access
++and functions. For non arrow functions, the test context is also set as the function `this`. Watch out, if you access 
+ it via `this` it won't work in an arrow function.
+ 
+ - `testContext.path`: the string path of the current validation
+diff --git a/src/schema.ts b/src/schema.ts
+index 4842af4..89b783a 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -12,6 +12,7 @@ import createValidation, {
+ import printValue from './util/printValue';
+ import Ref from './Reference';
+ import { getIn } from './util/reach';
++import toArray from './util/toArray';
+ import {
+   ValidateOptions,
+   TransformFunction,
+@@ -27,7 +28,6 @@ import ValidationError from './ValidationError';
+ import type { Asserts, Thunk } from './util/types';
+ import ReferenceSet from './util/ReferenceSet';
+ import Reference from './Reference';
+-import toArray from './util/toArray';
+ 
+ // const UNSET = 'unset' as const;
+ 
+@@ -381,8 +381,10 @@ export default abstract class BaseSchema<
+     let initialTests = [];
+ 
+     if (this._typeError) initialTests.push(this._typeError);
+-    if (this._whitelistError) initialTests.push(this._whitelistError);
+-    if (this._blacklistError) initialTests.push(this._blacklistError);
++
++    let finalTests = [];
++    if (this._whitelistError) finalTests.push(this._whitelistError);
++    if (this._blacklistError) finalTests.push(this._blacklistError);    
+ 
+     runTests(
+       {
+@@ -398,7 +400,7 @@ export default abstract class BaseSchema<
+ 
+         runTests(
+           {
+-            tests: this.tests,
++            tests: this.tests.concat(finalTests),
+             args,
+             path,
+             sync,
+@@ -682,14 +684,12 @@ export default abstract class BaseSchema<
+       test(value) {
+         if (value === undefined) return true;
+         let valids = this.schema._whitelist;
+-        let resolved = valids.resolveAll(this.resolve);
+ 
+-        return resolved.includes(value)
++        return valids.has(value, this.resolve)
+           ? true
+           : this.createError({
+               params: {
+                 values: valids.toArray().join(', '),
+-                resolved
+               },
+             });
+       },
+@@ -713,12 +713,10 @@ export default abstract class BaseSchema<
+       name: 'notOneOf',
+       test(value) {
+         let invalids = this.schema._blacklist;
+-        let resolved = invalids.resolveAll(this.resolve);
+-        if (resolved.includes(value))
++        if (invalids.has(value, this.resolve))
+           return this.createError({
+             params: {
+               values: invalids.toArray().join(', '),
+-              resolved
+             },
+           });
+         return true;
+diff --git a/src/util/ReferenceSet.ts b/src/util/ReferenceSet.ts
+index f9974af..a6ac2a1 100644
+--- a/src/util/ReferenceSet.ts
++++ b/src/util/ReferenceSet.ts
+@@ -26,10 +26,6 @@ export default class ReferenceSet {
+     return Array.from(this.list).concat(Array.from(this.refs.values()));
+   }
+ 
+-  resolveAll(resolve: (v: unknown) => unknown) {
+-    return this.toArray().reduce((acc: unknown[],e) => acc.concat(Reference.isRef(e) ? resolve(e) : e),[]);
+-  }
+-
+   add(value: unknown) {
+     Reference.isRef(value)
+       ? this.refs.set(value.key, value)
+@@ -40,6 +36,16 @@ export default class ReferenceSet {
+       ? this.refs.delete(value.key)
+       : this.list.delete(value);
+   }
++  has(value: unknown, resolve: (v: unknown) => unknown) {
++    if (this.list.has(value)) return true;
++
++    let item,
++      values = this.refs.values();
++    while (((item = values.next()), !item.done))
++      if (resolve(item.value) === value) return true;
++
++    return false;
++  }
+ 
+   clone() {
+     const next = new ReferenceSet();
+diff --git a/test/mixed.js b/test/mixed.js
+index d6cfefe..f422405 100644
+--- a/test/mixed.js
++++ b/test/mixed.js
+@@ -173,17 +173,6 @@ describe('Mixed Types ', () => {
+     );
+   });
+ 
+-  it('should limit values with a ref', async () => {
+-    let someValues =  [1,2,3] ;
+-    let context = { someValues };
+-    let inst = mixed().oneOf([ref('$someValues[0]'),ref('$someValues[1]'),ref('$someValues[2]')]);
+-    await inst.validate(1,{context}).should.eventually.equal(1);
+-    await inst.validate(4,{context}).should.be.rejected().then(err => {
+-      err.type.should.equal('oneOf')
+-      expect(err.params.resolved).to.deep.equal(someValues)
+-    })
+-  })
+-
+   it('should not require field when notRequired was set', async () => {
+     let inst = mixed().required();
+ 
+diff --git a/test/string.js b/test/string.js
+index eaed092..008782a 100644
+--- a/test/string.js
++++ b/test/string.js
+@@ -227,6 +227,26 @@ describe('String types', () => {
+     ]);
+   });
+ 
++  it('should check allowed values at the end',() => {
++    return Promise.all([
++      string()
++        .required('Required')
++        .notOneOf([ref('$someKey')])
++        .validate('',{context:{someKey:''}})
++        .should.be.rejected().then(err => {
++          err.type.should.equal('required')
++        }),
++      object({
++        email:string().required('Email Required'),
++        password:string().required('Password Required').notOneOf([ref('email')]),
++      }).validate({email:'',password:''},{abortEarly:false})
++      .should.be.rejected().then(err => {
++        err.errors.should.include('Email Required');
++        err.errors.should.include('Password Required');
++      })
++    ]);
++  });
++
+   it('should validate transforms', function () {
+     return Promise.all([
+       string().trim().isValid(' 3  ').should.eventually().equal(true),

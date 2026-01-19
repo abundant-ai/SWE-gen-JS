@@ -1,0 +1,334 @@
+diff --git a/changelog_unreleased/markdown/16158.md b/changelog_unreleased/markdown/16158.md
+deleted file mode 100644
+index 517e09e41..000000000
+--- a/changelog_unreleased/markdown/16158.md
++++ /dev/null
+@@ -1,21 +0,0 @@
+-#### Improve wrapping for markdown / mdx (#16158 by @seiyab)
+-
+-```json
+-{ "proseWrap": "always" }
+-```
+-
+-<!-- prettier-ignore -->
+-```md
+-<!-- Input --> 
+-\
+-word very-very-very-very-very-very-very-very-very-very-long-word very-very-very-very-very-very-very-very-very-very-long-word
+-
+-<!-- Prettier stable -->
+-\
+-word very-very-very-very-very-very-very-very-very-very-long-word very-very-very-very-very-very-very-very-very-very-long-word
+-
+-<!-- Prettier main -->
+-\
+-word very-very-very-very-very-very-very-very-very-very-long-word
+-very-very-very-very-very-very-very-very-very-very-long-word
+-```
+diff --git a/src/document/utils.js b/src/document/utils.js
+index 89aa5e4a5..ba9e9a8bb 100644
+--- a/src/document/utils.js
++++ b/src/document/utils.js
+@@ -337,11 +337,10 @@ function cleanDocFn(doc) {
+ 
+   return doc;
+ }
+-
+-// - concat strings
+-// - flat arrays except for parts of `fill`
+-// - merge arrays of strings into single strings
+-// - remove nested `group`s and empty `fill`/`align`/`indent`/`line-suffix`/`if-break` if possible
++// A safer version of `normalizeDoc`
++// - `normalizeDoc` concat strings and flat array in `fill`, while `cleanDoc` don't
++// - On array, `normalizeDoc` always return object with `parts`, `cleanDoc` may return strings
++// - `cleanDoc` also remove nested `group`s and empty `fill`/`align`/`indent`/`line-suffix`/`if-break` if possible
+ function cleanDoc(doc) {
+   return mapDoc(doc, (currentDoc) => cleanDocFn(currentDoc));
+ }
+@@ -377,6 +376,21 @@ function normalizeParts(parts) {
+   return newParts;
+ }
+ 
++function normalizeDoc(doc) {
++  return mapDoc(doc, (currentDoc) => {
++    if (Array.isArray(currentDoc)) {
++      return normalizeParts(currentDoc);
++    }
++    if (!currentDoc.parts) {
++      return currentDoc;
++    }
++    return {
++      ...currentDoc,
++      parts: normalizeParts(currentDoc.parts),
++    };
++  });
++}
++
+ function replaceEndOfLine(doc, replacement = literalline) {
+   return mapDoc(doc, (currentDoc) =>
+     typeof currentDoc === "string"
+@@ -408,6 +422,7 @@ export {
+   getDocType,
+   inheritLabel,
+   mapDoc,
++  normalizeDoc,
+   normalizeParts,
+   propagateBreaks,
+   removeLines,
+diff --git a/src/language-markdown/print-paragraph.js b/src/language-markdown/print-paragraph.js
+index 785e46c3c..199be19fc 100644
+--- a/src/language-markdown/print-paragraph.js
++++ b/src/language-markdown/print-paragraph.js
+@@ -1,6 +1,5 @@
+ import { fill } from "../document/builders.js";
+-import { DOC_TYPE_ARRAY, DOC_TYPE_FILL } from "../document/constants.js";
+-import { getDocType } from "../document/utils.js";
++import { normalizeDoc } from "../document/utils.js";
+ 
+ /**
+  * @typedef {import("../common/ast-path.js").default} AstPath
+@@ -15,41 +14,7 @@ import { getDocType } from "../document/utils.js";
+  */
+ function printParagraph(path, options, print) {
+   const parts = path.map(print, "children");
+-  return flattenFill(parts);
+-}
+-
+-/**
+- * @param {Doc[]} docs
+- * @returns {Doc}
+- */
+-function flattenFill(docs) {
+-  /*
+-   * We assume parts always meet following conditions:
+-   * - parts.length is odd
+-   * - odd elements are line-like doc that comes from odd element off inner fill
+-   */
+-  /** @type {Doc[]} */
+-  const parts = [""];
+-
+-  (function rec(/** @type {*} */ docArray) {
+-    for (const doc of docArray) {
+-      const docType = getDocType(doc);
+-      if (docType === DOC_TYPE_ARRAY) {
+-        rec(doc);
+-        continue;
+-      }
+-
+-      let head = doc;
+-      let rest = [];
+-      if (docType === DOC_TYPE_FILL) {
+-        [head, ...rest] = doc.parts;
+-      }
+-
+-      parts.push([parts.pop(), head], ...rest);
+-    }
+-  })(docs);
+-
+-  return fill(parts);
++  return normalizeDoc(fill(parts));
+ }
+ 
+ export { printParagraph };
+diff --git a/src/language-markdown/print-sentence.js b/src/language-markdown/print-sentence.js
+deleted file mode 100644
+index ef38876c0..000000000
+--- a/src/language-markdown/print-sentence.js
++++ /dev/null
+@@ -1,37 +0,0 @@
+-/**
+- * @typedef {import("../common/ast-path.js").default} AstPath
+- * @typedef {import("../document/builders.js").Doc} Doc
+- */
+-
+-import { fill } from "../document/builders.js";
+-import { DOC_TYPE_STRING } from "../document/constants.js";
+-import { getDocType } from "../document/utils.js";
+-
+-/**
+- * @param {AstPath} path
+- * @param {*} print
+- * @returns {Doc}
+- */
+-function printSentence(path, print) {
+-  /** @type {Doc[]} */
+-  const parts = [""];
+-
+-  path.each(() => {
+-    const { node } = path;
+-    const doc = print();
+-    switch (node.type) {
+-      case "whitespace":
+-        if (getDocType(doc) !== DOC_TYPE_STRING) {
+-          parts.push(doc, "");
+-          break;
+-        }
+-      // fallthrough
+-      default:
+-        parts.push([parts.pop(), doc]);
+-    }
+-  }, "children");
+-
+-  return fill(parts);
+-}
+-
+-export { printSentence };
+diff --git a/src/language-markdown/printer-markdown.js b/src/language-markdown/printer-markdown.js
+index 13f2830cf..f1bbf2b68 100644
+--- a/src/language-markdown/printer-markdown.js
++++ b/src/language-markdown/printer-markdown.js
+@@ -2,7 +2,6 @@ import collapseWhiteSpace from "collapse-white-space";
+ 
+ import {
+   align,
+-  fill,
+   group,
+   hardline,
+   indent,
+@@ -11,8 +10,7 @@ import {
+   markAsRoot,
+   softline,
+ } from "../document/builders.js";
+-import { DOC_TYPE_STRING } from "../document/constants.js";
+-import { getDocType, replaceEndOfLine } from "../document/utils.js";
++import { replaceEndOfLine } from "../document/utils.js";
+ import getMaxContinuousCount from "../utils/get-max-continuous-count.js";
+ import getMinNotPresentContinuousCount from "../utils/get-min-not-present-continuous-count.js";
+ import getPreferredQuote from "../utils/get-preferred-quote.js";
+@@ -26,7 +24,6 @@ import { insertPragma } from "./pragma.js";
+ import { printTable } from "./print/table.js";
+ import { printParagraph } from "./print-paragraph.js";
+ import preprocess from "./print-preprocess.js";
+-import { printSentence } from "./print-sentence.js";
+ import { printWhitespace } from "./print-whitespace.js";
+ import {
+   getFencedCodeBlockValue,
+@@ -51,27 +48,16 @@ function genericPrint(path, options, print) {
+   const { node } = path;
+ 
+   if (shouldRemainTheSameContent(path)) {
+-    /** @type {Doc} */
+-    const parts = [""];
+-    const textsNodes = splitText(
++    return splitText(
+       options.originalText.slice(
+         node.position.start.offset,
+         node.position.end.offset,
+       ),
++    ).map((node) =>
++      node.type === "word"
++        ? node.value
++        : printWhitespace(path, node.value, options.proseWrap, true),
+     );
+-    for (const node of textsNodes) {
+-      if (node.type === "word") {
+-        parts.push([parts.pop(), node.value]);
+-        continue;
+-      }
+-      const doc = printWhitespace(path, node.value, options.proseWrap, true);
+-      if (getDocType(doc) === DOC_TYPE_STRING) {
+-        parts.push([parts.pop(), doc]);
+-        continue;
+-      }
+-      parts.push(doc);
+-    }
+-    return fill(parts);
+   }
+ 
+   switch (node.type) {
+@@ -89,7 +75,7 @@ function genericPrint(path, options, print) {
+     case "paragraph":
+       return printParagraph(path, options, print);
+     case "sentence":
+-      return printSentence(path, print);
++      return printChildren(path, options, print);
+     case "word": {
+       let escapedValue = node.value
+         .replaceAll("*", "\\*") // escape all `*`
+diff --git a/tests/format/markdown/break/__snapshots__/jsfmt.spec.js.snap b/tests/format/markdown/break/__snapshots__/jsfmt.spec.js.snap
+index d5bd783e1..018ce01b8 100644
+--- a/tests/format/markdown/break/__snapshots__/jsfmt.spec.js.snap
++++ b/tests/format/markdown/break/__snapshots__/jsfmt.spec.js.snap
+@@ -28,29 +28,3 @@ proseWrap: "always"
+ 
+ ================================================================================
+ `;
+-
+-exports[`wrap.md - {"proseWrap":"always"} format 1`] = `
+-====================================options=====================================
+-parsers: ["markdown"]
+-printWidth: 80
+-proseWrap: "always"
+-                                                                                | printWidth
+-=====================================input======================================
+-a  
+- very-very-very-very-very-very-very-very-very-very-long-word very-very-very-very-very-very-very-very-very-very-long-word very-very-very-very-very-very-very-very-very-very-long-word
+-
+-\\
+-word very-very-very-very-very-very-very-very-very-very-long-word very-very-very-very-very-very-very-very-very-very-long-word
+-
+-=====================================output=====================================
+-a  
+- very-very-very-very-very-very-very-very-very-very-long-word
+-very-very-very-very-very-very-very-very-very-very-long-word
+-very-very-very-very-very-very-very-very-very-very-long-word
+-
+-\\
+-word very-very-very-very-very-very-very-very-very-very-long-word
+-very-very-very-very-very-very-very-very-very-very-long-word
+-
+-================================================================================
+-`;
+diff --git a/tests/format/markdown/break/wrap.md b/tests/format/markdown/break/wrap.md
+deleted file mode 100644
+index cfcc88d8a..000000000
+--- a/tests/format/markdown/break/wrap.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+-a  
+- very-very-very-very-very-very-very-very-very-very-long-word very-very-very-very-very-very-very-very-very-very-long-word very-very-very-very-very-very-very-very-very-very-long-word
+-
+-\
+-word very-very-very-very-very-very-very-very-very-very-long-word very-very-very-very-very-very-very-very-very-very-long-word
+diff --git a/tests/integration/__tests__/normalize-doc.js b/tests/integration/__tests__/normalize-doc.js
+new file mode 100644
+index 000000000..7be6d945f
+--- /dev/null
++++ b/tests/integration/__tests__/normalize-doc.js
+@@ -0,0 +1,36 @@
++import { fill, group } from "../../../src/document/builders.js";
++import { normalizeDoc } from "../../../src/document/utils.js";
++
++describe("normalizeDoc", () => {
++  test.each([
++    [
++      "removes empty strings",
++      ["", "foo", fill(["", "bar", ""]), ""],
++      ["foo", fill(["bar"])],
++    ],
++    [
++      "flattens nested concat",
++      ["foo ", "", ["bar ", "", ["baz", ""]]],
++      ["foo bar baz"],
++    ],
++    [
++      "flattens nested concat in other docs",
++      group(["foo ", ["bar ", "", ["baz", ""]]]),
++      group(["foo bar baz"]),
++    ],
++    [
++      "keeps groups",
++      [group("foo"), group("bar"), group("baz")],
++      [group("foo"), group("bar"), group("baz")],
++    ],
++    [
++      "keeps fills",
++      fill(["foo", fill(["bar", fill(["baz"])])]),
++      fill(["foo", fill(["bar", fill(["baz"])])]),
++    ],
++  ])("%s", (_, doc, expected) => {
++    const result = normalizeDoc(doc);
++
++    expect(result).toEqual(expected);
++  });
++});

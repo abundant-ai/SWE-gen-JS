@@ -1,0 +1,144 @@
+diff --git a/integration/microservices/src/grpc/grpc.controller.ts b/integration/microservices/src/grpc/grpc.controller.ts
+index 94b7c4f75..11c75e37b 100644
+--- a/integration/microservices/src/grpc/grpc.controller.ts
++++ b/integration/microservices/src/grpc/grpc.controller.ts
+@@ -1,4 +1,4 @@
+-import { Body, Controller, HttpCode, Post } from '@nestjs/common';
++import { Body, Controller, HttpCode, Post, Query } from '@nestjs/common';
+ import {
+   Client,
+   ClientGrpc,
+@@ -6,12 +6,28 @@ import {
+   GrpcStreamCall,
+   GrpcStreamMethod,
+   Transport,
++  ClientGrpcProxy,
++  RpcException,
+ } from '@nestjs/microservices';
+ import { join } from 'path';
+-import { Observable, of } from 'rxjs';
++import { Observable, of, catchError } from 'rxjs';
++
++class ErrorHandlingProxy extends ClientGrpcProxy {
++  serializeError(err) {
++    return new RpcException(err);
++  }
++}
+ 
+ @Controller()
+ export class GrpcController {
++  private readonly customClient: ClientGrpc;
++  constructor() {
++    this.customClient = new ErrorHandlingProxy({
++      package: 'math',
++      protoPath: join(__dirname, 'math.proto'),
++    });
++  }
++
+   @Client({
+     transport: Transport.GRPC,
+     options: {
+@@ -78,6 +94,19 @@ export class GrpcController {
+     });
+   }
+ 
++  @GrpcMethod('Math')
++  async divide(request: { dividend: number; divisor: number }): Promise<any> {
++    if (request.divisor === 0) {
++      throw new RpcException({
++        code: 3,
++        message: 'dividing by 0 is not possible',
++      });
++    }
++    return {
++      result: request.dividend / request.divisor,
++    };
++  }
++
+   @GrpcMethod('Math2')
+   async sum2({ data }: { data: number[] }): Promise<any> {
+     return of({
+@@ -98,4 +127,24 @@ export class GrpcController {
+     const svc = this.clientMulti.getService<any>('Math2');
+     return svc.sum2({ data });
+   }
++
++  @Post('error')
++  @HttpCode(200)
++  serializeError(
++    @Query('client') query: 'custom' | 'standard' = 'standard',
++    @Body() body: Record<string, any>,
++  ): Observable<boolean> {
++    const client = query === 'custom' ? this.customClient : this.client;
++    const svc = client.getService<any>('Math');
++
++    const errorDivideRequest = {
++      dividend: 1,
++      divisor: 0,
++    };
++    return svc.divide(errorDivideRequest).pipe(
++      catchError(err => {
++        return of(err instanceof RpcException);
++      }),
++    );
++  }
+ }
+diff --git a/integration/microservices/src/grpc/math.proto b/integration/microservices/src/grpc/math.proto
+index 43c835cb7..0ca9b3509 100644
+--- a/integration/microservices/src/grpc/math.proto
++++ b/integration/microservices/src/grpc/math.proto
+@@ -6,6 +6,7 @@ service Math {
+   rpc Sum (RequestSum) returns (SumResult);
+   rpc SumStream(stream RequestSum) returns(stream SumResult);
+   rpc SumStreamPass(stream RequestSum) returns(stream SumResult);
++  rpc Divide (RequestDivide) returns (DivideResult);
+ }
+ 
+ message SumResult {
+@@ -14,4 +15,13 @@ message SumResult {
+ 
+ message RequestSum {
+   repeated int32 data = 1;
+-}
+\ No newline at end of file
++}
++
++message RequestDivide {
++  int32 dividend = 1;
++  int32 divisor = 2 ;
++}
++
++message DivideResult {
++  int32 result = 1;
++}
+diff --git a/packages/microservices/client/client-grpc.ts b/packages/microservices/client/client-grpc.ts
+index 008bee4fa..5c1d90de3 100644
+--- a/packages/microservices/client/client-grpc.ts
++++ b/packages/microservices/client/client-grpc.ts
+@@ -174,7 +174,7 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
+               return;
+             }
+           }
+-          observer.error(error);
++          observer.error(this.serializeError(error));
+         });
+         call.on('end', () => {
+           if (upstreamSubscription) {
+@@ -216,7 +216,7 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
+           const callArgs = [
+             (error: unknown, data: unknown) => {
+               if (error) {
+-                return observer.error(error);
++                return observer.error(this.serializeError(error));
+               }
+               observer.next(data);
+               observer.complete();
+@@ -243,7 +243,7 @@ export class ClientGrpcProxy extends ClientProxy implements ClientGrpc {
+       return new Observable(observer => {
+         client[methodName](...args, (error: any, data: any) => {
+           if (error) {
+-            return observer.error(error);
++            return observer.error(this.serializeError(error));
+           }
+           observer.next(data);
+           observer.complete();

@@ -1,0 +1,359 @@
+diff --git a/docs/framework/react/react-native.md b/docs/framework/react/react-native.md
+index a8f71452b..f75701519 100644
+--- a/docs/framework/react/react-native.md
++++ b/docs/framework/react/react-native.md
+@@ -92,29 +92,108 @@ export function useRefreshOnFocus<T>(refetch: () => Promise<T>) {
+ 
+ In the above code, `refetch` is skipped the first time because `useFocusEffect` calls our callback on mount in addition to screen focus.
+ 
+-## Disable queries on out of focus screens
++## Disable re-renders on out of focus Screens
++
++In some situations, including performance concerns, you may want to stop re-renders when a React Native screen gets out of focus. To achieve this we can use `useFocusEffect` from `@react-navigation/native` together with the `notifyOnChangeProps` query option.
++
++This custom hook provides a `notifyOnChangeProps` option that will return an empty array whenever a screen goes out of focus - effectively stopping any re-renders on that scenario. Whenever the screens gets in focus again, the behavior goes back to normal.
++
++```tsx
++import React from 'react'
++import { NotifyOnChangeProps } from '@tanstack/query-core'
++import { useFocusEffect } from '@react-navigation/native'
+ 
+-If you don’t want certain queries to remain “live” while a screen is out of focus, you can use the subscribed prop on useQuery. This prop lets you control whether a query stays subscribed to updates. Combined with React Navigation’s useIsFocused, it allows you to seamlessly unsubscribe from queries when a screen isn’t in focus:
++export function useFocusNotifyOnChangeProps(
++  notifyOnChangeProps?: NotifyOnChangeProps,
++) {
++  const focusedRef = React.useRef(true)
++
++  useFocusEffect(
++    React.useCallback(() => {
++      focusedRef.current = true
++
++      return () => {
++        focusedRef.current = false
++      }
++    }, []),
++  )
++
++  return () => {
++    if (!focusedRef.current) {
++      return []
++    }
++
++    if (typeof notifyOnChangeProps === 'function') {
++      return notifyOnChangeProps()
++    }
++
++    return notifyOnChangeProps
++  }
++}
++```
++
++In the above code, `useFocusEffect` is used to change the value of a reference that the callback will use as a condition.
++
++The argument is wrapped in a reference to also guarantee that the returned callback always keeps the same reference.
+ 
+ Example usage:
+ 
++```tsx
++function MyComponent() {
++  const notifyOnChangeProps = useFocusNotifyOnChangeProps()
++
++  const { dataUpdatedAt } = useQuery({
++    queryKey: ['myKey'],
++    queryFn: async () => {
++      const response = await fetch(
++        'https://api.github.com/repos/tannerlinsley/react-query',
++      )
++      return response.json()
++    },
++    notifyOnChangeProps,
++  })
++
++  return <Text>DataUpdatedAt: {dataUpdatedAt}</Text>
++}
++```
++
++## Disable queries on out of focus screens
++
++Enabled can also be set to a callback to support disabling queries on out of focus screens without state and re-rendering on navigation, similar to how notifyOnChangeProps works but in addition it wont trigger refetching when invalidating queries with refetchType active.
++
+ ```tsx
+ import React from 'react'
+-import { useIsFocused } from '@react-navigation/native'
+-import { useQuery } from '@tanstack/react-query'
+-import { Text } from 'react-native'
++import { useFocusEffect } from '@react-navigation/native'
++
++export function useQueryFocusAware() {
++  const focusedRef = React.useRef(true)
++
++  useFocusEffect(
++    React.useCallback(() => {
++      focusedRef.current = true
++
++      return () => {
++        focusedRef.current = false
++      }
++    }, []),
++  )
++
++  return () => focusedRef.current
++}
++```
++
++Example usage:
+ 
++```tsx
+ function MyComponent() {
+-  const isFocused = useIsFocused()
++  const isFocused = useQueryFocusAware()
+ 
+   const { dataUpdatedAt } = useQuery({
+     queryKey: ['key'],
+     queryFn: () => fetch(...),
+-    subscribed: isFocused,
++    enabled: isFocused,
+   })
+ 
+   return <Text>DataUpdatedAt: {dataUpdatedAt}</Text>
+ }
+ ```
+-
+-When subscribed is false, the query unsubscribes from updates and won’t trigger re-renders or fetch new data for that screen. Once it becomes true again (e.g., when the screen regains focus), the query re-subscribes and stays up to date.
+diff --git a/docs/framework/react/reference/useQuery.md b/docs/framework/react/reference/useQuery.md
+index 3032287d9..92ce54f23 100644
+--- a/docs/framework/react/reference/useQuery.md
++++ b/docs/framework/react/reference/useQuery.md
+@@ -53,7 +53,6 @@ const {
+     select,
+     staleTime,
+     structuralSharing,
+-    subscribed,
+     throwOnError,
+   },
+   queryClient,
+@@ -162,10 +161,6 @@ const {
+   - Defaults to `true`
+   - If set to `false`, structural sharing between query results will be disabled.
+   - If set to a function, the old and new data values will be passed through this function, which should combine them into resolved data for the query. This way, you can retain references from the old data to improve performance even when that data contains non-serializable values.
+-- `subscribed: boolean`
+-  - Optional
+-  - Defaults to `true`
+-  - If set to `false`, this instance of `useQuery` will not be subscribed to the cache. This means it won't trigger the `queryFn` on its own, and it won't receive updates if data gets into cache by other means.
+ - `throwOnError: undefined | boolean | (error: TError, query: Query) => boolean`
+   - Defaults to the global query config's `throwOnError` value, which is `undefined`
+   - Set this to `true` if you want errors to be thrown in the render phase and propagate to the nearest error boundary
+diff --git a/packages/react-query/src/__tests__/useQuery.test.tsx b/packages/react-query/src/__tests__/useQuery.test.tsx
+index d0f881791..9f0cbce40 100644
+--- a/packages/react-query/src/__tests__/useQuery.test.tsx
++++ b/packages/react-query/src/__tests__/useQuery.test.tsx
+@@ -5964,110 +5964,6 @@ describe('useQuery', () => {
+     })
+   })
+ 
+-  describe('subscribed', () => {
+-    it('should be able to toggle subscribed', async () => {
+-      const key = queryKey()
+-      const queryFn = vi.fn(async () => 'data')
+-      function Page() {
+-        const [subscribed, setSubscribed] = React.useState(true)
+-        const { data } = useQuery({
+-          queryKey: key,
+-          queryFn,
+-          subscribed,
+-        })
+-        return (
+-          <div>
+-            <span>data: {data}</span>
+-            <button onClick={() => setSubscribed(!subscribed)}>toggle</button>
+-          </div>
+-        )
+-      }
+-
+-      const rendered = renderWithClient(queryClient, <Page />)
+-      await waitFor(() => rendered.getByText('data: data'))
+-
+-      expect(
+-        queryClient.getQueryCache().find({ queryKey: key })!.observers.length,
+-      ).toBe(1)
+-
+-      fireEvent.click(rendered.getByRole('button', { name: 'toggle' }))
+-
+-      expect(
+-        queryClient.getQueryCache().find({ queryKey: key })!.observers.length,
+-      ).toBe(0)
+-
+-      expect(queryFn).toHaveBeenCalledTimes(1)
+-
+-      fireEvent.click(rendered.getByRole('button', { name: 'toggle' }))
+-
+-      // background refetch when we re-subscribe
+-      await waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2))
+-      expect(
+-        queryClient.getQueryCache().find({ queryKey: key })!.observers.length,
+-      ).toBe(1)
+-    })
+-
+-    it('should not be attached to the query when subscribed is false', async () => {
+-      const key = queryKey()
+-      const queryFn = vi.fn(async () => 'data')
+-      function Page() {
+-        const { data } = useQuery({
+-          queryKey: key,
+-          queryFn,
+-          subscribed: false,
+-        })
+-        return (
+-          <div>
+-            <span>data: {data}</span>
+-          </div>
+-        )
+-      }
+-
+-      const rendered = renderWithClient(queryClient, <Page />)
+-      await waitFor(() => rendered.getByText('data:'))
+-
+-      expect(
+-        queryClient.getQueryCache().find({ queryKey: key })!.observers.length,
+-      ).toBe(0)
+-
+-      expect(queryFn).toHaveBeenCalledTimes(0)
+-    })
+-
+-    it('should not re-render when data is added to the cache when subscribed is false', async () => {
+-      const key = queryKey()
+-      let renders = 0
+-      function Page() {
+-        const { data } = useQuery({
+-          queryKey: key,
+-          queryFn: async () => 'data',
+-          subscribed: false,
+-        })
+-        renders++
+-        return (
+-          <div>
+-            <span>{data ? 'has data' + data : 'no data'}</span>
+-            <button
+-              onClick={() => queryClient.setQueryData<string>(key, 'new data')}
+-            >
+-              set data
+-            </button>
+-          </div>
+-        )
+-      }
+-
+-      const rendered = renderWithClient(queryClient, <Page />)
+-      await waitFor(() => rendered.getByText('no data'))
+-
+-      fireEvent.click(rendered.getByRole('button', { name: 'set data' }))
+-
+-      await sleep(10)
+-
+-      await waitFor(() => rendered.getByText('no data'))
+-
+-      expect(renders).toBe(1)
+-    })
+-  })
+-
+   it('should have status=error on mount when a query has failed', async () => {
+     const key = queryKey()
+     const states: Array<UseQueryResult<unknown>> = []
+diff --git a/packages/react-query/src/types.ts b/packages/react-query/src/types.ts
+index 8bbb351a8..9f6d7c315 100644
+--- a/packages/react-query/src/types.ts
++++ b/packages/react-query/src/types.ts
+@@ -36,13 +36,7 @@ export interface UseBaseQueryOptions<
+     TData,
+     TQueryData,
+     TQueryKey
+-  > {
+-  /**
+-   * Set this to `false` to unsubscribe this observer from updates to the query cache.
+-   * Defaults to `true`.
+-   */
+-  subscribed?: boolean
+-}
++  > {}
+ 
+ export type AnyUseQueryOptions = UseQueryOptions<any, any, any, any>
+ export interface UseQueryOptions<
+diff --git a/packages/react-query/src/useBaseQuery.ts b/packages/react-query/src/useBaseQuery.ts
+index 1ee2f1cd0..bcbf700ef 100644
+--- a/packages/react-query/src/useBaseQuery.ts
++++ b/packages/react-query/src/useBaseQuery.ts
+@@ -82,16 +82,14 @@ export function useBaseQuery<
+       ),
+   )
+ 
+-  // note: this must be called before useSyncExternalStore
+   const result = observer.getOptimisticResult(defaultedOptions)
+ 
+-  const shouldSubscribe = !isRestoring && options.subscribed !== false
+   React.useSyncExternalStore(
+     React.useCallback(
+       (onStoreChange) => {
+-        const unsubscribe = shouldSubscribe
+-          ? observer.subscribe(notifyManager.batchCalls(onStoreChange))
+-          : noop
++        const unsubscribe = isRestoring
++          ? noop
++          : observer.subscribe(notifyManager.batchCalls(onStoreChange))
+ 
+         // Update result to make sure we did not miss any query updates
+         // between creating the observer and subscribing to it.
+@@ -99,7 +97,7 @@ export function useBaseQuery<
+ 
+         return unsubscribe
+       },
+-      [observer, shouldSubscribe],
++      [observer, isRestoring],
+     ),
+     () => observer.getCurrentResult(),
+     () => observer.getCurrentResult(),
+diff --git a/packages/react-query/src/useQueries.ts b/packages/react-query/src/useQueries.ts
+index dd4ac9f96..90ef2e32a 100644
+--- a/packages/react-query/src/useQueries.ts
++++ b/packages/react-query/src/useQueries.ts
+@@ -47,7 +47,7 @@ type UseQueryOptionsForUseQueries<
+   TQueryKey extends QueryKey = QueryKey,
+ > = OmitKeyof<
+   UseQueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+-  'placeholderData' | 'subscribed'
++  'placeholderData'
+ > & {
+   placeholderData?: TQueryFnData | QueriesPlaceholderDataFunction<TQueryFnData>
+ }
+@@ -231,7 +231,6 @@ export function useQueries<
+   }: {
+     queries: readonly [...QueriesOptions<T>]
+     combine?: (result: QueriesResults<T>) => TCombinedResult
+-    subscribed?: boolean
+   },
+   queryClient?: QueryClient,
+ ): TCombinedResult {
+@@ -272,21 +271,19 @@ export function useQueries<
+       ),
+   )
+ 
+-  // note: this must be called before useSyncExternalStore
+   const [optimisticResult, getCombinedResult, trackResult] =
+     observer.getOptimisticResult(
+       defaultedQueries,
+       (options as QueriesObserverOptions<TCombinedResult>).combine,
+     )
+ 
+-  const shouldSubscribe = !isRestoring && options.subscribed !== false
+   React.useSyncExternalStore(
+     React.useCallback(
+       (onStoreChange) =>
+-        shouldSubscribe
+-          ? observer.subscribe(notifyManager.batchCalls(onStoreChange))
+-          : noop,
+-      [observer, shouldSubscribe],
++        isRestoring
++          ? noop
++          : observer.subscribe(notifyManager.batchCalls(onStoreChange)),
++      [observer, isRestoring],
+     ),
+     () => observer.getCurrentResult(),
+     () => observer.getCurrentResult(),

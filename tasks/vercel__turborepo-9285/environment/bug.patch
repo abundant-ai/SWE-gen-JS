@@ -1,0 +1,711 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ff29fd4c24..f8c99ea4eb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5182,7 +5182,6 @@ dependencies = [
+  "num-bigint",
+  "phf",
+  "scoped-tls",
+- "serde",
+  "string_enum",
+  "swc_atoms",
+  "swc_common",
+@@ -6362,9 +6361,6 @@ dependencies = [
+  "shared_child",
+  "struct_iterable",
+  "svix-ksuid",
+- "swc_common",
+- "swc_ecma_ast",
+- "swc_ecma_parser",
+  "sysinfo",
+  "tabwriter",
+  "tempfile",
+diff --git a/Cargo.toml b/Cargo.toml
+index ad2590030e..80484ff05f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -146,10 +146,6 @@ smallvec = { version = "1.13.1", features = [
+   "union",
+   "const_new",
+ ] }
+-swc_common = "0.37.5"
+-swc_ecma_ast = "0.118.2"
+-swc_ecma_parser = "0.149.1"
+-swc_ecma_visit = "0.104.8"
+ syn = "1.0.107"
+ tempfile = "3.3.0"
+ test-case = "3.0.0"
+diff --git a/crates/turbo-trace/Cargo.toml b/crates/turbo-trace/Cargo.toml
+index 08e15986dc..5eeb45bfc5 100644
+--- a/crates/turbo-trace/Cargo.toml
++++ b/crates/turbo-trace/Cargo.toml
+@@ -9,10 +9,10 @@ camino.workspace = true
+ clap = { version = "4.5.17", features = ["derive"] }
+ miette = { workspace = true, features = ["fancy"] }
+ oxc_resolver = "1.11.0"
+-swc_common = { workspace = true }
+-swc_ecma_ast = { workspace = true }
+-swc_ecma_parser = { workspace = true }
+-swc_ecma_visit = { workspace = true }
++swc_common = "0.37.5"
++swc_ecma_ast = "0.118.2"
++swc_ecma_parser = "0.149.1"
++swc_ecma_visit = "0.104.8"
+ thiserror = { workspace = true }
+ turbopath = { workspace = true }
+ 
+diff --git a/crates/turbo-trace/src/main.rs b/crates/turbo-trace/src/main.rs
+index f9b13a344a..5c5f10473e 100644
+--- a/crates/turbo-trace/src/main.rs
++++ b/crates/turbo-trace/src/main.rs
+@@ -13,8 +13,6 @@ struct Args {
+     #[clap(long)]
+     ts_config: Option<Utf8PathBuf>,
+     files: Vec<Utf8PathBuf>,
+-    #[clap(long)]
+-    depth: Option<usize>,
+ }
+ 
+ fn main() -> Result<(), PathError> {
+@@ -34,7 +32,7 @@ fn main() -> Result<(), PathError> {
+ 
+     let tracer = Tracer::new(abs_cwd, files, args.ts_config);
+ 
+-    let result = tracer.trace(args.depth);
++    let result = tracer.trace();
+ 
+     if !result.errors.is_empty() {
+         for error in &result.errors {
+@@ -42,7 +40,7 @@ fn main() -> Result<(), PathError> {
+         }
+         std::process::exit(1);
+     } else {
+-        for file in result.files.keys() {
++        for file in &result.files {
+             println!("{}", file);
+         }
+     }
+diff --git a/crates/turbo-trace/src/tracer.rs b/crates/turbo-trace/src/tracer.rs
+index f94e085ebd..bab720d626 100644
+--- a/crates/turbo-trace/src/tracer.rs
++++ b/crates/turbo-trace/src/tracer.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::HashMap, fs, rc::Rc};
++use std::{collections::HashSet, fs, rc::Rc};
+ 
+ use camino::Utf8PathBuf;
+ use miette::{Diagnostic, NamedSource, SourceSpan};
+@@ -14,13 +14,9 @@ use turbopath::{AbsoluteSystemPathBuf, PathError};
+ 
+ use crate::import_finder::ImportFinder;
+ 
+-#[derive(Default)]
+-pub struct SeenFile {
+-    pub ast: Option<swc_ecma_ast::Module>,
+-}
+-
+ pub struct Tracer {
+-    files: Vec<(AbsoluteSystemPathBuf, usize)>,
++    files: Vec<AbsoluteSystemPathBuf>,
++    seen: HashSet<AbsoluteSystemPathBuf>,
+     ts_config: Option<AbsoluteSystemPathBuf>,
+     source_map: Rc<SourceMap>,
+ }
+@@ -44,7 +40,7 @@ pub enum TraceError {
+ 
+ pub struct TraceResult {
+     pub errors: Vec<TraceError>,
+-    pub files: HashMap<AbsoluteSystemPathBuf, SeenFile>,
++    pub files: HashSet<AbsoluteSystemPathBuf>,
+ }
+ 
+ impl Tracer {
+@@ -56,22 +52,22 @@ impl Tracer {
+         let ts_config =
+             ts_config.map(|ts_config| AbsoluteSystemPathBuf::from_unknown(&cwd, ts_config));
+ 
+-        let files = files.into_iter().map(|file| (file, 0)).collect::<Vec<_>>();
++        let seen = HashSet::new();
+ 
+         Self {
+             files,
++            seen,
+             ts_config,
+             source_map: Rc::new(SourceMap::default()),
+         }
+     }
+ 
+-    pub fn trace(mut self, max_depth: Option<usize>) -> TraceResult {
++    pub fn trace(mut self) -> TraceResult {
+         let mut options = ResolveOptions::default()
+             .with_builtin_modules(true)
+             .with_force_extension(EnforceExtension::Disabled)
+             .with_extension(".ts")
+             .with_extension(".tsx");
+-
+         if let Some(ts_config) = self.ts_config.take() {
+             options.tsconfig = Some(TsconfigOptions {
+                 config_file: ts_config.into(),
+@@ -81,24 +77,17 @@ impl Tracer {
+ 
+         let resolver = Resolver::new(options);
+         let mut errors = vec![];
+-        let mut seen: HashMap<AbsoluteSystemPathBuf, SeenFile> = HashMap::new();
+ 
+-        while let Some((file_path, file_depth)) = self.files.pop() {
++        while let Some(file_path) = self.files.pop() {
+             if matches!(file_path.extension(), Some("json") | Some("css")) {
+                 continue;
+             }
+ 
+-            if seen.contains_key(&file_path) {
++            if self.seen.contains(&file_path) {
+                 continue;
+             }
+ 
+-            if let Some(max_depth) = max_depth {
+-                if file_depth > max_depth {
+-                    continue;
+-                }
+-            }
+-
+-            let entry = seen.entry(file_path.clone()).or_default();
++            self.seen.insert(file_path.clone());
+ 
+             // Read the file content
+             let Ok(file_content) = fs::read_to_string(&file_path) else {
+@@ -146,8 +135,6 @@ impl Tracer {
+             let mut finder = ImportFinder::default();
+             module.visit_with(&mut finder);
+ 
+-            entry.ast = Some(module);
+-
+             // Convert found imports/requires to absolute paths and add them to files to
+             // visit
+             for (import, span) in finder.imports() {
+@@ -157,7 +144,7 @@ impl Tracer {
+                 };
+                 match resolver.resolve(file_dir, import) {
+                     Ok(resolved) => match resolved.into_path_buf().try_into() {
+-                        Ok(path) => self.files.push((path, file_depth + 1)),
++                        Ok(path) => self.files.push(path),
+                         Err(err) => {
+                             errors.push(TraceError::PathEncoding(err));
+                         }
+@@ -176,7 +163,7 @@ impl Tracer {
+         }
+ 
+         TraceResult {
+-            files: seen,
++            files: self.seen,
+             errors,
+         }
+     }
+diff --git a/crates/turborepo-lib/Cargo.toml b/crates/turborepo-lib/Cargo.toml
+index 56816b40a6..a88c7cd83d 100644
+--- a/crates/turborepo-lib/Cargo.toml
++++ b/crates/turborepo-lib/Cargo.toml
+@@ -99,9 +99,6 @@ sha2 = { workspace = true }
+ shared_child = "1.0.0"
+ struct_iterable = "0.1.1"
+ svix-ksuid = { version = "0.7.0", features = ["serde"] }
+-swc_common = { workspace = true }
+-swc_ecma_ast = { workspace = true, features = ["serde-impl"] }
+-swc_ecma_parser = { workspace = true }
+ sysinfo = "0.27.7"
+ tabwriter = "1.3.0"
+ thiserror = "1.0.38"
+diff --git a/crates/turborepo-lib/src/query/file.rs b/crates/turborepo-lib/src/query/file.rs
+index 78a23965cc..b24e28508a 100644
+--- a/crates/turborepo-lib/src/query/file.rs
++++ b/crates/turborepo-lib/src/query/file.rs
+@@ -2,8 +2,6 @@ use std::sync::Arc;
+ 
+ use async_graphql::{Object, SimpleObject};
+ use itertools::Itertools;
+-use swc_ecma_ast::EsVersion;
+-use swc_ecma_parser::{EsSyntax, Syntax, TsSyntax};
+ use turbo_trace::Tracer;
+ use turbopath::AbsoluteSystemPathBuf;
+ 
+@@ -15,56 +13,11 @@ use crate::{
+ pub struct File {
+     run: Arc<Run>,
+     path: AbsoluteSystemPathBuf,
+-    ast: Option<swc_ecma_ast::Module>,
+ }
+ 
+ impl File {
+     pub fn new(run: Arc<Run>, path: AbsoluteSystemPathBuf) -> Self {
+-        Self {
+-            run,
+-            path,
+-            ast: None,
+-        }
+-    }
+-
+-    pub fn with_ast(mut self, ast: Option<swc_ecma_ast::Module>) -> Self {
+-        self.ast = ast;
+-
+-        self
+-    }
+-
+-    fn parse_file(&self) -> Result<swc_ecma_ast::Module, Error> {
+-        let contents = self.path.read_to_string()?;
+-        let source_map = swc_common::SourceMap::default();
+-        let file = source_map.new_source_file(
+-            swc_common::FileName::Custom(self.path.to_string()).into(),
+-            contents.clone(),
+-        );
+-        let syntax = if self.path.extension() == Some("ts") || self.path.extension() == Some("tsx")
+-        {
+-            Syntax::Typescript(TsSyntax {
+-                tsx: self.path.extension() == Some("tsx"),
+-                decorators: true,
+-                ..Default::default()
+-            })
+-        } else {
+-            Syntax::Es(EsSyntax {
+-                jsx: self.path.ends_with(".jsx"),
+-                ..Default::default()
+-            })
+-        };
+-        let comments = swc_common::comments::SingleThreadedComments::default();
+-        let mut errors = Vec::new();
+-        let module = swc_ecma_parser::parse_file_as_module(
+-            &file,
+-            syntax,
+-            EsVersion::EsNext,
+-            Some(&comments),
+-            &mut errors,
+-        )
+-        .map_err(Error::Parse)?;
+-
+-        Ok(module)
++        Self { run, path }
+     }
+ }
+ 
+@@ -120,8 +73,8 @@ impl TraceResult {
+             files: result
+                 .files
+                 .into_iter()
+-                .sorted_by(|a, b| a.0.cmp(&b.0))
+-                .map(|(path, file)| File::new(run.clone(), path).with_ast(file.ast))
++                .sorted()
++                .map(|path| File::new(run.clone(), path))
+                 .collect(),
+             errors: result.errors.into_iter().map(|e| e.into()).collect(),
+         }
+@@ -147,24 +100,16 @@ impl File {
+         Ok(self.path.to_string())
+     }
+ 
+-    async fn dependencies(&self, depth: Option<usize>) -> TraceResult {
++    async fn dependencies(&self) -> TraceResult {
+         let tracer = Tracer::new(
+             self.run.repo_root().to_owned(),
+             vec![self.path.clone()],
+             None,
+         );
+ 
+-        let mut result = tracer.trace(depth);
++        let mut result = tracer.trace();
+         // Remove the file itself from the result
+         result.files.remove(&self.path);
+         TraceResult::new(result, self.run.clone())
+     }
+-
+-    async fn ast(&self) -> Option<serde_json::Value> {
+-        if let Some(ast) = &self.ast {
+-            serde_json::to_value(ast).ok()
+-        } else {
+-            serde_json::to_value(&self.parse_file().ok()?).ok()
+-        }
+-    }
+ }
+diff --git a/crates/turborepo-lib/src/query/mod.rs b/crates/turborepo-lib/src/query/mod.rs
+index f6add1f4dd..fa61ea6180 100644
+--- a/crates/turborepo-lib/src/query/mod.rs
++++ b/crates/turborepo-lib/src/query/mod.rs
+@@ -49,8 +49,6 @@ pub enum Error {
+     #[error(transparent)]
+     #[diagnostic(transparent)]
+     Resolution(#[from] crate::run::scope::filter::ResolutionError),
+-    #[error("failed to parse file: {0:?}")]
+-    Parse(swc_ecma_parser::error::Error),
+ }
+ 
+ pub struct RepositoryQuery {
+diff --git a/turborepo-tests/integration/fixtures/turbo_trace/bar.js b/turborepo-tests/integration/fixtures/turbo_trace/bar.js
+deleted file mode 100644
+index a85f7dedb2..0000000000
+--- a/turborepo-tests/integration/fixtures/turbo_trace/bar.js
++++ /dev/null
+@@ -1,3 +0,0 @@
+-export default function bar() {
+-  console.log("bar");
+-}
+diff --git a/turborepo-tests/integration/fixtures/turbo_trace/foo.js b/turborepo-tests/integration/fixtures/turbo_trace/foo.js
+index 6bfab2b18b..de9fc706c8 100644
+--- a/turborepo-tests/integration/fixtures/turbo_trace/foo.js
++++ b/turborepo-tests/integration/fixtures/turbo_trace/foo.js
+@@ -1,5 +1,3 @@
+-import { bar } from "./bar";
+-
+ export default function foo() {
+   if (!process.env.IS_CI) {
+     return "bar";
+diff --git a/turborepo-tests/integration/tests/turbo-trace.t b/turborepo-tests/integration/tests/turbo-trace.t
+index 1cced63539..24569c5c76 100644
+--- a/turborepo-tests/integration/tests/turbo-trace.t
++++ b/turborepo-tests/integration/tests/turbo-trace.t
+@@ -20,9 +20,6 @@ Setup
+         "dependencies": {
+           "files": {
+             "items": [
+-              {
+-                "path": "bar.js"
+-              },
+               {
+                 "path": "button.tsx"
+               },
+@@ -100,337 +97,3 @@ Trace file with invalid import
+     }
+   }
+ 
+-Get AST from file
+-  $ ${TURBO} query "query { file(path: \"main.ts\") { path ast } }"
+-   WARNING  query command is experimental and may change in the future
+-  {
+-    "data": {
+-      "file": {
+-        "path": "main.ts",
+-        "ast": {
+-          "type": "Module",
+-          "span": {
+-            "start": 1,
+-            "end": 169
+-          },
+-          "body": [
+-            {
+-              "type": "ImportDeclaration",
+-              "span": {
+-                "start": 1,
+-                "end": 35
+-              },
+-              "specifiers": [
+-                {
+-                  "type": "ImportSpecifier",
+-                  "span": {
+-                    "start": 10,
+-                    "end": 16
+-                  },
+-                  "local": {
+-                    "type": "Identifier",
+-                    "span": {
+-                      "start": 10,
+-                      "end": 16
+-                    },
+-                    "ctxt": 0,
+-                    "value": "Button",
+-                    "optional": false
+-                  },
+-                  "imported": null,
+-                  "isTypeOnly": false
+-                }
+-              ],
+-              "source": {
+-                "type": "StringLiteral",
+-                "span": {
+-                  "start": 24,
+-                  "end": 34
+-                },
+-                "value": "./button",
+-                "raw": "\"./button\""
+-              },
+-              "typeOnly": false,
+-              "with": null,
+-              "phase": "evaluation"
+-            },
+-            {
+-              "type": "ImportDeclaration",
+-              "span": {
+-                "start": 36,
+-                "end": 60
+-              },
+-              "specifiers": [
+-                {
+-                  "type": "ImportDefaultSpecifier",
+-                  "span": {
+-                    "start": 43,
+-                    "end": 46
+-                  },
+-                  "local": {
+-                    "type": "Identifier",
+-                    "span": {
+-                      "start": 43,
+-                      "end": 46
+-                    },
+-                    "ctxt": 0,
+-                    "value": "foo",
+-                    "optional": false
+-                  }
+-                }
+-              ],
+-              "source": {
+-                "type": "StringLiteral",
+-                "span": {
+-                  "start": 52,
+-                  "end": 59
+-                },
+-                "value": "./foo",
+-                "raw": "\"./foo\""
+-              },
+-              "typeOnly": false,
+-              "with": null,
+-              "phase": "evaluation"
+-            },
+-            {
+-              "type": "ImportDeclaration",
+-              "span": {
+-                "start": 61,
+-                "end": 96
+-              },
+-              "specifiers": [
+-                {
+-                  "type": "ImportDefaultSpecifier",
+-                  "span": {
+-                    "start": 68,
+-                    "end": 74
+-                  },
+-                  "local": {
+-                    "type": "Identifier",
+-                    "span": {
+-                      "start": 68,
+-                      "end": 74
+-                    },
+-                    "ctxt": 0,
+-                    "value": "repeat",
+-                    "optional": false
+-                  }
+-                }
+-              ],
+-              "source": {
+-                "type": "StringLiteral",
+-                "span": {
+-                  "start": 80,
+-                  "end": 95
+-                },
+-                "value": "repeat-string",
+-                "raw": "\"repeat-string\""
+-              },
+-              "typeOnly": false,
+-              "with": null,
+-              "phase": "evaluation"
+-            },
+-            {
+-              "type": "VariableDeclaration",
+-              "span": {
+-                "start": 98,
+-                "end": 126
+-              },
+-              "ctxt": 0,
+-              "kind": "const",
+-              "declare": false,
+-              "declarations": [
+-                {
+-                  "type": "VariableDeclarator",
+-                  "span": {
+-                    "start": 104,
+-                    "end": 125
+-                  },
+-                  "id": {
+-                    "type": "Identifier",
+-                    "span": {
+-                      "start": 104,
+-                      "end": 110
+-                    },
+-                    "ctxt": 0,
+-                    "value": "button",
+-                    "optional": false,
+-                    "typeAnnotation": null
+-                  },
+-                  "init": {
+-                    "type": "NewExpression",
+-                    "span": {
+-                      "start": 113,
+-                      "end": 125
+-                    },
+-                    "ctxt": 0,
+-                    "callee": {
+-                      "type": "Identifier",
+-                      "span": {
+-                        "start": 117,
+-                        "end": 123
+-                      },
+-                      "ctxt": 0,
+-                      "value": "Button",
+-                      "optional": false
+-                    },
+-                    "arguments": [],
+-                    "typeArguments": null
+-                  },
+-                  "definite": false
+-                }
+-              ]
+-            },
+-            {
+-              "type": "ExpressionStatement",
+-              "span": {
+-                "start": 128,
+-                "end": 144
+-              },
+-              "expression": {
+-                "type": "CallExpression",
+-                "span": {
+-                  "start": 128,
+-                  "end": 143
+-                },
+-                "ctxt": 0,
+-                "callee": {
+-                  "type": "MemberExpression",
+-                  "span": {
+-                    "start": 128,
+-                    "end": 141
+-                  },
+-                  "object": {
+-                    "type": "Identifier",
+-                    "span": {
+-                      "start": 128,
+-                      "end": 134
+-                    },
+-                    "ctxt": 0,
+-                    "value": "button",
+-                    "optional": false
+-                  },
+-                  "property": {
+-                    "type": "Identifier",
+-                    "span": {
+-                      "start": 135,
+-                      "end": 141
+-                    },
+-                    "value": "render"
+-                  }
+-                },
+-                "arguments": [],
+-                "typeArguments": null
+-              }
+-            },
+-            {
+-              "type": "ExpressionStatement",
+-              "span": {
+-                "start": 145,
+-                "end": 162
+-              },
+-              "expression": {
+-                "type": "CallExpression",
+-                "span": {
+-                  "start": 145,
+-                  "end": 161
+-                },
+-                "ctxt": 0,
+-                "callee": {
+-                  "type": "Identifier",
+-                  "span": {
+-                    "start": 145,
+-                    "end": 151
+-                  },
+-                  "ctxt": 0,
+-                  "value": "repeat",
+-                  "optional": false
+-                },
+-                "arguments": [
+-                  {
+-                    "spread": null,
+-                    "expression": {
+-                      "type": "StringLiteral",
+-                      "span": {
+-                        "start": 152,
+-                        "end": 157
+-                      },
+-                      "value": "foo",
+-                      "raw": "\"foo\""
+-                    }
+-                  },
+-                  {
+-                    "spread": null,
+-                    "expression": {
+-                      "type": "NumericLiteral",
+-                      "span": {
+-                        "start": 159,
+-                        "end": 160
+-                      },
+-                      "value": 5.0,
+-                      "raw": "5"
+-                    }
+-                  }
+-                ],
+-                "typeArguments": null
+-              }
+-            },
+-            {
+-              "type": "ExpressionStatement",
+-              "span": {
+-                "start": 163,
+-                "end": 169
+-              },
+-              "expression": {
+-                "type": "CallExpression",
+-                "span": {
+-                  "start": 163,
+-                  "end": 168
+-                },
+-                "ctxt": 0,
+-                "callee": {
+-                  "type": "Identifier",
+-                  "span": {
+-                    "start": 163,
+-                    "end": 166
+-                  },
+-                  "ctxt": 0,
+-                  "value": "foo",
+-                  "optional": false
+-                },
+-                "arguments": [],
+-                "typeArguments": null
+-              }
+-            }
+-          ],
+-          "interpreter": null
+-        }
+-      }
+-    }
+-  }
+-
+-Set depth for dependencies
+-  $ ${TURBO} query "query { file(path: \"main.ts\") { path dependencies(depth: 1) { files { items { path } } } } }"
+-   WARNING  query command is experimental and may change in the future
+-  {
+-    "data": {
+-      "file": {
+-        "path": "main.ts",
+-        "dependencies": {
+-          "files": {
+-            "items": [
+-              {
+-                "path": "button.tsx"
+-              },
+-              {
+-                "path": "foo.js"
+-              },
+-              {
+-                "path": "node_modules(\/|\\\\)repeat-string(\/|\\\\)index.js" (re)
+-              }
+-            ]
+-          }
+-        }
+-      }
+-    }
+-  }
+\ No newline at end of file

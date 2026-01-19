@@ -1,0 +1,511 @@
+diff --git a/packages/nx/src/hasher/hash-task.ts b/packages/nx/src/hasher/hash-task.ts
+index 4864a2b3c3..20f77dac2e 100644
+--- a/packages/nx/src/hasher/hash-task.ts
++++ b/packages/nx/src/hasher/hash-task.ts
+@@ -60,10 +60,11 @@ export async function hashTasksThatDoNotDependOnOutputsOfOtherTasks(
+   if (tasksDetails?.recordTaskDetails) {
+     tasksDetails.recordTaskDetails(
+       tasksToHash.map((task) => ({
+-        hash: task.hash,
++        hash: task.hash!,
+         project: task.target.project,
+         target: task.target.target,
+         configuration: task.target.configuration,
++        cache: task.cache ?? false,
+       }))
+     );
+   }
+@@ -107,10 +108,11 @@ export async function hashTask(
+   if (taskDetails?.recordTaskDetails) {
+     taskDetails.recordTaskDetails([
+       {
+-        hash: task.hash,
++        hash: task.hash!,
+         project: task.target.project,
+         target: task.target.target,
+         configuration: task.target.configuration,
++        cache: task.cache ?? false,
+       },
+     ]);
+   }
+diff --git a/packages/nx/src/native/index.d.ts b/packages/nx/src/native/index.d.ts
+index 7f1d7d09af..fdd4a87f0c 100644
+--- a/packages/nx/src/native/index.d.ts
++++ b/packages/nx/src/native/index.d.ts
+@@ -235,6 +235,7 @@ export interface HashedTask {
+   project: string
+   target: string
+   configuration?: string
++  cache: boolean
+ }
+ 
+ export interface HasherOptions {
+@@ -320,6 +321,7 @@ export interface Task {
+   startTime?: number
+   endTime?: number
+   continuous?: boolean
++  cache?: boolean
+ }
+ 
+ export interface TaskGraph {
+diff --git a/packages/nx/src/native/tasks/details.rs b/packages/nx/src/native/tasks/details.rs
+index ac972f90d6..67b0bc48a9 100644
+--- a/packages/nx/src/native/tasks/details.rs
++++ b/packages/nx/src/native/tasks/details.rs
+@@ -10,6 +10,7 @@ pub struct HashedTask {
+     pub project: String,
+     pub target: String,
+     pub configuration: Option<String>,
++    pub cache: bool,
+ }
+ 
+ #[napi]
+@@ -34,7 +35,8 @@ impl TaskDetails {
+                 hash    TEXT PRIMARY KEY NOT NULL,
+                 project  TEXT NOT NULL,
+                 target  TEXT NOT NULL,
+-                configuration  TEXT
++                configuration  TEXT,
++                cache  BOOLEAN NOT NULL DEFAULT 0
+             );",
+             params![],
+         )?;
+@@ -46,10 +48,10 @@ impl TaskDetails {
+     pub fn record_task_details(&mut self, tasks: Vec<HashedTask>) -> anyhow::Result<()> {
+         trace!("Recording task details");
+         self.db.transaction(|conn| {
+-            let mut stmt = conn.prepare("INSERT OR REPLACE INTO task_details (hash, project, target, configuration) VALUES (?1, ?2, ?3, ?4)")?;
++            let mut stmt = conn.prepare("INSERT OR REPLACE INTO task_details (hash, project, target, configuration, cache) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+             for task in tasks.iter() {
+                 stmt.execute(
+-                    params![task.hash, task.project, task.target, task.configuration],
++                    params![task.hash, task.project, task.target, task.configuration, task.cache],
+                 )?;
+             }
+             Ok(())
+diff --git a/packages/nx/src/native/tasks/hashers/hash_workspace_files.rs b/packages/nx/src/native/tasks/hashers/hash_workspace_files.rs
+index 072aa0586f..d19499ac5b 100644
+--- a/packages/nx/src/native/tasks/hashers/hash_workspace_files.rs
++++ b/packages/nx/src/native/tasks/hashers/hash_workspace_files.rs
+@@ -147,7 +147,7 @@ mod test {
+             file: "packages/project/project.json".into(),
+             hash: "abc".into(),
+         };
+-        for i in 0..1000 {
++        for _i in 0..1000 {
+             let result = hash_workspace_files(
+                 &["{workspaceRoot}/**/*".to_string()],
+                 &[
+diff --git a/packages/nx/src/native/tasks/task_history.rs b/packages/nx/src/native/tasks/task_history.rs
+index 41adad17ef..b3f25c9e70 100644
+--- a/packages/nx/src/native/tasks/task_history.rs
++++ b/packages/nx/src/native/tasks/task_history.rs
+@@ -92,11 +92,16 @@ impl NxTaskHistory {
+                 .collect::<Vec<Value>>(),
+         );
+ 
++        // Find tasks that are flaky (have inconsistent exit codes) but only among cacheable tasks.
++        // Non-cacheable tasks (like dev servers) are expected to have inconsistent results
++        // and should not be considered flaky.
+         self.db
+             .prepare(
+-                "SELECT hash from task_history
+-                    WHERE hash IN rarray(?1)
+-                    GROUP BY hash
++                "SELECT task_history.hash from task_history
++                    JOIN task_details ON task_history.hash = task_details.hash
++                    WHERE task_history.hash IN rarray(?1)
++                    AND task_details.cache = 1
++                    GROUP BY task_history.hash
+                     HAVING COUNT(DISTINCT code) > 1
+                 ",
+             )?
+diff --git a/packages/nx/src/native/tasks/types.rs b/packages/nx/src/native/tasks/types.rs
+index ca8f5d92e2..83d9c41c70 100644
+--- a/packages/nx/src/native/tasks/types.rs
++++ b/packages/nx/src/native/tasks/types.rs
+@@ -16,6 +16,7 @@ pub struct Task {
+     pub start_time: Option<i64>,
+     pub end_time: Option<i64>,
+     pub continuous: Option<bool>,
++    pub cache: Option<bool>,
+ }
+ 
+ #[napi(object)]
+diff --git a/packages/nx/src/native/tests/cache.spec.ts b/packages/nx/src/native/tests/cache.spec.ts
+index d577cea4ea..a90a2242e9 100644
+--- a/packages/nx/src/native/tests/cache.spec.ts
++++ b/packages/nx/src/native/tests/cache.spec.ts
+@@ -32,6 +32,7 @@ describe('Cache', () => {
+         project: 'proj',
+         target: 'test',
+         configuration: 'production',
++        cache: true,
+       },
+     ]);
+   });
+diff --git a/packages/nx/src/native/tests/task_history.spec.ts b/packages/nx/src/native/tests/task_history.spec.ts
+index 991663459f..07beb06b66 100644
+--- a/packages/nx/src/native/tests/task_history.spec.ts
++++ b/packages/nx/src/native/tests/task_history.spec.ts
+@@ -28,12 +28,14 @@ describe('NxTaskHistory', () => {
+         project: 'proj',
+         target: 'build',
+         configuration: 'production',
++        cache: true,
+       },
+       {
+         hash: '234',
+         project: 'proj',
+         target: 'build',
+         configuration: 'production',
++        cache: true,
+       },
+     ]);
+   });
+@@ -123,4 +125,61 @@ describe('NxTaskHistory', () => {
+     ]);
+     expect(r['proj:build:production']).toEqual(60 * 60 * 1000);
+   });
++
++  it('should not consider non-cacheable tasks as flaky', () => {
++    // Add tasks with different cache settings that have mixed success/failure
++    taskDetails.recordTaskDetails([
++      {
++        hash: '345',
++        project: 'proj',
++        target: 'serve',
++        configuration: undefined,
++        cache: false,
++      },
++      {
++        hash: '456',
++        project: 'proj',
++        target: 'dev',
++        configuration: undefined,
++        cache: false, // explicitly non-cacheable
++      },
++    ]);
++
++    taskHistory.recordTaskRuns([
++      // cache: false task
++      {
++        hash: '345',
++        code: 1,
++        status: 'failure',
++        start: Date.now() - 1000 * 60 * 60,
++        end: Date.now(),
++      },
++      {
++        hash: '345',
++        code: 0,
++        status: 'success',
++        start: Date.now() - 1000 * 60 * 60,
++        end: Date.now(),
++      },
++      // cache: null task
++      {
++        hash: '456',
++        code: 1,
++        status: 'failure',
++        start: Date.now() - 1000 * 60 * 60,
++        end: Date.now(),
++      },
++      {
++        hash: '456',
++        code: 0,
++        status: 'success',
++        start: Date.now() - 1000 * 60 * 60,
++        end: Date.now(),
++      },
++    ]);
++
++    const r = taskHistory.getFlakyTasks(['345', '456']);
++    expect(r).not.toContain('345'); // Should not be flaky because cache = false
++    expect(r).not.toContain('456'); // Should not be flaky because cache = false
++  });
+ });
+diff --git a/packages/nx/src/native/tui/components/tasks_list.rs b/packages/nx/src/native/tui/components/tasks_list.rs
+index 58c03faf24..a335e3ff9a 100644
+--- a/packages/nx/src/native/tui/components/tasks_list.rs
++++ b/packages/nx/src/native/tui/components/tasks_list.rs
+@@ -1935,6 +1935,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+             Task {
+                 id: "task2".to_string(),
+@@ -1948,6 +1949,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+             Task {
+                 id: "task3".to_string(),
+@@ -1961,6 +1963,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+         ];
+         let selection_manager = Arc::new(Mutex::new(TaskSelectionManager::new(10)));
+@@ -2391,6 +2394,7 @@ mod tests {
+             continuous: Some(true),
+             start_time: None,
+             end_time: None,
++            cache: Some(false),
+         };
+ 
+         // Add and start the continuous task
+@@ -2426,6 +2430,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             };
+             tasks.push(task);
+         }
+@@ -2473,6 +2478,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+             Task {
+                 id: "task2".to_string(),
+@@ -2486,6 +2492,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+         ];
+ 
+@@ -2547,6 +2554,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+             Task {
+                 id: "another-very-long-task-name-for-testing-purposes".to_string(),
+@@ -2560,6 +2568,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+         ];
+ 
+@@ -2746,6 +2755,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             });
+         }
+ 
+@@ -2790,6 +2800,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             });
+         }
+ 
+@@ -2841,6 +2852,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             });
+         }
+ 
+@@ -2885,6 +2897,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             });
+         }
+ 
+@@ -3013,6 +3026,7 @@ mod tests {
+             continuous: Some(false),
+             start_time: None,
+             end_time: None,
++            cache: Some(false),
+         }];
+ 
+         let selection_manager = Arc::new(Mutex::new(TaskSelectionManager::new(10)));
+@@ -3041,6 +3055,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+             Task {
+                 id: "this-is-a-very-long-task-name-that-exceeds-thirty-characters".to_string(),
+@@ -3054,6 +3069,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+         ];
+ 
+@@ -3106,6 +3122,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++            cache: Some(false),
+             },
+             Task {
+                 id: "short2".to_string(),
+@@ -3119,6 +3136,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++            cache: Some(false),
+             },
+             Task {
+                 id: "short3".to_string(),
+@@ -3132,6 +3150,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++            cache: Some(false),
+             },
+             // Page 2: Long task names
+             Task {
+@@ -3146,6 +3165,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++            cache: Some(false),
+             },
+             Task {
+                 id: "another-extremely-long-task-name-for-testing-pagination-consistency-page2-task2".to_string(),
+@@ -3159,6 +3179,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++            cache: Some(false),
+             },
+         ];
+ 
+@@ -3226,6 +3247,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+             Task {
+                 id: "short2".to_string(),
+@@ -3239,6 +3261,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+             // Page 2: Long task names
+             Task {
+@@ -3254,6 +3277,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+             Task {
+                 id: "another-extremely-long-task-name-for-testing-pagination-consistency-behavior"
+@@ -3268,6 +3292,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++                cache: Some(false),
+             },
+         ];
+ 
+@@ -3335,6 +3360,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++            cache: Some(false),
+             },
+             Task {
+                 id: "short2".to_string(),
+@@ -3348,6 +3374,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++            cache: Some(false),
+             },
+             // Page 2: Long task names that would affect column visibility
+             Task {
+@@ -3362,6 +3389,7 @@ mod tests {
+                 continuous: Some(false),
+                 start_time: None,
+                 end_time: None,
++            cache: Some(false),
+             },
+         ];
+ 
+@@ -3420,6 +3448,7 @@ mod tests {
+             continuous: Some(false),
+             start_time: None,
+             end_time: None,
++            cache: Some(false),
+         }];
+ 
+         let selection_manager = Arc::new(Mutex::new(TaskSelectionManager::new(10)));
+diff --git a/packages/nx/src/native/tui/pty.rs b/packages/nx/src/native/tui/pty.rs
+index dc09e7461d..25b085c272 100644
+--- a/packages/nx/src/native/tui/pty.rs
++++ b/packages/nx/src/native/tui/pty.rs
+@@ -372,7 +372,7 @@ mod tests {
+ 
+     #[test]
+     fn test_handles_arrow_keys_cursor_movement() {
+-        let mut pty = create_test_pty_instance(false);
++        let pty = create_test_pty_instance(false);
+ 
+         // Initially should not be interactive
+         assert!(!pty.handles_arrow_keys());
+@@ -387,7 +387,7 @@ mod tests {
+ 
+     #[test]
+     fn test_handles_arrow_keys_enquirer_style_output() {
+-        let mut pty = create_test_pty_instance(false);
++        let pty = create_test_pty_instance(false);
+ 
+         // Simulate enquirer output with cursor positioning
+         let enquirer_output =
+diff --git a/packages/nx/src/native/tui/theme.rs b/packages/nx/src/native/tui/theme.rs
+index 78abb41894..b50b08ad93 100644
+--- a/packages/nx/src/native/tui/theme.rs
++++ b/packages/nx/src/native/tui/theme.rs
+@@ -2,7 +2,7 @@
+ #![allow(clippy::disallowed_types)]
+ 
+ // This is the only file we should use the `ratatui::style::Color` type in
+-use ratatui::style::{Color, Style};
++use ratatui::style::Color;
+ use std::sync::LazyLock;
+ use terminal_colorsaurus::{ColorScheme, QueryOptions, color_scheme};
+ use tracing::debug;
+diff --git a/packages/nx/src/native/tui/utils.rs b/packages/nx/src/native/tui/utils.rs
+index aa514d119c..96a23af7b0 100644
+--- a/packages/nx/src/native/tui/utils.rs
++++ b/packages/nx/src/native/tui/utils.rs
+@@ -400,7 +400,7 @@ mod tests {
+             let b = &tasks[i];
+ 
+             // Map status to category for comparison
+-            let status_to_category = |status: &TaskStatus, name: &str| -> u8 {
++            let status_to_category = |status: &TaskStatus, _name: &str| -> u8 {
+                 // In this test we're using an empty highlighted list
+                 match status {
+                     TaskStatus::InProgress | TaskStatus::Shared => 0,

@@ -1,0 +1,506 @@
+diff --git a/.changeset/beige-days-nail.md b/.changeset/beige-days-nail.md
+new file mode 100644
+index 0000000000..b235f928c6
+--- /dev/null
++++ b/.changeset/beige-days-nail.md
+@@ -0,0 +1,5 @@
++---
++'xstate': patch
++---
++
++Fixed an issue that prevented `invoke.input` from seeing the context updated by the same-level `entry` actions.
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index a68f320aa0..2014d86249 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -417,12 +417,9 @@ export class StateMachine<
+     if (typeof context === 'function') {
+       const assignment = ({ spawn, event }: any) =>
+         context({ spawn, input: event.input });
+-      return resolveActionsAndContext(
+-        [assign(assignment)],
+-        initEvent as TEvent,
+-        preInitial,
+-        actorCtx
+-      ) as SnapshotFrom<this>;
++      return resolveActionsAndContext(preInitial, initEvent, actorCtx, [
++        assign(assignment)
++      ]) as SnapshotFrom<this>;
+     }
+ 
+     return preInitial;
+@@ -493,7 +490,7 @@ export class StateMachine<
+   ): void {
+     Object.values(state.children).forEach((child: any) => {
+       if (child.status === 0) {
+-        child.start?.();
++        child.start();
+       }
+     });
+   }
+diff --git a/packages/core/src/actions/send.ts b/packages/core/src/actions/send.ts
+index f58ba44b4d..f4d5085ba2 100644
+--- a/packages/core/src/actions/send.ts
++++ b/packages/core/src/actions/send.ts
+@@ -60,7 +60,8 @@ function resolveSendTo(
+           EventObject
+         >
+       | undefined;
+-  }
++  },
++  extra: { deferredActorIds: string[] } | undefined
+ ) {
+   const delaysMap = state.machine.implementations.delays;
+ 
+@@ -82,7 +83,7 @@ function resolveSendTo(
+   }
+ 
+   const resolvedTarget = typeof to === 'function' ? to(args) : to;
+-  let targetActorRef: AnyActorRef | undefined;
++  let targetActorRef: AnyActorRef | string | undefined;
+ 
+   if (typeof resolvedTarget === 'string') {
+     if (resolvedTarget === SpecialTargets.Parent) {
+@@ -94,7 +95,9 @@ function resolveSendTo(
+       // #_invokeid. If the target is the special term '#_invokeid', where invokeid is the invokeid of an SCXML session that the sending session has created by <invoke>, the Processor must add the event to the external queue of that session.
+       targetActorRef = state.children[resolvedTarget.slice(2)];
+     } else {
+-      targetActorRef = state.children[resolvedTarget];
++      targetActorRef = extra?.deferredActorIds.includes(resolvedTarget)
++        ? resolvedTarget
++        : state.children[resolvedTarget];
+     }
+     if (!targetActorRef) {
+       throw new Error(
+@@ -110,6 +113,22 @@ function resolveSendTo(
+     { to: targetActorRef, event: resolvedEvent, id, delay: resolvedDelay }
+   ];
+ }
++
++function retryResolveSendTo(
++  _: AnyActorContext,
++  state: AnyState,
++  params: {
++    to: AnyActorRef;
++    event: EventObject;
++    id: string | undefined;
++    delay: number | undefined;
++  }
++) {
++  if (typeof params.to === 'string') {
++    params.to = state.children[params.to];
++  }
++}
++
+ function executeSendTo(
+   actorContext: AnyActorContext,
+   params: {
+@@ -126,9 +145,8 @@ function executeSendTo(
+     return;
+   }
+ 
+-  const { to, event } = params;
+-
+   actorContext.defer(() => {
++    const { to, event } = params;
+     actorContext?.system._relay(
+       actorContext.self,
+       to,
+@@ -205,6 +223,7 @@ export function sendTo<
+   sendTo.delay = options?.delay;
+ 
+   sendTo.resolve = resolveSendTo;
++  sendTo.retryResolve = retryResolveSendTo;
+   sendTo.execute = executeSendTo;
+ 
+   return sendTo;
+diff --git a/packages/core/src/actors/callback.ts b/packages/core/src/actors/callback.ts
+index 2890b39b40..df666511b5 100644
+--- a/packages/core/src/actors/callback.ts
++++ b/packages/core/src/actors/callback.ts
+@@ -9,7 +9,7 @@ import {
+   Snapshot,
+   HomomorphicOmit
+ } from '../types';
+-import { XSTATE_INIT, XSTATE_STOP } from '../constants.ts';
++import { XSTATE_STOP } from '../constants.ts';
+ 
+ type CallbackSnapshot<TInput, TEvent> = Snapshot<undefined> & {
+   input: TInput;
+@@ -63,10 +63,10 @@ export function fromCallback<TEvent extends EventObject, TInput = unknown>(
+   const logic: CallbackActorLogic<TEvent, TInput> = {
+     config: invokeCallback,
+     start: (_state, { self, system }) => {
+-      system._relay(self, self, { type: XSTATE_INIT });
++      system._relay(self, self, { type: 'xstate.create' });
+     },
+     transition: (state, event, { self, system }) => {
+-      if (event.type === XSTATE_INIT) {
++      if (event.type === 'xstate.create') {
+         const sendBack = (eventForParent: AnyEventObject) => {
+           if (state.status === 'stopped') {
+             return;
+diff --git a/packages/core/src/interpreter.ts b/packages/core/src/interpreter.ts
+index 71a80c5e21..8ca541f06b 100644
+--- a/packages/core/src/interpreter.ts
++++ b/packages/core/src/interpreter.ts
+@@ -15,7 +15,6 @@ import {
+   MissingImplementationsError
+ } from './typegenTypes.ts';
+ import type {
+-  ActorLogic,
+   ActorContext,
+   ActorSystem,
+   AnyActorLogic,
+@@ -24,7 +23,6 @@ import type {
+   PersistedStateFrom,
+   SnapshotFrom,
+   AnyActorRef,
+-  OutputFrom,
+   DoneActorEvent
+ } from './types.ts';
+ import {
+@@ -500,19 +498,19 @@ export class Actor<TLogic extends AnyActorLogic>
+   }
+ 
+   // TODO: make private (and figure out a way to do this within the machine)
+-  public delaySend({
+-    event,
+-    id,
+-    delay,
+-    to
+-  }: {
++  public delaySend(params: {
+     event: EventObject;
+     id: string | undefined;
+     delay: number;
+     to?: AnyActorRef;
+   }): void {
++    const { event, id, delay } = params;
+     const timerId = this.clock.setTimeout(() => {
+-      this.system._relay(this, to ?? this, event as EventFromLogic<TLogic>);
++      this.system._relay(
++        this,
++        params.to ?? this,
++        event as EventFromLogic<TLogic>
++      );
+     }, delay);
+ 
+     // TODO: consider the rehydration story here
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index b45099cbaf..854ca982de 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1059,7 +1059,6 @@ function microstepProcedure(
+   actorCtx: AnyActorContext,
+   isInitial: boolean
+ ): typeof currentState {
+-  const actions: UnknownAction[] = [];
+   const historyValue = {
+     ...currentState.historyValue
+   };
+@@ -1071,26 +1070,42 @@ function microstepProcedure(
+   );
+ 
+   const internalQueue = [...currentState._internalQueue];
++  // TODO: this `cloneState` is really just a hack to prevent infinite loops
++  // we need to take another look at how internal queue is managed
++  let nextState = cloneState(currentState, {
++    _internalQueue: []
++  });
+ 
+   // Exit states
+   if (!isInitial) {
+-    exitStates(filteredTransitions, mutConfiguration, historyValue, actions);
++    nextState = exitStates(
++      nextState,
++      event,
++      actorCtx,
++      filteredTransitions,
++      mutConfiguration,
++      historyValue
++    );
+   }
+ 
+   // Execute transition content
+-  actions.push(...filteredTransitions.flatMap((t) => t.actions));
++  nextState = resolveActionsAndContext(
++    nextState,
++    event,
++    actorCtx,
++    filteredTransitions.flatMap((t) => t.actions)
++  );
+ 
+   // Enter states
+-  enterStates(
++  nextState = enterStates(
++    nextState,
+     event,
++    actorCtx,
+     filteredTransitions,
+     mutConfiguration,
+-    actions,
+     internalQueue,
+-    currentState,
+     historyValue,
+-    isInitial,
+-    actorCtx
++    isInitial
+   );
+ 
+   const nextConfiguration = [...mutConfiguration];
+@@ -1098,20 +1113,17 @@ function microstepProcedure(
+   const done = isInFinalState(nextConfiguration);
+ 
+   if (done) {
+-    const finalActions = nextConfiguration
+-      .sort((a, b) => b.order - a.order)
+-      .flatMap((state) => state.exit);
+-    actions.push(...finalActions);
+-  }
+-
+-  try {
+-    const nextState = resolveActionsAndContext(
+-      actions,
++    nextState = resolveActionsAndContext(
++      nextState,
+       event,
+-      currentState,
+-      actorCtx
++      actorCtx,
++      nextConfiguration
++        .sort((a, b) => b.order - a.order)
++        .flatMap((state) => state.exit)
+     );
++  }
+ 
++  try {
+     const output = done
+       ? getOutput(nextConfiguration, nextState.context, event, actorCtx.self)
+       : undefined;
+@@ -1135,16 +1147,16 @@ function microstepProcedure(
+ }
+ 
+ function enterStates(
++  currentState: AnyState,
+   event: AnyEventObject,
++  actorCtx: AnyActorContext,
+   filteredTransitions: AnyTransitionDefinition[],
+   mutConfiguration: Set<AnyStateNode>,
+-  actions: UnknownAction[],
+   internalQueue: AnyEventObject[],
+-  currentState: AnyState,
+   historyValue: HistoryValue<any, any>,
+-  isInitial: boolean,
+-  actorContext: AnyActorContext
+-): void {
++  isInitial: boolean
++) {
++  let nextState = currentState;
+   const statesToEnter = new Set<AnyStateNode>();
+   const statesForDefaultEntry = new Set<AnyStateNode>();
+ 
+@@ -1164,20 +1176,30 @@ function enterStates(
+     (a, b) => a.order - b.order
+   )) {
+     mutConfiguration.add(stateNodeToEnter);
++    const actions: UnknownAction[] = [];
++
++    // Add entry actions
++    actions.push(...stateNodeToEnter.entry);
+ 
+     for (const invokeDef of stateNodeToEnter.invoke) {
+       actions.push(invoke(invokeDef));
+     }
+ 
+-    // Add entry actions
+-    actions.push(...stateNodeToEnter.entry);
+-
+     if (statesForDefaultEntry.has(stateNodeToEnter)) {
+       for (const stateNode of statesForDefaultEntry) {
+         const initialActions = stateNode.initial!.actions;
+         actions.push(...initialActions);
+       }
+     }
++
++    nextState = resolveActionsAndContext(
++      nextState,
++      event,
++      actorCtx,
++      actions,
++      stateNodeToEnter.invoke.map((invokeDef) => invokeDef.id)
++    );
++
+     if (stateNodeToEnter.type === 'final') {
+       const parent = stateNodeToEnter.parent!;
+ 
+@@ -1191,9 +1213,9 @@ function enterStates(
+           stateNodeToEnter.output
+             ? resolveOutput(
+                 stateNodeToEnter.output,
+-                currentState.context,
++                nextState.context,
+                 event,
+-                actorContext.self
++                actorCtx.self
+               )
+             : undefined
+         )
+@@ -1214,6 +1236,8 @@ function enterStates(
+       }
+     }
+   }
++
++  return nextState;
+ }
+ 
+ function computeEntrySet(
+@@ -1369,11 +1393,14 @@ function addAncestorStatesToEnter(
+ }
+ 
+ function exitStates(
++  currentState: AnyState,
++  event: AnyEventObject,
++  actorCtx: AnyActorContext,
+   transitions: AnyTransitionDefinition[],
+   mutConfiguration: Set<AnyStateNode>,
+-  historyValue: HistoryValue<any, any>,
+-  actions: UnknownAction[]
++  historyValue: HistoryValue<any, any>
+ ) {
++  let nextState = currentState;
+   const statesToExit = computeExitSet(
+     transitions,
+     mutConfiguration,
+@@ -1400,9 +1427,13 @@ function exitStates(
+   }
+ 
+   for (const s of statesToExit) {
+-    actions.push(...s.exit, ...s.invoke.map((def) => stop(def.id)));
++    nextState = resolveActionsAndContext(nextState, event, actorCtx, [
++      ...s.exit,
++      ...s.invoke.map((def) => stop(def.id))
++    ]);
+     mutConfiguration.delete(s);
+   }
++  return nextState;
+ }
+ 
+ interface BuiltinAction {
+@@ -1411,26 +1442,27 @@ interface BuiltinAction {
+     actorContext: AnyActorContext,
+     state: AnyState,
+     actionArgs: ActionArgs<any, any, any, any>,
+-    action: unknown
++    action: unknown,
++    extra: unknown
+   ) => [newState: AnyState, params: unknown, actions?: UnknownAction[]];
++  retryResolve: (
++    actorContext: AnyActorContext,
++    state: AnyState,
++    params: unknown
++  ) => void;
+   execute: (actorContext: AnyActorContext, params: unknown) => void;
+ }
+ 
+-export function resolveActionsAndContext<
+-  TContext extends MachineContext,
+-  TExpressionEvent extends EventObject
+->(
+-  actions: UnknownAction[],
+-  event: TExpressionEvent,
++function resolveActionsAndContextWorker(
+   currentState: AnyState,
+-  actorCtx: AnyActorContext
++  event: AnyEventObject,
++  actorCtx: AnyActorContext,
++  actions: UnknownAction[],
++  extra: { deferredActorIds: string[] } | undefined,
++  retries: (readonly [BuiltinAction, unknown])[] | undefined
+ ): AnyState {
+   const { machine } = currentState;
+-  // TODO: this `cloneState` is really just a hack to prevent infinite loops
+-  // we need to take another look at how internal queue is managed
+-  let intermediateState = cloneState(currentState, {
+-    _internalQueue: []
+-  });
++  let intermediateState = currentState;
+ 
+   for (const action of actions) {
+     const isInline = typeof action === 'function';
+@@ -1494,11 +1526,16 @@ export function resolveActionsAndContext<
+       actorCtx,
+       intermediateState,
+       actionArgs,
+-      resolvedAction // this holds all params
++      resolvedAction, // this holds all params
++      extra
+     );
+     intermediateState = nextState;
+ 
+-    if ('execute' in resolvedAction) {
++    if ('retryResolve' in builtinAction) {
++      retries?.push([builtinAction, params]);
++    }
++
++    if ('execute' in builtinAction) {
+       if (actorCtx?.self.status === ActorStatus.Running) {
+         builtinAction.execute(actorCtx!, params);
+       } else {
+@@ -1507,11 +1544,13 @@ export function resolveActionsAndContext<
+     }
+ 
+     if (actions) {
+-      intermediateState = resolveActionsAndContext(
+-        actions,
+-        event,
++      intermediateState = resolveActionsAndContextWorker(
+         intermediateState,
+-        actorCtx
++        event,
++        actorCtx,
++        actions,
++        extra,
++        retries
+       );
+     }
+   }
+@@ -1519,6 +1558,29 @@ export function resolveActionsAndContext<
+   return intermediateState;
+ }
+ 
++export function resolveActionsAndContext(
++  currentState: AnyState,
++  event: AnyEventObject,
++  actorCtx: AnyActorContext,
++  actions: UnknownAction[],
++  deferredActorIds?: string[]
++): AnyState {
++  const retries: (readonly [BuiltinAction, unknown])[] | undefined =
++    deferredActorIds ? [] : undefined;
++  const nextState = resolveActionsAndContextWorker(
++    currentState,
++    event,
++    actorCtx,
++    actions,
++    deferredActorIds && { deferredActorIds },
++    retries
++  );
++  retries?.forEach(([builtinAction, params]) => {
++    builtinAction.retryResolve(actorCtx, nextState, params);
++  });
++  return nextState;
++}
++
+ export function macrostep(
+   state: AnyState,
+   event: EventObject,
+@@ -1616,7 +1678,7 @@ function stopStep(
+     actions.push(stop(child));
+   }
+ 
+-  return resolveActionsAndContext(actions, event, nextState, actorCtx);
++  return resolveActionsAndContext(nextState, event, actorCtx, actions);
+ }
+ 
+ function selectTransitions(

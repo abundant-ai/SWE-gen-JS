@@ -1,0 +1,301 @@
+diff --git a/docs/gitbook/guide/flows/remove-dependency.md b/docs/gitbook/guide/flows/remove-dependency.md
+new file mode 100644
+index 0000000000..4e90ae6207
+--- /dev/null
++++ b/docs/gitbook/guide/flows/remove-dependency.md
+@@ -0,0 +1,48 @@
++# Remove Dependency
++
++In some situations, you may have a parent job and need to ignore when one of its children fail.
++
++The pattern to solve this requirement consists on using the **removeDependencyOnFailure** option. This option will make sure that when a job fails, the dependency is removed from the parent, so the parent will complete without waiting for the failed children.
++
++```typescript
++const flow = new FlowProducer({ connection });
++
++const originalTree = await flow.add({
++  name: 'root-job',
++  queueName: 'topQueueName',
++  data: {},
++  children: [
++    {
++      name,
++      data: { idx: 0, foo: 'bar' },
++      queueName: 'childrenQueueName',
++      opts: { removeDependencyOnFailure: true },
++      children: [
++        {
++          name,
++          data: { idx: 1, foo: 'bah' },
++          queueName: 'grandChildrenQueueName',
++        },
++        {
++          name,
++          data: { idx: 2, foo: 'baz' },
++          queueName: 'grandChildrenQueueName',
++        },
++      ],
++    },
++    {
++      name,
++      data: { idx: 3, foo: 'foo' },
++      queueName: 'childrenQueueName',
++    },
++  ],
++});
++```
++
++{% hint style="info" %}
++As soon as a **child** with this option fails, the parent job will be moved to a waiting state only if there are no more pending children.
++{% endhint %}
++
++## Read more:
++
++- 💡 [Add Flow API Reference](https://api.docs.bullmq.io/classes/FlowProducer.html#add)
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index 5f33b73b33..d0552c26bf 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -40,6 +40,7 @@ const logger = debuglog('bull');
+ const optsDecodeMap = {
+   fpof: 'failParentOnFailure',
+   kl: 'keepLogs',
++  rdof: 'removeDependencyOnFailure',
+ };
+ 
+ const optsEncodeMap = invert(optsDecodeMap);
+@@ -1078,6 +1079,12 @@ export class Job<
+       throw new Error(`Delay and repeat options could not be used together`);
+     }
+ 
++    if (this.opts.removeDependencyOnFailure && this.opts.failParentOnFailure) {
++      throw new Error(
++        `RemoveDependencyOnFailure and failParentOnFailure options can not be used together`,
++      );
++    }
++
+     if (`${parseInt(this.id, 10)}` === this.id) {
+       //TODO: throw an error in next breaking change
+       console.warn(
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index ed6ada91db..80ea3106ca 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -91,8 +91,9 @@ export class Scripts {
+       queueKeys.pc,
+     ];
+ 
+-    const fpof = opts.fpof ? { fpof: true } : {};
+-    const parent = job.parent ? { ...job.parent, ...fpof } : null;
++    const parent: Record<string, any> = job.parent
++      ? { ...job.parent, fpof: opts.fpof, rdof: opts.rdof }
++      : null;
+ 
+     const args = [
+       queueKeys[''],
+@@ -284,6 +285,7 @@ export class Scripts {
+           ? opts.metrics?.maxDataPoints
+           : '',
+         fpof: !!job.opts?.failParentOnFailure,
++        rdof: !!job.opts?.removeDependencyOnFailure,
+       }),
+     ];
+ 
+diff --git a/src/commands/includes/moveParentFromWaitingChildrenToFailed.lua b/src/commands/includes/moveParentFromWaitingChildrenToFailed.lua
+index b576fbd9fd..bd6a148a6a 100644
+--- a/src/commands/includes/moveParentFromWaitingChildrenToFailed.lua
++++ b/src/commands/includes/moveParentFromWaitingChildrenToFailed.lua
+@@ -2,6 +2,9 @@
+   Function to recursively move from waitingChildren to failed.
+ ]]
+ 
++-- Includes
++--- @include "moveParentToWaitIfNeeded"
++
+ local function moveParentFromWaitingChildrenToFailed( parentQueueKey, parentKey, parentId, jobIdKey, timestamp)
+   if rcall("ZREM", parentQueueKey .. ":waiting-children", parentId) == 1 then
+     rcall("ZADD", parentQueueKey .. ":failed", timestamp, parentId)
+@@ -22,6 +25,13 @@ local function moveParentFromWaitingChildrenToFailed( parentQueueKey, parentKey,
+           parentKey,
+           timestamp
+         )
++      elseif parentData['rdof'] then
++        local grandParentKey = parentData['queueKey'] .. ':' .. parentData['id']
++        local grandParentDependenciesSet = grandParentKey .. ":dependencies"
++        if rcall("SREM", grandParentDependenciesSet, parentKey) == 1 then
++          moveParentToWaitIfNeeded(parentData['queueKey'], grandParentDependenciesSet,
++            grandParentKey, parentData['id'], timestamp)
++        end
+       end
+     end
+   end
+diff --git a/src/commands/includes/moveParentToWaitIfNeeded.lua b/src/commands/includes/moveParentToWaitIfNeeded.lua
+new file mode 100644
+index 0000000000..42054c7a11
+--- /dev/null
++++ b/src/commands/includes/moveParentToWaitIfNeeded.lua
+@@ -0,0 +1,42 @@
++--[[
++  Validate and move parent to active if needed.
++]]
++
++-- Includes
++--- @include "addDelayMarkerIfNeeded"
++--- @include "addJobWithPriority"
++--- @include "getTargetQueueList"
++
++local function moveParentToWaitIfNeeded(parentQueueKey, parentDependenciesKey, parentKey, parentId, timestamp)
++  local isParentActive = rcall("ZSCORE", parentQueueKey .. ":waiting-children", parentId)
++  if rcall("SCARD", parentDependenciesKey) == 0 and isParentActive then 
++    rcall("ZREM", parentQueueKey .. ":waiting-children", parentId)
++    local parentWaitKey = parentQueueKey .. ":wait"
++    local parentTarget, paused = getTargetQueueList(parentQueueKey .. ":meta", parentWaitKey,
++      parentQueueKey .. ":paused")
++    local jobAttributes = rcall("HMGET", parentKey, "priority", "delay")
++    local priority = tonumber(jobAttributes[1]) or 0
++    local delay = tonumber(jobAttributes[2]) or 0
++
++    if delay > 0 then
++      local delayedTimestamp = tonumber(timestamp) + delay 
++      local score = delayedTimestamp * 0x1000
++      local parentDelayedKey = parentQueueKey .. ":delayed" 
++      rcall("ZADD", parentDelayedKey, score, parentId)
++      rcall("XADD", parentQueueKey .. ":events", "*", "event", "delayed", "jobId", parentId,
++        "delay", delayedTimestamp)
++
++      addDelayMarkerIfNeeded(parentTarget, parentDelayedKey)
++    else
++      if priority == 0 then
++        rcall("RPUSH", parentTarget, parentId)
++      else
++        addJobWithPriority(parentWaitKey, parentQueueKey .. ":prioritized", priority, paused,
++          parentId, parentQueueKey .. ":pc")
++      end
++  
++      rcall("XADD", parentQueueKey .. ":events", "*", "event", "waiting", "jobId", parentId,
++        "prev", "waiting-children")
++    end
++  end
++end
+diff --git a/src/commands/includes/updateParentDepsIfNeeded.lua b/src/commands/includes/updateParentDepsIfNeeded.lua
+index 590776d4ae..feaf01963d 100644
+--- a/src/commands/includes/updateParentDepsIfNeeded.lua
++++ b/src/commands/includes/updateParentDepsIfNeeded.lua
+@@ -3,40 +3,11 @@
+ ]]
+ 
+ -- Includes
+---- @include "addDelayMarkerIfNeeded"
+---- @include "addJobWithPriority"
+---- @include "getTargetQueueList"
++--- @include "moveParentToWaitIfNeeded"
+ 
+ local function updateParentDepsIfNeeded(parentKey, parentQueueKey, parentDependenciesKey,
+   parentId, jobIdKey, returnvalue, timestamp )
+   local processedSet = parentKey .. ":processed"
+   rcall("HSET", processedSet, jobIdKey, returnvalue)
+-  local activeParent = rcall("ZSCORE", parentQueueKey .. ":waiting-children", parentId)
+-  if rcall("SCARD", parentDependenciesKey) == 0 and activeParent then 
+-    rcall("ZREM", parentQueueKey .. ":waiting-children", parentId)
+-    local parentWaitKey = parentQueueKey .. ":wait"
+-    local parentTarget, paused = getTargetQueueList(parentQueueKey .. ":meta", parentWaitKey,
+-      parentQueueKey .. ":paused")
+-    local jobAttributes = rcall("HMGET", parentKey, "priority", "delay")
+-    local priority = tonumber(jobAttributes[1]) or 0
+-    local delay = tonumber(jobAttributes[2]) or 0
+-    if delay > 0 then
+-      local delayedTimestamp = tonumber(timestamp) + delay 
+-      local score = delayedTimestamp * 0x1000
+-      local parentDelayedKey = parentQueueKey .. ":delayed" 
+-      rcall("ZADD", parentDelayedKey, score, parentId)
+-
+-      rcall("XADD", parentQueueKey .. ":events", "*", "event", "delayed", "jobId", parentId,
+-        "delay", delayedTimestamp)
+-      addDelayMarkerIfNeeded(parentTarget, parentDelayedKey)
+-    else
+-      if priority == 0 then
+-        rcall("RPUSH", parentTarget, parentId)
+-      else
+-        addJobWithPriority(parentWaitKey, parentQueueKey .. ":prioritized", priority, paused,
+-          parentId, parentQueueKey .. ":pc")
+-      end
+-      rcall("XADD", parentQueueKey .. ":events", "*", "event", "waiting", "jobId", parentId, "prev", "waiting-children")
+-    end
+-  end
++  moveParentToWaitIfNeeded(parentQueueKey, parentDependenciesKey, parentKey, parentId, timestamp)
+ end
+diff --git a/src/commands/moveToFinished-13.lua b/src/commands/moveToFinished-13.lua
+index 62371ad4b0..a984f1662b 100644
+--- a/src/commands/moveToFinished-13.lua
++++ b/src/commands/moveToFinished-13.lua
+@@ -40,6 +40,7 @@
+       opts - attemptsMade
+       opts - maxMetricsSize
+       opts - fpof - fail parent on fail
++      opts - rdof - remove dependency on fail
+ 
+     Output:
+       0 OK
+@@ -60,6 +61,7 @@ local rcall = redis.call
+ --- @include "includes/moveJobFromPriorityToActive"
+ --- @include "includes/prepareJobForProcessing"
+ --- @include "includes/moveParentFromWaitingChildrenToFailed"
++--- @include "includes/moveParentToWaitIfNeeded"
+ --- @include "includes/promoteDelayedJobs"
+ --- @include "includes/removeJobsByMaxAge"
+ --- @include "includes/removeJobsByMaxCount"
+@@ -130,6 +132,7 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+         parentId = getJobIdFromKey(parentKey)
+         parentQueueKey = getJobKeyPrefix(parentKey, ":" .. parentId)
+     end
++
+     if parentId ~= "" then
+         if ARGV[5] == "completed" then
+             local dependenciesSet = parentKey .. ":dependencies"
+@@ -138,9 +141,17 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+                                          dependenciesSet, parentId, jobIdKey,
+                                          ARGV[4], timestamp)
+             end
+-        elseif opts['fpof'] then
+-            moveParentFromWaitingChildrenToFailed(parentQueueKey, parentKey,
+-                                                  parentId, jobIdKey, timestamp)
++        else
++            if opts['fpof'] then
++                moveParentFromWaitingChildrenToFailed(parentQueueKey, parentKey,
++                                            parentId, jobIdKey, timestamp)
++            elseif opts['rdof'] then
++                local dependenciesSet = parentKey .. ":dependencies"
++                if rcall("SREM", dependenciesSet, jobIdKey) == 1 then
++                    moveParentToWaitIfNeeded(parentQueueKey, dependenciesSet,
++                        parentKey, parentId, timestamp)
++                end 
++            end
+         end
+     end
+ 
+diff --git a/src/types/job-options.ts b/src/types/job-options.ts
+index 3d615fdb98..9a88d7e604 100644
+--- a/src/types/job-options.ts
++++ b/src/types/job-options.ts
+@@ -5,6 +5,11 @@ export type JobsOptions = BaseJobOptions & {
+    * If true, moves parent to failed.
+    */
+   failParentOnFailure?: boolean;
++
++  /**
++   * If true, removes the job from its parent dependencies when it fails after all attempts.
++   */
++  removeDependencyOnFailure?: boolean;
+ };
+ 
+ /**
+@@ -20,4 +25,9 @@ export type RedisJobOptions = BaseJobOptions & {
+    * Maximum amount of log entries that will be preserved
+    */
+   kl?: number;
++
++  /**
++   * If true, removes the job from its parent dependencies when it fails after all attempts.
++   */
++  rdof?: boolean;
+ };

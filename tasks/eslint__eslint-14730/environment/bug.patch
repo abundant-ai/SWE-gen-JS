@@ -1,0 +1,539 @@
+diff --git a/docs/developer-guide/nodejs-api.md b/docs/developer-guide/nodejs-api.md
+index 449d1ec08..daa56e764 100644
+--- a/docs/developer-guide/nodejs-api.md
++++ b/docs/developer-guide/nodejs-api.md
+@@ -355,9 +355,7 @@ The `LintResult` value is the information of the linting result of each file. Th
+ * `fixableWarningCount` (`number`)<br>
+   The number of warnings that can be fixed automatically by the `fix` constructor option.
+ * `errorCount` (`number`)<br>
+-  The number of errors. This includes fixable errors and fatal errors.
+-* `fatalErrorCount` (`number`)<br>
+-  The number of fatal errors.
++  The number of errors. This includes fixable errors.
+ * `warningCount` (`number`)<br>
+   The number of warnings. This includes fixable warnings.
+ * `output` (`string | undefined`)<br>
+diff --git a/docs/user-guide/command-line-interface.md b/docs/user-guide/command-line-interface.md
+index 4500e6ff6..99fd61eb9 100644
+--- a/docs/user-guide/command-line-interface.md
++++ b/docs/user-guide/command-line-interface.md
+@@ -81,7 +81,6 @@ Miscellaneous:
+   --init                         Run config initialization wizard - default: false
+   --env-info                     Output execution environment information - default: false
+   --no-error-on-unmatched-pattern  Prevent errors when pattern is unmatched - default: false
+-  --exit-on-fatal-error          Exit with exit code 2 in case of fatal error - default: false
+   --debug                        Output debugging information
+   -h, --help                     Show help
+   -v, --version                  Output the version number
+@@ -468,10 +467,6 @@ This option outputs information about the execution environment, including the v
+ 
+ This option prevents errors when a quoted glob pattern or `--ext` is unmatched. This will not prevent errors when your shell can't match a glob.
+ 
+-#### `--exit-on-fatal-error`
+-
+-This option causes ESLint to exit with exit code 2 if one or more fatal parsing errors occur. Without this option, fatal parsing errors are reported as rule violations.
+-
+ #### `--debug`
+ 
+ This option outputs debugging information to the console. This information is useful when you're seeing a problem and having a hard time pinpointing it. The ESLint team may ask for this debugging information to help solve bugs.
+diff --git a/lib/cli-engine/cli-engine.js b/lib/cli-engine/cli-engine.js
+index 24f6a10d1..ca298f9c3 100644
+--- a/lib/cli-engine/cli-engine.js
++++ b/lib/cli-engine/cli-engine.js
+@@ -156,9 +156,6 @@ function calculateStatsPerFile(messages) {
+     return messages.reduce((stat, message) => {
+         if (message.fatal || message.severity === 2) {
+             stat.errorCount++;
+-            if (message.fatal) {
+-                stat.fatalErrorCount++;
+-            }
+             if (message.fix) {
+                 stat.fixableErrorCount++;
+             }
+@@ -171,7 +168,6 @@ function calculateStatsPerFile(messages) {
+         return stat;
+     }, {
+         errorCount: 0,
+-        fatalErrorCount: 0,
+         warningCount: 0,
+         fixableErrorCount: 0,
+         fixableWarningCount: 0
+@@ -187,14 +183,12 @@ function calculateStatsPerFile(messages) {
+ function calculateStatsPerRun(results) {
+     return results.reduce((stat, result) => {
+         stat.errorCount += result.errorCount;
+-        stat.fatalErrorCount += result.fatalErrorCount;
+         stat.warningCount += result.warningCount;
+         stat.fixableErrorCount += result.fixableErrorCount;
+         stat.fixableWarningCount += result.fixableWarningCount;
+         return stat;
+     }, {
+         errorCount: 0,
+-        fatalErrorCount: 0,
+         warningCount: 0,
+         fixableErrorCount: 0,
+         fixableWarningCount: 0
+diff --git a/lib/cli.js b/lib/cli.js
+index 477310da5..f76676454 100644
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -131,16 +131,14 @@ function translateOptions({
+  */
+ function countErrors(results) {
+     let errorCount = 0;
+-    let fatalErrorCount = 0;
+     let warningCount = 0;
+ 
+     for (const result of results) {
+         errorCount += result.errorCount;
+-        fatalErrorCount += result.fatalErrorCount;
+         warningCount += result.warningCount;
+     }
+ 
+-    return { errorCount, fatalErrorCount, warningCount };
++    return { errorCount, warningCount };
+ }
+ 
+ /**
+@@ -316,12 +314,9 @@ const cli = {
+         if (await printResults(engine, resultsToPrint, options.format, options.outputFile)) {
+ 
+             // Errors and warnings from the original unfiltered results should determine the exit code
+-            const { errorCount, fatalErrorCount, warningCount } = countErrors(results);
+-
++            const { errorCount, warningCount } = countErrors(results);
+             const tooManyWarnings =
+                 options.maxWarnings >= 0 && warningCount > options.maxWarnings;
+-            const shouldExitForFatalErrors =
+-                options.exitOnFatalError && fatalErrorCount > 0;
+ 
+             if (!errorCount && tooManyWarnings) {
+                 log.error(
+@@ -330,10 +325,6 @@ const cli = {
+                 );
+             }
+ 
+-            if (shouldExitForFatalErrors) {
+-                return 2;
+-            }
+-
+             return (errorCount || tooManyWarnings) ? 1 : 0;
+         }
+ 
+diff --git a/lib/options.js b/lib/options.js
+index e3661ec81..92c140bd3 100644
+--- a/lib/options.js
++++ b/lib/options.js
+@@ -290,12 +290,6 @@ module.exports = optionator({
+             default: "true",
+             description: "Prevent errors when pattern is unmatched"
+         },
+-        {
+-            option: "exit-on-fatal-error",
+-            type: "Boolean",
+-            default: "false",
+-            description: "Exit with exit code 2 in case of fatal error"
+-        },
+         {
+             option: "debug",
+             type: "Boolean",
+diff --git a/tests/bin/eslint.js b/tests/bin/eslint.js
+index 4fed66aed..7500d6611 100644
+--- a/tests/bin/eslint.js
++++ b/tests/bin/eslint.js
+@@ -89,7 +89,6 @@ describe("bin/eslint.js", () => {
+                     filePath: "<text>",
+                     messages: [],
+                     errorCount: 0,
+-                    fatalErrorCount: 0,
+                     warningCount: 0,
+                     fixableErrorCount: 0,
+                     fixableWarningCount: 0,
+@@ -118,14 +117,6 @@ describe("bin/eslint.js", () => {
+             return assertExitCode(child, 1);
+         });
+ 
+-        it("has exit code 2 if a syntax error is thrown when exit-on-fatal-error is true", () => {
+-            const child = runESLint(["--stdin", "--no-eslintrc", "--exit-on-fatal-error"]);
+-
+-            child.stdin.write("This is not valid JS syntax.\n");
+-            child.stdin.end();
+-            return assertExitCode(child, 2);
+-        });
+-
+         it("has exit code 1 if a linting error occurs", () => {
+             const child = runESLint(["--stdin", "--no-eslintrc", "--rule", "semi:2"]);
+ 
+diff --git a/tests/fixtures/exit-on-fatal-error/fatal-error.js b/tests/fixtures/exit-on-fatal-error/fatal-error.js
+deleted file mode 100644
+index 53a47a5b7..000000000
+--- a/tests/fixtures/exit-on-fatal-error/fatal-error.js
++++ /dev/null
+@@ -1 +0,0 @@
+-var foo  1
+\ No newline at end of file
+diff --git a/tests/fixtures/exit-on-fatal-error/no-fatal-error-rule-violation.js b/tests/fixtures/exit-on-fatal-error/no-fatal-error-rule-violation.js
+deleted file mode 100644
+index a23ad4a79..000000000
+--- a/tests/fixtures/exit-on-fatal-error/no-fatal-error-rule-violation.js
++++ /dev/null
+@@ -1,3 +0,0 @@
+-/*eslint no-unused-vars: "error"*/
+-
+-var foo = 1;
+\ No newline at end of file
+diff --git a/tests/fixtures/exit-on-fatal-error/no-fatal-error.js b/tests/fixtures/exit-on-fatal-error/no-fatal-error.js
+deleted file mode 100644
+index d5814b856..000000000
+--- a/tests/fixtures/exit-on-fatal-error/no-fatal-error.js
++++ /dev/null
+@@ -1 +0,0 @@
+-var foo = 1;
+\ No newline at end of file
+diff --git a/tests/lib/cli-engine/cli-engine.js b/tests/lib/cli-engine/cli-engine.js
+index 680317b29..59243b0b7 100644
+--- a/tests/lib/cli-engine/cli-engine.js
++++ b/tests/lib/cli-engine/cli-engine.js
+@@ -144,7 +144,6 @@ describe("CLIEngine", () => {
+             assert.strictEqual(report.results.length, 1);
+             assert.strictEqual(report.errorCount, 5);
+             assert.strictEqual(report.warningCount, 0);
+-            assert.strictEqual(report.fatalErrorCount, 0);
+             assert.strictEqual(report.fixableErrorCount, 3);
+             assert.strictEqual(report.fixableWarningCount, 0);
+             assert.strictEqual(report.results[0].messages.length, 5);
+@@ -311,7 +310,6 @@ describe("CLIEngine", () => {
+                         messages: [],
+                         errorCount: 0,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         output: "var bar = foo;"
+@@ -319,7 +317,6 @@ describe("CLIEngine", () => {
+                 ],
+                 errorCount: 0,
+                 warningCount: 0,
+-                fatalErrorCount: 0,
+                 fixableErrorCount: 0,
+                 fixableWarningCount: 0,
+                 usedDeprecatedRules: []
+@@ -522,7 +519,6 @@ describe("CLIEngine", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         source: "var bar = foo"
+@@ -530,7 +526,6 @@ describe("CLIEngine", () => {
+                 ],
+                 errorCount: 1,
+                 warningCount: 0,
+-                fatalErrorCount: 0,
+                 fixableErrorCount: 0,
+                 fixableWarningCount: 0,
+                 usedDeprecatedRules: []
+@@ -567,7 +562,6 @@ describe("CLIEngine", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 1,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         output: "var bar = foothis is a syntax error."
+@@ -575,7 +569,6 @@ describe("CLIEngine", () => {
+                 ],
+                 errorCount: 1,
+                 warningCount: 0,
+-                fatalErrorCount: 1,
+                 fixableErrorCount: 0,
+                 fixableWarningCount: 0,
+                 usedDeprecatedRules: []
+@@ -611,7 +604,6 @@ describe("CLIEngine", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 1,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         source: "var bar ="
+@@ -619,7 +611,6 @@ describe("CLIEngine", () => {
+                 ],
+                 errorCount: 1,
+                 warningCount: 0,
+-                fatalErrorCount: 1,
+                 fixableErrorCount: 0,
+                 fixableWarningCount: 0,
+                 usedDeprecatedRules: []
+@@ -701,7 +692,6 @@ describe("CLIEngine", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 1,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         source: "var bar = foothis is a syntax error.\n return bar;"
+@@ -709,7 +699,6 @@ describe("CLIEngine", () => {
+                 ],
+                 errorCount: 1,
+                 warningCount: 0,
+-                fatalErrorCount: 1,
+                 fixableErrorCount: 0,
+                 fixableWarningCount: 0,
+                 usedDeprecatedRules: []
+@@ -1695,7 +1684,6 @@ describe("CLIEngine", () => {
+                         messages: [],
+                         errorCount: 0,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         output: "true ? \"yes\" : \"no\";\n"
+@@ -1705,7 +1693,6 @@ describe("CLIEngine", () => {
+                         messages: [],
+                         errorCount: 0,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0
+                     },
+@@ -1726,7 +1713,6 @@ describe("CLIEngine", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         output: "var msg = \"hi\";\nif (msg == \"hi\") {\n\n}\n"
+@@ -1748,7 +1734,6 @@ describe("CLIEngine", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         output: "var msg = \"hi\" + foo;\n"
+@@ -5092,7 +5077,6 @@ describe("CLIEngine", () => {
+                             ],
+                             errorCount: 1,
+                             warningCount: 0,
+-                            fatalErrorCount: 0,
+                             fixableErrorCount: 0,
+                             fixableWarningCount: 0,
+                             source: "/* eslint-disable */"
+@@ -5100,7 +5084,6 @@ describe("CLIEngine", () => {
+                     ],
+                     errorCount: 1,
+                     warningCount: 0,
+-                    fatalErrorCount: 0,
+                     fixableErrorCount: 0,
+                     fixableWarningCount: 0,
+                     usedDeprecatedRules: []
+@@ -6172,8 +6155,7 @@ describe("CLIEngine", () => {
+                             }
+                         ],
+                         source: "a == b",
+-                        warningCount: 0,
+-                        fatalErrorCount: 0
++                        warningCount: 0
+                     }
+                 ]);
+             });
+@@ -6195,8 +6177,7 @@ describe("CLIEngine", () => {
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         messages: [],
+-                        warningCount: 0,
+-                        fatalErrorCount: 0
++                        warningCount: 0
+                     }
+                 ]);
+             });
+@@ -6242,8 +6223,7 @@ describe("CLIEngine", () => {
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         messages: [],
+-                        warningCount: 0,
+-                        fatalErrorCount: 0
++                        warningCount: 0
+                     }
+                 ]);
+             });
+@@ -6278,8 +6258,7 @@ describe("CLIEngine", () => {
+                             }
+                         ],
+                         source: "a == b",
+-                        warningCount: 0,
+-                        fatalErrorCount: 0
++                        warningCount: 0
+                     }
+                 ]);
+             });
+diff --git a/tests/lib/cli.js b/tests/lib/cli.js
+index dbfe03c26..d1fea182d 100644
+--- a/tests/lib/cli.js
++++ b/tests/lib/cli.js
+@@ -803,38 +803,6 @@ describe("cli", () => {
+         });
+     });
+ 
+-    describe("when given the exit-on-fatal-error flag", () => {
+-        it("should not change exit code if no fatal errors are reported", async () => {
+-            const filePath = getFixturePath("exit-on-fatal-error", "no-fatal-error.js");
+-            const exitCode = await cli.execute(`--no-ignore --exit-on-fatal-error ${filePath}`);
+-
+-            assert.strictEqual(exitCode, 0);
+-        });
+-
+-        it("should exit with exit code 1 if no fatal errors are found, but rule violations are found", async () => {
+-            const filePath = getFixturePath("exit-on-fatal-error", "no-fatal-error-rule-violation.js");
+-            const exitCode = await cli.execute(`--no-ignore --exit-on-fatal-error ${filePath}`);
+-
+-            assert.strictEqual(exitCode, 1);
+-        });
+-
+-        it("should exit with exit code 2 if fatal error is found", async () => {
+-            const filePath = getFixturePath("exit-on-fatal-error", "fatal-error.js");
+-            const exitCode = await cli.execute(`--no-ignore --exit-on-fatal-error ${filePath}`);
+-
+-            assert.strictEqual(exitCode, 2);
+-        });
+-
+-        it("should exit with exit code 2 if fatal error is found in any file", async () => {
+-            const filePath = getFixturePath("exit-on-fatal-error");
+-            const exitCode = await cli.execute(`--no-ignore --exit-on-fatal-error ${filePath}`);
+-
+-            assert.strictEqual(exitCode, 2);
+-        });
+-
+-
+-    });
+-
+     describe("when passed --no-inline-config", () => {
+         let localCLI;
+ 
+diff --git a/tests/lib/eslint/eslint.js b/tests/lib/eslint/eslint.js
+index aa35b842e..c5a1b7360 100644
+--- a/tests/lib/eslint/eslint.js
++++ b/tests/lib/eslint/eslint.js
+@@ -397,7 +397,6 @@ describe("ESLint", () => {
+                     messages: [],
+                     errorCount: 0,
+                     warningCount: 0,
+-                    fatalErrorCount: 0,
+                     fixableErrorCount: 0,
+                     fixableWarningCount: 0,
+                     output: "var bar = foo;",
+@@ -598,7 +597,6 @@ describe("ESLint", () => {
+                     ],
+                     errorCount: 1,
+                     warningCount: 0,
+-                    fatalErrorCount: 0,
+                     fixableErrorCount: 0,
+                     fixableWarningCount: 0,
+                     source: "var bar = foo",
+@@ -638,7 +636,6 @@ describe("ESLint", () => {
+                     ],
+                     errorCount: 1,
+                     warningCount: 0,
+-                    fatalErrorCount: 1,
+                     fixableErrorCount: 0,
+                     fixableWarningCount: 0,
+                     output: "var bar = foothis is a syntax error.",
+@@ -677,7 +674,6 @@ describe("ESLint", () => {
+                     ],
+                     errorCount: 1,
+                     warningCount: 0,
+-                    fatalErrorCount: 1,
+                     fixableErrorCount: 0,
+                     fixableWarningCount: 0,
+                     source: "var bar =",
+@@ -765,7 +761,6 @@ describe("ESLint", () => {
+                     ],
+                     errorCount: 1,
+                     warningCount: 0,
+-                    fatalErrorCount: 1,
+                     fixableErrorCount: 0,
+                     fixableWarningCount: 0,
+                     source: "var bar = foothis is a syntax error.\n return bar;",
+@@ -1663,7 +1658,6 @@ describe("ESLint", () => {
+                         messages: [],
+                         errorCount: 0,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         output: "true ? \"yes\" : \"no\";\n",
+@@ -1674,7 +1668,6 @@ describe("ESLint", () => {
+                         messages: [],
+                         errorCount: 0,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         usedDeprecatedRules: []
+@@ -1696,7 +1689,6 @@ describe("ESLint", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         output: "var msg = \"hi\";\nif (msg == \"hi\") {\n\n}\n",
+@@ -1719,7 +1711,6 @@ describe("ESLint", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         output: "var msg = \"hi\" + foo;\n",
+@@ -5015,7 +5006,6 @@ describe("ESLint", () => {
+                         ],
+                         errorCount: 1,
+                         warningCount: 0,
+-                        fatalErrorCount: 0,
+                         fixableErrorCount: 0,
+                         fixableWarningCount: 0,
+                         source: "/* eslint-disable */",
+@@ -6070,8 +6060,7 @@ describe("ESLint", () => {
+                         ],
+                         source: "a == b",
+                         usedDeprecatedRules: [],
+-                        warningCount: 0,
+-                        fatalErrorCount: 0
++                        warningCount: 0
+                     }
+                 ]);
+             });
+@@ -6094,8 +6083,7 @@ describe("ESLint", () => {
+                         fixableWarningCount: 0,
+                         messages: [],
+                         usedDeprecatedRules: [],
+-                        warningCount: 0,
+-                        fatalErrorCount: 0
++                        warningCount: 0
+                     }
+                 ]);
+             });
+@@ -6142,8 +6130,7 @@ describe("ESLint", () => {
+                         fixableWarningCount: 0,
+                         messages: [],
+                         usedDeprecatedRules: [],
+-                        warningCount: 0,
+-                        fatalErrorCount: 0
++                        warningCount: 0
+                     }
+                 ]);
+             });
+@@ -6179,8 +6166,7 @@ describe("ESLint", () => {
+                         ],
+                         source: "a == b",
+                         usedDeprecatedRules: [],
+-                        warningCount: 0,
+-                        fatalErrorCount: 0
++                        warningCount: 0
+                     }
+                 ]);
+             });

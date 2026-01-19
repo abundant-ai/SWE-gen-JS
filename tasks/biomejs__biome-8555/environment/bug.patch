@@ -1,0 +1,834 @@
+diff --git a/crates/biome_html_parser/src/lexer/mod.rs b/crates/biome_html_parser/src/lexer/mod.rs
+index 1543690b21..fb77546c0c 100644
+--- a/crates/biome_html_parser/src/lexer/mod.rs
++++ b/crates/biome_html_parser/src/lexer/mod.rs
+@@ -339,38 +339,36 @@ impl<'src> HtmlLexer<'src> {
+     /// Consumes a restricted single text expression that stops at specific keywords
+     /// (e.g., 'as' in Svelte #each blocks). Tracks nested brackets and stops when
+     /// encountering a keyword at the top level.
+-    ///
+-    /// Finding a `{` at the top level will emit an error token.
+     fn consume_restricted_single_text_expression(
+         &mut self,
+         kind: RestrictedExpressionStopAt,
+     ) -> HtmlSyntaxKind {
+         let start_pos = self.position;
+         let mut brackets_stack = 0;
+-
+-        let is_opening_paren = |byte: u8| byte == b'(' || byte == b'[' || byte == b'{';
+-        let is_closing_paren = |byte: u8| byte == b')' || byte == b']' || byte == b'}';
+-
+         while let Some(current) = self.current_byte() {
+             match current {
+-                // That's usually the case where we find a tag
+-                _ if current == b'<' && brackets_stack == 0 => break,
+-                _ if is_opening_paren(current) && !kind.matches_punct(current) => {
+-                    brackets_stack += 1;
+-                    self.advance(1)
+-                }
+-                _ if is_closing_paren(current) && !kind.matches_punct(current) => {
++                b'}' => {
+                     if brackets_stack == 0 {
+                         // Reached the closing brace
+                         break;
+                     } else {
+                         brackets_stack -= 1;
+-                        self.advance(1)
++                        self.advance(1);
+                     }
+                 }
+-
++                b'{' => {
++                    brackets_stack += 1;
++                    self.advance(1);
++                }
+                 _ if brackets_stack == 0 && !is_at_start_identifier(current) => {
+-                    let should_stop = kind.matches_punct(current);
++                    let should_stop = match kind {
++                        RestrictedExpressionStopAt::AsOrComma => current == b',',
++                        RestrictedExpressionStopAt::OpeningParenOrComma => {
++                            current == b'(' || current == b','
++                        }
++                        RestrictedExpressionStopAt::ClosingParen => current == b')',
++                        RestrictedExpressionStopAt::ThenOrCatch => false,
++                    };
+                     if should_stop {
+                         break;
+                     }
+@@ -382,8 +380,17 @@ impl<'src> HtmlLexer<'src> {
+                     let prev_byte = self.prev_byte();
+                     if let Some(keyword_kind) = self.consume_language_identifier(current) {
+                         // Check if this keyword is in our stop list
+-                        let should_stop =
+-                            kind.matches_keyword(keyword_kind) && prev_byte == Some(b' ');
++                        let should_stop = match kind {
++                            RestrictedExpressionStopAt::AsOrComma => {
++                                keyword_kind == AS_KW && prev_byte == Some(b' ')
++                            }
++                            RestrictedExpressionStopAt::ThenOrCatch => {
++                                (keyword_kind == THEN_KW || keyword_kind == CATCH_KW)
++                                    && prev_byte == Some(b' ')
++                            }
++                            RestrictedExpressionStopAt::OpeningParenOrComma => false,
++                            RestrictedExpressionStopAt::ClosingParen => false,
++                        };
+ 
+                         if should_stop {
+                             // Rewind - don't consume the keyword
+diff --git a/crates/biome_html_parser/src/syntax/svelte.rs b/crates/biome_html_parser/src/syntax/svelte.rs
+index 7e598a08af..2f10ecaf63 100644
+--- a/crates/biome_html_parser/src/syntax/svelte.rs
++++ b/crates/biome_html_parser/src/syntax/svelte.rs
+@@ -151,8 +151,6 @@ pub(crate) fn parse_else_clause(p: &mut HtmlParser) -> ParsedSyntax {
+     Present(m.complete(p, SVELTE_ELSE_CLAUSE))
+ }
+ 
+-// #region parse `{#each}` functions
+-
+ fn parse_each_block(p: &mut HtmlParser, parent_marker: Marker) -> ParsedSyntax {
+     if !p.at(T![each]) {
+         parent_marker.abandon(p);
+@@ -284,6 +282,11 @@ fn parse_svelte_block_item(p: &mut HtmlParser) -> ParsedSyntax {
+     } else if p.at(T![,]) {
+         parse_each_keyed_item(p)
+     } else {
++        // Error: missing 'as' or ','
++        p.error(p.err_builder(
++            "Expected 'as' keyword for item binding or ',' for index-only syntax",
++            p.cur_range(),
++        ));
+         Absent
+     }
+ }
+@@ -340,7 +343,6 @@ fn parse_each_opening_block(p: &mut HtmlParser, parent_marker: Marker) -> (Parse
+         has_errors,
+     )
+ }
+-// #endregion
+ 
+ // #region await parse functions
+ 
+@@ -486,6 +488,13 @@ impl ParseNodeList for AwaitClausesList {
+             .and_then(|parsed| {
+                 let range = parsed.range(p);
+ 
++                if self.seen_then_block.is_none() && block_parsed == BlockParsed::Catch {
++                    p.error(
++                        p.err_builder("{:catch} cannot appear before the {:then} block.", range)
++                            .with_detail(p.cur_range(), "This is where the {:then} block starts."),
++                    )
++                }
++
+                 if let Some(seen_catch_block) = self.seen_catch_block
+                     && block_parsed == BlockParsed::Catch
+                 {
+@@ -514,19 +523,6 @@ impl ParseNodeList for AwaitClausesList {
+                     self.seen_then_block = Some(range);
+                 }
+ 
+-                if let Some(catch_range) = self.seen_catch_block
+-                    && let Some(then_range) = self.seen_then_block
+-                    && catch_range < then_range
+-                {
+-                    p.error(
+-                        p.err_builder(
+-                            "{:catch} cannot appear before the {:then} block.",
+-                            catch_range,
+-                        )
+-                        .with_detail(then_range, "This is where the {:then} block starts."),
+-                    )
+-                }
+-
+                 Present(parsed)
+             })
+             .or_else(|| Absent)
+diff --git a/crates/biome_html_parser/src/token_source.rs b/crates/biome_html_parser/src/token_source.rs
+index 049ac3391f..4e1ecad298 100644
+--- a/crates/biome_html_parser/src/token_source.rs
++++ b/crates/biome_html_parser/src/token_source.rs
+@@ -1,5 +1,5 @@
+ use crate::lexer::HtmlLexer;
+-use biome_html_syntax::HtmlSyntaxKind::{AS_KW, CATCH_KW, EOF, THEN_KW};
++use biome_html_syntax::HtmlSyntaxKind::EOF;
+ use biome_html_syntax::{HtmlSyntaxKind, TextRange};
+ use biome_parser::diagnostic::ParseDiagnostic;
+ use biome_parser::lexer::{BufferedLexer, LexContext};
+@@ -94,26 +94,6 @@ pub(crate) enum RestrictedExpressionStopAt {
+     ThenOrCatch,
+ }
+ 
+-impl RestrictedExpressionStopAt {
+-    pub(crate) fn matches_punct(&self, byte: u8) -> bool {
+-        match self {
+-            Self::AsOrComma => byte == b',',
+-            Self::OpeningParenOrComma => byte == b'(' || byte == b',',
+-            Self::ClosingParen => byte == b')',
+-            Self::ThenOrCatch => false,
+-        }
+-    }
+-
+-    pub(crate) fn matches_keyword(&self, keyword: HtmlSyntaxKind) -> bool {
+-        match self {
+-            Self::AsOrComma => keyword == AS_KW,
+-            Self::OpeningParenOrComma => false,
+-            Self::ClosingParen => false,
+-            Self::ThenOrCatch => keyword == THEN_KW || keyword == CATCH_KW,
+-        }
+-    }
+-}
+-
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum HtmlEmbeddedLanguage {
+     Script,
+diff --git a/crates/biome_html_parser/tests/html_specs/error/svelte/await_catch_before_then.svelte.snap b/crates/biome_html_parser/tests/html_specs/error/svelte/await_catch_before_then.svelte.snap
+index 6825e5bd84..db44051a89 100644
+--- a/crates/biome_html_parser/tests/html_specs/error/svelte/await_catch_before_then.svelte.snap
++++ b/crates/biome_html_parser/tests/html_specs/error/svelte/await_catch_before_then.svelte.snap
+@@ -263,10 +263,8 @@ await_catch_before_then.svelte:3:1 parse ━━━━━━━━━━━━━
+     3 │ {:catch error}
+     4 │   <p>{error.message}</p>
+   > 5 │ {:then value}
+-      │ ^^^^^^^^^^^^^
+-  > 6 │   <p>{value}</p>
+-      │   ^^^^^^^^^^^^^^
++      │ ^^
++    6 │   <p>{value}</p>
+     7 │ {/await}
+-    8 │ 
+   
+ ```
+diff --git a/crates/biome_html_parser/tests/html_specs/error/svelte/await_invalid_catch_only_with_clause.svelte.snap b/crates/biome_html_parser/tests/html_specs/error/svelte/await_invalid_catch_only_with_clause.svelte.snap
+index 014d85da8d..6c2b15ce53 100644
+--- a/crates/biome_html_parser/tests/html_specs/error/svelte/await_invalid_catch_only_with_clause.svelte.snap
++++ b/crates/biome_html_parser/tests/html_specs/error/svelte/await_invalid_catch_only_with_clause.svelte.snap
+@@ -212,4 +212,25 @@ await_invalid_catch_only_with_clause.svelte:5:1 parse ━━━━━━━━
+     2 │   <p>{error.message}</p>
+     3 │ {:catch anotherError}
+   
++await_invalid_catch_only_with_clause.svelte:3:1 parse ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++
++  × {:catch} cannot appear before the {:then} block.
++  
++    1 │ {#await promise catch error}
++    2 │   <p>{error.message}</p>
++  > 3 │ {:catch anotherError}
++      │ ^^^^^^^^^^^^^^^^^^^^^
++  > 4 │   <p>{anotherError.message}</p>
++      │   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++    5 │ {/await}
++    6 │ 
++  
++  i This is where the {:then} block starts.
++  
++    3 │ {:catch anotherError}
++    4 │   <p>{anotherError.message}</p>
++  > 5 │ {/await}
++      │ ^^
++    6 │ 
++  
+ ```
+diff --git a/crates/biome_html_parser/tests/html_specs/error/svelte/each_unclosed.svelte.snap b/crates/biome_html_parser/tests/html_specs/error/svelte/each_unclosed.svelte.snap
+index 0e971480bd..2fe113529c 100644
+--- a/crates/biome_html_parser/tests/html_specs/error/svelte/each_unclosed.svelte.snap
++++ b/crates/biome_html_parser/tests/html_specs/error/svelte/each_unclosed.svelte.snap
+@@ -30,18 +30,14 @@ HtmlRoot {
+                 item: SvelteEachAsKeyedItem {
+                     as_token: AS_KW@13..15 "as" [] [],
+                     name: HtmlTextExpression {
+-                        html_literal_token: HTML_LITERAL@15..23 " item\n  " [] [],
++                        html_literal_token: HTML_LITERAL@15..49 " item\n  <div>{item}</div>\n{/each}\n" [] [],
+                     },
+                     index: missing (optional),
+                     key: missing (optional),
+                 },
+                 r_curly_token: missing (required),
+             },
+-            children: HtmlElementList [
+-                HtmlContent {
+-                    value_token: HTML_LITERAL@23..49 "<div>{item}</div>\n{/each}\n" [] [],
+-                },
+-            ],
++            children: HtmlElementList [],
+             else_clause: missing (optional),
+             closing_block: missing (required),
+         },
+@@ -59,21 +55,19 @@ HtmlRoot {
+   2: (empty)
+   3: HTML_ELEMENT_LIST@0..49
+     0: SVELTE_EACH_BLOCK@0..49
+-      0: SVELTE_EACH_OPENING_BLOCK@0..23
++      0: SVELTE_EACH_OPENING_BLOCK@0..49
+         0: SV_CURLY_HASH@0..2 "{#" [] []
+         1: EACH_KW@2..6 "each" [] []
+         2: HTML_TEXT_EXPRESSION@6..13
+           0: HTML_LITERAL@6..13 " items " [] []
+-        3: SVELTE_EACH_AS_KEYED_ITEM@13..23
++        3: SVELTE_EACH_AS_KEYED_ITEM@13..49
+           0: AS_KW@13..15 "as" [] []
+-          1: HTML_TEXT_EXPRESSION@15..23
+-            0: HTML_LITERAL@15..23 " item\n  " [] []
++          1: HTML_TEXT_EXPRESSION@15..49
++            0: HTML_LITERAL@15..49 " item\n  <div>{item}</div>\n{/each}\n" [] []
+           2: (empty)
+           3: (empty)
+         4: (empty)
+-      1: HTML_ELEMENT_LIST@23..49
+-        0: HTML_CONTENT@23..49
+-          0: HTML_LITERAL@23..49 "<div>{item}</div>\n{/each}\n" [] []
++      1: HTML_ELEMENT_LIST@49..49
+       2: (empty)
+       3: (empty)
+   4: EOF@49..49 "" [] []
+@@ -83,33 +77,16 @@ HtmlRoot {
+ ## Diagnostics
+ 
+ ```
+-each_unclosed.svelte:2:3 parse ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  × expected `}` but instead found `<div>{item}</div>
+-    {/each}
+-    `
+-  
+-    1 │ {#each items as item
+-  > 2 │   <div>{item}</div>
+-      │   ^^^^^^^^^^^^^^^^^
+-  > 3 │ {/each}
+-  > 4 │ 
+-      │ 
+-  
+-  i Remove <div>{item}</div>
+-    {/each}
+-  
+-  
+ each_unclosed.svelte:4:1 parse ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+-  × Expected a closing block, instead found none.
++  × expected `}` but instead the file ends
+   
+     2 │   <div>{item}</div>
+     3 │ {/each}
+   > 4 │ 
+       │ 
+   
+-  i This is where the block started.
++  i the file ends here
+   
+     2 │   <div>{item}</div>
+     3 │ {/each}
+diff --git a/crates/biome_html_parser/tests/html_specs/error/svelte/invalid_curly_in_expression.svelte b/crates/biome_html_parser/tests/html_specs/error/svelte/invalid_curly_in_expression.svelte
+deleted file mode 100644
+index 23e7add266..0000000000
+--- a/crates/biome_html_parser/tests/html_specs/error/svelte/invalid_curly_in_expression.svelte
++++ /dev/null
+@@ -1,2 +0,0 @@
+-{#each somethi{}}
+-{/each}
+diff --git a/crates/biome_html_parser/tests/html_specs/error/svelte/invalid_curly_in_expression.svelte.snap b/crates/biome_html_parser/tests/html_specs/error/svelte/invalid_curly_in_expression.svelte.snap
+deleted file mode 100644
+index dc1f0017c5..0000000000
+--- a/crates/biome_html_parser/tests/html_specs/error/svelte/invalid_curly_in_expression.svelte.snap
++++ /dev/null
+@@ -1,83 +0,0 @@
+----
+-source: crates/biome_html_parser/tests/spec_test.rs
+-expression: snapshot
+----
+-## Input
+-
+-```svelte
+-{#each somethi{}}
+-{/each}
+-
+-```
+-
+-
+-## AST
+-
+-```
+-HtmlRoot {
+-    bom_token: missing (optional),
+-    frontmatter: missing (optional),
+-    directive: missing (optional),
+-    html: HtmlElementList [
+-        SvelteBogusBlock {
+-            items: [
+-                SvelteEachOpeningBlock {
+-                    sv_curly_hash_token: SV_CURLY_HASH@0..2 "{#" [] [],
+-                    each_token: EACH_KW@2..6 "each" [] [],
+-                    list: HtmlTextExpression {
+-                        html_literal_token: HTML_LITERAL@6..16 " somethi{}" [] [],
+-                    },
+-                    item: missing (optional),
+-                    r_curly_token: R_CURLY@16..17 "}" [] [],
+-                },
+-                HtmlElementList [],
+-                SvelteEachClosingBlock {
+-                    sv_curly_slash_token: SV_CURLY_SLASH@17..20 "{/" [Newline("\n")] [],
+-                    each_token: EACH_KW@20..24 "each" [] [],
+-                    r_curly_token: R_CURLY@24..25 "}" [] [],
+-                },
+-            ],
+-        },
+-    ],
+-    eof_token: EOF@25..26 "" [Newline("\n")] [],
+-}
+-```
+-
+-## CST
+-
+-```
+-0: HTML_ROOT@0..26
+-  0: (empty)
+-  1: (empty)
+-  2: (empty)
+-  3: HTML_ELEMENT_LIST@0..25
+-    0: SVELTE_BOGUS_BLOCK@0..25
+-      0: SVELTE_EACH_OPENING_BLOCK@0..17
+-        0: SV_CURLY_HASH@0..2 "{#" [] []
+-        1: EACH_KW@2..6 "each" [] []
+-        2: HTML_TEXT_EXPRESSION@6..16
+-          0: HTML_LITERAL@6..16 " somethi{}" [] []
+-        3: (empty)
+-        4: R_CURLY@16..17 "}" [] []
+-      1: HTML_ELEMENT_LIST@17..17
+-      2: SVELTE_EACH_CLOSING_BLOCK@17..25
+-        0: SV_CURLY_SLASH@17..20 "{/" [Newline("\n")] []
+-        1: EACH_KW@20..24 "each" [] []
+-        2: R_CURLY@24..25 "}" [] []
+-  4: EOF@25..26 "" [Newline("\n")] []
+-
+-```
+-
+-## Diagnostics
+-
+-```
+-invalid_curly_in_expression.svelte:1:17 parse ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-
+-  × Expected 'as' keyword for item binding or ',' for index-only syntax
+-  
+-  > 1 │ {#each somethi{}}
+-      │                 ^
+-    2 │ {/each}
+-    3 │ 
+-  
+-```
+diff --git a/crates/biome_html_parser/tests/html_specs/ok/svelte/await_catch_no_then.svelte b/crates/biome_html_parser/tests/html_specs/ok/svelte/await_catch_no_then.svelte
+deleted file mode 100644
+index 83177b7426..0000000000
+--- a/crates/biome_html_parser/tests/html_specs/ok/svelte/await_catch_no_then.svelte
++++ /dev/null
+@@ -1,5 +0,0 @@
+-{#await finixInit}
+-	<Icons.DotsBounce />
+-{:catch error}
+-	<p>Could not initialize form: {error.message}</p>
+-{/await}
+diff --git a/crates/biome_html_parser/tests/html_specs/ok/svelte/await_catch_no_then.svelte.snap b/crates/biome_html_parser/tests/html_specs/ok/svelte/await_catch_no_then.svelte.snap
+deleted file mode 100644
+index 5824fce353..0000000000
+--- a/crates/biome_html_parser/tests/html_specs/ok/svelte/await_catch_no_then.svelte.snap
++++ /dev/null
+@@ -1,160 +0,0 @@
+----
+-source: crates/biome_html_parser/tests/spec_test.rs
+-expression: snapshot
+----
+-## Input
+-
+-```svelte
+-{#await finixInit}
+-	<Icons.DotsBounce />
+-{:catch error}
+-	<p>Could not initialize form: {error.message}</p>
+-{/await}
+-
+-```
+-
+-
+-## AST
+-
+-```
+-HtmlRoot {
+-    bom_token: missing (optional),
+-    frontmatter: missing (optional),
+-    directive: missing (optional),
+-    html: HtmlElementList [
+-        SvelteAwaitBlock {
+-            opening_block: SvelteAwaitOpeningBlock {
+-                sv_curly_hash_token: SV_CURLY_HASH@0..2 "{#" [] [],
+-                await_token: AWAIT_KW@2..7 "await" [] [],
+-                expression: HtmlTextExpression {
+-                    html_literal_token: HTML_LITERAL@7..17 " finixInit" [] [],
+-                },
+-                then_clause: missing (optional),
+-                catch_clause: missing (optional),
+-                r_curly_token: R_CURLY@17..18 "}" [] [],
+-                children: HtmlElementList [
+-                    HtmlSelfClosingElement {
+-                        l_angle_token: L_ANGLE@18..21 "<" [Newline("\n"), Whitespace("\t")] [],
+-                        name: HtmlTagName {
+-                            value_token: HTML_LITERAL@21..38 "Icons.DotsBounce" [] [Whitespace(" ")],
+-                        },
+-                        attributes: HtmlAttributeList [],
+-                        slash_token: SLASH@38..39 "/" [] [],
+-                        r_angle_token: R_ANGLE@39..40 ">" [] [],
+-                    },
+-                ],
+-            },
+-            clauses: SvelteAwaitClausesList [
+-                SvelteAwaitCatchBlock {
+-                    sv_curly_colon_token: SV_CURLY_COLON@40..43 "{:" [Newline("\n")] [],
+-                    catch_token: CATCH_KW@43..48 "catch" [] [],
+-                    name: HtmlTextExpression {
+-                        html_literal_token: HTML_LITERAL@48..54 " error" [] [],
+-                    },
+-                    r_curly_token: R_CURLY@54..55 "}" [] [],
+-                    children: HtmlElementList [
+-                        HtmlElement {
+-                            opening_element: HtmlOpeningElement {
+-                                l_angle_token: L_ANGLE@55..58 "<" [Newline("\n"), Whitespace("\t")] [],
+-                                name: HtmlTagName {
+-                                    value_token: HTML_LITERAL@58..59 "p" [] [],
+-                                },
+-                                attributes: HtmlAttributeList [],
+-                                r_angle_token: R_ANGLE@59..60 ">" [] [],
+-                            },
+-                            children: HtmlElementList [
+-                                HtmlContent {
+-                                    value_token: HTML_LITERAL@60..87 "Could not initialize form:" [] [Whitespace(" ")],
+-                                },
+-                                HtmlSingleTextExpression {
+-                                    l_curly_token: L_CURLY@87..88 "{" [] [],
+-                                    expression: HtmlTextExpression {
+-                                        html_literal_token: HTML_LITERAL@88..101 "error.message" [] [],
+-                                    },
+-                                    r_curly_token: R_CURLY@101..102 "}" [] [],
+-                                },
+-                            ],
+-                            closing_element: HtmlClosingElement {
+-                                l_angle_token: L_ANGLE@102..103 "<" [] [],
+-                                slash_token: SLASH@103..104 "/" [] [],
+-                                name: HtmlTagName {
+-                                    value_token: HTML_LITERAL@104..105 "p" [] [],
+-                                },
+-                                r_angle_token: R_ANGLE@105..106 ">" [] [],
+-                            },
+-                        },
+-                    ],
+-                },
+-            ],
+-            closing_block: SvelteAwaitClosingBlock {
+-                sv_curly_slash_token: SV_CURLY_SLASH@106..109 "{/" [Newline("\n")] [],
+-                await_token: AWAIT_KW@109..114 "await" [] [],
+-                r_curly_token: R_CURLY@114..115 "}" [] [],
+-            },
+-        },
+-    ],
+-    eof_token: EOF@115..116 "" [Newline("\n")] [],
+-}
+-```
+-
+-## CST
+-
+-```
+-0: HTML_ROOT@0..116
+-  0: (empty)
+-  1: (empty)
+-  2: (empty)
+-  3: HTML_ELEMENT_LIST@0..115
+-    0: SVELTE_AWAIT_BLOCK@0..115
+-      0: SVELTE_AWAIT_OPENING_BLOCK@0..40
+-        0: SV_CURLY_HASH@0..2 "{#" [] []
+-        1: AWAIT_KW@2..7 "await" [] []
+-        2: HTML_TEXT_EXPRESSION@7..17
+-          0: HTML_LITERAL@7..17 " finixInit" [] []
+-        3: (empty)
+-        4: (empty)
+-        5: R_CURLY@17..18 "}" [] []
+-        6: HTML_ELEMENT_LIST@18..40
+-          0: HTML_SELF_CLOSING_ELEMENT@18..40
+-            0: L_ANGLE@18..21 "<" [Newline("\n"), Whitespace("\t")] []
+-            1: HTML_TAG_NAME@21..38
+-              0: HTML_LITERAL@21..38 "Icons.DotsBounce" [] [Whitespace(" ")]
+-            2: HTML_ATTRIBUTE_LIST@38..38
+-            3: SLASH@38..39 "/" [] []
+-            4: R_ANGLE@39..40 ">" [] []
+-      1: SVELTE_AWAIT_CLAUSES_LIST@40..106
+-        0: SVELTE_AWAIT_CATCH_BLOCK@40..106
+-          0: SV_CURLY_COLON@40..43 "{:" [Newline("\n")] []
+-          1: CATCH_KW@43..48 "catch" [] []
+-          2: HTML_TEXT_EXPRESSION@48..54
+-            0: HTML_LITERAL@48..54 " error" [] []
+-          3: R_CURLY@54..55 "}" [] []
+-          4: HTML_ELEMENT_LIST@55..106
+-            0: HTML_ELEMENT@55..106
+-              0: HTML_OPENING_ELEMENT@55..60
+-                0: L_ANGLE@55..58 "<" [Newline("\n"), Whitespace("\t")] []
+-                1: HTML_TAG_NAME@58..59
+-                  0: HTML_LITERAL@58..59 "p" [] []
+-                2: HTML_ATTRIBUTE_LIST@59..59
+-                3: R_ANGLE@59..60 ">" [] []
+-              1: HTML_ELEMENT_LIST@60..102
+-                0: HTML_CONTENT@60..87
+-                  0: HTML_LITERAL@60..87 "Could not initialize form:" [] [Whitespace(" ")]
+-                1: HTML_SINGLE_TEXT_EXPRESSION@87..102
+-                  0: L_CURLY@87..88 "{" [] []
+-                  1: HTML_TEXT_EXPRESSION@88..101
+-                    0: HTML_LITERAL@88..101 "error.message" [] []
+-                  2: R_CURLY@101..102 "}" [] []
+-              2: HTML_CLOSING_ELEMENT@102..106
+-                0: L_ANGLE@102..103 "<" [] []
+-                1: SLASH@103..104 "/" [] []
+-                2: HTML_TAG_NAME@104..105
+-                  0: HTML_LITERAL@104..105 "p" [] []
+-                3: R_ANGLE@105..106 ">" [] []
+-      2: SVELTE_AWAIT_CLOSING_BLOCK@106..115
+-        0: SV_CURLY_SLASH@106..109 "{/" [Newline("\n")] []
+-        1: AWAIT_KW@109..114 "await" [] []
+-        2: R_CURLY@114..115 "}" [] []
+-  4: EOF@115..116 "" [Newline("\n")] []
+-
+-```
+diff --git a/crates/biome_html_parser/tests/html_specs/ok/svelte/complex_expressions.svelte b/crates/biome_html_parser/tests/html_specs/ok/svelte/complex_expressions.svelte
+deleted file mode 100644
+index 98dd94bc88..0000000000
+--- a/crates/biome_html_parser/tests/html_specs/ok/svelte/complex_expressions.svelte
++++ /dev/null
+@@ -1,7 +0,0 @@
+-{#each cells.filter(f => { return f === 1}), item}
+-	<InputOTP.Slot {cell} />
+-{/each}
+-
+-{#each cells.slice(0, 3) as cell, i (i)}
+-	<InputOTP.Slot {cell} />
+-{/each}
+diff --git a/crates/biome_html_parser/tests/html_specs/ok/svelte/complex_expressions.svelte.snap b/crates/biome_html_parser/tests/html_specs/ok/svelte/complex_expressions.svelte.snap
+deleted file mode 100644
+index 422c7f9341..0000000000
+--- a/crates/biome_html_parser/tests/html_specs/ok/svelte/complex_expressions.svelte.snap
++++ /dev/null
+@@ -1,207 +0,0 @@
+----
+-source: crates/biome_html_parser/tests/spec_test.rs
+-expression: snapshot
+----
+-## Input
+-
+-```svelte
+-{#each cells.filter(f => { return f === 1}), item}
+-	<InputOTP.Slot {cell} />
+-{/each}
+-
+-{#each cells.slice(0, 3) as cell, i (i)}
+-	<InputOTP.Slot {cell} />
+-{/each}
+-
+-```
+-
+-
+-## AST
+-
+-```
+-HtmlRoot {
+-    bom_token: missing (optional),
+-    frontmatter: missing (optional),
+-    directive: missing (optional),
+-    html: HtmlElementList [
+-        SvelteEachBlock {
+-            opening_block: SvelteEachOpeningBlock {
+-                sv_curly_hash_token: SV_CURLY_HASH@0..2 "{#" [] [],
+-                each_token: EACH_KW@2..6 "each" [] [],
+-                list: HtmlTextExpression {
+-                    html_literal_token: HTML_LITERAL@6..43 " cells.filter(f => { return f === 1})" [] [],
+-                },
+-                item: SvelteEachKeyedItem {
+-                    index: SvelteEachIndex {
+-                        comma_token: COMMA@43..44 "," [] [],
+-                        value: HtmlTextExpression {
+-                            html_literal_token: HTML_LITERAL@44..49 " item" [] [],
+-                        },
+-                    },
+-                },
+-                r_curly_token: R_CURLY@49..50 "}" [] [],
+-            },
+-            children: HtmlElementList [
+-                HtmlSelfClosingElement {
+-                    l_angle_token: L_ANGLE@50..53 "<" [Newline("\n"), Whitespace("\t")] [],
+-                    name: HtmlTagName {
+-                        value_token: HTML_LITERAL@53..67 "InputOTP.Slot" [] [Whitespace(" ")],
+-                    },
+-                    attributes: HtmlAttributeList [
+-                        HtmlSingleTextExpression {
+-                            l_curly_token: L_CURLY@67..68 "{" [] [],
+-                            expression: HtmlTextExpression {
+-                                html_literal_token: HTML_LITERAL@68..72 "cell" [] [],
+-                            },
+-                            r_curly_token: R_CURLY@72..74 "}" [] [Whitespace(" ")],
+-                        },
+-                    ],
+-                    slash_token: SLASH@74..75 "/" [] [],
+-                    r_angle_token: R_ANGLE@75..76 ">" [] [],
+-                },
+-            ],
+-            else_clause: missing (optional),
+-            closing_block: SvelteEachClosingBlock {
+-                sv_curly_slash_token: SV_CURLY_SLASH@76..79 "{/" [Newline("\n")] [],
+-                each_token: EACH_KW@79..83 "each" [] [],
+-                r_curly_token: R_CURLY@83..84 "}" [] [],
+-            },
+-        },
+-        SvelteEachBlock {
+-            opening_block: SvelteEachOpeningBlock {
+-                sv_curly_hash_token: SV_CURLY_HASH@84..88 "{#" [Newline("\n"), Newline("\n")] [],
+-                each_token: EACH_KW@88..92 "each" [] [],
+-                list: HtmlTextExpression {
+-                    html_literal_token: HTML_LITERAL@92..111 " cells.slice(0, 3) " [] [],
+-                },
+-                item: SvelteEachAsKeyedItem {
+-                    as_token: AS_KW@111..113 "as" [] [],
+-                    name: HtmlTextExpression {
+-                        html_literal_token: HTML_LITERAL@113..118 " cell" [] [],
+-                    },
+-                    index: SvelteEachIndex {
+-                        comma_token: COMMA@118..119 "," [] [],
+-                        value: HtmlTextExpression {
+-                            html_literal_token: HTML_LITERAL@119..122 " i " [] [],
+-                        },
+-                    },
+-                    key: SvelteEachKey {
+-                        l_paren_token: L_PAREN@122..123 "(" [] [],
+-                        expression: HtmlTextExpression {
+-                            html_literal_token: HTML_LITERAL@123..124 "i" [] [],
+-                        },
+-                        r_paren_token: R_PAREN@124..125 ")" [] [],
+-                    },
+-                },
+-                r_curly_token: R_CURLY@125..126 "}" [] [],
+-            },
+-            children: HtmlElementList [
+-                HtmlSelfClosingElement {
+-                    l_angle_token: L_ANGLE@126..129 "<" [Newline("\n"), Whitespace("\t")] [],
+-                    name: HtmlTagName {
+-                        value_token: HTML_LITERAL@129..143 "InputOTP.Slot" [] [Whitespace(" ")],
+-                    },
+-                    attributes: HtmlAttributeList [
+-                        HtmlSingleTextExpression {
+-                            l_curly_token: L_CURLY@143..144 "{" [] [],
+-                            expression: HtmlTextExpression {
+-                                html_literal_token: HTML_LITERAL@144..148 "cell" [] [],
+-                            },
+-                            r_curly_token: R_CURLY@148..150 "}" [] [Whitespace(" ")],
+-                        },
+-                    ],
+-                    slash_token: SLASH@150..151 "/" [] [],
+-                    r_angle_token: R_ANGLE@151..152 ">" [] [],
+-                },
+-            ],
+-            else_clause: missing (optional),
+-            closing_block: SvelteEachClosingBlock {
+-                sv_curly_slash_token: SV_CURLY_SLASH@152..155 "{/" [Newline("\n")] [],
+-                each_token: EACH_KW@155..159 "each" [] [],
+-                r_curly_token: R_CURLY@159..160 "}" [] [],
+-            },
+-        },
+-    ],
+-    eof_token: EOF@160..161 "" [Newline("\n")] [],
+-}
+-```
+-
+-## CST
+-
+-```
+-0: HTML_ROOT@0..161
+-  0: (empty)
+-  1: (empty)
+-  2: (empty)
+-  3: HTML_ELEMENT_LIST@0..160
+-    0: SVELTE_EACH_BLOCK@0..84
+-      0: SVELTE_EACH_OPENING_BLOCK@0..50
+-        0: SV_CURLY_HASH@0..2 "{#" [] []
+-        1: EACH_KW@2..6 "each" [] []
+-        2: HTML_TEXT_EXPRESSION@6..43
+-          0: HTML_LITERAL@6..43 " cells.filter(f => { return f === 1})" [] []
+-        3: SVELTE_EACH_KEYED_ITEM@43..49
+-          0: SVELTE_EACH_INDEX@43..49
+-            0: COMMA@43..44 "," [] []
+-            1: HTML_TEXT_EXPRESSION@44..49
+-              0: HTML_LITERAL@44..49 " item" [] []
+-        4: R_CURLY@49..50 "}" [] []
+-      1: HTML_ELEMENT_LIST@50..76
+-        0: HTML_SELF_CLOSING_ELEMENT@50..76
+-          0: L_ANGLE@50..53 "<" [Newline("\n"), Whitespace("\t")] []
+-          1: HTML_TAG_NAME@53..67
+-            0: HTML_LITERAL@53..67 "InputOTP.Slot" [] [Whitespace(" ")]
+-          2: HTML_ATTRIBUTE_LIST@67..74
+-            0: HTML_SINGLE_TEXT_EXPRESSION@67..74
+-              0: L_CURLY@67..68 "{" [] []
+-              1: HTML_TEXT_EXPRESSION@68..72
+-                0: HTML_LITERAL@68..72 "cell" [] []
+-              2: R_CURLY@72..74 "}" [] [Whitespace(" ")]
+-          3: SLASH@74..75 "/" [] []
+-          4: R_ANGLE@75..76 ">" [] []
+-      2: (empty)
+-      3: SVELTE_EACH_CLOSING_BLOCK@76..84
+-        0: SV_CURLY_SLASH@76..79 "{/" [Newline("\n")] []
+-        1: EACH_KW@79..83 "each" [] []
+-        2: R_CURLY@83..84 "}" [] []
+-    1: SVELTE_EACH_BLOCK@84..160
+-      0: SVELTE_EACH_OPENING_BLOCK@84..126
+-        0: SV_CURLY_HASH@84..88 "{#" [Newline("\n"), Newline("\n")] []
+-        1: EACH_KW@88..92 "each" [] []
+-        2: HTML_TEXT_EXPRESSION@92..111
+-          0: HTML_LITERAL@92..111 " cells.slice(0, 3) " [] []
+-        3: SVELTE_EACH_AS_KEYED_ITEM@111..125
+-          0: AS_KW@111..113 "as" [] []
+-          1: HTML_TEXT_EXPRESSION@113..118
+-            0: HTML_LITERAL@113..118 " cell" [] []
+-          2: SVELTE_EACH_INDEX@118..122
+-            0: COMMA@118..119 "," [] []
+-            1: HTML_TEXT_EXPRESSION@119..122
+-              0: HTML_LITERAL@119..122 " i " [] []
+-          3: SVELTE_EACH_KEY@122..125
+-            0: L_PAREN@122..123 "(" [] []
+-            1: HTML_TEXT_EXPRESSION@123..124
+-              0: HTML_LITERAL@123..124 "i" [] []
+-            2: R_PAREN@124..125 ")" [] []
+-        4: R_CURLY@125..126 "}" [] []
+-      1: HTML_ELEMENT_LIST@126..152
+-        0: HTML_SELF_CLOSING_ELEMENT@126..152
+-          0: L_ANGLE@126..129 "<" [Newline("\n"), Whitespace("\t")] []
+-          1: HTML_TAG_NAME@129..143
+-            0: HTML_LITERAL@129..143 "InputOTP.Slot" [] [Whitespace(" ")]
+-          2: HTML_ATTRIBUTE_LIST@143..150
+-            0: HTML_SINGLE_TEXT_EXPRESSION@143..150
+-              0: L_CURLY@143..144 "{" [] []
+-              1: HTML_TEXT_EXPRESSION@144..148
+-                0: HTML_LITERAL@144..148 "cell" [] []
+-              2: R_CURLY@148..150 "}" [] [Whitespace(" ")]
+-          3: SLASH@150..151 "/" [] []
+-          4: R_ANGLE@151..152 ">" [] []
+-      2: (empty)
+-      3: SVELTE_EACH_CLOSING_BLOCK@152..160
+-        0: SV_CURLY_SLASH@152..155 "{/" [Newline("\n")] []
+-        1: EACH_KW@155..159 "each" [] []
+-        2: R_CURLY@159..160 "}" [] []
+-  4: EOF@160..161 "" [Newline("\n")] []
+-
+-```
+diff --git a/crates/biome_html_parser/tests/quick_test.rs b/crates/biome_html_parser/tests/quick_test.rs
+index 459b98042f..51ca743f1a 100644
+--- a/crates/biome_html_parser/tests/quick_test.rs
++++ b/crates/biome_html_parser/tests/quick_test.rs
+@@ -4,9 +4,9 @@ use biome_test_utils::has_bogus_nodes_or_empty_slots;
+ #[ignore]
+ #[test]
+ pub fn quick_test() {
+-    let code = r#"{#each items as { id, name }}
+-  <div>{id}: {name}</div>
+-{/each}"#;
++    let code = r#"{#snippet f()}
++    <p></p>
++{/snippet}"#;
+ 
+     let options = HtmlParseOptions::default().with_single_text_expression();
+     let root = parse_html(code, options);

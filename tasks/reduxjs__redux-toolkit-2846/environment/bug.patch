@@ -1,0 +1,520 @@
+diff --git a/docs/api/autoBatchEnhancer.mdx b/docs/api/autoBatchEnhancer.mdx
+deleted file mode 100644
+index d907d4db..00000000
+--- a/docs/api/autoBatchEnhancer.mdx
++++ /dev/null
+@@ -1,130 +0,0 @@
+----
+-id: autoBatchEnhancer
+-title: autoBatchEnhancer
+-sidebar_label: autoBatchEnhancer
+-hide_title: true
+----
+-
+-&nbsp;
+-
+-# `autoBatchEnhancer`
+-
+-A Redux store enhancer that looks for one or more "low-priority" dispatched actions in a row, and delays notifying subscribers until either the end of the current event loop tick or when the next "normal-priority" action is dispatched.
+-
+-## Basic Usage
+-
+-```ts
+-import {
+-  createSlice,
+-  configureStore,
+-  autoBatchEnhancer,
+-  prepareAutoBatched,
+-} from '@reduxjs/toolkit'
+-
+-interface CounterState {
+-  value: number
+-}
+-
+-const counterSlice = createSlice({
+-  name: 'counter',
+-  initialState: { value: 0 } as CounterState,
+-  reducers: {
+-    incrementBatched: {
+-      // Batched, low-priority
+-      reducer(state) {
+-        state.value += 1
+-      },
+-      // highlight-start
+-      // Use the `prepareAutoBatched` utility to automatically
+-      // add the `action.meta[SHOULD_AUTOBATCH]` field the enhancer needs
+-      prepare: prepareAutoBatched<void>(),
+-      // highlight-end
+-    },
+-    // Not batched, normal priority
+-    decrementUnbatched(state) {
+-      state.value -= 1
+-    },
+-  },
+-})
+-const { incrementBatched, decrementUnbatched } = counterSlice.actions
+-
+-const store = configureStore({
+-  reducer: counterSlice.reducer,
+-  // highlight-start
+-  enhancers: (existingEnhancers) => {
+-    // Add the autobatch enhancer to the store setup
+-    return existingEnhancers.concat(autoBatchEnhancer())
+-  },
+-  // highlight-end
+-})
+-```
+-
+-## API
+-
+-### `autoBatchEnhancer`
+-
+-```ts title="autoBatchEnhancer signature" no-transpile
+-export type SHOULD_AUTOBATCH = string
+-export type autoBatchEnhancer = () => StoreEnhancer
+-```
+-
+-Creates a new instance of the autobatch store enhancer.
+-
+-Any action that is tagged with `action.meta[SHOULD_AUTOBATCH] = true` will be treated as "low-priority", and the enhancer will delay notifying subscribers until either:
+-
+-- The end of the current event loop tick happens, and a queued microtask runs the notifications
+-- A "normal-priority" action (any action _without_ `action.meta[SHOULD_AUTOBATCH] = true`) is dispatched in the same tick
+-
+-This method currently does not accept any options. We may consider allowing customization of the delay behavior in the future.
+-
+-The `SHOULD_AUTOBATCH` value is meant to be opaque - it's currently a string for simplicity, but could be a `Symbol` in the future.
+-
+-### `prepareAutoBatched`
+-
+-```ts title="prepareAutoBatched signature" no-transpile
+-type prepareAutoBatched = <T>() => (payload: T) => { payload: T; meta: unknown }
+-```
+-
+-Creates a function that accepts a `payload` value, and returns an object with `{payload, meta: {[SHOULD_AUTOBATCH]: true}}`. This is meant to be used with RTK's `createSlice` and its "`prepare` callback" syntax:
+-
+-```ts no-transpile
+-createSlice({
+-  name: 'todos',
+-  initialState,
+-  reducers: {
+-    todoAdded: {
+-      reducer(state, action: PayloadAction<Todo>) {
+-        state.push(action.payload)
+-      },
+-      // highlight-start
+-      prepare: prepareAutoBatched<Todo>(),
+-      // highlight-end
+-    },
+-  },
+-})
+-```
+-
+-## Batching Approach and Background
+-
+-The post [A Comparison of Redux Batching Techniques](https://blog.isquaredsoftware.com/2020/01/blogged-answers-redux-batching-techniques/) describes four different approaches for "batching Redux actions/dispatches"
+-
+-- a higher-order reducer that accepts multiple actions nested inside one real action, and iterates over them together
+-- an enhancer that wraps `dispatch` and debounces the notification callback
+-- an enhancer that wraps `dispatch` to accept an array of actions
+-- React's `unstable_batchedUpdates()`, which just combines multiple queued renders into one but doesn't affect subscriber notifications
+-
+-This enhancer is a variation of the "debounce" approach, but with a twist.
+-
+-Instead of _just_ debouncing _all_ subscriber notifications, it watches for any actions with a specific `action.meta[SHOULD_AUTOBATCH]: true` field attached.
+-
+-When it sees an action with that field, it queues a microtask. The reducer is updated immediately, but the enhancer does _not_ notify subscribers right way. If other actions with the same field are dispatched in succession, the enhancer will continue to _not_ notify subscribers. Then, when the queued microtask runs at the end of the event loop tick, it finally notifies all subscribers, similar to how React batches re-renders.
+-
+-The additional twist is also inspired by React's separation of updates into "low-priority" and "immediate" behavior (such as a render queued by an AJAX request vs a render queued by a user input that should be handled synchronously).
+-
+-If some low-pri actions have been dispatched and a notification microtask is queued, then a _normal_ priority action (without the field) is dispatched, the enhancer will go ahead and notify all subscribers synchronously as usual, and _not_ notify them at the end of the tick.
+-
+-This allows Redux users to selectively tag certain actions for effective batching behavior, making this purely opt-in on a per-action basis, while retaining normal notification behavior for all other actions.
+-
+-### RTK Query and Batching
+-
+-RTK Query already marks several of its key internal action types as batchable. If you add the `autoBatchEnhancer` to the store setup, it will improve the overall UI performance, especially when rendering large lists of components that use the RTKQ query hooks.
+diff --git a/packages/toolkit/src/autoBatchEnhancer.ts b/packages/toolkit/src/autoBatchEnhancer.ts
+deleted file mode 100644
+index 8f8e44d6..00000000
+--- a/packages/toolkit/src/autoBatchEnhancer.ts
++++ /dev/null
+@@ -1,110 +0,0 @@
+-import type { StoreEnhancer } from 'redux'
+-
+-export const SHOULD_AUTOBATCH = 'RTK_autoBatch'
+-
+-export const prepareAutoBatched =
+-  <T>() =>
+-  (payload: T): { payload: T; meta: unknown } => ({
+-    payload,
+-    meta: { [SHOULD_AUTOBATCH]: true },
+-  })
+-
+-// TODO Remove this in 2.0
+-// Copied from https://github.com/feross/queue-microtask
+-let promise: Promise<any>
+-const queueMicrotaskShim =
+-  typeof queueMicrotask === 'function'
+-    ? queueMicrotask.bind(typeof window !== 'undefined' ? window : global)
+-    : // reuse resolved promise, and allocate it lazily
+-      (cb: () => void) =>
+-        (promise || (promise = Promise.resolve())).then(cb).catch((err: any) =>
+-          setTimeout(() => {
+-            throw err
+-          }, 0)
+-        )
+-
+-/**
+- * A Redux store enhancer that watches for "low-priority" actions, and delays
+- * notifying subscribers until either the end of the event loop tick or the
+- * next "standard-priority" action is dispatched.
+- *
+- * This allows dispatching multiple "low-priority" actions in a row with only
+- * a single subscriber notification to the UI after the sequence of actions
+- * is finished, thus improving UI re-render performance.
+- *
+- * Watches for actions with the `action.meta[SHOULD_AUTOBATCH]` attribute.
+- * This can be added to `action.meta` manually, or by using the
+- * `prepareAutoBatched` helper.
+- *
+- */
+-export const autoBatchEnhancer =
+-  (): StoreEnhancer =>
+-  (next) =>
+-  (...args) => {
+-    const store = next(...args)
+-
+-    let notifying = true
+-    let shouldNotifyAtEndOfTick = false
+-    let notificationQueued = false
+-
+-    const listeners = new Set<() => void>()
+-
+-    const notifyListeners = () => {
+-      // We're running at the end of the event loop tick.
+-      // Run the real listener callbacks to actually update the UI.
+-      notificationQueued = false
+-      if (shouldNotifyAtEndOfTick) {
+-        shouldNotifyAtEndOfTick = false
+-        listeners.forEach((l) => l())
+-      }
+-    }
+-
+-    return Object.assign({}, store, {
+-      // Override the base `store.subscribe` method to keep original listeners
+-      // from running if we're delaying notifications
+-      subscribe(listener: () => void) {
+-        // Each wrapped listener will only call the real listener if
+-        // the `notifying` flag is currently active when it's called.
+-        // This lets the base store work as normal, while the actual UI
+-        // update becomes controlled by this enhancer.
+-        const wrappedListener: typeof listener = () => notifying && listener()
+-        const unsubscribe = store.subscribe(wrappedListener)
+-        listeners.add(listener)
+-        return () => {
+-          unsubscribe()
+-          listeners.delete(listener)
+-        }
+-      },
+-      // Override the base `store.dispatch` method so that we can check actions
+-      // for the `shouldAutoBatch` flag and determine if batching is active
+-      dispatch(action: any) {
+-        try {
+-          // If the action does _not_ have the `shouldAutoBatch` flag,
+-          // we resume/continue normal notify-after-each-dispatch behavior
+-          notifying = !action?.meta?.[SHOULD_AUTOBATCH]
+-          // If a `notifyListeners` microtask was queued, you can't cancel it.
+-          // Instead, we set a flag so that it's a no-op when it does run
+-          shouldNotifyAtEndOfTick = !notifying
+-          if (shouldNotifyAtEndOfTick) {
+-            // We've seen at least 1 action with `SHOULD_AUTOBATCH`. Try to queue
+-            // a microtask to notify listeners at the end of the event loop tick.
+-            // Make sure we only enqueue this _once_ per tick.
+-            if (!notificationQueued) {
+-              notificationQueued = true
+-              queueMicrotaskShim(notifyListeners)
+-            }
+-          }
+-          // Go ahead and process the action as usual, including reducers.
+-          // If normal notification behavior is enabled, the store will notify
+-          // all of its own listeners, and the wrapper callbacks above will
+-          // see `notifying` is true and pass on to the real listener callbacks.
+-          // If we're "batching" behavior, then the wrapped callbacks will
+-          // bail out, causing the base store notification behavior to be no-ops.
+-          return store.dispatch(action)
+-        } finally {
+-          // Assume we're back to normal behavior after each action
+-          notifying = true
+-        }
+-      },
+-    })
+-  }
+diff --git a/packages/toolkit/src/index.ts b/packages/toolkit/src/index.ts
+index 7827f902..580a3412 100644
+--- a/packages/toolkit/src/index.ts
++++ b/packages/toolkit/src/index.ts
+@@ -184,9 +184,3 @@ export {
+   clearAllListeners,
+   TaskAbortError,
+ } from './listenerMiddleware/index'
+-
+-export {
+-  SHOULD_AUTOBATCH,
+-  prepareAutoBatched,
+-  autoBatchEnhancer,
+-} from './autoBatchEnhancer'
+diff --git a/packages/toolkit/src/query/core/buildSlice.ts b/packages/toolkit/src/query/core/buildSlice.ts
+index ef4fc26f..1e500818 100644
+--- a/packages/toolkit/src/query/core/buildSlice.ts
++++ b/packages/toolkit/src/query/core/buildSlice.ts
+@@ -7,7 +7,6 @@ import {
+   isFulfilled,
+   isRejectedWithValue,
+   createNextState,
+-  prepareAutoBatched,
+ } from '@reduxjs/toolkit'
+ import type {
+   CombinedState as CombinedQueryState,
+@@ -115,14 +114,11 @@ export function buildSlice({
+     name: `${reducerPath}/queries`,
+     initialState: initialState as QueryState<any>,
+     reducers: {
+-      removeQueryResult: {
+-        reducer(
+-          draft,
+-          { payload: { queryCacheKey } }: PayloadAction<QuerySubstateIdentifier>
+-        ) {
+-          delete draft[queryCacheKey]
+-        },
+-        prepare: prepareAutoBatched<QuerySubstateIdentifier>(),
++      removeQueryResult(
++        draft,
++        { payload: { queryCacheKey } }: PayloadAction<QuerySubstateIdentifier>
++      ) {
++        delete draft[queryCacheKey]
+       },
+       queryResultPatched(
+         draft,
+@@ -247,14 +243,14 @@ export function buildSlice({
+     name: `${reducerPath}/mutations`,
+     initialState: initialState as MutationState<any>,
+     reducers: {
+-      removeMutationResult: {
+-        reducer(draft, { payload }: PayloadAction<MutationSubstateIdentifier>) {
+-          const cacheKey = getMutationCacheKey(payload)
+-          if (cacheKey in draft) {
+-            delete draft[cacheKey]
+-          }
+-        },
+-        prepare: prepareAutoBatched<MutationSubstateIdentifier>(),
++      removeMutationResult(
++        draft,
++        { payload }: PayloadAction<MutationSubstateIdentifier>
++      ) {
++        const cacheKey = getMutationCacheKey(payload)
++        if (cacheKey in draft) {
++          delete draft[cacheKey]
++        }
+       },
+     },
+     extraReducers(builder) {
+diff --git a/packages/toolkit/src/query/core/buildThunks.ts b/packages/toolkit/src/query/core/buildThunks.ts
+index 2627a64c..67291aad 100644
+--- a/packages/toolkit/src/query/core/buildThunks.ts
++++ b/packages/toolkit/src/query/core/buildThunks.ts
+@@ -39,7 +39,7 @@ import type {
+   ThunkDispatch,
+   AsyncThunk,
+ } from '@reduxjs/toolkit'
+-import { createAsyncThunk, SHOULD_AUTOBATCH } from '@reduxjs/toolkit'
++import { createAsyncThunk } from '@reduxjs/toolkit'
+ 
+ import { HandledError } from '../HandledError'
+ 
+@@ -123,18 +123,13 @@ export interface MutationThunkArg {
+ export type ThunkResult = unknown
+ 
+ export type ThunkApiMetaConfig = {
+-  pendingMeta: {
+-    startedTimeStamp: number
+-    [SHOULD_AUTOBATCH]: true
+-  }
++  pendingMeta: { startedTimeStamp: number }
+   fulfilledMeta: {
+     fulfilledTimeStamp: number
+     baseQueryMeta: unknown
+-    [SHOULD_AUTOBATCH]: true
+   }
+   rejectedMeta: {
+     baseQueryMeta: unknown
+-    [SHOULD_AUTOBATCH]: true
+   }
+ }
+ export type QueryThunk = AsyncThunk<
+@@ -404,7 +399,6 @@ export function buildThunks<
+         {
+           fulfilledTimeStamp: Date.now(),
+           baseQueryMeta: result.meta,
+-          [SHOULD_AUTOBATCH]: true,
+         }
+       )
+     } catch (error) {
+@@ -429,7 +423,7 @@ export function buildThunks<
+               catchedError.meta,
+               arg.originalArgs
+             ),
+-            { baseQueryMeta: catchedError.meta, [SHOULD_AUTOBATCH]: true }
++            { baseQueryMeta: catchedError.meta }
+           )
+         } catch (e) {
+           catchedError = e
+@@ -479,7 +473,7 @@ In the case of an unhandled error, no tags will be "provided" or "invalidated".`
+     ThunkApiMetaConfig & { state: RootState<any, string, ReducerPath> }
+   >(`${reducerPath}/executeQuery`, executeEndpoint, {
+     getPendingMeta() {
+-      return { startedTimeStamp: Date.now(), [SHOULD_AUTOBATCH]: true }
++      return { startedTimeStamp: Date.now() }
+     },
+     condition(queryThunkArgs, { getState }) {
+       const state = getState()
+@@ -538,7 +532,7 @@ In the case of an unhandled error, no tags will be "provided" or "invalidated".`
+     ThunkApiMetaConfig & { state: RootState<any, string, ReducerPath> }
+   >(`${reducerPath}/executeMutation`, executeEndpoint, {
+     getPendingMeta() {
+-      return { startedTimeStamp: Date.now(), [SHOULD_AUTOBATCH]: true }
++      return { startedTimeStamp: Date.now() }
+     },
+   })
+ 
+diff --git a/packages/toolkit/src/tests/autoBatchEnhancer.test.ts b/packages/toolkit/src/tests/autoBatchEnhancer.test.ts
+deleted file mode 100644
+index 49c62319..00000000
+--- a/packages/toolkit/src/tests/autoBatchEnhancer.test.ts
++++ /dev/null
+@@ -1,111 +0,0 @@
+-import { configureStore } from '../configureStore'
+-import { createSlice } from '../createSlice'
+-import { autoBatchEnhancer, prepareAutoBatched } from '../autoBatchEnhancer'
+-import { delay } from '../utils'
+-
+-interface CounterState {
+-  value: number
+-}
+-
+-const counterSlice = createSlice({
+-  name: 'counter',
+-  initialState: { value: 0 } as CounterState,
+-  reducers: {
+-    incrementBatched: {
+-      // Batched, low-priority
+-      reducer(state) {
+-        state.value += 1
+-      },
+-      prepare: prepareAutoBatched<void>(),
+-    },
+-    // Not batched, normal priority
+-    decrementUnbatched(state) {
+-      state.value -= 1
+-    },
+-  },
+-})
+-const { incrementBatched, decrementUnbatched } = counterSlice.actions
+-
+-const makeStore = () => {
+-  return configureStore({
+-    reducer: counterSlice.reducer,
+-    enhancers: (existingEnhancers) => {
+-      return existingEnhancers.concat(autoBatchEnhancer())
+-    },
+-  })
+-}
+-
+-let store: ReturnType<typeof makeStore>
+-
+-let subscriptionNotifications = 0
+-
+-beforeEach(() => {
+-  subscriptionNotifications = 0
+-  store = makeStore()
+-
+-  store.subscribe(() => {
+-    subscriptionNotifications++
+-  })
+-})
+-
+-describe('autoBatchEnhancer', () => {
+-  test('Does not alter normal subscription notification behavior', async () => {
+-    store.dispatch(decrementUnbatched())
+-    expect(subscriptionNotifications).toBe(1)
+-    store.dispatch(decrementUnbatched())
+-    expect(subscriptionNotifications).toBe(2)
+-    store.dispatch(decrementUnbatched())
+-    expect(subscriptionNotifications).toBe(3)
+-    store.dispatch(decrementUnbatched())
+-
+-    await delay(5)
+-
+-    expect(subscriptionNotifications).toBe(4)
+-  })
+-
+-  test('Only notifies once if several batched actions are dispatched in a row', async () => {
+-    store.dispatch(incrementBatched())
+-    expect(subscriptionNotifications).toBe(0)
+-    store.dispatch(incrementBatched())
+-    expect(subscriptionNotifications).toBe(0)
+-    store.dispatch(incrementBatched())
+-    expect(subscriptionNotifications).toBe(0)
+-    store.dispatch(incrementBatched())
+-
+-    await delay(5)
+-
+-    expect(subscriptionNotifications).toBe(1)
+-  })
+-
+-  test('Notifies immediately if a non-batched action is dispatched', async () => {
+-    store.dispatch(incrementBatched())
+-    expect(subscriptionNotifications).toBe(0)
+-    store.dispatch(incrementBatched())
+-    expect(subscriptionNotifications).toBe(0)
+-    store.dispatch(decrementUnbatched())
+-    expect(subscriptionNotifications).toBe(1)
+-    store.dispatch(incrementBatched())
+-
+-    await delay(5)
+-
+-    expect(subscriptionNotifications).toBe(2)
+-  })
+-
+-  test('Does not notify at end of tick if last action was normal priority', async () => {
+-    store.dispatch(incrementBatched())
+-    expect(subscriptionNotifications).toBe(0)
+-    store.dispatch(incrementBatched())
+-    expect(subscriptionNotifications).toBe(0)
+-    store.dispatch(decrementUnbatched())
+-    expect(subscriptionNotifications).toBe(1)
+-    store.dispatch(incrementBatched())
+-    store.dispatch(decrementUnbatched())
+-    expect(subscriptionNotifications).toBe(2)
+-    store.dispatch(decrementUnbatched())
+-    expect(subscriptionNotifications).toBe(3)
+-
+-    await delay(5)
+-
+-    expect(subscriptionNotifications).toBe(3)
+-  })
+-})
+diff --git a/website/sidebars.json b/website/sidebars.json
+index b469f3c8..12c080cc 100644
+--- a/website/sidebars.json
++++ b/website/sidebars.json
+@@ -41,8 +41,7 @@
+             "api/getDefaultMiddleware",
+             "api/immutabilityMiddleware",
+             "api/serializabilityMiddleware",
+-            "api/createListenerMiddleware",
+-            "api/autoBatchEnhancer"
++            "api/createListenerMiddleware"
+           ]
+         },
+         {

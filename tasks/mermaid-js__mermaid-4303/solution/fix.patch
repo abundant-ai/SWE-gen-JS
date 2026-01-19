@@ -1,0 +1,264 @@
+diff --git a/docs/syntax/classDiagram.md b/docs/syntax/classDiagram.md
+index 15ae26444..1287908c9 100644
+--- a/docs/syntax/classDiagram.md
++++ b/docs/syntax/classDiagram.md
+@@ -128,7 +128,7 @@ classDiagram
+     Vehicle <|-- Car
+ ```
+ 
+-Naming convention: a class name should be composed only of alphanumeric characters (including unicode), and underscores.
++Naming convention: a class name should be composed only of alphanumeric characters (including unicode), underscores, and dashes (-).
+ 
+ ### Class labels
+ 
+@@ -283,12 +283,12 @@ To describe the visibility (or encapsulation) of an attribute or method/function
+ - `#` Protected
+ - `~` Package/Internal
+ 
+-> _note_ you can also include additional _classifiers_ to a method definition by adding the following notation to the _end_ of the method, i.e.: after the `()`:
++> _note_ you can also include additional _classifiers_ to a method definition by adding the following notation to the _end_ of the method, i.e.: after the `()` or after the return type:
+ >
+-> - `*` Abstract e.g.: `someAbstractMethod()*`
+-> - `$` Static e.g.: `someStaticMethod()$`
++> - `*` Abstract e.g.: `someAbstractMethod()*` or `someAbstractMethod() int*`
++> - `$` Static e.g.: `someStaticMethod()$` or `someStaticMethod() String$`
+ 
+-> _note_ you can also include additional _classifiers_ to a field definition by adding the following notation to the end of its name:
++> _note_ you can also include additional _classifiers_ to a field definition by adding the following notation to the very end:
+ >
+ > - `$` Static e.g.: `String someField$`
+ 
+diff --git a/packages/mermaid/src/diagrams/class/classDb.ts b/packages/mermaid/src/diagrams/class/classDb.ts
+index 8fa1eeb26..a2121f69e 100644
+--- a/packages/mermaid/src/diagrams/class/classDb.ts
++++ b/packages/mermaid/src/diagrams/class/classDb.ts
+@@ -106,6 +106,7 @@ export const clear = function () {
+ export const getClass = function (id: string) {
+   return classes[id];
+ };
++
+ export const getClasses = function () {
+   return classes;
+ };
+@@ -170,9 +171,10 @@ export const addMember = function (className: string, member: string) {
+     const memberString = member.trim();
+ 
+     if (memberString.startsWith('<<') && memberString.endsWith('>>')) {
+-      // Remove leading and trailing brackets
++      // its an annotation
+       theClass.annotations.push(sanitizeText(memberString.substring(2, memberString.length - 2)));
+     } else if (memberString.indexOf(')') > 0) {
++      //its a method
+       theClass.methods.push(sanitizeText(memberString));
+     } else if (memberString) {
+       theClass.members.push(sanitizeText(memberString));
+@@ -234,6 +236,7 @@ const setTooltip = function (ids: string, tooltip?: string) {
+     }
+   });
+ };
++
+ export const getTooltip = function (id: string) {
+   return classes[id].tooltip;
+ };
+diff --git a/packages/mermaid/src/diagrams/class/parser/classDiagram.jison b/packages/mermaid/src/diagrams/class/parser/classDiagram.jison
+index 0c9ad2f2a..6a7834eca 100644
+--- a/packages/mermaid/src/diagrams/class/parser/classDiagram.jison
++++ b/packages/mermaid/src/diagrams/class/parser/classDiagram.jison
+@@ -200,7 +200,7 @@ Function arguments are optional: 'call <callback_name>()' simply executes 'callb
+ 
+ start
+     : mermaidDoc
+-    | statments
++    | statements
+     | direction
+     | directive start
+     ;
+@@ -259,8 +259,8 @@ className
+     : alphaNumToken { $$=$1; }
+     | classLiteralName { $$=$1; }
+     | alphaNumToken className { $$=$1+$2; }
+-    | alphaNumToken GENERICTYPE { $$=$1+'~'+$2; }
+-    | classLiteralName GENERICTYPE { $$=$1+'~'+$2; }
++    | alphaNumToken GENERICTYPE { $$=$1+'~'+$2+'~'; }
++    | classLiteralName GENERICTYPE { $$=$1+'~'+$2+'~'; }
+     ;
+ 
+ statement
+@@ -366,7 +366,7 @@ textToken      : textNoTagsToken | TAGSTART | TAGEND | '=='  | '--' | PCT | DEFA
+ 
+ textNoTagsToken: alphaNumToken | SPACE | MINUS | keywords ;
+ 
+-alphaNumToken  : UNICODE_TEXT | NUM | ALPHA;
++alphaNumToken  : UNICODE_TEXT | NUM | ALPHA | MINUS;
+ 
+ classLiteralName : BQUOTE_STR;
+ 
+diff --git a/packages/mermaid/src/diagrams/class/svgDraw.js b/packages/mermaid/src/diagrams/class/svgDraw.js
+index 3ce8e980b..7206506a2 100644
+--- a/packages/mermaid/src/diagrams/class/svgDraw.js
++++ b/packages/mermaid/src/diagrams/class/svgDraw.js
+@@ -199,11 +199,7 @@ export const drawClass = function (elem, classDef, conf, diagObj) {
+     isFirst = false;
+   });
+ 
+-  let classTitleString = classDef.id;
+-
+-  if (classDef.type !== undefined && classDef.type !== '') {
+-    classTitleString += '<' + classDef.type + '>';
+-  }
++  let classTitleString = getClassTitleString(classDef);
+ 
+   const classTitle = title.append('tspan').text(classTitleString).attr('class', 'title');
+ 
+@@ -291,6 +287,16 @@ export const drawClass = function (elem, classDef, conf, diagObj) {
+   return classInfo;
+ };
+ 
++export const getClassTitleString = function (classDef) {
++  let classTitleString = classDef.id;
++
++  if (classDef.type) {
++    classTitleString += '<' + classDef.type + '>';
++  }
++
++  return classTitleString;
++};
++
+ /**
+  * Renders a note diagram
+  *
+@@ -355,6 +361,9 @@ export const drawNote = function (elem, note, conf, diagObj) {
+ };
+ 
+ export const parseMember = function (text) {
++  // Note: these two regular expressions don't parse the official UML syntax for attributes
++  // and methods. They parse a Java-style syntax of the form
++  // "String name" (for attributes) and "String name(int x)" for methods
+   const fieldRegEx = /^([#+~-])?(\w+)(~\w+~|\[])?\s+(\w+) *([$*])?$/;
+   const methodRegEx = /^([#+|~-])?(\w+) *\( *(.*)\) *([$*])? *(\w*[[\]|~]*\s*\w*~?)$/;
+ 
+@@ -421,33 +430,48 @@ const buildLegacyDisplay = function (text) {
+   let displayText = '';
+   let cssStyle = '';
+   let returnType = '';
++
++  let visibility = '';
++  let firstChar = text.substring(0, 1);
++  let lastChar = text.substring(text.length - 1, text.length);
++
++  if (firstChar.match(/[#+~-]/)) {
++    visibility = firstChar;
++  }
++
++  let noClassifierRe = /[\s\w)~]/;
++  if (!lastChar.match(noClassifierRe)) {
++    cssStyle = parseClassifier(lastChar);
++  }
++
++  let startIndex = visibility === '' ? 0 : 1;
++  let endIndex = cssStyle === '' ? text.length : text.length - 1;
++  text = text.substring(startIndex, endIndex);
++
+   let methodStart = text.indexOf('(');
+   let methodEnd = text.indexOf(')');
+ 
+   if (methodStart > 1 && methodEnd > methodStart && methodEnd <= text.length) {
+-    let visibility = '';
+-    let methodName = '';
+-
+-    let firstChar = text.substring(0, 1);
+-    if (firstChar.match(/\w/)) {
+-      methodName = text.substring(0, methodStart).trim();
+-    } else {
+-      if (firstChar.match(/[#+~-]/)) {
+-        visibility = firstChar;
+-      }
+-
+-      methodName = text.substring(1, methodStart).trim();
+-    }
++    let methodName = text.substring(0, methodStart).trim();
+ 
+     const parameters = text.substring(methodStart + 1, methodEnd);
+-    const classifier = text.substring(methodEnd + 1, 1);
+-    cssStyle = parseClassifier(text.substring(methodEnd + 1, methodEnd + 2));
+ 
+     displayText = visibility + methodName + '(' + parseGenericTypes(parameters.trim()) + ')';
+ 
+     if (methodEnd < text.length) {
+-      returnType = text.substring(methodEnd + 2).trim();
++      // special case: classifier after the closing parenthesis
++      let potentialClassifier = text.substring(methodEnd + 1, methodEnd + 2);
++      if (cssStyle === '' && !potentialClassifier.match(noClassifierRe)) {
++        cssStyle = parseClassifier(potentialClassifier);
++        returnType = text.substring(methodEnd + 2).trim();
++      } else {
++        returnType = text.substring(methodEnd + 1).trim();
++      }
++
+       if (returnType !== '') {
++        if (returnType.charAt(0) === ':') {
++          returnType = returnType.substring(1).trim();
++        }
+         returnType = ' : ' + parseGenericTypes(returnType);
+         displayText += returnType;
+       }
+@@ -502,6 +526,7 @@ const parseClassifier = function (classifier) {
+ };
+ 
+ export default {
++  getClassTitleString,
+   drawClass,
+   drawEdge,
+   drawNote,
+diff --git a/packages/mermaid/src/diagrams/common/common.ts b/packages/mermaid/src/diagrams/common/common.ts
+index 3b72e8718..369d84f21 100644
+--- a/packages/mermaid/src/diagrams/common/common.ts
++++ b/packages/mermaid/src/diagrams/common/common.ts
+@@ -1,6 +1,8 @@
+ import DOMPurify from 'dompurify';
+ import { MermaidConfig } from '../../config.type.js';
+ 
++export const lineBreakRegex = /<br\s*\/?>/gi;
++
+ /**
+  * Gets the rows of lines in a string
+  *
+@@ -65,8 +67,6 @@ export const sanitizeTextOrArray = (
+   return a.flat().map((x: string) => sanitizeText(x, config));
+ };
+ 
+-export const lineBreakRegex = /<br\s*\/?>/gi;
+-
+ /**
+  * Whether or not a text has any line breaks
+  *
+diff --git a/packages/mermaid/src/docs/syntax/classDiagram.md b/packages/mermaid/src/docs/syntax/classDiagram.md
+index d019774b2..871ade057 100644
+--- a/packages/mermaid/src/docs/syntax/classDiagram.md
++++ b/packages/mermaid/src/docs/syntax/classDiagram.md
+@@ -74,7 +74,7 @@ classDiagram
+     Vehicle <|-- Car
+ ```
+ 
+-Naming convention: a class name should be composed only of alphanumeric characters (including unicode), and underscores.
++Naming convention: a class name should be composed only of alphanumeric characters (including unicode), underscores, and dashes (-).
+ 
+ ### Class labels
+ 
+@@ -171,12 +171,12 @@ To describe the visibility (or encapsulation) of an attribute or method/function
+ - `#` Protected
+ - `~` Package/Internal
+ 
+-> _note_ you can also include additional _classifiers_ to a method definition by adding the following notation to the _end_ of the method, i.e.: after the `()`:
++> _note_ you can also include additional _classifiers_ to a method definition by adding the following notation to the _end_ of the method, i.e.: after the `()` or after the return type:
+ >
+-> - `*` Abstract e.g.: `someAbstractMethod()*`
+-> - `$` Static e.g.: `someStaticMethod()$`
++> - `*` Abstract e.g.: `someAbstractMethod()*` or `someAbstractMethod() int*`
++> - `$` Static e.g.: `someStaticMethod()$` or `someStaticMethod() String$`
+ 
+-> _note_ you can also include additional _classifiers_ to a field definition by adding the following notation to the end of its name:
++> _note_ you can also include additional _classifiers_ to a field definition by adding the following notation to the very end:
+ >
+ > - `$` Static e.g.: `String someField$`
+ 

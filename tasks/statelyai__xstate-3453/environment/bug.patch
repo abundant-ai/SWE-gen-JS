@@ -1,0 +1,180 @@
+diff --git a/.changeset/pretty-dots-push.md b/.changeset/pretty-dots-push.md
+deleted file mode 100644
+index bbc49f7326..0000000000
+--- a/.changeset/pretty-dots-push.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-"xstate": patch
+----
+-
+-Call the `complete` callback of the subscribed `observer` when an interpreter gets stopped.
+diff --git a/packages/core/src/interpreter.ts b/packages/core/src/interpreter.ts
+index 9ef7354954..794d81abf6 100644
+--- a/packages/core/src/interpreter.ts
++++ b/packages/core/src/interpreter.ts
+@@ -388,8 +388,8 @@ export class Interpreter<
+     return this;
+   }
+   public subscribe(
+-    observer: Partial<
+-      Observer<State<TContext, TEvent, any, TTypestate, TResolvedTypesMeta>>
++    observer: Observer<
++      State<TContext, TEvent, any, TTypestate, TResolvedTypesMeta>
+     >
+   ): Subscription;
+   public subscribe(
+@@ -404,39 +404,48 @@ export class Interpreter<
+       | ((
+           state: State<TContext, TEvent, any, TTypestate, TResolvedTypesMeta>
+         ) => void)
+-      | Partial<
+-          Observer<State<TContext, TEvent, any, TTypestate, TResolvedTypesMeta>>
+-        >,
++      | Observer<State<TContext, TEvent, any, TTypestate, TResolvedTypesMeta>>,
+     _?: (error: any) => void, // TODO: error listener
+     completeListener?: () => void
+   ): Subscription {
+-    const observer = toObserver(nextListenerOrObserver, _, completeListener);
++    if (!nextListenerOrObserver) {
++      return { unsubscribe: () => void 0 };
++    }
++
++    let listener: (
++      state: State<TContext, TEvent, any, TTypestate, TResolvedTypesMeta>
++    ) => void;
++    let resolvedCompleteListener = completeListener;
++
++    if (typeof nextListenerOrObserver === 'function') {
++      listener = nextListenerOrObserver;
++    } else {
++      listener = nextListenerOrObserver.next.bind(nextListenerOrObserver);
++      resolvedCompleteListener = nextListenerOrObserver.complete.bind(
++        nextListenerOrObserver
++      );
++    }
+ 
+-    this.listeners.add(observer.next);
++    this.listeners.add(listener);
+ 
+     // Send current state to listener
+     if (this.status !== InterpreterStatus.NotStarted) {
+-      observer.next(this.state);
++      listener(this.state);
+     }
+ 
+-    const completeOnce = () => {
+-      this.doneListeners.delete(completeOnce);
+-      this.stopListeners.delete(completeOnce);
+-      observer.complete();
+-    };
+-
+-    if (this.status === InterpreterStatus.Stopped) {
+-      observer.complete();
+-    } else {
+-      this.onDone(completeOnce);
+-      this.onStop(completeOnce);
++    if (resolvedCompleteListener) {
++      if (this.status === InterpreterStatus.Stopped) {
++        resolvedCompleteListener();
++      } else {
++        this.onDone(resolvedCompleteListener);
++      }
+     }
+ 
+     return {
+       unsubscribe: () => {
+-        this.listeners.delete(observer.next);
+-        this.doneListeners.delete(completeOnce);
+-        this.stopListeners.delete(completeOnce);
++        listener && this.listeners.delete(listener);
++        resolvedCompleteListener &&
++          this.doneListeners.delete(resolvedCompleteListener);
+       }
+     };
+   }
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index 89b528df6d..acb45ee8b1 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -699,20 +699,20 @@ export function toInvokeSource(
+ }
+ 
+ export function toObserver<T>(
+-  nextHandler?: Partial<Observer<T>> | ((value: T) => void),
++  nextHandler: Observer<T> | ((value: T) => void),
+   errorHandler?: (error: any) => void,
+   completionHandler?: () => void
+ ): Observer<T> {
+-  const noop = () => {};
+-  const isObserver = typeof nextHandler === 'object';
+-  const self = isObserver ? nextHandler : null;
++  if (typeof nextHandler === 'object') {
++    return nextHandler;
++  }
++
++  const noop = () => void 0;
+ 
+   return {
+-    next: ((isObserver ? nextHandler.next : nextHandler) || noop).bind(self),
+-    error: ((isObserver ? nextHandler.error : errorHandler) || noop).bind(self),
+-    complete: (
+-      (isObserver ? nextHandler.complete : completionHandler) || noop
+-    ).bind(self)
++    next: nextHandler,
++    error: errorHandler || noop,
++    complete: completionHandler || noop
+   };
+ }
+ 
+diff --git a/packages/core/test/interpreter.test.ts b/packages/core/test/interpreter.test.ts
+index 7b0ec29cda..39af909425 100644
+--- a/packages/core/test/interpreter.test.ts
++++ b/packages/core/test/interpreter.test.ts
+@@ -1750,46 +1750,6 @@ Event: {\\"type\\":\\"SOME_EVENT\\"}"
+       service.send('INC');
+       service.send('INC');
+     });
+-
+-    it('should call complete() once a final state is reached', () => {
+-      const completeCb = jest.fn();
+-
+-      const service = interpret(
+-        createMachine({
+-          initial: 'idle',
+-          states: {
+-            idle: {
+-              on: {
+-                NEXT: 'done'
+-              }
+-            },
+-            done: { type: 'final' }
+-          }
+-        })
+-      ).start();
+-
+-      service.subscribe({
+-        complete: completeCb
+-      });
+-
+-      service.send({ type: 'NEXT' });
+-
+-      expect(completeCb).toHaveBeenCalledTimes(1);
+-    });
+-
+-    it('should call complete() once the interpreter is stopped', () => {
+-      const completeCb = jest.fn();
+-
+-      const service = interpret(createMachine({})).start();
+-
+-      service.subscribe({
+-        complete: completeCb
+-      });
+-
+-      service.stop();
+-
+-      expect(completeCb).toHaveBeenCalledTimes(1);
+-    });
+   });
+ 
+   describe('services', () => {

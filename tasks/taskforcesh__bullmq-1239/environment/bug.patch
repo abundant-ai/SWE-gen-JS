@@ -1,0 +1,173 @@
+diff --git a/src/classes/compat.ts b/src/classes/compat.ts
+index fa4ee0a53d..800b3bb68f 100644
+--- a/src/classes/compat.ts
++++ b/src/classes/compat.ts
+@@ -276,11 +276,9 @@ export class Queue3<T = any> extends EventEmitter {
+    *
+    * name: The name of the to be removed job
+    */
+-  async removeRepeatable(name: string, opts: RepeatOptions): Promise<boolean> {
++  async removeRepeatable(name: string, opts: RepeatOptions): Promise<void> {
+     const repeat = await this.queue.repeat;
+-    const removed = await repeat.removeRepeatable(name, opts, opts.jobId);
+-
+-    return !removed;
++    return repeat.removeRepeatable(name, opts, opts.jobId);
+   }
+ 
+   /**
+diff --git a/src/classes/queue.ts b/src/classes/queue.ts
+index 2134df0061..87e158970c 100644
+--- a/src/classes/queue.ts
++++ b/src/classes/queue.ts
+@@ -299,18 +299,12 @@ export class Queue<
+     name: NameType,
+     repeatOpts: RepeatOptions,
+     jobId?: string,
+-  ): Promise<boolean> {
+-    const repeat = await this.repeat;
+-    const removed = await repeat.removeRepeatable(name, repeatOpts, jobId);
+-
+-    return !removed;
++  ) {
++    return (await this.repeat).removeRepeatable(name, repeatOpts, jobId);
+   }
+ 
+-  async removeRepeatableByKey(key: string): Promise<boolean> {
+-    const repeat = await this.repeat;
+-    const removed = await repeat.removeRepeatableByKey(key);
+-
+-    return !removed;
++  async removeRepeatableByKey(key: string) {
++    return (await this.repeat).removeRepeatableByKey(key);
+   }
+ 
+   /**
+diff --git a/src/classes/repeat.ts b/src/classes/repeat.ts
+index 8349bbf14c..c9267a08b1 100644
+--- a/src/classes/repeat.ts
++++ b/src/classes/repeat.ts
+@@ -118,7 +118,7 @@ export class Repeat extends QueueBase {
+     name: string,
+     repeat: RepeatOptions,
+     jobId?: string,
+-  ): Promise<number> {
++  ): Promise<void> {
+     const repeatJobKey = getRepeatKey(name, { ...repeat, jobId });
+     const repeatJobId = getRepeatJobId(
+       name,
+@@ -130,7 +130,7 @@ export class Repeat extends QueueBase {
+     return Scripts.removeRepeatable(this, repeatJobId, repeatJobKey);
+   }
+ 
+-  async removeRepeatableByKey(repeatJobKey: string): Promise<number> {
++  async removeRepeatableByKey(repeatJobKey: string): Promise<void> {
+     const data = this.keyToData(repeatJobKey);
+ 
+     const repeatJobId = getRepeatJobId(
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index b5a069050f..6378fae252 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -172,7 +172,7 @@ export class Scripts {
+     queue: MinimalQueue,
+     repeatJobId: string,
+     repeatJobKey: string,
+-  ): Promise<number> {
++  ): Promise<void> {
+     const client = await queue.client;
+     const args = this.removeRepeatableArgs(queue, repeatJobId, repeatJobKey);
+ 
+diff --git a/src/commands/moveStalledJobsToWait-8.lua b/src/commands/moveStalledJobsToWait-8.lua
+index 6117b8733a..9be84f9942 100644
+--- a/src/commands/moveStalledJobsToWait-8.lua
++++ b/src/commands/moveStalledJobsToWait-8.lua
+@@ -87,7 +87,7 @@ if (#stalling > 0) then
+                     if opts["removeOnFail"] then
+                       removeJob(jobId, false, ARGV[2])
+                       rcall("ZREM", KEYS[4], jobId)
+-                    end
++                    end                  
+                   elseif removeOnFailType ~= "nil" then
+                     local maxAge = opts["removeOnFail"]["age"]
+                     local maxCount = opts["removeOnFail"]["count"]
+@@ -95,7 +95,7 @@ if (#stalling > 0) then
+                     if maxAge ~= nil then
+                       removeJobsByMaxAge(ARGV[3], maxAge, KEYS[4], ARGV[2])
+                     end
+-
++            
+                     if maxCount ~= nil and maxCount > 0 then
+                       removeJobsByMaxCount(maxCount, KEYS[4], ARGV[2])
+                     end
+diff --git a/src/commands/removeRepeatable-2.lua b/src/commands/removeRepeatable-2.lua
+index faf5569c32..fdc1950f5a 100644
+--- a/src/commands/removeRepeatable-2.lua
++++ b/src/commands/removeRepeatable-2.lua
+@@ -8,10 +8,6 @@
+     ARGV[1] repeat job id
+     ARGV[2] repeat job key
+     ARGV[3] queue key
+-
+-  Output:
+-    0 - OK
+-    1 - Missing repeat job
+ ]]
+ local rcall = redis.call
+ local millis = rcall("ZSCORE", KEYS[1], ARGV[2])
+@@ -25,8 +21,4 @@ if(millis) then
+   end
+ end
+ 
+-if(rcall("ZREM", KEYS[1], ARGV[2]) == 1) then
+-  return 0
+-end
+-
+-return 1
++rcall("ZREM", KEYS[1], ARGV[2]);
+diff --git a/tests/test_repeat.ts b/tests/test_repeat.ts
+index 9a234cb575..91cac2a0b7 100644
+--- a/tests/test_repeat.ts
++++ b/tests/test_repeat.ts
+@@ -752,11 +752,10 @@ describe('repeat', function () {
+     let processor;
+ 
+     const processing = new Promise<void>((resolve, reject) => {
+-      processor = async () => {
++      processor = async (job: Job) => {
+         counter++;
+         if (counter == numJobs) {
+-          const removed = await queue.removeRepeatable('remove', repeat);
+-          expect(removed).to.be.true;
++          await queue.removeRepeatable('remove', repeat);
+           this.clock.tick(nextTick);
+           const delayed = await queue.getDelayed();
+           expect(delayed).to.be.empty;
+@@ -794,26 +793,11 @@ describe('repeat', function () {
+     await queue.add('remove', { foo: 'bar' }, { repeat });
+     const repeatableJobs = await queue.getRepeatableJobs();
+     expect(repeatableJobs).to.have.length(1);
+-    const removed = await queue.removeRepeatableByKey(repeatableJobs[0].key);
+-    expect(removed).to.be.true;
++    await queue.removeRepeatableByKey(repeatableJobs[0].key);
+     const repeatableJobsAfterRemove = await queue.getRepeatableJobs();
+     expect(repeatableJobsAfterRemove).to.have.length(0);
+   });
+ 
+-  describe('when repeatable job does not exist', function () {
+-    it('returns false', async () => {
+-      const repeat = { cron: '*/2 * * * * *' };
+-
+-      await queue.add('remove', { foo: 'bar' }, { repeat });
+-      const repeatableJobs = await queue.getRepeatableJobs();
+-      expect(repeatableJobs).to.have.length(1);
+-      const removed = await queue.removeRepeatableByKey(repeatableJobs[0].key);
+-      expect(removed).to.be.true;
+-      const removed2 = await queue.removeRepeatableByKey(repeatableJobs[0].key);
+-      expect(removed2).to.be.false;
+-    });
+-  });
+-
+   it('should allow removing a customId repeatable job', async function () {
+     const queueScheduler = new QueueScheduler(queueName, { connection });
+     await queueScheduler.waitUntilReady();

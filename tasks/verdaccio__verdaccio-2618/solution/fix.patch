@@ -1,0 +1,445 @@
+diff --git a/.changeset/sour-buses-shout.md b/.changeset/sour-buses-shout.md
+new file mode 100644
+index 000000000..4ebba878a
+--- /dev/null
++++ b/.changeset/sour-buses-shout.md
+@@ -0,0 +1,11 @@
++---
++'@verdaccio/fastify-migration': minor
++'@verdaccio/store': minor
++'@verdaccio/utils': minor
++'@verdaccio/web': minor
++'@verdaccio/website': minor
++---
++
++feat: migrate web sidebar endpoint to fastify
++
++reuse utils methods between packages
+diff --git a/packages/core/server/src/routes/web/api/sidebar.ts b/packages/core/server/src/routes/web/api/sidebar.ts
+new file mode 100644
+index 000000000..99f96f16d
+--- /dev/null
++++ b/packages/core/server/src/routes/web/api/sidebar.ts
+@@ -0,0 +1,68 @@
++import buildDebug from 'debug';
++import { FastifyInstance } from 'fastify';
++import _ from 'lodash';
++
++import { DIST_TAGS } from '@verdaccio/core';
++import { convertDistRemoteToLocalTarballUrls } from '@verdaccio/tarball';
++import { Package, Version } from '@verdaccio/types';
++import {
++  addGravatarSupport,
++  deleteProperties,
++  formatAuthor,
++  isVersionValid,
++} from '@verdaccio/utils';
++
++const debug = buildDebug('verdaccio:web:api:sidebar');
++export type $SidebarPackage = Package & { latest: Version };
++
++async function sidebarRoute(fastify: FastifyInstance) {
++  fastify.get('/sidebar/(@:scope/)?:packageName', async (request, reply) => {
++    // @ts-ignore
++    const { packageName, scope } = request.params;
++    debug('pkg name %s, scope %s ', packageName, scope);
++    getSidebar(fastify, request, packageName, (err, sidebar) => {
++      if (err) {
++        reply.send(err);
++      } else {
++        reply.code(fastify.statusCode.OK).send(sidebar);
++      }
++    });
++  });
++}
++
++function getSidebar(fastify: FastifyInstance, request: any, packageName, callback) {
++  fastify.storage.getPackage({
++    name: packageName,
++    uplinksLook: true,
++    keepUpLinkData: true,
++    req: request.raw,
++    callback: function (err: Error, info: $SidebarPackage): void {
++      debug('sidebar pkg info %o', info);
++
++      if (_.isNil(err)) {
++        const { v } = request.query;
++        let sideBarInfo = _.clone(info);
++        sideBarInfo.versions = convertDistRemoteToLocalTarballUrls(
++          info,
++          { protocol: request.protocol, headers: request.headers as any, host: request.hostname },
++          fastify.configInstance.url_prefix
++        ).versions;
++        if (typeof v === 'string' && isVersionValid(info, v)) {
++          sideBarInfo.latest = sideBarInfo.versions[v];
++          sideBarInfo.latest.author = formatAuthor(sideBarInfo.latest.author);
++        } else {
++          sideBarInfo.latest = sideBarInfo.versions[info[DIST_TAGS].latest];
++          sideBarInfo.latest.author = formatAuthor(sideBarInfo.latest.author);
++        }
++        sideBarInfo = deleteProperties(['readme', '_attachments', '_rev', 'name'], sideBarInfo);
++        const authorAvatar = fastify.configInstance.web
++          ? addGravatarSupport(sideBarInfo, fastify.configInstance.web.gravatar)
++          : addGravatarSupport(sideBarInfo);
++        callback(null, authorAvatar);
++      } else {
++        callback(fastify.statusCode.NOT_FOUND).send(err);
++      }
++    },
++  });
++}
++export default sidebarRoute;
+diff --git a/packages/core/server/src/server.ts b/packages/core/server/src/server.ts
+index d1e321bb0..c33a95092 100644
+--- a/packages/core/server/src/server.ts
++++ b/packages/core/server/src/server.ts
+@@ -14,6 +14,7 @@ import configPlugin from './plugins/config';
+ import coreUtils from './plugins/coreUtils';
+ import storagePlugin from './plugins/storage';
+ import readme from './routes/web/api/readme';
++import sidebar from './routes/web/api/sidebar';
+ 
+ const debug = buildDebug('verdaccio:fastify');
+ 
+@@ -36,6 +37,7 @@ async function startServer({ logger, config }) {
+     instance.register(whoami);
+     instance.register(tarball);
+     instance.register(readme, { prefix: '/-/verdaccio' });
++    instance.register(sidebar, { prefix: '/-/verdaccio' });
+     done();
+   });
+ 
+diff --git a/packages/store/src/local-storage.ts b/packages/store/src/local-storage.ts
+index 0cbde924d..67b0bdd83 100644
+--- a/packages/store/src/local-storage.ts
++++ b/packages/store/src/local-storage.ts
+@@ -29,7 +29,7 @@ import {
+   Version,
+ } from '@verdaccio/types';
+ import { getLatestVersion, isObject } from '@verdaccio/utils';
+-import { createTarballHash } from '@verdaccio/utils';
++import { createTarballHash, normalizeContributors } from '@verdaccio/utils';
+ 
+ import {
+   STORAGE,
+@@ -37,7 +37,6 @@ import {
+   generatePackageTemplate,
+   generateRevision,
+   getLatestReadme,
+-  normalizeContributors,
+   normalizePackage,
+   tagVersion,
+ } from './storage-utils';
+diff --git a/packages/store/src/storage-utils.ts b/packages/store/src/storage-utils.ts
+index d5c54ba38..488c4823a 100644
+--- a/packages/store/src/storage-utils.ts
++++ b/packages/store/src/storage-utils.ts
+@@ -3,7 +3,7 @@ import semver from 'semver';
+ 
+ import { errorUtils, pkgUtils, validatioUtils } from '@verdaccio/core';
+ import { API_ERROR, DIST_TAGS, HTTP_STATUS, USERS } from '@verdaccio/core';
+-import { Author, Package, StringValue, Version } from '@verdaccio/types';
++import { Package, StringValue, Version } from '@verdaccio/types';
+ import { generateRandomHexString, isNil, normalizeDistTags } from '@verdaccio/utils';
+ 
+ import { LocalStorage } from './local-storage';
+@@ -98,24 +98,6 @@ export function cleanUpReadme(version: any): Version {
+   return version;
+ }
+ 
+-export function normalizeContributors(contributors: Author[]): Author[] {
+-  if (isNil(contributors)) {
+-    return [];
+-  } else if (contributors && _.isArray(contributors) === false) {
+-    // FIXME: this branch is clearly no an array, still tsc complains
+-    // @ts-ignore
+-    return [contributors];
+-  } else if (_.isString(contributors)) {
+-    return [
+-      {
+-        name: contributors,
+-      },
+-    ];
+-  }
+-
+-  return contributors;
+-}
+-
+ export const WHITELIST = [
+   '_rev',
+   'name',
+diff --git a/packages/utils/src/utils.ts b/packages/utils/src/utils.ts
+index 5a157ba49..2efb81f4f 100644
+--- a/packages/utils/src/utils.ts
++++ b/packages/utils/src/utils.ts
+@@ -5,6 +5,9 @@ import semver from 'semver';
+ import { DEFAULT_USER, DIST_TAGS } from '@verdaccio/core';
+ import { Author, Package, Version } from '@verdaccio/types';
+ 
++import { stringToMD5 } from './crypto-utils';
++
++export type AuthorAvatar = Author & { avatar?: string };
+ /**
+  * From normalize-package-data/lib/fixer.js
+  * @param {*} name  the package name
+@@ -253,3 +256,111 @@ export function isVersionValid(packageMeta, packageVersion): boolean {
+   const hasMatchVersion = Object.keys(packageMeta.versions).includes(packageVersion);
+   return hasMatchVersion;
+ }
++
++export function addGravatarSupport(pkgInfo: Package, online = true): AuthorAvatar {
++  const pkgInfoCopy = { ...pkgInfo } as any;
++  const author: any = _.get(pkgInfo, 'latest.author', null) as any;
++  const contributors: AuthorAvatar[] = normalizeContributors(
++    _.get(pkgInfo, 'latest.contributors', [])
++  );
++  const maintainers = _.get(pkgInfo, 'latest.maintainers', []);
++
++  // for author.
++  if (author && _.isObject(author)) {
++    const { email } = author as Author;
++    pkgInfoCopy.latest.author.avatar = generateGravatarUrl(email, online);
++  }
++
++  if (author && _.isString(author)) {
++    pkgInfoCopy.latest.author = {
++      avatar: GENERIC_AVATAR,
++      email: '',
++      author,
++    };
++  }
++
++  // for contributors
++  if (_.isEmpty(contributors) === false) {
++    pkgInfoCopy.latest.contributors = contributors.map((contributor): AuthorAvatar => {
++      if (isObject(contributor)) {
++        contributor.avatar = generateGravatarUrl(contributor.email, online);
++      } else if (_.isString(contributor)) {
++        contributor = {
++          avatar: GENERIC_AVATAR,
++          email: contributor,
++          name: contributor,
++        };
++      }
++
++      return contributor;
++    });
++  }
++
++  // for maintainers
++  if (_.isEmpty(maintainers) === false) {
++    pkgInfoCopy.latest.maintainers = maintainers.map((maintainer): void => {
++      maintainer.avatar = generateGravatarUrl(maintainer.email, online);
++      return maintainer;
++    });
++  }
++
++  return pkgInfoCopy;
++}
++
++const AVATAR_PROVIDER = 'https://www.gravatar.com/avatar/';
++export const GENERIC_AVATAR =
++  'data:image/svg+xml;utf8,' +
++  encodeURIComponent(
++    '<svg height="100" viewBox="-27 24 100 100" width="100" xmlns="http://www.w3.org/' +
++      '2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><defs><circle cx="23" cy="7' +
++      '4" id="a" r="50"/></defs><use fill="#F5EEE5" overflow="visible" xlink:href="#a"/' +
++      '><clipPath id="b"><use overflow="visible" xlink:href="#a"/></clipPath><g clip-pa' +
++      'th="url(#b)"><defs><path d="M36 95.9c0 4 4.7 5.2 7.1 5.8 7.6 2 22.8 5.9 22.8 5.9' +
++      ' 3.2 1.1 5.7 3.5 7.1 6.6v9.8H-27v-9.8c1.3-3.1 3.9-5.5 7.1-6.6 0 0 15.2-3.9 22.8-' +
++      '5.9 2.4-.6 7.1-1.8 7.1-5.8V85h26v10.9z" id="c"/></defs><use fill="#E6C19C" overf' +
++      'low="visible" xlink:href="#c"/><clipPath id="d"><use overflow="visible" xlink:hr' +
++      'ef="#c"/></clipPath><path clip-path="url(#d)" d="M23.2 35h.2c3.3 0 8.2.2 11.4 2 ' +
++      '3.3 1.9 7.3 5.6 8.5 12.1 2.4 13.7-2.1 35.4-6.3 42.4-4 6.7-9.8 9.2-13.5 9.4H23h-.' +
++      '1c-3.7-.2-9.5-2.7-13.5-9.4-4.2-7-8.7-28.7-6.3-42.4 1.2-6.5 5.2-10.2 8.5-12.1 3.2' +
++      '-1.8 8.1-2 11.4-2h.2z" fill="#D4B08C"/></g><path d="M22.6 40c19.1 0 20.7 13.8 20' +
++      '.8 15.1 1.1 11.9-3 28.1-6.8 33.7-4 5.9-9.8 8.1-13.5 8.3h-.5c-3.8-.3-9.6-2.5-13.6' +
++      '-8.4-3.8-5.6-7.9-21.8-6.8-33.8C2.3 53.7 3.5 40 22.6 40z" fill="#F2CEA5"/></svg>'
++  );
++
++/**
++ * Generate gravatar url from email address
++ */
++export function generateGravatarUrl(email: string | void = '', online: boolean = true): string {
++  if (online && _.isString(email) && _.size(email) > 0) {
++    email = email.trim().toLocaleLowerCase();
++    const emailMD5 = stringToMD5(email);
++    return `${AVATAR_PROVIDER}${emailMD5}`;
++  }
++  return GENERIC_AVATAR;
++}
++
++export function normalizeContributors(contributors: Author[]): Author[] {
++  if (_.isNil(contributors)) {
++    return [];
++  } else if (contributors && _.isArray(contributors) === false) {
++    // FIXME: this branch is clearly no an array, still tsc complains
++    // @ts-ignore
++    return [contributors];
++  } else if (_.isString(contributors)) {
++    return [
++      {
++        name: contributors,
++      },
++    ];
++  }
++
++  return contributors;
++}
++
++export function deleteProperties(propertiesToDelete: string[], objectItem: any): any {
++  _.forEach(propertiesToDelete, (property): any => {
++    delete objectItem[property];
++  });
++
++  return objectItem;
++}
+diff --git a/packages/web/src/api/package.ts b/packages/web/src/api/package.ts
+index 746bd7cf8..6ffebc58f 100644
+--- a/packages/web/src/api/package.ts
++++ b/packages/web/src/api/package.ts
+@@ -8,9 +8,8 @@ import { $NextFunctionVer, $RequestExtend, $ResponseExtend } from '@verdaccio/mi
+ import { Storage } from '@verdaccio/store';
+ import { getLocalRegistryTarballUri } from '@verdaccio/tarball';
+ import { Config, Package, RemoteUser } from '@verdaccio/types';
+-import { formatAuthor } from '@verdaccio/utils';
++import { formatAuthor, generateGravatarUrl } from '@verdaccio/utils';
+ 
+-import { generateGravatarUrl } from '../utils/user';
+ import { AuthorAvatar, sortByName } from '../utils/web-utils';
+ 
+ export { $RequestExtend, $ResponseExtend, $NextFunctionVer }; // Was required by other packages
+diff --git a/packages/web/src/api/sidebar.ts b/packages/web/src/api/sidebar.ts
+index da7fb2c74..d711cf76b 100644
+--- a/packages/web/src/api/sidebar.ts
++++ b/packages/web/src/api/sidebar.ts
+@@ -8,9 +8,9 @@ import { $NextFunctionVer, $RequestExtend, $ResponseExtend, allow } from '@verda
+ import { Storage } from '@verdaccio/store';
+ import { convertDistRemoteToLocalTarballUrls } from '@verdaccio/tarball';
+ import { Config, Package, Version } from '@verdaccio/types';
+-import { formatAuthor, isVersionValid } from '@verdaccio/utils';
++import { addGravatarSupport, formatAuthor, isVersionValid } from '@verdaccio/utils';
+ 
+-import { AuthorAvatar, addGravatarSupport, addScope, deleteProperties } from '../utils/web-utils';
++import { AuthorAvatar, addScope, deleteProperties } from '../utils/web-utils';
+ 
+ export { $RequestExtend, $ResponseExtend, $NextFunctionVer }; // Was required by other packages
+ 
+diff --git a/packages/web/src/utils/user.ts b/packages/web/src/utils/user.ts
+deleted file mode 100644
+index 1f81ba4bf..000000000
+--- a/packages/web/src/utils/user.ts
++++ /dev/null
+@@ -1,37 +0,0 @@
+-import _ from 'lodash';
+-
+-import { stringToMD5 } from '@verdaccio/utils';
+-
+-// this is a generic avatar
+-// https://www.iconfinder.com/icons/403017/anonym_avatar_default_head_person_unknown_user_icon
+-// license: free commercial usage
+-export const GENERIC_AVATAR =
+-  'data:image/svg+xml;utf8,' +
+-  encodeURIComponent(
+-    '<svg height="100" viewBox="-27 24 100 100" width="100" xmlns="http://www.w3.org/' +
+-      '2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><defs><circle cx="23" cy="7' +
+-      '4" id="a" r="50"/></defs><use fill="#F5EEE5" overflow="visible" xlink:href="#a"/' +
+-      '><clipPath id="b"><use overflow="visible" xlink:href="#a"/></clipPath><g clip-pa' +
+-      'th="url(#b)"><defs><path d="M36 95.9c0 4 4.7 5.2 7.1 5.8 7.6 2 22.8 5.9 22.8 5.9' +
+-      ' 3.2 1.1 5.7 3.5 7.1 6.6v9.8H-27v-9.8c1.3-3.1 3.9-5.5 7.1-6.6 0 0 15.2-3.9 22.8-' +
+-      '5.9 2.4-.6 7.1-1.8 7.1-5.8V85h26v10.9z" id="c"/></defs><use fill="#E6C19C" overf' +
+-      'low="visible" xlink:href="#c"/><clipPath id="d"><use overflow="visible" xlink:hr' +
+-      'ef="#c"/></clipPath><path clip-path="url(#d)" d="M23.2 35h.2c3.3 0 8.2.2 11.4 2 ' +
+-      '3.3 1.9 7.3 5.6 8.5 12.1 2.4 13.7-2.1 35.4-6.3 42.4-4 6.7-9.8 9.2-13.5 9.4H23h-.' +
+-      '1c-3.7-.2-9.5-2.7-13.5-9.4-4.2-7-8.7-28.7-6.3-42.4 1.2-6.5 5.2-10.2 8.5-12.1 3.2' +
+-      '-1.8 8.1-2 11.4-2h.2z" fill="#D4B08C"/></g><path d="M22.6 40c19.1 0 20.7 13.8 20' +
+-      '.8 15.1 1.1 11.9-3 28.1-6.8 33.7-4 5.9-9.8 8.1-13.5 8.3h-.5c-3.8-.3-9.6-2.5-13.6' +
+-      '-8.4-3.8-5.6-7.9-21.8-6.8-33.8C2.3 53.7 3.5 40 22.6 40z" fill="#F2CEA5"/></svg>'
+-  );
+-
+-/**
+- * Generate gravatar url from email address
+- */
+-export function generateGravatarUrl(email: string | void = '', online: boolean = true): string {
+-  if (online && _.isString(email) && _.size(email) > 0) {
+-    email = email.trim().toLocaleLowerCase();
+-    const emailMD5 = stringToMD5(email);
+-    return `https://www.gravatar.com/avatar/${emailMD5}`;
+-  }
+-  return GENERIC_AVATAR;
+-}
+diff --git a/packages/web/src/utils/web-utils.ts b/packages/web/src/utils/web-utils.ts
+index cd563427b..0bea5fcf3 100644
+--- a/packages/web/src/utils/web-utils.ts
++++ b/packages/web/src/utils/web-utils.ts
+@@ -2,11 +2,8 @@ import buildDebug from 'debug';
+ import _ from 'lodash';
+ 
+ import sanitizyReadme from '@verdaccio/readme';
+-import { normalizeContributors } from '@verdaccio/store';
+-import { Author, ConfigYaml, Package } from '@verdaccio/types';
+-import { isObject } from '@verdaccio/utils';
+-
+-import { GENERIC_AVATAR, generateGravatarUrl } from './user';
++// import { normalizeContributors } from '@verdaccio/store';
++import { Author, ConfigYaml } from '@verdaccio/types';
+ 
+ export type AuthorAvatar = Author & { avatar?: string };
+ 
+@@ -22,56 +19,6 @@ export function validatePrimaryColor(primaryColor) {
+   return primaryColor;
+ }
+ 
+-export function addGravatarSupport(pkgInfo: Package, online = true): AuthorAvatar {
+-  const pkgInfoCopy = { ...pkgInfo } as any;
+-  const author: any = _.get(pkgInfo, 'latest.author', null) as any;
+-  const contributors: AuthorAvatar[] = normalizeContributors(
+-    _.get(pkgInfo, 'latest.contributors', [])
+-  );
+-  const maintainers = _.get(pkgInfo, 'latest.maintainers', []);
+-
+-  // for author.
+-  if (author && _.isObject(author)) {
+-    const { email } = author as Author;
+-    pkgInfoCopy.latest.author.avatar = generateGravatarUrl(email, online);
+-  }
+-
+-  if (author && _.isString(author)) {
+-    pkgInfoCopy.latest.author = {
+-      avatar: GENERIC_AVATAR,
+-      email: '',
+-      author,
+-    };
+-  }
+-
+-  // for contributors
+-  if (_.isEmpty(contributors) === false) {
+-    pkgInfoCopy.latest.contributors = contributors.map((contributor): AuthorAvatar => {
+-      if (isObject(contributor)) {
+-        contributor.avatar = generateGravatarUrl(contributor.email, online);
+-      } else if (_.isString(contributor)) {
+-        contributor = {
+-          avatar: GENERIC_AVATAR,
+-          email: contributor,
+-          name: contributor,
+-        };
+-      }
+-
+-      return contributor;
+-    });
+-  }
+-
+-  // for maintainers
+-  if (_.isEmpty(maintainers) === false) {
+-    pkgInfoCopy.latest.maintainers = maintainers.map((maintainer): void => {
+-      maintainer.avatar = generateGravatarUrl(maintainer.email, online);
+-      return maintainer;
+-    });
+-  }
+-
+-  return pkgInfoCopy;
+-}
+-
+ /**
+  * parse package readme - markdown/ascii
+  * @param {String} packageName name of package

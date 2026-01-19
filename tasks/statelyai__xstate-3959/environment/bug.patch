@@ -1,0 +1,294 @@
+diff --git a/.changeset/large-cooks-taste.md b/.changeset/large-cooks-taste.md
+deleted file mode 100644
+index a4286b127f..0000000000
+--- a/.changeset/large-cooks-taste.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': patch
+----
+-
+-Unresolved promises will now be properly persisted. The current behavior is to restart a promise that is unresolved.
+diff --git a/packages/core/src/actors/callback.ts b/packages/core/src/actors/callback.ts
+index 69ab8f51d5..9b2bbe9bb5 100644
+--- a/packages/core/src/actors/callback.ts
++++ b/packages/core/src/actors/callback.ts
+@@ -34,7 +34,7 @@ export function fromCallback<TEvent extends EventObject>(
+       if (_event.name === startSignalType) {
+         const sender = (eventForParent: AnyEventObject) => {
+           if (state.canceled) {
+-            return;
++            return state;
+           }
+ 
+           self._parent?.send(toSCXMLEvent(eventForParent, { origin: self }));
+diff --git a/packages/core/src/actors/observable.ts b/packages/core/src/actors/observable.ts
+index 42710baa40..bb87ec6b62 100644
+--- a/packages/core/src/actors/observable.ts
++++ b/packages/core/src/actors/observable.ts
+@@ -9,7 +9,8 @@ import { stopSignalType } from '../actors';
+ 
+ export interface ObservableInternalState<T> {
+   subscription: Subscription | undefined;
+-  status: 'active' | 'done' | 'error' | 'canceled';
++  canceled: boolean;
++  status: 'active' | 'done' | 'error';
+   data: T | undefined;
+   input?: any;
+ }
+@@ -42,12 +43,13 @@ export function fromObservable<T, TEvent extends EventObject>(
+     transition: (state, event, { self, id, defer }) => {
+       const _event = toSCXMLEvent(event);
+ 
+-      if (state.status !== 'active') {
++      if (state.canceled) {
+         return state;
+       }
+ 
+       switch (_event.name) {
+         case nextEventType:
++          state.data = event.data.data;
+           // match the exact timing of events sent by machines
+           // send actions are not executed immediately
+           defer(() => {
+@@ -61,33 +63,21 @@ export function fromObservable<T, TEvent extends EventObject>(
+               )
+             );
+           });
+-          return {
+-            ...state,
+-            data: event.data.data
+-          };
++          return state;
+         case errorEventType:
+-          return {
+-            ...state,
+-            status: 'error',
+-            input: undefined,
+-            data: _event.data.data,
+-            subscription: undefined
+-          };
++          state.status = 'error';
++          delete state.input;
++          state.data = _event.data.data;
++          return state;
+         case completeEventType:
+-          return {
+-            ...state,
+-            status: 'done',
+-            input: undefined,
+-            subscription: undefined
+-          };
++          state.status = 'done';
++          delete state.input;
++          return state;
+         case stopSignalType:
++          state.canceled = true;
++          delete state.input;
+           state.subscription!.unsubscribe();
+-          return {
+-            ...state,
+-            status: 'canceled',
+-            input: undefined,
+-            subscription: undefined
+-          };
++          return state;
+         default:
+           return state;
+       }
+@@ -95,6 +85,7 @@ export function fromObservable<T, TEvent extends EventObject>(
+     getInitialState: (_, input) => {
+       return {
+         subscription: undefined,
++        canceled: false,
+         status: 'active',
+         data: undefined,
+         input
+@@ -118,7 +109,8 @@ export function fromObservable<T, TEvent extends EventObject>(
+       });
+     },
+     getSnapshot: (state) => state.data,
+-    getPersistedState: ({ status, data, input }) => ({
++    getPersistedState: ({ canceled, status, data, input }) => ({
++      canceled,
+       status,
+       data,
+       input
+@@ -158,34 +150,25 @@ export function fromEventObservable<T extends EventObject>(
+     transition: (state, event) => {
+       const _event = toSCXMLEvent(event);
+ 
+-      if (state.status !== 'active') {
++      if (state.canceled) {
+         return state;
+       }
+ 
+       switch (_event.name) {
+         case errorEventType:
+-          return {
+-            ...state,
+-            status: 'error',
+-            input: undefined,
+-            data: _event.data.data,
+-            subscription: undefined
+-          };
++          state.status = 'error';
++          delete state.input;
++          state.data = _event.data.data;
++          return state;
+         case completeEventType:
+-          return {
+-            ...state,
+-            status: 'done',
+-            input: undefined,
+-            subscription: undefined
+-          };
++          state.status = 'done';
++          delete state.input;
++          return state;
+         case stopSignalType:
++          state.canceled = true;
++          delete state.input;
+           state.subscription!.unsubscribe();
+-          return {
+-            ...state,
+-            status: 'canceled',
+-            input: undefined,
+-            subscription: undefined
+-          };
++          return state;
+         default:
+           return state;
+       }
+@@ -193,6 +176,7 @@ export function fromEventObservable<T extends EventObject>(
+     getInitialState: () => {
+       return {
+         subscription: undefined,
++        canceled: false,
+         status: 'active',
+         data: undefined
+       };
+@@ -216,7 +200,8 @@ export function fromEventObservable<T extends EventObject>(
+       });
+     },
+     getSnapshot: (_) => undefined,
+-    getPersistedState: ({ status, data, input }) => ({
++    getPersistedState: ({ canceled, status, data, input }) => ({
++      canceled,
+       status,
+       data,
+       input
+diff --git a/packages/core/src/actors/promise.ts b/packages/core/src/actors/promise.ts
+index 51162f592c..a2952f1b92 100644
+--- a/packages/core/src/actors/promise.ts
++++ b/packages/core/src/actors/promise.ts
+@@ -3,7 +3,8 @@ import { toSCXMLEvent } from '../utils';
+ import { stopSignalType } from '../actors';
+ 
+ export interface PromiseInternalState<T> {
+-  status: 'active' | 'error' | 'done' | 'canceled';
++  status: 'active' | 'error' | 'done';
++  canceled: boolean;
+   data: T | undefined;
+   input?: any;
+ }
+@@ -32,7 +33,7 @@ export function fromPromise<T>(
+     transition: (state, event) => {
+       const _event = toSCXMLEvent(event);
+ 
+-      if (state.status !== 'active') {
++      if (state.canceled) {
+         return state;
+       }
+ 
+@@ -40,25 +41,19 @@ export function fromPromise<T>(
+ 
+       switch (_event.name) {
+         case resolveEventType:
+-          return {
+-            ...state,
+-            status: 'done',
+-            data: eventObject.data,
+-            input: undefined
+-          };
++          state.status = 'done';
++          state.data = eventObject.data;
++          delete state.input;
++          return state;
+         case rejectEventType:
+-          return {
+-            ...state,
+-            status: 'error',
+-            data: eventObject.data,
+-            input: undefined
+-          };
++          state.status = 'error';
++          state.data = eventObject.data;
++          delete state.input;
++          return state;
+         case stopSignalType:
+-          return {
+-            ...state,
+-            status: 'canceled',
+-            input: undefined
+-          };
++          state.canceled = true;
++          delete state.input;
++          return state;
+         default:
+           return state;
+       }
+@@ -85,6 +80,7 @@ export function fromPromise<T>(
+     },
+     getInitialState: (_, input) => {
+       return {
++        canceled: false,
+         status: 'active',
+         data: undefined,
+         input
+diff --git a/packages/core/test/behaviors.test.ts b/packages/core/test/behaviors.test.ts
+index 2985373b9f..c6574ca373 100644
+--- a/packages/core/test/behaviors.test.ts
++++ b/packages/core/test/behaviors.test.ts
+@@ -86,31 +86,7 @@ describe('promise behavior (fromPromise)', () => {
+     expect(called).toBe(false);
+   });
+ 
+-  it('should persist an unresolved promise', (done) => {
+-    const promiseBehavior = fromPromise(
+-      () =>
+-        new Promise<number>((res) => {
+-          setTimeout(() => res(42), 10);
+-        })
+-    );
+-
+-    const actor = interpret(promiseBehavior);
+-    actor.start();
+-
+-    const resolvedPersistedState = actor.getPersistedState();
+-    actor.stop();
+-
+-    const restoredActor = interpret(promiseBehavior, {
+-      state: resolvedPersistedState
+-    }).start();
+-
+-    setTimeout(() => {
+-      expect(restoredActor.getSnapshot()).toBe(42);
+-      done();
+-    }, 20);
+-  });
+-
+-  it('should persist a resolved promise', (done) => {
++  it('should persist a promise', (done) => {
+     const promiseBehavior = fromPromise(
+       () =>
+         new Promise<number>((res) => {
+@@ -374,7 +350,7 @@ describe('machine behavior', () => {
+ 
+     expect(persistedState.children.a.state).toEqual(
+       expect.objectContaining({
+-        status: 'done',
++        canceled: false,
+         data: 42
+       })
+     );

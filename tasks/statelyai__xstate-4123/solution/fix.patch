@@ -1,0 +1,692 @@
+diff --git a/.changeset/tender-cups-obey.md b/.changeset/tender-cups-obey.md
+new file mode 100644
+index 0000000000..0ca78cd46d
+--- /dev/null
++++ b/.changeset/tender-cups-obey.md
+@@ -0,0 +1,23 @@
++---
++'xstate': patch
++---
++
++Removed the ability to configure transitions using arrays:
++
++```ts
++createMachine({
++  on: [{ event: 'FOO', target: '#id' }]
++  // ...
++});
++```
++
++Only regular object-based configs will be supported from now on:
++
++```ts
++createMachine({
++  on: {
++    FOO: '#id'
++  }
++  // ...
++});
++```
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index 7210d93a16..b7d29fe2ae 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -122,7 +122,7 @@ export class StateNode<
+   public description?: string;
+ 
+   public tags: string[] = [];
+-  public transitions!: Array<TransitionDefinition<TContext, TEvent>>;
++  public transitions!: Map<string, TransitionDefinition<TContext, TEvent>[]>;
+   public always?: Array<TransitionDefinition<TContext, TEvent>>;
+ 
+   constructor(
+@@ -194,8 +194,8 @@ export class StateNode<
+   public _initialize() {
+     this.transitions = formatTransitions(this);
+     if (this.config.always) {
+-      this.always = toTransitionConfigArray(NULL_EVENT, this.config.always).map(
+-        (t) => formatTransition(this, t)
++      this.always = toTransitionConfigArray(this.config.always).map((t) =>
++        formatTransition(this, NULL_EVENT, t)
+       );
+     }
+ 
+@@ -233,7 +233,7 @@ export class StateNode<
+         return state.definition;
+       }) as StatesDefinition<TContext, TEvent>,
+       on: this.on,
+-      transitions: this.transitions,
++      transitions: [...this.transitions.values()].flat(),
+       entry: this.entry,
+       exit: this.exit,
+       meta: this.meta,
+@@ -306,11 +306,13 @@ export class StateNode<
+     return memo(this, 'on', () => {
+       const transitions = this.transitions;
+ 
+-      return transitions.reduce((map, transition) => {
+-        map[transition.eventType] = map[transition.eventType] || [];
+-        map[transition.eventType].push(transition as any);
+-        return map;
+-      }, {} as TransitionDefinitionMap<TContext, TEvent>);
++      return [...transitions]
++        .flatMap(([descriptor, t]) => t.map((t) => [descriptor, t] as const))
++        .reduce((map: any, [descriptor, transition]) => {
++          map[descriptor] = map[descriptor] || [];
++          map[descriptor].push(transition);
++          return map;
++        }, {} as TransitionDefinitionMap<TContext, TEvent>);
+     });
+   }
+ 
+@@ -427,15 +429,18 @@ export class StateNode<
+    */
+   public get ownEvents(): Array<TEvent['type']> {
+     const events = new Set(
+-      this.transitions
+-        .filter((transition) => {
+-          return !(
+-            !transition.target &&
+-            !transition.actions.length &&
+-            !transition.reenter
++      [...this.transitions.keys()].filter((descriptor) => {
++        return this.transitions
++          .get(descriptor)!
++          .some(
++            (transition) =>
++              !(
++                !transition.target &&
++                !transition.actions.length &&
++                !transition.reenter
++              )
+           );
+-        })
+-        .map((transition) => transition.eventType)
++      })
+     );
+ 
+     return Array.from(events);
+diff --git a/packages/core/src/scxml.ts b/packages/core/src/scxml.ts
+index 621c83eca0..cf0216366b 100644
+--- a/packages/core/src/scxml.ts
++++ b/packages/core/src/scxml.ts
+@@ -25,17 +25,18 @@ export function sanitizeStateId(id: string) {
+ }
+ 
+ function appendWildcards(state: AnyStateNode) {
+-  for (const t of state.transitions) {
+-    if (
+-      typeof t.eventType === 'string' &&
+-      !!t.eventType &&
+-      t.eventType !== '*' &&
+-      !t.eventType.endsWith('.*')
+-    ) {
+-      t.eventType = `${t.eventType}.*`;
++  const newTransitions: typeof state.transitions = new Map();
++
++  for (const [descriptor, transitions] of state.transitions) {
++    if (descriptor !== '*' && !descriptor.endsWith('.*')) {
++      newTransitions.set(`${descriptor}.*`, transitions);
++    } else {
++      newTransitions.set(descriptor, transitions);
+     }
+   }
+ 
++  state.transitions = newTransitions;
++
+   for (const key of Object.keys(state.states)) {
+     appendWildcards(state.states[key]);
+   }
+@@ -400,7 +401,7 @@ function toConfig(nodeJson: XMLElement, id: string): StateNodeConfig<any, any> {
+     }
+ 
+     const always: any[] = [];
+-    const on: any[] = [];
++    const on: Record<string, any> = [];
+ 
+     transitionElements.map((value) => {
+       const events = ((getAttribute(value, 'event') as string) || '').split(
+@@ -439,7 +440,6 @@ function toConfig(nodeJson: XMLElement, id: string): StateNodeConfig<any, any> {
+         }
+ 
+         const transitionConfig = {
+-          event: eventType,
+           target: getTargets(targets),
+           ...(value.elements ? executableContent(value.elements) : undefined),
+           ...guardObject,
+@@ -449,7 +449,12 @@ function toConfig(nodeJson: XMLElement, id: string): StateNodeConfig<any, any> {
+         if (eventType === NULL_EVENT) {
+           always.push(transitionConfig);
+         } else {
+-          on.push(transitionConfig);
++          let existing = on[eventType];
++          if (!existing) {
++            existing = [];
++            on[eventType] = existing;
++          }
++          existing.push(transitionConfig);
+         }
+       });
+     });
+@@ -502,7 +507,7 @@ function toConfig(nodeJson: XMLElement, id: string): StateNodeConfig<any, any> {
+             states: mapValues(states, (state, key) => toConfig(state, key))
+           }
+         : undefined),
+-      ...(transitionElements.length ? { on } : undefined),
++      on,
+       ...(always.length ? { always } : undefined),
+       ...(onEntry ? { entry: onEntry } : undefined),
+       ...(onExit ? { exit: onExit } : undefined),
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index f38b8d9594..dc5109e219 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -232,59 +232,58 @@ export function getCandidates<TEvent extends EventObject>(
+   stateNode: StateNode<any, TEvent>,
+   receivedEventType: TEvent['type']
+ ): Array<TransitionDefinition<any, TEvent>> {
+-  const candidates = stateNode.transitions.filter((transition) => {
+-    const { eventType } = transition;
+-    // First, check the trivial case: event names are exactly equal
+-    if (eventType === receivedEventType) {
+-      return true;
+-    }
+-
+-    // Then, check if transition is a wildcard transition,
+-    // which matches any non-transient events
+-    if (eventType === WILDCARD) {
+-      return true;
+-    }
++  const candidates =
++    stateNode.transitions.get(receivedEventType) ||
++    [...stateNode.transitions.keys()]
++      .filter((descriptor) => {
++        // check if transition is a wildcard transition,
++        // which matches any non-transient events
++        if (descriptor === WILDCARD) {
++          return true;
++        }
+ 
+-    if (!eventType.endsWith('.*')) {
+-      return false;
+-    }
++        if (!descriptor.endsWith('.*')) {
++          return false;
++        }
+ 
+-    if (isDevelopment && /.*\*.+/.test(eventType)) {
+-      console.warn(
+-        `Wildcards can only be the last token of an event descriptor (e.g., "event.*") or the entire event descriptor ("*"). Check the "${eventType}" event.`
+-      );
+-    }
++        if (isDevelopment && /.*\*.+/.test(descriptor)) {
++          console.warn(
++            `Wildcards can only be the last token of an event descriptor (e.g., "event.*") or the entire event descriptor ("*"). Check the "${descriptor}" event.`
++          );
++        }
+ 
+-    const partialEventTokens = eventType.split('.');
+-    const eventTokens = receivedEventType.split('.');
++        const partialEventTokens = descriptor.split('.');
++        const eventTokens = receivedEventType.split('.');
+ 
+-    for (
+-      let tokenIndex = 0;
+-      tokenIndex < partialEventTokens.length;
+-      tokenIndex++
+-    ) {
+-      const partialEventToken = partialEventTokens[tokenIndex];
+-      const eventToken = eventTokens[tokenIndex];
++        for (
++          let tokenIndex = 0;
++          tokenIndex < partialEventTokens.length;
++          tokenIndex++
++        ) {
++          const partialEventToken = partialEventTokens[tokenIndex];
++          const eventToken = eventTokens[tokenIndex];
+ 
+-      if (partialEventToken === '*') {
+-        const isLastToken = tokenIndex === partialEventTokens.length - 1;
++          if (partialEventToken === '*') {
++            const isLastToken = tokenIndex === partialEventTokens.length - 1;
+ 
+-        if (isDevelopment && !isLastToken) {
+-          console.warn(
+-            `Infix wildcards in transition events are not allowed. Check the "${eventType}" event.`
+-          );
+-        }
++            if (isDevelopment && !isLastToken) {
++              console.warn(
++                `Infix wildcards in transition events are not allowed. Check the "${descriptor}" transition.`
++              );
++            }
+ 
+-        return isLastToken;
+-      }
++            return isLastToken;
++          }
+ 
+-      if (partialEventToken !== eventToken) {
+-        return false;
+-      }
+-    }
++          if (partialEventToken !== eventToken) {
++            return false;
++          }
++        }
+ 
+-    return true;
+-  });
++        return true;
++      })
++      .sort((a, b) => b.length - a.length)
++      .flatMap((key) => stateNode.transitions.get(key)!);
+ 
+   return candidates;
+ }
+@@ -335,7 +334,11 @@ export function getDelayedTransitions<
+   return delayedTransitions.map((delayedTransition) => {
+     const { delay } = delayedTransition;
+     return {
+-      ...formatTransition(stateNode, delayedTransition),
++      ...formatTransition(
++        stateNode,
++        delayedTransition.event,
++        delayedTransition
++      ),
+       delay
+     };
+   });
+@@ -346,9 +349,8 @@ export function formatTransition<
+   TEvent extends EventObject
+ >(
+   stateNode: AnyStateNode,
+-  transitionConfig: TransitionConfig<TContext, TEvent> & {
+-    event: TEvent['type'] | typeof NULL_EVENT | '*';
+-  }
++  descriptor: string,
++  transitionConfig: TransitionConfig<TContext, TEvent>
+ ): AnyTransitionDefinition {
+   const normalizedTarget = normalizeTarget(transitionConfig.target);
+   const reenter = transitionConfig.reenter ?? false;
+@@ -373,7 +375,7 @@ export function formatTransition<
+     target,
+     source: stateNode,
+     reenter,
+-    eventType: transitionConfig.event,
++    eventType: descriptor,
+     toJSON: () => ({
+       ...transition,
+       source: `#${stateNode.id}`,
+@@ -387,95 +389,76 @@ export function formatTransition<
+ export function formatTransitions<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+->(stateNode: AnyStateNode): Array<AnyTransitionDefinition> {
+-  const transitionConfigs: Array<
+-    TransitionConfig<TContext, TEvent> & {
+-      event: string;
+-    }
+-  > = [];
+-  if (Array.isArray(stateNode.config.on)) {
+-    transitionConfigs.push(...stateNode.config.on);
+-  } else if (stateNode.config.on) {
+-    const { [WILDCARD]: wildcardConfigs = [], ...namedTransitionConfigs } =
+-      stateNode.config.on;
+-    for (const eventType of Object.keys(namedTransitionConfigs)) {
+-      if (eventType === NULL_EVENT) {
++>(
++  stateNode: AnyStateNode
++): Map<string, TransitionDefinition<TContext, TEvent>[]> {
++  const transitions = new Map<
++    string,
++    TransitionDefinition<TContext, AnyEventObject>[]
++  >();
++  if (stateNode.config.on) {
++    for (const descriptor of Object.keys(stateNode.config.on)) {
++      if (descriptor === NULL_EVENT) {
+         throw new Error(
+           'Null events ("") cannot be specified as a transition key. Use `always: { ... }` instead.'
+         );
+       }
+-      const eventTransitionConfigs = toTransitionConfigArray<TContext, TEvent>(
+-        eventType,
+-        namedTransitionConfigs![eventType as string]
++      const transitionsConfig = stateNode.config.on[descriptor];
++      transitions.set(
++        descriptor,
++        toTransitionConfigArray(transitionsConfig).map((t) =>
++          formatTransition(stateNode, descriptor, t)
++        )
+       );
+-
+-      transitionConfigs.push(...eventTransitionConfigs);
+-      // TODO: add dev-mode validation for unreachable transitions
+     }
+-    transitionConfigs.push(
+-      ...toTransitionConfigArray(
+-        WILDCARD,
+-        wildcardConfigs as SingleOrArray<
+-          TransitionConfig<TContext, TEvent> & {
+-            event: '*';
+-          }
+-        >
++  }
++  if (stateNode.config.onDone) {
++    const descriptor = String(done(stateNode.id));
++    transitions.set(
++      descriptor,
++      toTransitionConfigArray(stateNode.config.onDone).map((t) =>
++        formatTransition(stateNode, descriptor, t)
+       )
+     );
+   }
+-  const doneConfig = stateNode.config.onDone
+-    ? toTransitionConfigArray(
+-        String(done(stateNode.id)),
+-        stateNode.config.onDone
+-      )
+-    : [];
+-  const invokeConfig = stateNode.invoke.flatMap((invokeDef) => {
+-    const settleTransitions: any[] = [];
++  for (const invokeDef of stateNode.invoke) {
+     if (invokeDef.onDone) {
+-      settleTransitions.push(
+-        ...toTransitionConfigArray(
+-          `done.invoke.${invokeDef.id}`,
+-          invokeDef.onDone
++      const descriptor = `done.invoke.${invokeDef.id}`;
++      transitions.set(
++        descriptor,
++        toTransitionConfigArray(invokeDef.onDone).map((t) =>
++          formatTransition(stateNode, descriptor, t)
+         )
+       );
+     }
+     if (invokeDef.onError) {
+-      settleTransitions.push(
+-        ...toTransitionConfigArray(
+-          `error.platform.${invokeDef.id}`,
+-          invokeDef.onError
++      const descriptor = `error.platform.${invokeDef.id}`;
++      transitions.set(
++        descriptor,
++        toTransitionConfigArray(invokeDef.onError).map((t) =>
++          formatTransition(stateNode, descriptor, t)
+         )
+       );
+     }
+     if (invokeDef.onSnapshot) {
+-      settleTransitions.push(
+-        ...toTransitionConfigArray(
+-          `xstate.snapshot.${invokeDef.id}`,
+-          invokeDef.onSnapshot
++      const descriptor = `xstate.snapshot.${invokeDef.id}`;
++      transitions.set(
++        descriptor,
++        toTransitionConfigArray(invokeDef.onSnapshot).map((t) =>
++          formatTransition(stateNode, descriptor, t)
+         )
+       );
+     }
+-    return settleTransitions;
+-  });
+-  const delayedTransitions = stateNode.after;
+-  const formattedTransitions = [
+-    ...doneConfig,
+-    ...invokeConfig,
+-    ...transitionConfigs
+-  ].flatMap(
+-    (
+-      transitionConfig: TransitionConfig<TContext, TEvent> & {
+-        event: TEvent['type'] | '*';
+-      }
+-    ) =>
+-      toArray(transitionConfig).map((transition) =>
+-        formatTransition(stateNode, transition)
+-      )
+-  );
+-  for (const delayedTransition of delayedTransitions) {
+-    formattedTransitions.push(delayedTransition as any);
+   }
+-  return formattedTransitions;
++  for (const delayedTransition of stateNode.after) {
++    let existing = transitions.get(delayedTransition.eventType);
++    if (!existing) {
++      existing = [];
++      transitions.set(delayedTransition.eventType, existing);
++    }
++    existing.push(delayedTransition);
++  }
++  return transitions as Map<string, TransitionDefinition<TContext, any>[]>;
+ }
+ 
+ export function formatInitialTransition<
+@@ -529,7 +512,7 @@ export function formatInitialTransition<
+     return transition;
+   }
+ 
+-  return formatTransition(stateNode, {
++  return formatTransition(stateNode, '__INITIAL__', {
+     target: toArray(_target.target).map((t) => {
+       if (isString(t)) {
+         return isStateId(t) ? t : `${STATE_DELIMITER}${t}`;
+@@ -537,8 +520,7 @@ export function formatInitialTransition<
+ 
+       return t;
+     }),
+-    actions: _target.actions,
+-    event: null as any
++    actions: _target.actions
+   }) as InitialTransitionDefinition<TContext, TEvent>;
+ }
+ 
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 2bcbd1754b..5a736cdf45 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -478,7 +478,7 @@ export type TransitionConfigOrTarget<
+   TransitionConfigTarget | TransitionConfig<TContext, TExpressionEvent, TEvent>
+ >;
+ 
+-export type TransitionsConfigMap<
++export type TransitionsConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+ > = {
+@@ -487,24 +487,6 @@ export type TransitionsConfigMap<
+     : TransitionConfigOrTarget<TContext, ExtractEvent<TEvent, K>, TEvent>;
+ };
+ 
+-type TransitionsConfigArray<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> = Array<
+-  // distribute the union
+-  | (TEvent extends EventObject
+-      ? TransitionConfig<TContext, TEvent> & { event: TEvent['type'] }
+-      : never)
+-  | (TransitionConfig<TContext, TEvent> & { event: '*' })
+->;
+-
+-export type TransitionsConfig<
+-  TContext extends MachineContext,
+-  TEvent extends EventObject
+-> =
+-  | TransitionsConfigMap<TContext, TEvent>
+-  | TransitionsConfigArray<TContext, TEvent>;
+-
+ export interface InvokeConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index 79c296eb04..1ffe4fbf58 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -338,31 +338,20 @@ export function toTransitionConfigArray<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+ >(
+-  event: TEvent['type'] | typeof NULL_EVENT | '*',
+   configLike: SingleOrArray<
+     TransitionConfig<TContext, TEvent> | TransitionConfigTarget
+   >
+-): Array<
+-  TransitionConfig<TContext, TEvent> & {
+-    event: TEvent['type'] | typeof NULL_EVENT | '*';
+-  }
+-> {
+-  const transitions = toArrayStrict(configLike).map((transitionLike) => {
++): Array<TransitionConfig<TContext, TEvent>> {
++  return toArrayStrict(configLike).map((transitionLike) => {
+     if (
+       typeof transitionLike === 'undefined' ||
+       typeof transitionLike === 'string'
+     ) {
+-      return { target: transitionLike, event };
++      return { target: transitionLike };
+     }
+ 
+-    return { ...transitionLike, event };
+-  }) as Array<
+-    TransitionConfig<TContext, TEvent> & {
+-      event: TEvent['type'] | typeof NULL_EVENT | '*';
+-    } // TODO: fix 'as' (remove)
+-  >;
+-
+-  return transitions;
++    return transitionLike;
++  });
+ }
+ 
+ export function normalizeTarget<
+diff --git a/packages/xstate-graph/src/graph.ts b/packages/xstate-graph/src/graph.ts
+index c9aeb980e4..8ca32c3d5d 100644
+--- a/packages/xstate-graph/src/graph.ts
++++ b/packages/xstate-graph/src/graph.ts
+@@ -116,7 +116,7 @@ export function toDirectedGraph(
+     stateMachine instanceof StateMachine ? stateMachine.root : stateMachine; // TODO: accept only machines
+ 
+   const edges: DirectedGraphEdge[] = flatten(
+-    stateNode.transitions.map((t, transitionIndex) => {
++    [...stateNode.transitions.values()].flat().map((t, transitionIndex) => {
+       const targets = t.target ? t.target : [stateNode];
+ 
+       return targets.map((target, targetIndex) => {
+diff --git a/packages/xstate-scxml/src/scxml.ts b/packages/xstate-scxml/src/scxml.ts
+index a11a72d658..44b3e853a3 100644
+--- a/packages/xstate-scxml/src/scxml.ts
++++ b/packages/xstate-scxml/src/scxml.ts
+@@ -19,17 +19,18 @@ import {
+ import { not, stateIn } from 'xstate/guards';
+ 
+ function appendWildcards(state: AnyStateNode) {
+-  for (const t of state.transitions) {
+-    if (
+-      typeof t.eventType === 'string' &&
+-      !!t.eventType &&
+-      t.eventType !== '*' &&
+-      !t.eventType.endsWith('.*')
+-    ) {
+-      t.eventType = `${t.eventType}.*`;
++  const newTransitions: typeof state.transitions = new Map();
++
++  for (const [descriptor, transitions] of state.transitions) {
++    if (descriptor !== '*' && !descriptor.endsWith('.*')) {
++      newTransitions.set(`${descriptor}.*`, transitions);
++    } else {
++      newTransitions.set(descriptor, transitions);
+     }
+   }
+ 
++  state.transitions = newTransitions;
++
+   for (const key of Object.keys(state.states)) {
+     appendWildcards(state.states[key]);
+   }
+@@ -422,7 +423,10 @@ function toConfig(nodeJson: XMLElement, id: string): StateNodeConfig<any, any> {
+       initial = stateElements[0].attributes!.id;
+     }
+ 
+-    const on = transitionElements.flatMap((value) => {
++    const always: any[] = [];
++    const on: Record<string, any> = {};
++
++    transitionElements.flatMap((value) => {
+       const events = ((getAttribute(value, 'event') as string) || '').split(
+         /\s+/
+       );
+@@ -458,13 +462,23 @@ function toConfig(nodeJson: XMLElement, id: string): StateNodeConfig<any, any> {
+           }
+         }
+ 
+-        return {
+-          event,
++        const transitionConfig = {
+           target: getTargets(targets),
+           ...(value.elements ? executableContent(value.elements) : undefined),
+           ...guardObject,
+           internal
+         };
++
++        if (event === '') {
++          always.push(transitionConfig);
++        } else {
++          let existing = on[event];
++          if (!existing) {
++            existing = [];
++            on[event] = existing;
++          }
++          existing.push(transitionConfig);
++        }
+       });
+     });
+ 
+@@ -516,7 +530,7 @@ function toConfig(nodeJson: XMLElement, id: string): StateNodeConfig<any, any> {
+             states: mapValues(states, (state, key) => toConfig(state, key))
+           }
+         : undefined),
+-      ...(transitionElements.length ? { on } : undefined),
++      on,
+       ...(onEntry ? { entry: onEntry } : undefined),
+       ...(onExit ? { exit: onExit } : undefined),
+       ...(invoke.length ? { invoke } : undefined)
+diff --git a/packages/xstate-test/src/types.ts b/packages/xstate-test/src/types.ts
+index 5017a2d2b5..64f871b395 100644
+--- a/packages/xstate-test/src/types.ts
++++ b/packages/xstate-test/src/types.ts
+@@ -144,7 +144,7 @@ export interface TestTransitionConfig<
+   test?: (state: State<TContext, TEvent>, testContext: TTestContext) => void;
+ }
+ 
+-export type TestTransitionsConfigMap<
++export type TestTransitionsConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject,
+   TTestContext
+diff --git a/packages/xstate-test/src/validateMachine.ts b/packages/xstate-test/src/validateMachine.ts
+index 79491c86d7..7c03eca233 100644
+--- a/packages/xstate-test/src/validateMachine.ts
++++ b/packages/xstate-test/src/validateMachine.ts
+@@ -12,13 +12,14 @@ export const validateMachine = (machine: AnyStateMachine) => {
+     if (state.after.length > 0) {
+       throw new Error('After events on test machines are not supported');
+     }
+-    const actions = [...state.entry, ...state.exit];
+-
+-    state.transitions.forEach((transition) => {
+-      actions.push(...transition.actions);
+-    });
+-
+-    actions.forEach((action) => {
++    // TODO: this doesn't account for always transitions
++    [
++      ...state.entry,
++      ...state.exit,
++      ...[...state.transitions.values()].flatMap((t) =>
++        t.flatMap((t) => t.actions)
++      )
++    ].forEach((action) => {
+       if (
+         action.type.startsWith('xstate.') &&
+         typeof (action as any).params.delay === 'number'

@@ -1,0 +1,272 @@
+diff --git a/.changeset/rich-bananas-chew.md b/.changeset/rich-bananas-chew.md
+deleted file mode 100644
+index dd33e21a8..000000000
+--- a/.changeset/rich-bananas-chew.md
++++ /dev/null
+@@ -1,7 +0,0 @@
+----
+-'@verdaccio/api': patch
+-'@verdaccio/core': patch
+-'@verdaccio/middleware': patch
+----
+-
+-fix: official package "-" cannot be synced
+diff --git a/packages/api/src/index.ts b/packages/api/src/index.ts
+index fb19188a9..c7c419dc7 100644
+--- a/packages/api/src/index.ts
++++ b/packages/api/src/index.ts
+@@ -50,6 +50,7 @@ export default function (config: Config, auth: Auth, storage: Storage): Router {
+   app.use(encodeScopePackage);
+   // for "npm whoami"
+   whoami(app);
++  pkg(app, auth, storage);
+   profile(app, auth, config);
+   // @deprecated endpoint, 404 by default
+   search(app);
+@@ -61,6 +62,5 @@ export default function (config: Config, auth: Auth, storage: Storage): Router {
+   // @ts-ignore
+   v1Search(app, auth, storage);
+   token(app, auth, storage, config);
+-  pkg(app, auth, storage);
+   return app;
+ }
+diff --git a/packages/core/core/test/validation-utilts.spec.ts b/packages/core/core/test/validation-utilts.spec.ts
+index 382224f57..9d2d7cdcf 100644
+--- a/packages/core/core/test/validation-utilts.spec.ts
++++ b/packages/core/core/test/validation-utilts.spec.ts
+@@ -10,10 +10,6 @@ import {
+ 
+ describe('validatePackage', () => {
+   test('should validate package names', () => {
+-    expect(validatePackage('-')).toBeTruthy();
+-    expect(validatePackage('--')).toBeTruthy();
+-    expect(validatePackage('a')).toBeTruthy();
+-    expect(validatePackage('a-')).toBeTruthy();
+     expect(validatePackage('package-name')).toBeTruthy();
+     expect(validatePackage('@scope/package-name')).toBeTruthy();
+   });
+@@ -25,7 +21,6 @@ describe('validatePackage', () => {
+     expect(validatePackage('node_modules')).toBeFalsy();
+     expect(validatePackage('__proto__')).toBeFalsy();
+     expect(validatePackage('favicon.ico')).toBeFalsy();
+-    expect(validatePackage('%')).toBeFalsy();
+   });
+ });
+ 
+@@ -80,7 +75,6 @@ describe('validateName', () => {
+   test('good ones', () => {
+     expect(validateName('verdaccio')).toBeTruthy();
+     expect(validateName('some.weird.package-zzz')).toBeTruthy();
+-    expect(validateName('--0.0.1.tgz')).toBeTruthy();
+     expect(validateName('old-package@0.1.2.tgz')).toBeTruthy();
+     // fix https://github.com/verdaccio/verdaccio/issues/1400
+     expect(validateName('-build-infra')).toBeTruthy();
+diff --git a/packages/middleware/src/middlewares/validation.ts b/packages/middleware/src/middlewares/validation.ts
+index 163902740..218042385 100644
+--- a/packages/middleware/src/middlewares/validation.ts
++++ b/packages/middleware/src/middlewares/validation.ts
+@@ -1,17 +1,27 @@
+-import { errorUtils, validationUtils } from '@verdaccio/core';
++import { errorUtils } from '@verdaccio/core';
++import {
++  validateName as utilValidateName,
++  validatePackage as utilValidatePackage,
++} from '@verdaccio/utils';
+ 
+ export function validateName(_req, _res, next, value: string, name: string) {
+-  if (validationUtils.validateName(value)) {
++  if (value === '-') {
++    // special case in couchdb usually
++    next('route');
++  } else if (utilValidateName(value)) {
+     next();
+   } else {
+-    next(errorUtils.getBadRequest('invalid ' + name));
++    next(errorUtils.getForbidden('invalid ' + name));
+   }
+ }
+ 
+ export function validatePackage(_req, _res, next, value: string, name: string) {
+-  if (validationUtils.validatePackage(value)) {
++  if (value === '-') {
++    // special case in couchdb usually
++    next('route');
++  } else if (utilValidatePackage(value)) {
+     next();
+   } else {
+-    next(errorUtils.getBadRequest('invalid ' + name));
++    next(errorUtils.getForbidden('invalid ' + name));
+   }
+ }
+diff --git a/packages/middleware/test/params.spec.ts b/packages/middleware/test/params.spec.ts
+index 4adbe42ab..c4b7d102e 100644
+--- a/packages/middleware/test/params.spec.ts
++++ b/packages/middleware/test/params.spec.ts
+@@ -2,9 +2,55 @@ import request from 'supertest';
+ 
+ import { HTTP_STATUS } from '@verdaccio/core';
+ 
+-import { match } from '../src';
++import { match, validateName, validatePackage } from '../src';
+ import { getApp } from './helper';
+ 
++describe('validate params', () => {
++  test('should validate package name', async () => {
++    const app = getApp([]);
++    // @ts-ignore
++    app.param('package', validatePackage);
++    app.get('/pkg/:package', (req, res) => {
++      res.status(HTTP_STATUS.OK).json({});
++    });
++
++    return request(app).get('/pkg/react').expect(HTTP_STATUS.OK);
++  });
++
++  test('should fails validate package name', async () => {
++    const app = getApp([]);
++    // @ts-ignore
++    app.param('package', validatePackage);
++    app.get('/pkg/:package', (req, res) => {
++      res.status(HTTP_STATUS.OK).json({});
++    });
++
++    return request(app).get('/pkg/node_modules').expect(HTTP_STATUS.FORBIDDEN);
++  });
++
++  test('should fails file name package name', async () => {
++    const app = getApp([]);
++    // @ts-ignore
++    app.param('filename', validateName);
++    app.get('/file/:filename', (req, res) => {
++      res.status(HTTP_STATUS.OK).json({});
++    });
++
++    return request(app).get('/file/__proto__').expect(HTTP_STATUS.FORBIDDEN);
++  });
++
++  test('should validate file name package name', async () => {
++    const app = getApp([]);
++    // @ts-ignore
++    app.param('filename', validateName);
++    app.get('/file/:filename', (req, res) => {
++      res.status(HTTP_STATUS.OK).json({});
++    });
++
++    return request(app).get('/file/react.tar.gz').expect(HTTP_STATUS.OK);
++  });
++});
++
+ describe('match', () => {
+   test('should not match middleware', async () => {
+     const app = getApp([]);
+diff --git a/packages/middleware/test/validation.spec.ts b/packages/middleware/test/validation.spec.ts
+deleted file mode 100644
+index d71a54ffa..000000000
+--- a/packages/middleware/test/validation.spec.ts
++++ /dev/null
+@@ -1,92 +0,0 @@
+-import request from 'supertest';
+-
+-import { HTTP_STATUS } from '@verdaccio/core';
+-
+-import { validateName, validatePackage } from '../src';
+-import { getApp } from './helper';
+-
+-describe('validate package name middleware', () => {
+-  test.each(['jquery', '-'])('%s should be valid package name', (pkg) => {
+-    const app = getApp([]);
+-    app.param('pkg', validatePackage);
+-    app.get('/:pkg', (_req, res) => {
+-      res.status(HTTP_STATUS.OK).json({});
+-    });
+-
+-    return request(app).get(`/${pkg}`).expect(HTTP_STATUS.OK);
+-  });
+-
+-  test.each(['node_modules', '%'])('%s should be invalid package name', (pkg) => {
+-    const app = getApp([]);
+-    app.param('pkg', validatePackage);
+-    app.get('/:pkg', (_req, res) => {
+-      res.status(HTTP_STATUS.OK).json({});
+-    });
+-
+-    return request(app).get(`/${pkg}`).expect(HTTP_STATUS.BAD_REQUEST);
+-  });
+-
+-  test('should validate package name double level', async () => {
+-    const app = getApp([]);
+-    // @ts-ignore
+-    app.param('package', validatePackage);
+-    app.get('/pkg/:package', (req, res) => {
+-      res.status(HTTP_STATUS.OK).json({});
+-    });
+-
+-    return request(app).get('/pkg/react').expect(HTTP_STATUS.OK);
+-  });
+-
+-  test('should fails validate package name double level', async () => {
+-    const app = getApp([]);
+-    // @ts-ignore
+-    app.param('package', validatePackage);
+-    app.get('/pkg/:package', (req, res) => {
+-      res.status(HTTP_STATUS.OK).json({});
+-    });
+-
+-    return request(app).get('/pkg/node_modules').expect(HTTP_STATUS.BAD_REQUEST);
+-  });
+-});
+-
+-describe('validate file name name middleware', () => {
+-  test.each(['old-package@0.1.2.tgz', '--0.0.1.tgz'])('%s should be valid file name', (pkg) => {
+-    const app = getApp([]);
+-    app.param('pkg', validateName);
+-    app.get('/:pkg', (_req, res) => {
+-      res.status(HTTP_STATUS.OK).json({});
+-    });
+-
+-    return request(app).get(`/${pkg}`).expect(HTTP_STATUS.OK);
+-  });
+-
+-  test.each(['some%2Fthing', '.bin'])('%s should be invalid package name', (pkg) => {
+-    const app = getApp([]);
+-    app.param('pkg', validateName);
+-    app.get('/:pkg', (_req, res) => {
+-      res.status(HTTP_STATUS.OK).json({});
+-    });
+-
+-    return request(app).get(`/${pkg}`).expect(HTTP_STATUS.BAD_REQUEST);
+-  });
+-
+-  test('should fails file name package name', async () => {
+-    const app = getApp([]);
+-    app.param('filename', validateName);
+-    app.get('/file/:filename', (req, res) => {
+-      res.status(HTTP_STATUS.OK).json({});
+-    });
+-
+-    return request(app).get('/file/__proto__').expect(HTTP_STATUS.BAD_REQUEST);
+-  });
+-
+-  test('should validate file name package name', async () => {
+-    const app = getApp([]);
+-    app.param('filename', validateName);
+-    app.get('/file/:filename', (req, res) => {
+-      res.status(HTTP_STATUS.OK).json({});
+-    });
+-
+-    return request(app).get('/file/react.tar.gz').expect(HTTP_STATUS.OK);
+-  });
+-});
+diff --git a/packages/server/express/jest.config.js b/packages/server/express/jest.config.js
+index bee1513b1..b1a6d5cd8 100644
+--- a/packages/server/express/jest.config.js
++++ b/packages/server/express/jest.config.js
+@@ -4,7 +4,7 @@ module.exports = Object.assign({}, config, {
+   coverageThreshold: {
+     global: {
+       // FIXME: increase to 90
+-      lines: 84,
++      lines: 85,
+     },
+   },
+ });

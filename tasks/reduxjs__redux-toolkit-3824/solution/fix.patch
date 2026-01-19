@@ -1,0 +1,489 @@
+diff --git a/packages/toolkit/src/query/core/buildInitiate.ts b/packages/toolkit/src/query/core/buildInitiate.ts
+index 2811f426..1b3a1e0a 100644
+--- a/packages/toolkit/src/query/core/buildInitiate.ts
++++ b/packages/toolkit/src/query/core/buildInitiate.ts
+@@ -20,6 +20,7 @@ import type { BaseQueryError, QueryReturnValue } from '../baseQueryTypes'
+ import type { QueryResultSelectorResult } from './buildSelectors'
+ import type { Dispatch } from 'redux'
+ import { isNotNullish } from '../utils/isNotNullish'
++import { countObjectKeys } from '../utils/countObjectKeys'
+ 
+ declare module './module' {
+   export interface ApiEndpointQuery<
+@@ -265,19 +266,18 @@ export function buildInitiate({
+   function middlewareWarning(dispatch: Dispatch) {
+     if (process.env.NODE_ENV !== 'production') {
+       if ((middlewareWarning as any).triggered) return
+-      const registered:
+-        | ReturnType<typeof api.internalActions.internal_probeSubscription>
+-        | boolean = dispatch(
+-        api.internalActions.internal_probeSubscription({
+-          queryCacheKey: 'DOES_NOT_EXIST',
+-          requestId: 'DUMMY_REQUEST_ID',
+-        })
++      const returnedValue = dispatch(
++        api.internalActions.internal_getRTKQSubscriptions()
+       )
+ 
+       ;(middlewareWarning as any).triggered = true
+ 
+-      // The RTKQ middleware _should_ always return a boolean for `probeSubscription`
+-      if (typeof registered !== 'boolean') {
++      // The RTKQ middleware should return the internal state object,
++      // but it should _not_ be the action object.
++      if (
++        typeof returnedValue !== 'object' ||
++        typeof returnedValue?.type === 'string'
++      ) {
+         // Otherwise, must not have been added
+         throw new Error(
+           `Warning: Middleware for RTK-Query API at reducerPath "${api.reducerPath}" has not been added to the store.
+@@ -395,7 +395,7 @@ You must add the middleware for RTK-Query to function correctly!`
+ 
+           statePromise.then(() => {
+             delete running[queryCacheKey]
+-            if (!Object.keys(running).length) {
++            if (!countObjectKeys(running)) {
+               runningQueries.delete(dispatch)
+             }
+           })
+@@ -443,7 +443,7 @@ You must add the middleware for RTK-Query to function correctly!`
+         running[requestId] = ret
+         ret.then(() => {
+           delete running[requestId]
+-          if (!Object.keys(running).length) {
++          if (!countObjectKeys(running)) {
+             runningMutations.delete(dispatch)
+           }
+         })
+@@ -452,7 +452,7 @@ You must add the middleware for RTK-Query to function correctly!`
+           ret.then(() => {
+             if (running[fixedCacheKey] === ret) {
+               delete running[fixedCacheKey]
+-              if (!Object.keys(running).length) {
++              if (!countObjectKeys(running)) {
+                 runningMutations.delete(dispatch)
+               }
+             }
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts b/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
+index dda25a4e..f941bcd5 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
+@@ -1,17 +1,18 @@
+-import type { InternalHandlerBuilder } from './types'
++import type { InternalHandlerBuilder, SubscriptionSelectors } from './types'
+ import type { SubscriptionState } from '../apiState'
+ import { produceWithPatches } from 'immer'
+ import type { Action } from '@reduxjs/toolkit'
++import { countObjectKeys } from '../../utils/countObjectKeys'
+ 
+ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+-  [actionShouldContinue: boolean, subscriptionExists: boolean]
++  [actionShouldContinue: boolean, returnValue: SubscriptionSelectors | boolean]
+ > = ({ api, queryThunk, internalState }) => {
+   const subscriptionsPrefix = `${api.reducerPath}/subscriptions`
+ 
+   let previousSubscriptions: SubscriptionState =
+     null as unknown as SubscriptionState
+ 
+-  let dispatchQueued = false
++  let updateSyncTimer: ReturnType<typeof window.setTimeout> | null = null
+ 
+   const { updateSubscriptionOptions, unsubscribeQueryResult } =
+     api.internalActions
+@@ -79,10 +80,30 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+     return mutated
+   }
+ 
++  const getSubscriptions = () => internalState.currentSubscriptions
++  const getSubscriptionCount = (queryCacheKey: string) => {
++    const subscriptions = getSubscriptions()
++    const subscriptionsForQueryArg = subscriptions[queryCacheKey] ?? {}
++    return countObjectKeys(subscriptionsForQueryArg)
++  }
++  const isRequestSubscribed = (queryCacheKey: string, requestId: string) => {
++    const subscriptions = getSubscriptions()
++    return !!subscriptions?.[queryCacheKey]?.[requestId]
++  }
++
++  const subscriptionSelectors: SubscriptionSelectors = {
++    getSubscriptions,
++    getSubscriptionCount,
++    isRequestSubscribed,
++  }
++
+   return (
+     action,
+     mwApi
+-  ): [actionShouldContinue: boolean, hasSubscription: boolean] => {
++  ): [
++    actionShouldContinue: boolean,
++    result: SubscriptionSelectors | boolean
++  ] => {
+     if (!previousSubscriptions) {
+       // Initialize it the first time this handler runs
+       previousSubscriptions = JSON.parse(
+@@ -92,16 +113,16 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+ 
+     if (api.util.resetApiState.match(action)) {
+       previousSubscriptions = internalState.currentSubscriptions = {}
++      updateSyncTimer = null
+       return [true, false]
+     }
+ 
+     // Intercept requests by hooks to see if they're subscribed
+-    // Necessary because we delay updating store state to the end of the tick
+-    if (api.internalActions.internal_probeSubscription.match(action)) {
+-      const { queryCacheKey, requestId } = action.payload
+-      const hasSubscription =
+-        !!internalState.currentSubscriptions[queryCacheKey]?.[requestId]
+-      return [false, hasSubscription]
++    // We return the internal state reference so that hooks
++    // can do their own checks to see if they're still active.
++    // It's stupid and hacky, but it does cut down on some dispatch calls.
++    if (api.internalActions.internal_getRTKQSubscriptions.match(action)) {
++      return [false, subscriptionSelectors]
+     }
+ 
+     // Update subscription data based on this action
+@@ -110,9 +131,16 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+       action
+     )
+ 
++    let actionShouldContinue = true
++
+     if (didMutate) {
+-      if (!dispatchQueued) {
+-        queueMicrotask(() => {
++      if (!updateSyncTimer) {
++        // We only use the subscription state for the Redux DevTools at this point,
++        // as the real data is kept here in the middleware.
++        // Given that, we can throttle synchronizing this state significantly to
++        // save on overall perf.
++        // In 1.9, it was updated in a microtask, but now we do it at most every 500ms.
++        updateSyncTimer = setTimeout(() => {
+           // Deep clone the current subscription data
+           const newSubscriptions: SubscriptionState = JSON.parse(
+             JSON.stringify(internalState.currentSubscriptions)
+@@ -127,25 +155,23 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+           mwApi.next(api.internalActions.subscriptionsUpdated(patches))
+           // Save the cloned state for later reference
+           previousSubscriptions = newSubscriptions
+-          dispatchQueued = false
+-        })
+-        dispatchQueued = true
++          updateSyncTimer = null
++        }, 500)
+       }
+ 
+       const isSubscriptionSliceAction =
+         typeof action.type == 'string' &&
+         !!action.type.startsWith(subscriptionsPrefix)
++
+       const isAdditionalSubscriptionAction =
+         queryThunk.rejected.match(action) &&
+         action.meta.condition &&
+         !!action.meta.arg.subscribe
+ 
+-      const actionShouldContinue =
++      actionShouldContinue =
+         !isSubscriptionSliceAction && !isAdditionalSubscriptionAction
+-
+-      return [actionShouldContinue, false]
+     }
+ 
+-    return [true, false]
++    return [actionShouldContinue, false]
+   }
+ }
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/index.ts b/packages/toolkit/src/query/core/buildMiddleware/index.ts
+index aa58617d..eecd189e 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/index.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/index.ts
+@@ -71,6 +71,7 @@ export function buildMiddleware<
+       >),
+       internalState,
+       refetchQuery,
++      isThisApiSliceAction,
+     }
+ 
+     const handlers = handlerBuilders.map((build) => build(builderArgs))
+@@ -93,18 +94,15 @@ export function buildMiddleware<
+ 
+         const stateBefore = mwApi.getState()
+ 
+-        const [actionShouldContinue, hasSubscription] = batchedActionsHandler(
+-          action,
+-          mwApiWithNext,
+-          stateBefore
+-        )
++        const [actionShouldContinue, internalProbeResult] =
++          batchedActionsHandler(action, mwApiWithNext, stateBefore)
+ 
+         let res: any
+ 
+         if (actionShouldContinue) {
+           res = next(action)
+         } else {
+-          res = hasSubscription
++          res = internalProbeResult
+         }
+ 
+         if (!!mwApi.getState()[reducerPath]) {
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts b/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
+index 181e50f5..e92c692d 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/invalidationByTags.ts
+@@ -9,7 +9,9 @@ import type {
+   SubMiddlewareApi,
+   InternalHandlerBuilder,
+   ApiMiddlewareInternalHandler,
++  InternalMiddlewareState,
+ } from './types'
++import { countObjectKeys } from '../../utils/countObjectKeys'
+ 
+ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+   reducerPath,
+@@ -19,6 +21,7 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+   api,
+   assertTagType,
+   refetchQuery,
++  internalState,
+ }) => {
+   const { removeQueryResult } = api.internalActions
+   const isThunkActionWithTags = isAnyOf(
+@@ -35,7 +38,8 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+           endpointDefinitions,
+           assertTagType
+         ),
+-        mwApi
++        mwApi,
++        internalState
+       )
+     }
+ 
+@@ -49,16 +53,19 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+           undefined,
+           assertTagType
+         ),
+-        mwApi
++        mwApi,
++        internalState
+       )
+     }
+   }
+ 
+   function invalidateTags(
+     tags: readonly FullTagDescription<string>[],
+-    mwApi: SubMiddlewareApi
++    mwApi: SubMiddlewareApi,
++    internalState: InternalMiddlewareState
+   ) {
+     const rootState = mwApi.getState()
++
+     const state = rootState[reducerPath]
+ 
+     const toInvalidate = api.util.selectInvalidatedBy(rootState, tags)
+@@ -67,10 +74,11 @@ export const buildInvalidationByTagsHandler: InternalHandlerBuilder = ({
+       const valuesArray = Array.from(toInvalidate.values())
+       for (const { queryCacheKey } of valuesArray) {
+         const querySubState = state.queries[queryCacheKey]
+-        const subscriptionSubState = state.subscriptions[queryCacheKey] ?? {}
++        const subscriptionSubState =
++          internalState.currentSubscriptions[queryCacheKey] ?? {}
+ 
+         if (querySubState) {
+-          if (Object.keys(subscriptionSubState).length === 0) {
++          if (countObjectKeys(subscriptionSubState) === 0) {
+             mwApi.dispatch(
+               removeQueryResult({
+                 queryCacheKey: queryCacheKey as QueryCacheKey,
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/types.ts b/packages/toolkit/src/query/core/buildMiddleware/types.ts
+index c7e4e52e..2e41e095 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/types.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/types.ts
+@@ -32,6 +32,12 @@ export interface InternalMiddlewareState {
+   currentSubscriptions: SubscriptionState
+ }
+ 
++export interface SubscriptionSelectors {
++  getSubscriptions: () => SubscriptionState
++  getSubscriptionCount: (queryCacheKey: string) => number
++  isRequestSubscribed: (queryCacheKey: string, requestId: string) => boolean
++}
++
+ export interface BuildMiddlewareInput<
+   Definitions extends EndpointDefinitions,
+   ReducerPath extends string,
+@@ -61,6 +67,7 @@ export interface BuildSubMiddlewareInput
+     queryCacheKey: string,
+     override?: Partial<QueryThunkArg>
+   ): AsyncThunkAction<ThunkResult, QueryThunkArg, {}>
++  isThisApiSliceAction: (action: Action) => boolean
+ }
+ 
+ export type SubMiddlewareBuilder = (
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/windowEventHandling.ts b/packages/toolkit/src/query/core/buildMiddleware/windowEventHandling.ts
+index 4caa97c7..409bc56e 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/windowEventHandling.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/windowEventHandling.ts
+@@ -6,6 +6,7 @@ import type {
+   InternalHandlerBuilder,
+   SubMiddlewareApi,
+ } from './types'
++import { countObjectKeys } from '../../utils/countObjectKeys'
+ 
+ export const buildWindowEventHandler: InternalHandlerBuilder = ({
+   reducerPath,
+@@ -50,7 +51,7 @@ export const buildWindowEventHandler: InternalHandlerBuilder = ({
+             state.config[type])
+ 
+         if (shouldRefetch) {
+-          if (Object.keys(subscriptionSubState).length === 0) {
++          if (countObjectKeys(subscriptionSubState) === 0) {
+             api.dispatch(
+               removeQueryResult({
+                 queryCacheKey: queryCacheKey as QueryCacheKey,
+diff --git a/packages/toolkit/src/query/core/buildSlice.ts b/packages/toolkit/src/query/core/buildSlice.ts
+index 648e3fd2..bb712281 100644
+--- a/packages/toolkit/src/query/core/buildSlice.ts
++++ b/packages/toolkit/src/query/core/buildSlice.ts
+@@ -1,4 +1,4 @@
+-import type { PayloadAction, UnknownAction } from '@reduxjs/toolkit'
++import type { Action, PayloadAction, UnknownAction } from '@reduxjs/toolkit'
+ import {
+   combineReducers,
+   createAction,
+@@ -443,12 +443,7 @@ export function buildSlice({
+       ) {
+         // Dummy
+       },
+-      internal_probeSubscription(
+-        d,
+-        a: PayloadAction<{ queryCacheKey: string; requestId: string }>
+-      ) {
+-        // dummy
+-      },
++      internal_getRTKQSubscriptions() {},
+     },
+   })
+ 
+diff --git a/packages/toolkit/src/query/react/buildHooks.ts b/packages/toolkit/src/query/react/buildHooks.ts
+index 4ab1f9db..ba86d843 100644
+--- a/packages/toolkit/src/query/react/buildHooks.ts
++++ b/packages/toolkit/src/query/react/buildHooks.ts
+@@ -53,6 +53,10 @@ import { UNINITIALIZED_VALUE } from './constants'
+ import { useShallowStableValue } from './useShallowStableValue'
+ import type { BaseQueryFn } from '../baseQueryTypes'
+ import { defaultSerializeQueryArgs } from '../defaultSerializeQueryArgs'
++import {
++  InternalMiddlewareState,
++  SubscriptionSelectors,
++} from '../core/buildMiddleware/types'
+ 
+ // Copy-pasted from React-Redux
+ export const useIsomorphicLayoutEffect =
+@@ -681,6 +685,27 @@ export function buildHooks<Definitions extends EndpointDefinitions>({
+         Definitions
+       >
+       const dispatch = useDispatch<ThunkDispatch<any, any, UnknownAction>>()
++      const subscriptionSelectorsRef = useRef<SubscriptionSelectors>()
++      if (!subscriptionSelectorsRef.current) {
++        const returnedValue = dispatch(
++          api.internalActions.internal_getRTKQSubscriptions()
++        )
++
++        if (process.env.NODE_ENV !== 'production') {
++          if (
++            typeof returnedValue !== 'object' ||
++            typeof returnedValue?.type === 'string'
++          ) {
++            throw new Error(
++              `Warning: Middleware for RTK-Query API at reducerPath "${api.reducerPath}" has not been added to the store.
++    You must add the middleware for RTK-Query to function correctly!`
++            )
++          }
++        }
++
++        subscriptionSelectorsRef.current =
++          returnedValue as unknown as SubscriptionSelectors
++      }
+       const stableArg = useStableQueryArgs(
+         skip ? skipToken : arg,
+         // Even if the user provided a per-endpoint `serializeQueryArgs` with
+@@ -704,28 +729,15 @@ export function buildHooks<Definitions extends EndpointDefinitions>({
+ 
+       let { queryCacheKey, requestId } = promiseRef.current || {}
+ 
+-      // HACK Because the latest state is in the middleware, we actually
+-      // dispatch an action that will be intercepted and returned.
++      // HACK We've saved the middleware subscription lookup callbacks into a ref,
++      // so we can directly check here if the subscription exists for this query.
+       let currentRenderHasSubscription = false
+       if (queryCacheKey && requestId) {
+-        // This _should_ return a boolean, even if the types don't line up
+-        const returnedValue = dispatch(
+-          api.internalActions.internal_probeSubscription({
++        currentRenderHasSubscription =
++          subscriptionSelectorsRef.current.isRequestSubscribed(
+             queryCacheKey,
+-            requestId,
+-          })
+-        )
+-
+-        if (process.env.NODE_ENV !== 'production') {
+-          if (typeof returnedValue !== 'boolean') {
+-            throw new Error(
+-              `Warning: Middleware for RTK-Query API at reducerPath "${api.reducerPath}" has not been added to the store.
+-    You must add the middleware for RTK-Query to function correctly!`
+-            )
+-          }
+-        }
+-
+-        currentRenderHasSubscription = !!returnedValue
++            requestId
++          )
+       }
+ 
+       const subscriptionRemoved =
+diff --git a/packages/toolkit/src/query/react/module.ts b/packages/toolkit/src/query/react/module.ts
+index c5d42619..3ff9a021 100644
+--- a/packages/toolkit/src/query/react/module.ts
++++ b/packages/toolkit/src/query/react/module.ts
+@@ -22,6 +22,7 @@ import {
+ } from 'react-redux'
+ import type { QueryKeys } from '../core/apiState'
+ import type { PrefetchOptions } from '../core/module'
++import { countObjectKeys } from '../utils/countObjectKeys'
+ 
+ export const reactHooksModuleName = /* @__PURE__ */ Symbol()
+ export type ReactHooksModule = typeof reactHooksModuleName
+@@ -147,7 +148,7 @@ export const reactHooksModule = ({
+     let warned = false
+     for (const hookName of hookNames) {
+       // warn for old hook options
+-      if (Object.keys(rest).length > 0) {
++      if (countObjectKeys(rest) > 0) {
+         if ((rest as Partial<typeof hooks>)[hookName]) {
+           if (!warned) {
+             console.warn(
+diff --git a/packages/toolkit/src/query/utils/countObjectKeys.ts b/packages/toolkit/src/query/utils/countObjectKeys.ts
+new file mode 100644
+index 00000000..b0de9834
+--- /dev/null
++++ b/packages/toolkit/src/query/utils/countObjectKeys.ts
+@@ -0,0 +1,14 @@
++// Fast method for counting an object's keys
++// without resorting to `Object.keys(obj).length
++// Will this make a big difference in perf? Probably not
++// But we can save a few allocations.
++
++export function countObjectKeys(obj: Record<any, any>) {
++  let count = 0
++
++  for (const _key in obj) {
++    count++
++  }
++
++  return count
++}

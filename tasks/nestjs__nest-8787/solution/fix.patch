@@ -1,0 +1,215 @@
+diff --git a/packages/common/constants.ts b/packages/common/constants.ts
+index d6ded9f97..bd18972d5 100644
+--- a/packages/common/constants.ts
++++ b/packages/common/constants.ts
+@@ -29,3 +29,6 @@ export const REDIRECT_METADATA = '__redirect__';
+ export const RESPONSE_PASSTHROUGH_METADATA = '__responsePassthrough__';
+ export const SSE_METADATA = '__sse__';
+ export const VERSION_METADATA = '__version__';
++export const INJECTABLE_WATERMARK = '__injectable__';
++export const CONTROLLER_WATERMARK = '__controller__';
++export const CATCH_WATERMARK = '__catch__';
+diff --git a/packages/common/decorators/core/catch.decorator.ts b/packages/common/decorators/core/catch.decorator.ts
+index d211a6d82..fbf7fb698 100644
+--- a/packages/common/decorators/core/catch.decorator.ts
++++ b/packages/common/decorators/core/catch.decorator.ts
+@@ -1,4 +1,4 @@
+-import { FILTER_CATCH_EXCEPTIONS } from '../../constants';
++import { CATCH_WATERMARK, FILTER_CATCH_EXCEPTIONS } from '../../constants';
+ import { Type } from '../../interfaces';
+ 
+ /**
+@@ -20,6 +20,7 @@ import { Type } from '../../interfaces';
+  */
+ export function Catch(...exceptions: Type<any>[]): ClassDecorator {
+   return (target: object) => {
++    Reflect.defineMetadata(CATCH_WATERMARK, true, target);
+     Reflect.defineMetadata(FILTER_CATCH_EXCEPTIONS, exceptions, target);
+   };
+ }
+diff --git a/packages/common/decorators/core/controller.decorator.ts b/packages/common/decorators/core/controller.decorator.ts
+index 9f17a9fb5..d182ae8fd 100644
+--- a/packages/common/decorators/core/controller.decorator.ts
++++ b/packages/common/decorators/core/controller.decorator.ts
+@@ -1,4 +1,5 @@
+ import {
++  CONTROLLER_WATERMARK,
+   HOST_METADATA,
+   PATH_METADATA,
+   SCOPE_OPTIONS_METADATA,
+@@ -167,6 +168,7 @@ export function Controller(
+       ];
+ 
+   return (target: object) => {
++    Reflect.defineMetadata(CONTROLLER_WATERMARK, true, target);
+     Reflect.defineMetadata(PATH_METADATA, path, target);
+     Reflect.defineMetadata(HOST_METADATA, host, target);
+     Reflect.defineMetadata(SCOPE_OPTIONS_METADATA, scopeOptions, target);
+diff --git a/packages/common/decorators/core/injectable.decorator.ts b/packages/common/decorators/core/injectable.decorator.ts
+index 91910dfc5..453e7666f 100644
+--- a/packages/common/decorators/core/injectable.decorator.ts
++++ b/packages/common/decorators/core/injectable.decorator.ts
+@@ -1,5 +1,5 @@
+ import { v4 as uuid } from 'uuid';
+-import { SCOPE_OPTIONS_METADATA } from '../../constants';
++import { INJECTABLE_WATERMARK, SCOPE_OPTIONS_METADATA } from '../../constants';
+ import { ScopeOptions } from '../../interfaces/scope-options.interface';
+ import { Type } from '../../interfaces/type.interface';
+ 
+@@ -42,6 +42,7 @@ export type InjectableOptions = ScopeOptions;
+  */
+ export function Injectable(options?: InjectableOptions): ClassDecorator {
+   return (target: object) => {
++    Reflect.defineMetadata(INJECTABLE_WATERMARK, true, target);
+     Reflect.defineMetadata(SCOPE_OPTIONS_METADATA, options, target);
+   };
+ }
+diff --git a/packages/core/errors/exceptions/invalid-class-module.exception.ts b/packages/core/errors/exceptions/invalid-class-module.exception.ts
+new file mode 100644
+index 000000000..0761ea5ce
+--- /dev/null
++++ b/packages/core/errors/exceptions/invalid-class-module.exception.ts
+@@ -0,0 +1,10 @@
++import { USING_INVALID_CLASS_AS_A_MODULE_MESSAGE } from '../messages';
++import { RuntimeException } from './runtime.exception';
++
++export class InvalidClassModuleException extends RuntimeException {
++  constructor(metatypeUsedAsAModule: any, scope: any[]) {
++    super(
++      USING_INVALID_CLASS_AS_A_MODULE_MESSAGE(metatypeUsedAsAModule, scope),
++    );
++  }
++}
+diff --git a/packages/core/errors/messages.ts b/packages/core/errors/messages.ts
+index 9f385db8f..209260359 100644
+--- a/packages/core/errors/messages.ts
++++ b/packages/core/errors/messages.ts
+@@ -117,6 +117,20 @@ Received an unexpected value at index [${index}] of the ${parentModuleName} "imp
+ Scope [${stringifyScope(scope)}]`;
+ };
+ 
++export const USING_INVALID_CLASS_AS_A_MODULE_MESSAGE = (
++  metatypeUsedAsAModule: Type | ForwardReference,
++  scope: any[],
++) => {
++  const metatypeName = getInstanceName(metatypeUsedAsAModule) || 'found';
++
++  // TODO(v9): Edit the message below:
++  return `In the next major version, Nest will not allow classes annotated with @Injectable(), @Catch(), and @Controller() decorators to appear in the "imports" array of a module.
++Please remove "${metatypeName}" (including forwarded occurrences, if any) from all of the "imports" arrays.
++
++Scope [${stringifyScope(scope)}]
++`;
++};
++
+ export const UNDEFINED_MODULE_MESSAGE = (
+   parentModule: any,
+   index: number,
+diff --git a/packages/core/scanner.ts b/packages/core/scanner.ts
+index ef4ebecc8..c318dba07 100644
+--- a/packages/core/scanner.ts
++++ b/packages/core/scanner.ts
+@@ -4,11 +4,15 @@ import {
+   flatten,
+   ForwardReference,
+   Provider,
++  Logger,
+ } from '@nestjs/common';
+ import {
+   EXCEPTION_FILTERS_METADATA,
+   GUARDS_METADATA,
+   INTERCEPTORS_METADATA,
++  INJECTABLE_WATERMARK,
++  CONTROLLER_WATERMARK,
++  CATCH_WATERMARK,
+   MODULE_METADATA,
+   PIPES_METADATA,
+   ROUTE_ARGS_METADATA,
+@@ -38,6 +42,7 @@ import { ApplicationConfig } from './application-config';
+ import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from './constants';
+ import { CircularDependencyException } from './errors/exceptions/circular-dependency.exception';
+ import { InvalidModuleException } from './errors/exceptions/invalid-module.exception';
++import { InvalidClassModuleException } from './errors/exceptions/invalid-class-module.exception';
+ import { UndefinedModuleException } from './errors/exceptions/undefined-module.exception';
+ import { getClassScope } from './helpers/get-class-scope';
+ import { NestContainer } from './injector/container';
+@@ -54,6 +59,7 @@ interface ApplicationProviderWrapper {
+ }
+ 
+ export class DependenciesScanner {
++  private readonly logger = new Logger(DependenciesScanner.name);
+   private readonly applicationProvidersApplyMap: ApplicationProviderWrapper[] =
+     [];
+ 
+@@ -133,13 +139,25 @@ export class DependenciesScanner {
+   }
+ 
+   public async insertModule(
+-    module: any,
++    moduleDefinition: any,
+     scope: Type<unknown>[],
+   ): Promise<Module | undefined> {
+-    if (module && module.forwardRef) {
+-      return this.container.addModule(module.forwardRef(), scope);
++    const moduleToAdd = this.isForwardReference(moduleDefinition)
++      ? moduleDefinition.forwardRef()
++      : moduleDefinition;
++
++    if (
++      this.isInjectable(moduleToAdd) ||
++      this.isController(moduleToAdd) ||
++      this.isExceptionFilter(moduleToAdd)
++    ) {
++      // TODO(v9): Throw the exception instead of printing a warning
++      this.logger.warn(
++        new InvalidClassModuleException(moduleDefinition, scope).message,
++      );
+     }
+-    return this.container.addModule(module, scope);
++
++    return this.container.addModule(moduleToAdd, scope);
+   }
+ 
+   public async scanModulesForDependencies(
+@@ -315,7 +333,7 @@ export class DependenciesScanner {
+     if (isUndefined(related)) {
+       throw new CircularDependencyException(context);
+     }
+-    if (related && related.forwardRef) {
++    if (this.isForwardReference(related)) {
+       return this.container.addImport(related.forwardRef(), token);
+     }
+     await this.container.addImport(related, token);
+@@ -502,7 +520,31 @@ export class DependenciesScanner {
+     return module && !!(module as DynamicModule).module;
+   }
+ 
+-  public isForwardReference(
++  /**
++   * @param metatype
++   * @returns `true` if `metatype` is annotated with the `@Injectable()` decorator.
++   */
++  private isInjectable(metatype: Type<any>): boolean {
++    return !!Reflect.getMetadata(INJECTABLE_WATERMARK, metatype);
++  }
++
++  /**
++   * @param metatype
++   * @returns `true` if `metatype` is annotated with the `@Controller()` decorator.
++   */
++  private isController(metatype: Type<any>): boolean {
++    return !!Reflect.getMetadata(CONTROLLER_WATERMARK, metatype);
++  }
++
++  /**
++   * @param metatype
++   * @returns `true` if `metatype` is annotated with the `@Catch()` decorator.
++   */
++  private isExceptionFilter(metatype: Type<any>): boolean {
++    return !!Reflect.getMetadata(CATCH_WATERMARK, metatype);
++  }
++
++  private isForwardReference(
+     module: Type<any> | DynamicModule | ForwardReference,
+   ): module is ForwardReference {
+     return module && !!(module as ForwardReference).forwardRef;

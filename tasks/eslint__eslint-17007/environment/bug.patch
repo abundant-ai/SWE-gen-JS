@@ -1,0 +1,502 @@
+diff --git a/lib/rules/no-misleading-character-class.js b/lib/rules/no-misleading-character-class.js
+index ddbcaefd5..ef6e14180 100644
+--- a/lib/rules/no-misleading-character-class.js
++++ b/lib/rules/no-misleading-character-class.js
+@@ -4,15 +4,16 @@
+ "use strict";
+ 
+ const { CALL, CONSTRUCT, ReferenceTracker, getStringIfConstant } = require("@eslint-community/eslint-utils");
+-const { RegExpParser, visitRegExpAST } = require("@eslint-community/regexpp");
++const { RegExpValidator, RegExpParser, visitRegExpAST } = require("@eslint-community/regexpp");
+ const { isCombiningCharacter, isEmojiModifier, isRegionalIndicatorSymbol, isSurrogatePair } = require("./utils/unicode");
+ const astUtils = require("./utils/ast-utils.js");
+-const { isValidWithUnicodeFlag } = require("./utils/regular-expressions");
+ 
+ //------------------------------------------------------------------------------
+ // Helpers
+ //------------------------------------------------------------------------------
+ 
++const REGEXPP_LATEST_ECMA_VERSION = 2022;
++
+ /**
+  * Iterate character sequences of a given nodes.
+  *
+@@ -184,10 +185,38 @@ module.exports = {
+             }
+         }
+ 
++        /**
++         * Checks if the given regular expression pattern would be valid with the `u` flag.
++         * @param {string} pattern The regular expression pattern to verify.
++         * @returns {boolean} `true` if the pattern would be valid with the `u` flag.
++         * `false` if the pattern would be invalid with the `u` flag or the configured
++         * ecmaVersion doesn't support the `u` flag.
++         */
++        function isValidWithUnicodeFlag(pattern) {
++            const { ecmaVersion } = context.languageOptions;
++
++            // ecmaVersion <= 5 doesn't support the 'u' flag
++            if (ecmaVersion <= 5) {
++                return false;
++            }
++
++            const validator = new RegExpValidator({
++                ecmaVersion: Math.min(ecmaVersion, REGEXPP_LATEST_ECMA_VERSION)
++            });
++
++            try {
++                validator.validatePattern(pattern, void 0, void 0, /* uFlag = */ true);
++            } catch {
++                return false;
++            }
++
++            return true;
++        }
++
+         return {
+             "Literal[regex]"(node) {
+                 verify(node, node.regex.pattern, node.regex.flags, fixer => {
+-                    if (!isValidWithUnicodeFlag(context.languageOptions.ecmaVersion, node.regex.pattern)) {
++                    if (!isValidWithUnicodeFlag(node.regex.pattern)) {
+                         return null;
+                     }
+ 
+@@ -213,7 +242,7 @@ module.exports = {
+                     if (typeof pattern === "string") {
+                         verify(refNode, pattern, flags || "", fixer => {
+ 
+-                            if (!isValidWithUnicodeFlag(context.languageOptions.ecmaVersion, pattern)) {
++                            if (!isValidWithUnicodeFlag(pattern)) {
+                                 return null;
+                             }
+ 
+diff --git a/lib/rules/prefer-regex-literals.js b/lib/rules/prefer-regex-literals.js
+index 94b52155e..b26405061 100644
+--- a/lib/rules/prefer-regex-literals.js
++++ b/lib/rules/prefer-regex-literals.js
+@@ -13,12 +13,13 @@ const astUtils = require("./utils/ast-utils");
+ const { CALL, CONSTRUCT, ReferenceTracker, findVariable } = require("@eslint-community/eslint-utils");
+ const { RegExpValidator, visitRegExpAST, RegExpParser } = require("@eslint-community/regexpp");
+ const { canTokensBeAdjacent } = require("./utils/ast-utils");
+-const { REGEXPP_LATEST_ECMA_VERSION } = require("./utils/regular-expressions");
+ 
+ //------------------------------------------------------------------------------
+ // Helpers
+ //------------------------------------------------------------------------------
+ 
++const REGEXPP_LATEST_ECMA_VERSION = 2022;
++
+ /**
+  * Determines whether the given node is a string literal.
+  * @param {ASTNode} node Node to check.
+diff --git a/lib/rules/require-unicode-regexp.js b/lib/rules/require-unicode-regexp.js
+index 2fe1539cf..acedb956e 100644
+--- a/lib/rules/require-unicode-regexp.js
++++ b/lib/rules/require-unicode-regexp.js
+@@ -15,8 +15,6 @@ const {
+     ReferenceTracker,
+     getStringIfConstant
+ } = require("@eslint-community/eslint-utils");
+-const astUtils = require("./utils/ast-utils.js");
+-const { isValidWithUnicodeFlag } = require("./utils/regular-expressions");
+ 
+ //------------------------------------------------------------------------------
+ // Rule Definition
+@@ -33,10 +31,7 @@ module.exports = {
+             url: "https://eslint.org/docs/rules/require-unicode-regexp"
+         },
+ 
+-        hasSuggestions: true,
+-
+         messages: {
+-            addUFlag: "Add the 'u' flag.",
+             requireUFlag: "Use the 'u' flag."
+         },
+ 
+@@ -52,20 +47,7 @@ module.exports = {
+                 const flags = node.regex.flags || "";
+ 
+                 if (!flags.includes("u")) {
+-                    context.report({
+-                        messageId: "requireUFlag",
+-                        node,
+-                        suggest: isValidWithUnicodeFlag(context.languageOptions.ecmaVersion, node.regex.pattern)
+-                            ? [
+-                                {
+-                                    fix(fixer) {
+-                                        return fixer.insertTextAfter(node, "u");
+-                                    },
+-                                    messageId: "addUFlag"
+-                                }
+-                            ]
+-                            : null
+-                    });
++                    context.report({ node, messageId: "requireUFlag" });
+                 }
+             },
+ 
+@@ -77,46 +59,11 @@ module.exports = {
+                 };
+ 
+                 for (const { node: refNode } of tracker.iterateGlobalReferences(trackMap)) {
+-                    const [patternNode, flagsNode] = refNode.arguments;
+-                    const pattern = getStringIfConstant(patternNode, scope);
++                    const flagsNode = refNode.arguments[1];
+                     const flags = getStringIfConstant(flagsNode, scope);
+ 
+                     if (!flagsNode || (typeof flags === "string" && !flags.includes("u"))) {
+-                        context.report({
+-                            messageId: "requireUFlag",
+-                            node: refNode,
+-                            suggest: typeof pattern === "string" && isValidWithUnicodeFlag(context.languageOptions.ecmaVersion, pattern)
+-                                ? [
+-                                    {
+-                                        fix(fixer) {
+-                                            if (flagsNode) {
+-                                                if ((flagsNode.type === "Literal" && typeof flagsNode.value === "string") || flagsNode.type === "TemplateLiteral") {
+-                                                    const flagsNodeText = sourceCode.getText(flagsNode);
+-
+-                                                    return fixer.replaceText(flagsNode, [
+-                                                        flagsNodeText.slice(0, flagsNodeText.length - 1),
+-                                                        flagsNodeText.slice(flagsNodeText.length - 1)
+-                                                    ].join("u"));
+-                                                }
+-
+-                                                // We intentionally don't suggest concatenating + "u" to non-literals
+-                                                return null;
+-                                            }
+-
+-                                            const penultimateToken = sourceCode.getLastToken(refNode, { skip: 1 }); // skip closing parenthesis
+-
+-                                            return fixer.insertTextAfter(
+-                                                penultimateToken,
+-                                                astUtils.isCommaToken(penultimateToken)
+-                                                    ? ' "u",'
+-                                                    : ', "u"'
+-                                            );
+-                                        },
+-                                        messageId: "addUFlag"
+-                                    }
+-                                ]
+-                                : null
+-                        });
++                        context.report({ node: refNode, messageId: "requireUFlag" });
+                     }
+                 }
+             }
+diff --git a/lib/rules/utils/regular-expressions.js b/lib/rules/utils/regular-expressions.js
+deleted file mode 100644
+index 234a1cb8b..000000000
+--- a/lib/rules/utils/regular-expressions.js
++++ /dev/null
+@@ -1,42 +0,0 @@
+-/**
+- * @fileoverview Common utils for regular expressions.
+- * @author Josh Goldberg
+- * @author Toru Nagashima
+- */
+-
+-"use strict";
+-
+-const { RegExpValidator } = require("@eslint-community/regexpp");
+-
+-const REGEXPP_LATEST_ECMA_VERSION = 2022;
+-
+-/**
+- * Checks if the given regular expression pattern would be valid with the `u` flag.
+- * @param {number} ecmaVersion ECMAScript version to parse in.
+- * @param {string} pattern The regular expression pattern to verify.
+- * @returns {boolean} `true` if the pattern would be valid with the `u` flag.
+- * `false` if the pattern would be invalid with the `u` flag or the configured
+- * ecmaVersion doesn't support the `u` flag.
+- */
+-function isValidWithUnicodeFlag(ecmaVersion, pattern) {
+-    if (ecmaVersion <= 5) { // ecmaVersion <= 5 doesn't support the 'u' flag
+-        return false;
+-    }
+-
+-    const validator = new RegExpValidator({
+-        ecmaVersion: Math.min(ecmaVersion, REGEXPP_LATEST_ECMA_VERSION)
+-    });
+-
+-    try {
+-        validator.validatePattern(pattern, void 0, void 0, /* uFlag = */ true);
+-    } catch {
+-        return false;
+-    }
+-
+-    return true;
+-}
+-
+-module.exports = {
+-    isValidWithUnicodeFlag,
+-    REGEXPP_LATEST_ECMA_VERSION
+-};
+diff --git a/tests/lib/rules/require-unicode-regexp.js b/tests/lib/rules/require-unicode-regexp.js
+index 22ada7aac..16b6be4ff 100644
+--- a/tests/lib/rules/require-unicode-regexp.js
++++ b/tests/lib/rules/require-unicode-regexp.js
+@@ -25,10 +25,8 @@ ruleTester.run("require-unicode-regexp", rule, {
+         "/foo/u",
+         "/foo/gimuy",
+         "RegExp('', 'u')",
+-        "RegExp('', `u`)",
+         "new RegExp('', 'u')",
+         "RegExp('', 'gimuy')",
+-        "RegExp('', `gimuy`)",
+         "new RegExp('', 'gimuy')",
+         "const flags = 'u'; new RegExp('', flags)",
+         "const flags = 'g'; new RegExp('', flags + 'u')",
+@@ -46,239 +44,60 @@ ruleTester.run("require-unicode-regexp", rule, {
+         { code: "class C { #RegExp; foo() { new globalThis.#RegExp('foo') } }", parserOptions: { ecmaVersion: 2022 }, env: { es2020: true } }
+     ],
+     invalid: [
+-        {
+-            code: "/\\a/",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
+-        },
+         {
+             code: "/foo/",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "/foo/u"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "/foo/gimy",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "/foo/gimyu"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "RegExp('foo')",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "RegExp('foo', \"u\")"
+-                    }
+-                ]
+-            }]
+-        },
+-        {
+-            code: "RegExp('\\\\a')",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "RegExp('foo', '')",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "RegExp('foo', 'u')"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "RegExp('foo', 'gimy')",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "RegExp('foo', 'gimyu')"
+-                    }
+-                ]
+-            }]
+-        },
+-        {
+-            code: "RegExp('foo', `gimy`)",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "RegExp('foo', `gimyu`)"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "new RegExp('foo')",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "new RegExp('foo', \"u\")"
+-                    }
+-                ]
+-            }]
+-        },
+-        {
+-            code: "new RegExp('foo', false)",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
+-        },
+-        {
+-            code: "new RegExp('foo', 1)",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "new RegExp('foo', '')",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "new RegExp('foo', 'u')"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "new RegExp('foo', 'gimy')",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "new RegExp('foo', 'gimyu')"
+-                    }
+-                ]
+-            }]
+-        },
+-        {
+-            code: "new RegExp(('foo'))",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "new RegExp(('foo'), \"u\")"
+-                    }
+-                ]
+-            }]
+-        },
+-        {
+-            code: "new RegExp(('unrelated', 'foo'))",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "new RegExp(('unrelated', 'foo'), \"u\")"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "const flags = 'gi'; new RegExp('foo', flags)",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
+-        },
+-        {
+-            code: "const flags = 'gi'; new RegExp('foo', ('unrelated', flags))",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
+-        },
+-        {
+-            code: "let flags; new RegExp('foo', flags = 'g')",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
+-        },
+-        {
+-            code: "const flags = `gi`; new RegExp(`foo`, (`unrelated`, flags))",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "const flags = 'gimu'; new RegExp('foo', flags[0])",
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: null
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "new window.RegExp('foo')",
+             env: { browser: true },
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "new window.RegExp('foo', \"u\")"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "new global.RegExp('foo')",
+             env: { node: true },
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "new global.RegExp('foo', \"u\")"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         },
+         {
+             code: "new globalThis.RegExp('foo')",
+             env: { es2020: true },
+-            errors: [{
+-                messageId: "requireUFlag",
+-                suggestions: [
+-                    {
+-                        messageId: "addUFlag",
+-                        output: "new globalThis.RegExp('foo', \"u\")"
+-                    }
+-                ]
+-            }]
++            errors: [{ messageId: "requireUFlag" }]
+         }
+     ]
+ });

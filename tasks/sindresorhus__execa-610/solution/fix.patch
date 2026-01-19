@@ -1,0 +1,140 @@
+diff --git a/index.d.ts b/index.d.ts
+index 6ce169d..f216dee 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -12,7 +12,7 @@ export type StdioOption =
+ 	| number
+ 	| undefined;
+ 
+-export type StdinOption = StdioOption | Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array>;
++export type StdinOption = StdioOption | Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array> | URL;
+ 
+ type EncodingOption =
+   | 'utf8'
+@@ -88,7 +88,7 @@ export type CommonOptions<EncodingType extends EncodingOption = DefaultEncodingO
+ 	/**
+ 	Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+-	It can also be an [`Iterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_iterable_protocol) or an [`AsyncIterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols), providing neither [`execaSync()`](#execasyncfile-arguments-options), the [`input` option](#input) nor the [`inputFile` option](#inputfile) is used.
++	It can also be a file URL, an [`Iterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_iterable_protocol) or an [`AsyncIterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols), providing neither [`execaSync()`](#execasyncfile-arguments-options), the [`input` option](#input) nor the [`inputFile` option](#inputfile) is used.
+ 
+ 	@default `inherit` with `$`, `pipe` otherwise
+ 	*/
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 0f5a6de..0b74107 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -164,6 +164,7 @@ execa('unicorns', {stdin: stringGenerator()});
+ execa('unicorns', {stdin: binaryGenerator()});
+ expectError(execa('unicorns', {stdin: [0]}));
+ expectError(execa('unicorns', {stdin: numberGenerator()}));
++execa('unicorns', {stdin: new URL('file:///test')});
+ execa('unicorns', {stdin: 1});
+ execa('unicorns', {stdin: undefined});
+ execa('unicorns', {stdout: 'pipe'});
+diff --git a/lib/stdio.js b/lib/stdio.js
+index 20f8ca8..aac7dfa 100644
+--- a/lib/stdio.js
++++ b/lib/stdio.js
+@@ -15,15 +15,28 @@ const getIterableStdin = stdioArray => isIterableStdin(stdioArray[0])
+ 	? stdioArray[0]
+ 	: undefined;
+ 
++const isUrlInstance = stdioOption => Object.prototype.toString.call(stdioOption) === '[object URL]';
++const hasFileProtocol = url => url.protocol === 'file:';
++const isFileUrl = stdioOption => isUrlInstance(stdioOption) && hasFileProtocol(stdioOption);
++const isRegularUrl = stdioOption => isUrlInstance(stdioOption) && !hasFileProtocol(stdioOption);
++
+ // Check whether the `stdin` option results in `spawned.stdin` being `undefined`.
+ // We use a deny list instead of an allow list to be forward compatible with new options.
+ const cannotPipeStdio = stdioOption => NO_PIPE_STDIN.has(stdioOption)
+ 	|| isStream(stdioOption)
+ 	|| typeof stdioOption === 'number'
+-	|| isIterableStdin(stdioOption);
++	|| isIterableStdin(stdioOption)
++	|| isFileUrl(stdioOption);
+ 
+ const NO_PIPE_STDIN = new Set(['ipc', 'ignore', 'inherit']);
+ 
++const validateFileUrl = stdioOption => {
++	if (isRegularUrl(stdioOption)) {
++		throw new TypeError(`The \`stdin: URL\` option must use the \`file:\` scheme.
++For example, you can use the \`pathToFileURL()\` method of the \`url\` core module.`);
++	}
++};
++
+ const validateInputOptions = (stdioArray, input, inputFile) => {
+ 	if (input !== undefined && inputFile !== undefined) {
+ 		throw new TypeError('The `input` and `inputFile` options cannot be both set.');
+@@ -37,6 +50,8 @@ const validateInputOptions = (stdioArray, input, inputFile) => {
+ 	if (noPipeStdin && inputFile !== undefined) {
+ 		throw new TypeError('The `inputFile` and `stdin` options cannot be both set.');
+ 	}
++
++	validateFileUrl(stdioArray[0]);
+ };
+ 
+ const getStdioStreams = (stdioArray, {input, inputFile}) => {
+@@ -46,6 +61,10 @@ const getStdioStreams = (stdioArray, {input, inputFile}) => {
+ 		return {stdinStream: Readable.from(iterableStdin)};
+ 	}
+ 
++	if (isFileUrl(stdioArray[0])) {
++		return {stdinStream: createReadStream(stdioArray[0])};
++	}
++
+ 	if (inputFile !== undefined) {
+ 		return {stdinStream: createReadStream(inputFile)};
+ 	}
+@@ -95,6 +114,12 @@ export const pipeStdioOption = (spawned, {stdinStream, stdinInput}) => {
+ 	}
+ };
+ 
++const transformStdioItemSync = stdioItem => isFileUrl(stdioItem) ? 'pipe' : stdioItem;
++
++const transformStdioSync = stdio => Array.isArray(stdio)
++	? stdio.map(stdioItem => transformStdioItemSync(stdioItem))
++	: stdio;
++
+ const validateInputOptionsSync = (stdioArray, input) => {
+ 	if (getIterableStdin(stdioArray) !== undefined) {
+ 		throw new TypeError('The `stdin` option cannot be an iterable in sync mode');
+@@ -110,6 +135,10 @@ const getInputOption = (stdio, {input, inputFile}) => {
+ 	validateInputOptions(stdioArray, input, inputFile);
+ 	validateInputOptionsSync(stdioArray, input);
+ 
++	if (isFileUrl(stdioArray[0])) {
++		return readFileSync(stdioArray[0]);
++	}
++
+ 	if (inputFile !== undefined) {
+ 		return readFileSync(inputFile);
+ 	}
+@@ -126,7 +155,7 @@ export const handleInputOption = options => {
+ 		options.input = input;
+ 	}
+ 
+-	options.stdio = stdio;
++	options.stdio = transformStdioSync(stdio);
+ };
+ 
+ const hasAlias = options => aliases.some(alias => options[alias] !== undefined);
+diff --git a/readme.md b/readme.md
+index a5d8610..44864f3 100644
+--- a/readme.md
++++ b/readme.md
+@@ -559,12 +559,12 @@ If the input is not a file, use the [`input` option](#input) instead.
+ 
+ #### stdin
+ 
+-Type: `string | number | Stream | undefined | Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array>`\
++Type: `string | number | Stream | undefined | URL | Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array>`\
+ Default: `inherit` with [`$`](#command), `pipe` otherwise
+ 
+ Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+-It can also be an [`Iterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_iterable_protocol) or an [`AsyncIterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols), providing neither [`execaSync()`](#execasyncfile-arguments-options), the [`input` option](#input) nor the [`inputFile` option](#inputfile) is used.
++It can also be a file URL, an [`Iterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_iterable_protocol) or an [`AsyncIterable`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols), providing neither [`execaSync()`](#execasyncfile-arguments-options), the [`input` option](#input) nor the [`inputFile` option](#inputfile) is used.
+ 
+ #### stdout
+ 

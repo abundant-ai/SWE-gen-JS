@@ -1,0 +1,801 @@
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+index 1ed474fb26..a212bbaa10 100644
+--- a/.cargo/config.toml
++++ b/.cargo/config.toml
+@@ -29,8 +29,4 @@ rustflags = [
+   "-Zshare-generics=y",
+   "-Csymbol-mangling-version=v0",
+   "-Aclippy::too_many_arguments",
+-  # Clippy's needless mut lint is buggy: https://github.com/rust-lang/rust-clippy/issues/11299
+-  "-Aclippy::needless_pass_by_ref_mut",
+-  # Clippy's partial_eq lint is buggy: https://github.com/rust-lang/rust-clippy/issues/11178
+-  "-Aclippy::non_canonical_partial_ord_impl",
+ ]
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index c5096512a9..031699f535 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -612,7 +612,7 @@ jobs:
+ 
+       - name: Run cargo clippy
+         run: |
+-          RUSTFLAGS="-D warnings -A deprecated -Aclippy::too_many_arguments -Aclippy::needless_pass_by_ref_mut -Aclippy::non_canonical_partial_ord_impl" cargo groups clippy turbopack --features rustls-tls
++          RUSTFLAGS="-D warnings -A deprecated -Aclippy::too_many_arguments" cargo groups clippy turbopack --features rustls-tls
+ 
+       - name: Run ast-grep lints
+         run: |
+diff --git a/cli/internal/daemonclient/daemonclient.go b/cli/internal/daemonclient/daemonclient.go
+index 23a3fb5348..262d11e251 100644
+--- a/cli/internal/daemonclient/daemonclient.go
++++ b/cli/internal/daemonclient/daemonclient.go
+@@ -5,8 +5,6 @@ package daemonclient
+ import (
+ 	"context"
+ 	"path/filepath"
+-	"runtime"
+-	"strings"
+ 
+ 	"github.com/vercel/turbo/cli/internal/daemon/connector"
+ 	"github.com/vercel/turbo/cli/internal/fs/hash"
+@@ -34,32 +32,12 @@ func New(client *connector.Client) *DaemonClient {
+ 	}
+ }
+ 
+-// formats a repo-relative glob to unix format with ':' characters handled.
+-// On windows, ':' is an invalid path character, but you can, and Turborepo does,
+-// read to and write from files that contain alternate data streams denoted by ':'.
+-// In the case of windows and an alternate data stream, we want change notifications just
+-// for the root file. Note that since ':' denotes a data stream for a _file_, it cannot
+-// appear in a directory name. Thus, if we find one, we know it's in the filename.
+-// See https://learn.microsoft.com/en-us/sysinternals/downloads/streams
+-func formatRepoRelativeGlob(input string) string {
+-	unixInput := filepath.ToSlash(input)
+-	if runtime.GOOS == "windows" {
+-		colonIndex := strings.Index(input, ":")
+-		if colonIndex > -1 {
+-			// we found an alternate data stream
+-			unixInput = unixInput[:colonIndex]
+-		}
+-		return unixInput
+-	}
+-	return strings.ReplaceAll(unixInput, ":", "\\:")
+-}
+-
+ // GetChangedOutputs implements runcache.OutputWatcher.GetChangedOutputs
+ func (d *DaemonClient) GetChangedOutputs(ctx context.Context, hash string, repoRelativeOutputGlobs []string) ([]string, int, error) {
+ 	// The daemon expects globs to be unix paths
+ 	var outputGlobs []string
+ 	for _, outputGlob := range repoRelativeOutputGlobs {
+-		outputGlobs = append(outputGlobs, formatRepoRelativeGlob(outputGlob))
++		outputGlobs = append(outputGlobs, filepath.ToSlash(outputGlob))
+ 	}
+ 	resp, err := d.client.GetChangedOutputs(ctx, &turbodprotocol.GetChangedOutputsRequest{
+ 		Hash:        hash,
+@@ -77,10 +55,10 @@ func (d *DaemonClient) NotifyOutputsWritten(ctx context.Context, hash string, re
+ 	var inclusions []string
+ 	var exclusions []string
+ 	for _, inclusion := range repoRelativeOutputGlobs.Inclusions {
+-		inclusions = append(inclusions, formatRepoRelativeGlob(inclusion))
++		inclusions = append(inclusions, filepath.ToSlash(inclusion))
+ 	}
+ 	for _, exclusion := range repoRelativeOutputGlobs.Exclusions {
+-		exclusions = append(exclusions, formatRepoRelativeGlob(exclusion))
++		exclusions = append(exclusions, filepath.ToSlash(exclusion))
+ 	}
+ 	_, err := d.client.NotifyOutputsWritten(ctx, &turbodprotocol.NotifyOutputsWrittenRequest{
+ 		Hash:                 hash,
+diff --git a/cli/internal/daemonclient/daemonclient_test.go b/cli/internal/daemonclient/daemonclient_test.go
+deleted file mode 100644
+index 634f0bfc79..0000000000
+--- a/cli/internal/daemonclient/daemonclient_test.go
++++ /dev/null
+@@ -1,23 +0,0 @@
+-package daemonclient
+-
+-import (
+-	"path/filepath"
+-	"runtime"
+-	"testing"
+-)
+-
+-func TestFormatRepoRelativeGlob(t *testing.T) {
+-	rawGlob := filepath.Join("some", ".turbo", "turbo-foo:bar.log")
+-	// Note that we expect unix slashes whether or not we are on Windows
+-	var expected string
+-	if runtime.GOOS == "windows" {
+-		expected = "some/.turbo/turbo-foo"
+-	} else {
+-		expected = "some/.turbo/turbo-foo\\:bar.log"
+-	}
+-
+-	result := formatRepoRelativeGlob(rawGlob)
+-	if result != expected {
+-		t.Errorf("formatRepoRelativeGlob(%v) got %v, want %v", rawGlob, result, expected)
+-	}
+-}
+diff --git a/cli/internal/runcache/runcache.go b/cli/internal/runcache/runcache.go
+index 9e371cffee..2abf4f8af4 100644
+--- a/cli/internal/runcache/runcache.go
++++ b/cli/internal/runcache/runcache.go
+@@ -123,6 +123,7 @@ func (tc *TaskCache) RestoreOutputs(ctx context.Context, prefixedUI *cli.Prefixe
+ 
+ 	if err != nil {
+ 		progressLogger.Warn(fmt.Sprintf("Failed to check if we can skip restoring outputs for %v: %v. Proceeding to check cache", tc.pt.TaskID, err))
++		prefixedUI.Warn(ui.Dim(fmt.Sprintf("Failed to check if we can skip restoring outputs for %v: %v. Proceeding to check cache", tc.pt.TaskID, err)))
+ 		changedOutputGlobs = tc.repoRelativeGlobs.Inclusions
+ 	}
+ 
+diff --git a/crates/turbo-tasks-memory/src/aggregation_tree/bottom_tree.rs b/crates/turbo-tasks-memory/src/aggregation_tree/bottom_tree.rs
+index b5ffdaad80..e3e2980992 100644
+--- a/crates/turbo-tasks-memory/src/aggregation_tree/bottom_tree.rs
++++ b/crates/turbo-tasks-memory/src/aggregation_tree/bottom_tree.rs
+@@ -555,7 +555,7 @@ impl<T, I: Clone + Eq + Hash + IsEnabled> BottomTree<T, I> {
+     ) {
+         let mut state = self.state.write();
+         let change = aggregation_context.apply_change(&mut state.data, change);
+-        propagate_change_to_upper(&mut state, aggregation_context, change);
++        propagate_change_to_upper(&state, aggregation_context, change);
+     }
+ 
+     pub fn get_root_info<C: AggregationContext<Info = T, ItemRef = I>>(
+@@ -627,7 +627,7 @@ fn propagate_new_following_to_uppers<C: AggregationContext>(
+ }
+ 
+ fn propagate_change_to_upper<C: AggregationContext>(
+-    state: &mut RwLockWriteGuard<BottomTreeState<C::Info, C::ItemRef>>,
++    state: &RwLockWriteGuard<BottomTreeState<C::Info, C::ItemRef>>,
+     aggregation_context: &C,
+     change: Option<C::ItemChange>,
+ ) {
+@@ -642,6 +642,7 @@ fn propagate_change_to_upper<C: AggregationContext>(
+     }
+ }
+ 
++#[allow(clippy::disallowed_methods)] // Allow VecDeque::new() in this test
+ #[cfg(test)]
+ fn visit_graph<C: AggregationContext>(
+     aggregation_context: &C,
+@@ -667,6 +668,7 @@ fn visit_graph<C: AggregationContext>(
+     (visited.len(), edges)
+ }
+ 
++#[allow(clippy::disallowed_methods)] // Allow VecDeque::new() in this test
+ #[cfg(test)]
+ pub fn print_graph<C: AggregationContext>(
+     aggregation_context: &C,
+@@ -696,7 +698,7 @@ pub fn print_graph<C: AggregationContext>(
+     while let Some(item) = queue.pop_front() {
+         let tree = bottom_tree(aggregation_context, &item, height);
+         let name = name_fn(&item);
+-        let label = format!("{}", name);
++        let label = name.to_string();
+         let state = tree.state.read();
+         if color_upper {
+             print!(r#""{} {}" [color=red];"#, height - 1, name);
+diff --git a/crates/turbo-tasks-memory/src/aggregation_tree/tests.rs b/crates/turbo-tasks-memory/src/aggregation_tree/tests.rs
+index f24ca29045..1f43bdc50a 100644
+--- a/crates/turbo-tasks-memory/src/aggregation_tree/tests.rs
++++ b/crates/turbo-tasks-memory/src/aggregation_tree/tests.rs
+@@ -79,7 +79,7 @@ struct NodeGuard {
+ }
+ 
+ impl NodeGuard {
+-    unsafe fn new<'a>(guard: MutexGuard<'a, NodeInner>, node: Arc<Node>) -> Self {
++    unsafe fn new(guard: MutexGuard<'_, NodeInner>, node: Arc<Node>) -> Self {
+         NodeGuard {
+             guard: unsafe { std::mem::transmute(guard) },
+             node,
+@@ -154,13 +154,11 @@ impl<'a> AggregationContext for NodeAggregationContext<'a> {
+         if self.add_value {
+             info.value += change.value;
+         }
+-        Some(change.clone())
++        Some(*change)
+     }
+ 
+     fn info_to_add_change(&self, info: &Self::Info) -> Option<Self::ItemChange> {
+-        let change = Change {
+-            value: info.value as i32,
+-        };
++        let change = Change { value: info.value };
+         if change.is_empty() {
+             None
+         } else {
+@@ -169,9 +167,7 @@ impl<'a> AggregationContext for NodeAggregationContext<'a> {
+     }
+ 
+     fn info_to_remove_change(&self, info: &Self::Info) -> Option<Self::ItemChange> {
+-        let change = Change {
+-            value: -(info.value as i32),
+-        };
++        let change = Change { value: -info.value };
+         if change.is_empty() {
+             None
+         } else {
+@@ -184,6 +180,7 @@ impl<'a> AggregationContext for NodeAggregationContext<'a> {
+     type RootInfoType = ();
+ 
+     fn new_root_info(&self, root_info_type: &Self::RootInfoType) -> Self::RootInfo {
++        #[allow(clippy::match_single_binding)]
+         match root_info_type {
+             () => false,
+         }
+@@ -194,6 +191,7 @@ impl<'a> AggregationContext for NodeAggregationContext<'a> {
+         info: &Self::Info,
+         root_info_type: &Self::RootInfoType,
+     ) -> Self::RootInfo {
++        #[allow(clippy::match_single_binding)]
+         match root_info_type {
+             () => info.active,
+         }
+@@ -248,7 +246,7 @@ fn chain() {
+ 
+     {
+         let root_info = leaf.inner.lock().aggregation_leaf.get_root_info(&ctx, &());
+-        assert_eq!(root_info, false);
++        assert!(!root_info);
+     }
+ 
+     {
+@@ -262,7 +260,7 @@ fn chain() {
+ 
+     {
+         let root_info = leaf.inner.lock().aggregation_leaf.get_root_info(&ctx, &());
+-        assert_eq!(root_info, false);
++        assert!(!root_info);
+     }
+ 
+     leaf.incr(&ctx);
+@@ -274,14 +272,14 @@ fn chain() {
+         let aggregated = aggregation_info(&ctx, &current);
+         let mut aggregated = aggregated.lock();
+         assert_eq!(aggregated.value, 25050);
+-        (*aggregated).active = true;
++        aggregated.active = true;
+     }
+     assert_eq!(ctx.additions.load(Ordering::SeqCst), 0);
+     ctx.additions.store(0, Ordering::SeqCst);
+ 
+     {
+         let root_info = leaf.inner.lock().aggregation_leaf.get_root_info(&ctx, &());
+-        assert_eq!(root_info, true);
++        assert!(root_info);
+     }
+ 
+     let i = 101;
+@@ -310,7 +308,7 @@ fn chain() {
+ 
+     {
+         let root_info = leaf.inner.lock().aggregation_leaf.get_root_info(&ctx, &());
+-        assert_eq!(root_info, true);
++        assert!(root_info);
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks-memory/src/aggregation_tree/top_tree.rs b/crates/turbo-tasks-memory/src/aggregation_tree/top_tree.rs
+index e55684c1a3..da21c55d4d 100644
+--- a/crates/turbo-tasks-memory/src/aggregation_tree/top_tree.rs
++++ b/crates/turbo-tasks-memory/src/aggregation_tree/top_tree.rs
+@@ -111,7 +111,7 @@ impl<T> TopTree<T> {
+     ) {
+         let mut state = self.state.lock();
+         let change = aggregation_context.apply_change(&mut state.data, change);
+-        propagate_change_to_upper(&mut state, aggregation_context, change);
++        propagate_change_to_upper(&state, aggregation_context, change);
+     }
+ 
+     pub fn get_root_info<C: AggregationContext<Info = T>>(
+@@ -147,7 +147,7 @@ impl<T> TopTree<T> {
+ }
+ 
+ fn propagate_change_to_upper<C: AggregationContext>(
+-    state: &mut MutexGuard<TopTreeState<C::Info>>,
++    state: &MutexGuard<TopTreeState<C::Info>>,
+     aggregation_context: &C,
+     change: Option<C::ItemChange>,
+ ) {
+diff --git a/crates/turbo-tasks-memory/tests/scope_stress.rs b/crates/turbo-tasks-memory/tests/scope_stress.rs
+index dea2b23327..9670e5e72c 100644
+--- a/crates/turbo-tasks-memory/tests/scope_stress.rs
++++ b/crates/turbo-tasks-memory/tests/scope_stress.rs
+@@ -8,6 +8,7 @@ use turbo_tasks_testing::register;
+ 
+ register!();
+ 
++#[allow(clippy::no_effect)] // for *REGISTER
+ #[test]
+ fn rectangle_stress() {
+     *REGISTER;
+diff --git a/crates/turbo-tasks/src/magic_any.rs b/crates/turbo-tasks/src/magic_any.rs
+index 2805511171..cdc697bfe1 100644
+--- a/crates/turbo-tasks/src/magic_any.rs
++++ b/crates/turbo-tasks/src/magic_any.rs
+@@ -90,7 +90,7 @@ impl Eq for dyn MagicAny {}
+ 
+ impl PartialOrd for dyn MagicAny {
+     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+-        Some(self.magic_cmp(other))
++        Some(self.cmp(other))
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks/src/native_function.rs b/crates/turbo-tasks/src/native_function.rs
+index c95c8d4a64..658b0c8549 100644
+--- a/crates/turbo-tasks/src/native_function.rs
++++ b/crates/turbo-tasks/src/native_function.rs
+@@ -91,10 +91,7 @@ impl Hash for &'static NativeFunction {
+ 
+ impl PartialOrd for &'static NativeFunction {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        PartialOrd::partial_cmp(
+-            &(*self as *const NativeFunction),
+-            &(*other as *const NativeFunction),
+-        )
++        Some(self.cmp(other))
+     }
+ }
+ impl Ord for &'static NativeFunction {
+diff --git a/crates/turbo-tasks/src/task/concrete_task_input.rs b/crates/turbo-tasks/src/task/concrete_task_input.rs
+index 24a10268f0..e44e4f7ffa 100644
+--- a/crates/turbo-tasks/src/task/concrete_task_input.rs
++++ b/crates/turbo-tasks/src/task/concrete_task_input.rs
+@@ -47,10 +47,7 @@ impl PartialEq for SharedReference {
+ impl Eq for SharedReference {}
+ impl PartialOrd for SharedReference {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        PartialOrd::partial_cmp(
+-            &(&*self.1 as *const (dyn Any + Send + Sync)),
+-            &(&*other.1 as *const (dyn Any + Send + Sync)),
+-        )
++        Some(self.cmp(other))
+     }
+ }
+ impl Ord for SharedReference {
+diff --git a/crates/turbo-tasks/src/trait_ref.rs b/crates/turbo-tasks/src/trait_ref.rs
+index db254e793c..27e3207531 100644
+--- a/crates/turbo-tasks/src/trait_ref.rs
++++ b/crates/turbo-tasks/src/trait_ref.rs
+@@ -49,7 +49,7 @@ impl<T> Eq for TraitRef<T> {}
+ 
+ impl<T> PartialOrd for TraitRef<T> {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        self.shared_reference.partial_cmp(&other.shared_reference)
++        Some(self.cmp(other))
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks/src/value.rs b/crates/turbo-tasks/src/value.rs
+index 4e2ff1b0c0..639fbc2d18 100644
+--- a/crates/turbo-tasks/src/value.rs
++++ b/crates/turbo-tasks/src/value.rs
+@@ -100,7 +100,7 @@ impl<T> std::hash::Hash for TransientInstance<T> {
+ 
+ impl<T> PartialOrd for TransientInstance<T> {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        self.inner.partial_cmp(&other.inner)
++        Some(self.cmp(other))
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks/src/value_type.rs b/crates/turbo-tasks/src/value_type.rs
+index d4f37d1568..1a637f935d 100644
+--- a/crates/turbo-tasks/src/value_type.rs
++++ b/crates/turbo-tasks/src/value_type.rs
+@@ -58,7 +58,7 @@ impl PartialEq for ValueType {
+ 
+ impl PartialOrd for ValueType {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        (self as *const ValueType).partial_cmp(&(other as *const ValueType))
++        Some(self.cmp(other))
+     }
+ }
+ impl Ord for ValueType {
+@@ -225,7 +225,7 @@ impl PartialEq for TraitType {
+ 
+ impl PartialOrd for TraitType {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        (self as *const TraitType).partial_cmp(&(other as *const TraitType))
++        Some(self.cmp(other))
+     }
+ }
+ 
+diff --git a/crates/turbo-tasks/src/vc/mod.rs b/crates/turbo-tasks/src/vc/mod.rs
+index e388c32254..7039e89277 100644
+--- a/crates/turbo-tasks/src/vc/mod.rs
++++ b/crates/turbo-tasks/src/vc/mod.rs
+@@ -230,7 +230,7 @@ where
+     T: ?Sized + Send,
+ {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+-        self.node.partial_cmp(&other.node)
++        Some(self.cmp(other))
+     }
+ }
+ 
+diff --git a/crates/turbopack-core/src/chunk/containment_tree.rs b/crates/turbopack-core/src/chunk/containment_tree.rs
+index 5949be7f22..33eafdc50f 100644
+--- a/crates/turbopack-core/src/chunk/containment_tree.rs
++++ b/crates/turbopack-core/src/chunk/containment_tree.rs
+@@ -47,7 +47,7 @@ where
+ 
+         let orphan_values = Self::add_values_to_tree(&mut trees, values);
+ 
+-        let roots = Self::treeify(relationships, &mut trees);
++        let roots = Self::treeify(relationships, &trees);
+ 
+         // optimize tree by removing unnecessary nodes
+         Self::skip_unnecessary_nodes(&mut trees);
+@@ -146,7 +146,7 @@ where
+     /// Nest each tree by relationship, compute the roots
+     fn treeify(
+         relationships: Vec<(Option<K>, K)>,
+-        trees: &mut IndexMap<K, Rc<RefCell<Node<K, V>>>>,
++        trees: &IndexMap<K, Rc<RefCell<Node<K, V>>>>,
+     ) -> Vec<Rc<RefCell<Node<K, V>>>> {
+         relationships
+             .into_iter()
+diff --git a/crates/turbopack-dev/src/ecmascript/optimize.rs b/crates/turbopack-dev/src/ecmascript/optimize.rs
+index 060a5a5fcf..a47ce8eb4d 100644
+--- a/crates/turbopack-dev/src/ecmascript/optimize.rs
++++ b/crates/turbopack-dev/src/ecmascript/optimize.rs
+@@ -139,12 +139,12 @@ async fn merge_duplicated_and_contained(
+ 
+     impl PartialOrd for FloatOrd {
+         fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+-            self.0.partial_cmp(&other.0)
++            Some(self.cmp(other))
+         }
+     }
+     impl Ord for FloatOrd {
+         fn cmp(&self, other: &Self) -> Ordering {
+-            self.partial_cmp(other).unwrap_or(Ordering::Equal)
++            self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
+         }
+     }
+ 
+diff --git a/crates/turbopack-ecmascript/src/analyzer/graph.rs b/crates/turbopack-ecmascript/src/analyzer/graph.rs
+index 4e823d756c..2dafc012eb 100644
+--- a/crates/turbopack-ecmascript/src/analyzer/graph.rs
++++ b/crates/turbopack-ecmascript/src/analyzer/graph.rs
+@@ -1644,7 +1644,7 @@ impl<'a> Analyzer<'a> {
+     fn add_conditional_effect(
+         &mut self,
+         test: &Expr,
+-        ast_path: &mut AstNodePath<AstParentNodeRef<'_>>,
++        ast_path: &AstNodePath<AstParentNodeRef<'_>>,
+         ast_kind: AstParentKind,
+         span: Span,
+         mut cond_kind: ConditionalKind,
+diff --git a/crates/turbopack-ecmascript/src/analyzer/mod.rs b/crates/turbopack-ecmascript/src/analyzer/mod.rs
+index 9def37b299..e492a8b6c4 100644
+--- a/crates/turbopack-ecmascript/src/analyzer/mod.rs
++++ b/crates/turbopack-ecmascript/src/analyzer/mod.rs
+@@ -1370,6 +1370,10 @@ impl JsValue {
+                         "process",
+                         "The Node.js process module: https://nodejs.org/api/process.html",
+                     ),
++                    WellKnownObjectKind::NodeProcessArgv => (
++                        "process.argv",
++                        "The Node.js process.argv property: https://nodejs.org/api/process.html#processargv",
++                    ),
+                     WellKnownObjectKind::NodeProcessEnv => (
+                         "process.env",
+                         "The Node.js process.env property: https://nodejs.org/api/process.html#processenv",
+@@ -2960,6 +2964,7 @@ pub enum WellKnownObjectKind {
+     OsModule,
+     OsModuleDefault,
+     NodeProcess,
++    NodeProcessArgv,
+     NodeProcessEnv,
+     NodePreGyp,
+     NodeExpressApp,
+@@ -2978,6 +2983,7 @@ impl WellKnownObjectKind {
+             Self::ChildProcess => Some(&["child_process"]),
+             Self::OsModule => Some(&["os"]),
+             Self::NodeProcess => Some(&["process"]),
++            Self::NodeProcessArgv => Some(&["process", "argv"]),
+             Self::NodeProcessEnv => Some(&["process", "env"]),
+             Self::NodeBuffer => Some(&["Buffer"]),
+             Self::RequireCache => Some(&["require", "cache"]),
+diff --git a/crates/turbopack-ecmascript/src/analyzer/well_known.rs b/crates/turbopack-ecmascript/src/analyzer/well_known.rs
+index 4e3e208064..c3dce752cb 100644
+--- a/crates/turbopack-ecmascript/src/analyzer/well_known.rs
++++ b/crates/turbopack-ecmascript/src/analyzer/well_known.rs
+@@ -666,6 +666,7 @@ pub fn child_process_module_member(kind: WellKnownObjectKind, prop: JsValue) ->
+         (WellKnownObjectKind::ChildProcess, Some("default")) => {
+             JsValue::WellKnownObject(WellKnownObjectKind::ChildProcessDefault)
+         }
++
+         _ => JsValue::unknown(
+             JsValue::member(
+                 Box::new(JsValue::WellKnownObject(WellKnownObjectKind::ChildProcess)),
+@@ -714,6 +715,7 @@ async fn node_process_member(
+             .as_str()
+             .into(),
+         Some("cwd") => JsValue::WellKnownFunction(WellKnownFunctionKind::ProcessCwd),
++        Some("argv") => JsValue::WellKnownObject(WellKnownObjectKind::NodeProcessArgv),
+         Some("env") => JsValue::WellKnownObject(WellKnownObjectKind::NodeProcessEnv),
+         _ => JsValue::unknown(
+             JsValue::member(
+diff --git a/crates/turbopack-ecmascript/src/references/mod.rs b/crates/turbopack-ecmascript/src/references/mod.rs
+index d919380fdb..cea4ff1a76 100644
+--- a/crates/turbopack-ecmascript/src/references/mod.rs
++++ b/crates/turbopack-ecmascript/src/references/mod.rs
+@@ -27,6 +27,7 @@ use constant_condition::{ConstantCondition, ConstantConditionValue};
+ use constant_value::ConstantValue;
+ use indexmap::IndexSet;
+ use lazy_static::lazy_static;
++use num_traits::Zero;
+ use parking_lot::Mutex;
+ use regex::Regex;
+ use swc_core::{
+@@ -88,7 +89,8 @@ use super::{
+         graph::{create_graph, Effect},
+         linker::link,
+         well_known::replace_well_known,
+-        JsValue, ObjectPart, WellKnownFunctionKind, WellKnownObjectKind,
++        ConstantValue as JsConstantValue, JsValue, ObjectPart, WellKnownFunctionKind,
++        WellKnownObjectKind,
+     },
+     errors,
+     parse::{parse, ParseResult},
+@@ -108,7 +110,7 @@ use crate::{
+         imports::{ImportedSymbol, Reexport},
+         parse_require_context,
+         top_level_await::has_top_level_await,
+-        ModuleValue, RequireContextValue,
++        ConstantNumber, ConstantString, ModuleValue, RequireContextValue,
+     },
+     chunk::EcmascriptExports,
+     code_gen::{
+@@ -1323,6 +1325,12 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
+         }
+         JsValue::WellKnownFunction(WellKnownFunctionKind::ChildProcessSpawnMethod(name)) => {
+             let args = linked_args(args).await?;
++
++            // Is this specifically `spawn(process.argv[0], ['-e', ...])`?
++            if is_invoking_node_process_eval(&args) {
++                return Ok(());
++            }
++
+             if !args.is_empty() {
+                 let mut show_dynamic_warning = false;
+                 let pat = js_value_to_pattern(&args[0]);
+@@ -2715,3 +2723,49 @@ fn detect_dynamic_export(p: &Program) -> DetectedDynamicExportType {
+         DetectedDynamicExportType::None
+     }
+ }
++
++/// Detects whether a list of arguments is specifically
++/// `(process.argv[0], ['-e', ...])`. This is useful for detecting if a node
++/// process is being spawned to interpret a string of JavaScript code, and does
++/// not require static analysis.
++fn is_invoking_node_process_eval(args: &[JsValue]) -> bool {
++    if args.len() < 2 {
++        return false;
++    }
++
++    if let JsValue::Member(_, obj, constant) = &args[0] {
++        // Is the first argument to spawn `process.argv[]`?
++        if let (
++            box JsValue::WellKnownObject(WellKnownObjectKind::NodeProcessArgv),
++            box JsValue::Constant(JsConstantValue::Num(ConstantNumber(num))),
++        ) = (obj, constant)
++        {
++            // Is it specifically `process.argv[0]`?
++            if num.is_zero() {
++                if let JsValue::Array {
++                    total_nodes: _,
++                    items,
++                    mutable: _,
++                } = &args[1]
++                {
++                    // Is `-e` one of the arguments passed to the program?
++                    if items.iter().any(|e| {
++                        if let JsValue::Constant(JsConstantValue::Str(ConstantString::Word(arg))) =
++                            e
++                        {
++                            arg == "-e"
++                        } else {
++                            false
++                        }
++                    }) {
++                        // If so, this is likely spawning node to evaluate a string, and
++                        // does not need to be statically analyzed.
++                        return true;
++                    }
++                }
++            }
++        }
++    }
++
++    false
++}
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/index.js b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/index.js
+new file mode 100644
+index 0000000000..59b2403d08
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/index.js
+@@ -0,0 +1,3 @@
++import { spawn } from "child_process";
++
++let x = spawn(process.argv[0], ["-e", "console.log('foo');"]);
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/node_modules/child_process/index.js b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/node_modules/child_process/index.js
+new file mode 100644
+index 0000000000..96c72b27fc
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/node_modules/child_process/index.js
+@@ -0,0 +1,3 @@
++export function spawn(cmd, args) {
++  //
++}
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/options.json b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/options.json
+new file mode 100644
+index 0000000000..d56676da5a
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/options.json
+@@ -0,0 +1,3 @@
++{
++    "environment": "NodeJs"
++}
+\ No newline at end of file
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/134fc_child_process_index_64e768.js b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/134fc_child_process_index_64e768.js
+new file mode 100644
+index 0000000000..207d872285
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/134fc_child_process_index_64e768.js
+@@ -0,0 +1,15 @@
++(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push(["output/134fc_child_process_index_64e768.js", {
++
++"[project]/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/node_modules/child_process/index.js (ecmascript)": (({ r: __turbopack_require__, f: __turbopack_require_context__, i: __turbopack_import__, s: __turbopack_esm__, v: __turbopack_export_value__, n: __turbopack_export_namespace__, c: __turbopack_cache__, l: __turbopack_load__, j: __turbopack_dynamic__, g: global, __dirname, x: __turbopack_external_require__, y: __turbopack_external_import__, k: __turbopack_refresh__ }) => (() => {
++
++__turbopack_esm__({
++    "spawn": ()=>spawn
++});
++function spawn(cmd, args) {
++//
++}
++
++})()),
++}]);
++
++//# sourceMappingURL=134fc_child_process_index_64e768.js.map
+\ No newline at end of file
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/134fc_child_process_index_64e768.js.map b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/134fc_child_process_index_64e768.js.map
+new file mode 100644
+index 0000000000..bb3badb173
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/134fc_child_process_index_64e768.js.map
+@@ -0,0 +1,6 @@
++{
++  "version": 3,
++  "sections": [
++    {"offset": {"line": 4, "column": 0}, "map": {"version":3,"sources":["/turbopack/[project]/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/node_modules/child_process/index.js"],"sourcesContent":["export function spawn(cmd, args) {\n  //\n}\n"],"names":[],"mappings":";;;AAAO,SAAS,MAAM,GAAG,EAAE,IAAI;AAC7B,EAAE;AACJ"}},
++    {"offset": {"line": 10, "column": 0}, "map": {"version":3,"sources":[],"names":[],"mappings":"A"}}]
++}
+\ No newline at end of file
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_a238f1.js b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_a238f1.js
+new file mode 100644
+index 0000000000..1547be0ba9
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_a238f1.js
+@@ -0,0 +1,12 @@
++(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push([
++    "output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_a238f1.js",
++    {},
++]);
++(globalThis.TURBOPACK_CHUNK_LISTS = globalThis.TURBOPACK_CHUNK_LISTS || []).push({
++  "path": "output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_a238f1.js",
++  "chunks": [
++    "output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js",
++    "output/134fc_child_process_index_64e768.js"
++  ],
++  "source": "entry"
++});
+\ No newline at end of file
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js
+new file mode 100644
+index 0000000000..9ebe7c0398
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js
+@@ -0,0 +1,16 @@
++(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push(["output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js", {
++
++"[project]/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/index.js (ecmascript)": (({ r: __turbopack_require__, f: __turbopack_require_context__, i: __turbopack_import__, s: __turbopack_esm__, v: __turbopack_export_value__, n: __turbopack_export_namespace__, c: __turbopack_cache__, l: __turbopack_load__, j: __turbopack_dynamic__, g: global, __dirname, x: __turbopack_external_require__, y: __turbopack_external_import__, k: __turbopack_refresh__ }) => (() => {
++
++var __TURBOPACK__imported__module__$5b$project$5d2f$crates$2f$turbopack$2d$tests$2f$tests$2f$snapshot$2f$node$2f$spawn_node_eval$2f$input$2f$node_modules$2f$child_process$2f$index$2e$js__$28$ecmascript$29$__ = __turbopack_import__("[project]/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/node_modules/child_process/index.js (ecmascript)");
++"__TURBOPACK__ecmascript__hoisting__location__";
++;
++let x = __TURBOPACK__imported__module__$5b$project$5d2f$crates$2f$turbopack$2d$tests$2f$tests$2f$snapshot$2f$node$2f$spawn_node_eval$2f$input$2f$node_modules$2f$child_process$2f$index$2e$js__$28$ecmascript$29$__["spawn"](process.argv[0], [
++    "-e",
++    "console.log('foo');"
++]);
++
++})()),
++}]);
++
++//# sourceMappingURL=crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js.map
+\ No newline at end of file
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js.map b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js.map
+new file mode 100644
+index 0000000000..2edf1b41ad
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js.map
+@@ -0,0 +1,6 @@
++{
++  "version": 3,
++  "sections": [
++    {"offset": {"line": 4, "column": 0}, "map": {"version":3,"sources":["/turbopack/[project]/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/index.js"],"sourcesContent":["import { spawn } from \"child_process\";\n\nlet x = spawn(process.argv[0], [\"-e\", \"console.log('foo');\"]);\n"],"names":[],"mappings":";;;AAEA,IAAI,IAAI,qNAAM,QAAQ,IAAI,CAAC,EAAE,EAAE;IAAC;IAAM;CAAsB"}},
++    {"offset": {"line": 11, "column": 0}, "map": {"version":3,"sources":[],"names":[],"mappings":"A"}}]
++}
+\ No newline at end of file
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_e27a00.js b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_e27a00.js
+new file mode 100644
+index 0000000000..cd10c07c04
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_e27a00.js
+@@ -0,0 +1,6 @@
++(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push([
++    "output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_e27a00.js",
++    {},
++    {"otherChunks":[{"path":"output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_b53fce.js","included":["[project]/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/index.js (ecmascript)"]},{"path":"output/134fc_child_process_index_64e768.js","included":["[project]/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/node_modules/child_process/index.js (ecmascript)"]}],"runtimeModuleIds":["[project]/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/input/index.js (ecmascript)"]}
++]);
++// Dummy runtime
+\ No newline at end of file
+diff --git a/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_e27a00.js.map b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_e27a00.js.map
+new file mode 100644
+index 0000000000..a12b83d333
+--- /dev/null
++++ b/crates/turbopack-tests/tests/snapshot/node/spawn_node_eval/output/crates_turbopack-tests_tests_snapshot_node_spawn_node_eval_input_index_e27a00.js.map
+@@ -0,0 +1,4 @@
++{
++  "version": 3,
++  "sections": []
++}
+\ No newline at end of file
+diff --git a/crates/turborepo-filewatch/src/globwatcher.rs b/crates/turborepo-filewatch/src/globwatcher.rs
+index fb05222813..2a64ae924b 100644
+--- a/crates/turborepo-filewatch/src/globwatcher.rs
++++ b/crates/turborepo-filewatch/src/globwatcher.rs
+@@ -593,12 +593,7 @@ mod test {
+ 
+         let glob_watcher = GlobWatcher::new(&repo_root, cookie_jar, watcher.subscribe());
+ 
+-        // On windows, we expect different sanitization before the
+-        // globs are passed in, due to alternative data streams in files.
+-        #[cfg(windows)]
+         let raw_includes = &["my-pkg/.next/next-file"];
+-        #[cfg(not(windows))]
+-        let raw_includes = &["my-pkg/.next/next-file\\:build"];
+         let raw_excludes: [&str; 0] = [];
+         let globs = GlobSet {
+             include: make_includes(raw_includes),
+@@ -623,8 +618,10 @@ mod test {
+         assert!(results.is_empty());
+ 
+         // Change the watched file
+-        let watched_file = repo_root.join_components(&["my-pkg", ".next", "next-file:build"]);
+-        watched_file.create_with_contents("hello").unwrap();
++        repo_root
++            .join_components(&["my-pkg", ".next", "next-file"])
++            .create_with_contents("hello")
++            .unwrap();
+         let results = glob_watcher
+             .get_changed_globs(hash.clone(), candidates.clone())
+             .await
+diff --git a/go.work b/go.work
+new file mode 100644
+index 0000000000..b2b0306060
+--- /dev/null
++++ b/go.work
+@@ -0,0 +1,3 @@
++go 1.20
++
++use ./cli
+diff --git a/rust-toolchain b/rust-toolchain
+index fe109472d2..38686d9d69 100644
+--- a/rust-toolchain
++++ b/rust-toolchain
+@@ -1 +1 @@
+-nightly-2023-09-21
++nightly-2023-10-06

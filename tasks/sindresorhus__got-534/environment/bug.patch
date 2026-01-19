@@ -1,0 +1,780 @@
+diff --git a/readme.md b/readme.md
+index a988c4d..5e20aaf 100644
+--- a/readme.md
++++ b/readme.md
+@@ -188,14 +188,7 @@ Type: `number` `Object`
+ 
+ Milliseconds to wait for the server to end the response before aborting request with `ETIMEDOUT` error (a.k.a. `request` property). By default there's no timeout.
+ 
+-This also accepts an object with separate `lookup`, `connect`, `socket`, `response` and `request` fields to specify granular timeouts for each phase of the request.
+-
+-- `lookup` starts when a socket is assigned and ends when the hostname has been resolved. Does not apply when using a Unix domain socket.
+-- `connect` starts when `lookup` completes (or when the socket is assigned if lookup does not apply to the request) and ends when the socket is connected.
+-- `socket` starts when the socket is connected. See [request.setTimeout](https://nodejs.org/api/http.html#http_request_settimeout_timeout_callback).
+-- `response` starts when the request has been written to the socket and ends when the response headers are received.
+-- `send` starts when the socket is connected and ends with the request has been written to the socket.
+-- `request` starts when the request is initiated and ends when the response's end event fires.
++This also accepts an object with separate `connect`, `socket`, and `request` fields for connection, socket, and entire request timeouts.
+ 
+ ###### retry
+ 
+diff --git a/source/as-promise.js b/source/as-promise.js
+index 1b4ff00..fcd261d 100644
+--- a/source/as-promise.js
++++ b/source/as-promise.js
+@@ -24,22 +24,17 @@ module.exports = options => {
+ 
+ 			proxy.emit('request', req);
+ 
+-			const uploadComplete = () => {
+-				req.emit('upload-complete');
+-			};
+-
+ 			onCancel(() => {
+ 				req.abort();
+ 			});
+ 
+ 			if (is.nodeStream(options.body)) {
+-				options.body.once('end', uploadComplete);
+ 				options.body.pipe(req);
+ 				options.body = undefined;
+ 				return;
+ 			}
+ 
+-			req.end(options.body, uploadComplete);
++			req.end(options.body);
+ 		});
+ 
+ 		emitter.on('response', async response => {
+diff --git a/source/as-stream.js b/source/as-stream.js
+index 501da2b..35f14c5 100644
+--- a/source/as-stream.js
++++ b/source/as-stream.js
+@@ -28,28 +28,23 @@ module.exports = options => {
+ 
+ 	emitter.on('request', req => {
+ 		proxy.emit('request', req);
+-		const uploadComplete = () => {
+-			req.emit('upload-complete');
+-		};
+ 
+ 		if (is.nodeStream(options.body)) {
+-			options.body.once('end', uploadComplete);
+ 			options.body.pipe(req);
+ 			return;
+ 		}
+ 
+ 		if (options.body) {
+-			req.end(options.body, uploadComplete);
++			req.end(options.body);
+ 			return;
+ 		}
+ 
+ 		if (options.method === 'POST' || options.method === 'PUT' || options.method === 'PATCH') {
+-			input.once('end', uploadComplete);
+ 			input.pipe(req);
+ 			return;
+ 		}
+ 
+-		req.end(uploadComplete);
++		req.end();
+ 	});
+ 
+ 	emitter.on('response', response => {
+diff --git a/source/errors.js b/source/errors.js
+index dff0576..ad83388 100644
+--- a/source/errors.js
++++ b/source/errors.js
+@@ -19,7 +19,6 @@ class GotError extends Error {
+ 			hostname: opts.hostname,
+ 			method: opts.method,
+ 			path: opts.path,
+-			socketPath: opts.socketPath,
+ 			protocol: opts.protocol,
+ 			url: opts.href
+ 		});
+@@ -90,12 +89,4 @@ module.exports.UnsupportedProtocolError = class extends GotError {
+ 	}
+ };
+ 
+-module.exports.TimeoutError = class extends GotError {
+-	constructor(threshold, event, opts) {
+-		super(`Timeout awaiting '${event}' for ${threshold}ms`, {code: 'ETIMEDOUT'}, opts);
+-		this.name = 'TimeoutError';
+-		this.event = event;
+-	}
+-};
+-
+ module.exports.CancelError = PCancelable.CancelError;
+diff --git a/source/request-as-event-emitter.js b/source/request-as-event-emitter.js
+index 7631b53..0f9f3bc 100644
+--- a/source/request-as-event-emitter.js
++++ b/source/request-as-event-emitter.js
+@@ -10,7 +10,7 @@ const timedOut = require('./timed-out');
+ const getBodySize = require('./get-body-size');
+ const getResponse = require('./get-response');
+ const progress = require('./progress');
+-const {GotError, CacheError, UnsupportedProtocolError, MaxRedirectsError, RequestError} = require('./errors');
++const {CacheError, UnsupportedProtocolError, MaxRedirectsError, RequestError} = require('./errors');
+ 
+ const getMethodRedirectCodes = new Set([300, 301, 302, 303, 304, 305, 307, 308]);
+ const allMethodRedirectCodes = new Set([300, 303, 307, 308]);
+@@ -91,11 +91,13 @@ module.exports = (options = {}) => {
+ 				return;
+ 			}
+ 
+-			try {
+-				getResponse(response, options, emitter, redirects);
+-			} catch (error) {
+-				emitter.emit('error', error);
+-			}
++			setImmediate(() => {
++				try {
++					getResponse(response, options, emitter, redirects);
++				} catch (error) {
++					emitter.emit('error', error);
++				}
++			});
+ 		});
+ 
+ 		cacheReq.on('error', error => {
+@@ -117,12 +119,10 @@ module.exports = (options = {}) => {
+ 					return;
+ 				}
+ 
+-				if (!(error instanceof GotError)) {
+-					error = new RequestError(error, options);
+-				}
+-				emitter.emit('retry', error, retried => {
++				const err = new RequestError(error, options);
++				emitter.emit('retry', err, retried => {
+ 					if (!retried) {
+-						emitter.emit('error', error);
++						emitter.emit('error', err);
+ 					}
+ 				});
+ 			});
+@@ -130,10 +130,12 @@ module.exports = (options = {}) => {
+ 			progress.upload(req, emitter, uploadBodySize);
+ 
+ 			if (options.gotTimeout) {
+-				timedOut(req, options);
++				timedOut(req, options.gotTimeout);
+ 			}
+ 
+-			emitter.emit('request', req);
++			setImmediate(() => {
++				emitter.emit('request', req);
++			});
+ 		});
+ 	};
+ 
+diff --git a/source/timed-out.js b/source/timed-out.js
+index aeb5134..0c43bf1 100644
+--- a/source/timed-out.js
++++ b/source/timed-out.js
+@@ -1,131 +1,79 @@
+ 'use strict';
+-const net = require('net');
+-const {TimeoutError} = require('./errors');
+ 
+-const reentry = Symbol('reentry');
++// Forked from https://github.com/floatdrop/timed-out
+ 
+-function addTimeout(delay, callback, ...args) {
+-	// Event loop order is timers, poll, immediates.
+-	// The timed event may emit during the current tick poll phase, so
+-	// defer calling the handler until the poll phase completes.
+-	let immediate;
+-	const timeout = setTimeout(
+-		() => {
+-			immediate = setImmediate(callback, delay, ...args);
+-			if (immediate.unref) {
+-				// Added in node v9.7.0
+-				immediate.unref();
+-			}
+-		},
+-		delay
+-	);
+-	timeout.unref();
+-	return () => {
+-		clearTimeout(timeout);
+-		clearImmediate(immediate);
+-	};
+-}
+-
+-module.exports = function (req, options) {
+-	if (req[reentry]) {
+-		return;
++module.exports = function (req, delays) {
++	if (req.timeoutTimer) {
++		return req;
+ 	}
+-	req[reentry] = true;
+-	const {gotTimeout: delays, host, hostname} = options;
+-	const timeoutHandler = (delay, event) => {
+-		req.abort();
+-		req.emit('error', new TimeoutError(delay, event, options));
+-	};
+-	const cancelers = [];
+-	const cancelTimeouts = () => {
+-		cancelers.forEach(cancelTimeout => cancelTimeout());
+-	};
+ 
+-	req.on('error', cancelTimeouts);
+-	req.once('response', response => {
+-		response.once('end', cancelTimeouts);
+-	});
++	const host = req._headers ? (' to ' + req._headers.host) : '';
+ 
+-	if (delays.request !== undefined) {
+-		const cancelTimeout = addTimeout(
+-			delays.request,
+-			timeoutHandler,
+-			'request'
+-		);
+-		cancelers.push(cancelTimeout);
+-	}
+-	if (delays.socket !== undefined) {
+-		req.setTimeout(
+-			delays.socket,
+-			() => {
+-				timeoutHandler(delays.socket, 'socket');
+-			}
+-		);
++	function throwESOCKETTIMEDOUT() {
++		req.abort();
++		const e = new Error('Socket timed out on request' + host);
++		e.code = 'ESOCKETTIMEDOUT';
++		req.emit('error', e);
+ 	}
+-	if (delays.lookup !== undefined && !req.socketPath && !net.isIP(hostname || host)) {
+-		req.once('socket', socket => {
+-			if (socket.connecting) {
+-				const cancelTimeout = addTimeout(
+-					delays.lookup,
+-					timeoutHandler,
+-					'lookup'
+-				);
+-				cancelers.push(cancelTimeout);
+-				socket.once('lookup', cancelTimeout);
+-			}
+-		});
++
++	function throwETIMEDOUT() {
++		req.abort();
++		const e = new Error('Connection timed out on request' + host);
++		e.code = 'ETIMEDOUT';
++		req.emit('error', e);
+ 	}
++
+ 	if (delays.connect !== undefined) {
+-		req.once('socket', socket => {
+-			if (socket.connecting) {
+-				const timeConnect = () => {
+-					const cancelTimeout = addTimeout(
+-						delays.connect,
+-						timeoutHandler,
+-						'connect'
+-					);
+-					cancelers.push(cancelTimeout);
+-					return cancelTimeout;
+-				};
+-				if (req.socketPath || net.isIP(hostname || host)) {
+-					socket.once('connect', timeConnect());
+-				} else {
+-					socket.once('lookup', () => {
+-						socket.once('connect', timeConnect());
+-					});
+-				}
+-			}
+-		});
++		req.timeoutTimer = setTimeout(throwETIMEDOUT, delays.connect);
+ 	}
+-	if (delays.send !== undefined) {
+-		req.once('socket', socket => {
+-			const timeRequest = () => {
+-				const cancelTimeout = addTimeout(
+-					delays.send,
+-					timeoutHandler,
+-					'send'
+-				);
+-				cancelers.push(cancelTimeout);
+-				return cancelTimeout;
+-			};
+-			if (socket.connecting) {
+-				socket.once('connect', () => {
+-					req.once('upload-complete', timeRequest());
+-				});
++
++	if (delays.request !== undefined) {
++		req.requestTimeoutTimer = setTimeout(() => {
++			clear();
++
++			if (req.connection.connecting) {
++				throwETIMEDOUT();
+ 			} else {
+-				req.once('upload-complete', timeRequest());
++				throwESOCKETTIMEDOUT();
+ 			}
+-		});
++		}, delays.request);
++	}
++
++	// Clear the connection timeout timer once a socket is assigned to the
++	// request and is connected.
++	req.on('socket', socket => {
++		// Socket may come from Agent pool and may be already connected.
++		if (!socket.connecting) {
++			connect();
++			return;
++		}
++
++		socket.once('connect', connect);
++	});
++
++	function clear() {
++		if (req.timeoutTimer) {
++			clearTimeout(req.timeoutTimer);
++			req.timeoutTimer = null;
++		}
+ 	}
+-	if (delays.response !== undefined) {
+-		req.once('upload-complete', () => {
+-			const cancelTimeout = addTimeout(
+-				delays.response,
+-				timeoutHandler,
+-				'response'
+-			);
+-			cancelers.push(cancelTimeout);
+-			req.once('response', cancelTimeout);
++
++	function connect() {
++		clear();
++
++		if (delays.socket !== undefined) {
++			// Abort the request if there is no activity on the socket for more
++			// than `delays.socket` milliseconds.
++			req.setTimeout(delays.socket, throwESOCKETTIMEDOUT);
++		}
++
++		req.on('response', res => {
++			res.on('end', () => {
++				// The request is finished, cancel request timeout.
++				clearTimeout(req.requestTimeoutTimer);
++			});
+ 		});
+ 	}
++
++	return req.on('error', clear);
+ };
+diff --git a/test/retry.js b/test/retry.js
+index 364097b..a25c7a8 100644
+--- a/test/retry.js
++++ b/test/retry.js
+@@ -10,7 +10,8 @@ let fifth = 0;
+ let lastTried413access = Date.now();
+ 
+ const retryAfterOn413 = 2;
+-const socketTimeout = 200;
++const connectTimeout = 500;
++const socketTimeout = 100;
+ 
+ test.before('setup', async () => {
+ 	s = await createServer();
+@@ -68,12 +69,12 @@ test.before('setup', async () => {
+ });
+ 
+ test('works on timeout error', async t => {
+-	t.is((await got(`${s.url}/knock-twice`, {timeout: {socket: socketTimeout}})).body, 'who`s there?');
++	t.is((await got(`${s.url}/knock-twice`, {timeout: {connect: connectTimeout, socket: socketTimeout}})).body, 'who`s there?');
+ });
+ 
+ test('can be disabled with option', async t => {
+ 	const err = await t.throws(got(`${s.url}/try-me`, {
+-		timeout: {socket: socketTimeout},
++		timeout: {connect: connectTimeout, socket: socketTimeout},
+ 		retry: 0
+ 	}));
+ 	t.truthy(err);
+@@ -82,7 +83,7 @@ test('can be disabled with option', async t => {
+ 
+ test('function gets iter count', async t => {
+ 	await got(`${s.url}/fifth`, {
+-		timeout: {socket: socketTimeout},
++		timeout: {connect: connectTimeout, socket: socketTimeout},
+ 		retry: {
+ 			retries: iteration => iteration < 10
+ 		}
+@@ -92,7 +93,7 @@ test('function gets iter count', async t => {
+ 
+ test('falsy value prevents retries', async t => {
+ 	const err = await t.throws(got(`${s.url}/long`, {
+-		timeout: {socket: socketTimeout},
++		timeout: {connect: connectTimeout, socket: socketTimeout},
+ 		retry: {
+ 			retries: () => 0
+ 		}
+@@ -102,7 +103,7 @@ test('falsy value prevents retries', async t => {
+ 
+ test('falsy value prevents retries #2', async t => {
+ 	const err = await t.throws(got(`${s.url}/long`, {
+-		timeout: {socket: socketTimeout},
++		timeout: {connect: connectTimeout, socket: socketTimeout},
+ 		retry: {
+ 			retries: (iter, err) => {
+ 				t.truthy(err);
+diff --git a/test/timeout.js b/test/timeout.js
+index 309dfab..fb29a88 100644
+--- a/test/timeout.js
++++ b/test/timeout.js
+@@ -1,6 +1,3 @@
+-import http from 'http';
+-import net from 'net';
+-import stream from 'stream';
+ import getStream from 'get-stream';
+ import test from 'ava';
+ import pEvent from 'p-event';
+@@ -9,48 +6,14 @@ import got from '../source';
+ import {createServer} from './helpers/server';
+ 
+ let s;
+-const reqDelay = 250;
+-const slowDataStream = () => {
+-	const slowStream = new stream.PassThrough();
+-	let count = 0;
+-	const interval = setInterval(() => {
+-		if (count++ < 10) {
+-			return slowStream.push('data\n'.repeat(100));
+-		}
+-		clearInterval(interval);
+-		slowStream.push(null);
+-	}, 100);
+-	return slowStream;
+-};
+-const reqTimeout = reqDelay - 10;
+-const errorMatcher = {
+-	instanceOf: got.TimeoutError,
+-	code: 'ETIMEDOUT'
+-};
+-const keepAliveAgent = new http.Agent({
+-	keepAlive: true
+-});
++const reqDelay = 160;
+ 
+ test.before('setup', async () => {
+ 	s = await createServer();
+ 
+ 	s.on('/', async (req, res) => {
+-		req.on('data', () => {});
+-		req.on('end', async () => {
+-			await delay(reqDelay);
+-			res.end('OK');
+-		});
+-	});
+-
+-	s.on('/download', async (req, res) => {
+-		res.writeHead(200, {
+-			'transfer-encoding': 'chunked'
+-		});
+-		res.flushHeaders();
+-		slowDataStream().pipe(res);
+-	});
+-
+-	s.on('/prime', (req, res) => {
++		await delay(reqDelay);
++		res.statusCode = 200;
+ 		res.end('OK');
+ 	});
+ 
+@@ -64,246 +27,69 @@ test('timeout option (ETIMEDOUT)', async t => {
+ 			retry: 0
+ 		}),
+ 		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'request' for 0ms`
++			code: 'ETIMEDOUT'
+ 		}
+ 	);
+ });
+ 
+-test('timeout option as object (ETIMEDOUT)', async t => {
++test('timeout option (ESOCKETTIMEDOUT)', async t => {
+ 	await t.throws(
+ 		got(s.url, {
+-			timeout: {socket: reqDelay * 2.5, request: 1},
++			timeout: reqDelay,
+ 			retry: 0
+ 		}),
+ 		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'request' for 1ms`
++			code: 'ESOCKETTIMEDOUT'
+ 		}
+ 	);
+ });
+ 
+-test('socket timeout', async t => {
++test('timeout option as object (ETIMEDOUT)', async t => {
+ 	await t.throws(
+ 		got(s.url, {
+-			timeout: {socket: reqTimeout},
++			timeout: {socket: reqDelay * 2.5, request: 0},
+ 			retry: 0
+ 		}),
+ 		{
+-			instanceOf: got.TimeoutError,
+-			code: 'ETIMEDOUT',
+-			message: `Timeout awaiting 'socket' for ${reqTimeout}ms`
++			code: 'ETIMEDOUT'
+ 		}
+ 	);
+ });
+ 
+-test('send timeout', async t => {
++test('timeout option as object (ESOCKETTIMEDOUT)', async t => {
+ 	await t.throws(
+ 		got(s.url, {
+-			timeout: {send: 1},
++			timeout: {socket: reqDelay * 1.5, request: reqDelay},
+ 			retry: 0
+ 		}),
+ 		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'send' for 1ms`
+-		}
+-	);
+-});
+-
+-test('send timeout (keepalive)', async t => {
+-	await got(`${s.url}/prime`, {agent: keepAliveAgent});
+-	await t.throws(
+-		got(s.url, {
+-			agent: keepAliveAgent,
+-			timeout: {send: 1},
+-			retry: 0,
+-			body: slowDataStream()
+-		}).on('request', req => {
+-			req.once('socket', socket => {
+-				t.false(socket.connecting);
+-				socket.once('connect', () => {
+-					t.fail(`'connect' event fired, invalidating test`);
+-				});
+-			});
+-		}),
+-		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'send' for 1ms`
++			code: 'ESOCKETTIMEDOUT'
+ 		}
+ 	);
+ });
+ 
+-test('response timeout', async t => {
++test('socket timeout', async t => {
+ 	await t.throws(
+ 		got(s.url, {
+-			timeout: {response: 1},
++			timeout: {socket: reqDelay / 20},
+ 			retry: 0
+ 		}),
+ 		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'response' for 1ms`
++			code: 'ESOCKETTIMEDOUT'
+ 		}
+ 	);
+ });
+ 
+-test('response timeout unaffected by slow upload', async t => {
+-	await got(s.url, {
+-		timeout: {response: reqDelay * 2},
+-		retry: 0,
+-		body: slowDataStream()
+-	}).on('request', request => {
+-		request.on('error', error => {
+-			t.fail(`unexpected error: ${error}`);
+-		});
+-	});
+-	await delay(reqDelay * 3);
+-	t.pass('no error emitted');
+-});
+-
+-test('response timeout unaffected by slow download', async t => {
+-	await got(`${s.url}/download`, {
+-		timeout: {response: 100},
+-		retry: 0
+-	}).on('request', request => {
+-		request.on('error', error => {
+-			t.fail(`unexpected error: ${error}`);
+-		});
+-	});
+-	await delay(reqDelay * 3);
+-	t.pass('no error emitted');
+-});
+-
+-test('response timeout (keepalive)', async t => {
+-	await got(`${s.url}/prime`, {agent: keepAliveAgent});
+-	await delay(100);
+-	const request = got(s.url, {
+-		agent: keepAliveAgent,
+-		timeout: {response: 1},
+-		retry: 0
+-	}).on('request', req => {
+-		req.once('socket', socket => {
+-			t.false(socket.connecting);
+-			socket.once('connect', () => {
+-				t.fail(`'connect' event fired, invalidating test`);
+-			});
+-		});
+-	});
+-	await t.throws(request, {
+-		...errorMatcher,
+-		message: `Timeout awaiting 'response' for 1ms`
+-	});
+-});
+-
+-test('connect timeout', async t => {
+-	await t.throws(
+-		got({
+-			host: s.host,
+-			port: s.port,
+-			createConnection: options => {
+-				const socket = new net.Socket(options);
+-				socket.connecting = true;
+-				setImmediate(
+-					socket.emit.bind(socket),
+-					'lookup',
+-					null,
+-					'127.0.0.1',
+-					4,
+-					'localhost'
+-				);
+-				return socket;
+-			}
+-		}, {
+-			timeout: {connect: 1},
+-			retry: 0
+-		}),
+-		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'connect' for 1ms`
+-		}
+-	);
+-});
+-
+-test('connect timeout (ip address)', async t => {
+-	await t.throws(
+-		got({
+-			hostname: '127.0.0.1',
+-			port: s.port,
+-			createConnection: options => {
+-				const socket = new net.Socket(options);
+-				socket.connecting = true;
+-				return socket;
+-			}
+-		}, {
+-			timeout: {connect: 1},
+-			retry: 0
+-		}),
+-		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'connect' for 1ms`
+-		}
+-	);
+-});
+-
+-test('lookup timeout', async t => {
+-	await t.throws(
+-		got({
+-			host: s.host,
+-			port: s.port,
+-			lookup: () => { }
+-		}, {
+-			timeout: {lookup: 1},
+-			retry: 0
+-		}),
+-		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'lookup' for 1ms`
+-		}
+-	);
+-});
+-
+-test('lookup timeout no error (ip address)', async t => {
+-	await got({
+-		hostname: '127.0.0.1',
+-		port: s.port
+-	}, {
+-		timeout: {lookup: 100},
+-		retry: 0
+-	}).on('request', request => {
+-		request.on('error', error => {
+-			t.fail(`error emitted: ${error}`);
+-		});
+-	});
+-	await delay(100);
+-	t.pass('no error emitted');
+-});
+-
+-test('lookup timeout no error (keepalive)', async t => {
+-	await got(`${s.url}/prime`, {agent: keepAliveAgent});
+-	await got(s.url, {
+-		agent: keepAliveAgent,
+-		timeout: {lookup: 100},
+-		retry: 0
+-	}).on('request', request => {
+-		request.once('connect', () => {
+-			t.fail('connect event fired, invalidating test');
+-		});
+-		request.on('error', error => {
+-			t.fail(`error emitted: ${error}`);
+-		});
+-	});
+-	await delay(100);
+-	t.pass('no error emitted');
+-});
++test.todo('connection timeout');
+ 
+ test('request timeout', async t => {
+ 	await t.throws(
+ 		got(s.url, {
+-			timeout: {request: reqTimeout},
++			timeout: {request: reqDelay},
+ 			retry: 0
+ 		}),
+ 		{
+-			...errorMatcher,
+-			message: `Timeout awaiting 'request' for ${reqTimeout}ms`
++			code: 'ESOCKETTIMEDOUT'
+ 		}
+ 	);
+ });
+@@ -312,7 +98,7 @@ test('retries on timeout (ESOCKETTIMEDOUT)', async t => {
+ 	let tried = false;
+ 
+ 	await t.throws(got(s.url, {
+-		timeout: reqTimeout,
++		timeout: reqDelay,
+ 		retry: {
+ 			retries: () => {
+ 				if (tried) {
+@@ -324,8 +110,7 @@ test('retries on timeout (ESOCKETTIMEDOUT)', async t => {
+ 			}
+ 		}
+ 	}), {
+-		...errorMatcher,
+-		message: `Timeout awaiting 'request' for ${reqTimeout}ms`
++		code: 'ESOCKETTIMEDOUT'
+ 	});
+ 
+ 	t.true(tried);
+@@ -346,7 +131,7 @@ test('retries on timeout (ETIMEDOUT)', async t => {
+ 				return 1;
+ 			}
+ 		}
+-	}), {...errorMatcher});
++	}), {code: 'ETIMEDOUT'});
+ 
+ 	t.true(tried);
+ });

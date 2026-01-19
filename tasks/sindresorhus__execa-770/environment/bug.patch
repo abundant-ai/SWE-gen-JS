@@ -1,0 +1,165 @@
+diff --git a/index.js b/index.js
+index 030677d..e03083f 100644
+--- a/index.js
++++ b/index.js
+@@ -7,7 +7,7 @@ import crossSpawn from 'cross-spawn';
+ import stripFinalNewline from 'strip-final-newline';
+ import {npmRunPathEnv} from 'npm-run-path';
+ import {makeError} from './lib/error.js';
+-import {handleInputAsync, pipeOutputAsync, cleanupStdioStreams} from './lib/stdio/async.js';
++import {handleInputAsync, pipeOutputAsync} from './lib/stdio/async.js';
+ import {handleInputSync, pipeOutputSync} from './lib/stdio/sync.js';
+ import {normalizeStdioNode} from './lib/stdio/normalize.js';
+ import {spawnedKill, validateTimeout, normalizeForceKillAfterDelay} from './lib/kill.js';
+@@ -134,7 +134,6 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 	try {
+ 		spawned = childProcess.spawn(file, args, options);
+ 	} catch (error) {
+-		cleanupStdioStreams(stdioStreamsGroups);
+ 		// Ensure the returned error is always both a promise and a child process
+ 		const dummySpawned = new childProcess.ChildProcess();
+ 		const errorInstance = makeError({
+diff --git a/lib/stdio/async.js b/lib/stdio/async.js
+index 57fd8f1..bb5d8a2 100644
+--- a/lib/stdio/async.js
++++ b/lib/stdio/async.js
+@@ -5,7 +5,7 @@ import mergeStreams from '@sindresorhus/merge-streams';
+ import {handleInput} from './handle.js';
+ import {TYPE_TO_MESSAGE} from './type.js';
+ import {generatorToDuplexStream, pipeGenerator} from './generator.js';
+-import {pipeStreams, isStandardStream} from './utils.js';
++import {pipeStreams} from './utils.js';
+ 
+ // Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in async mode
+ export const handleInputAsync = options => handleInput(addPropertiesAsync, options, false);
+@@ -66,15 +66,3 @@ const pipeStdioOption = (spawned, {type, value, direction, index}, inputStreamsG
+ 		inputStreamsGroups[index] = [...(inputStreamsGroups[index] ?? []), value];
+ 	}
+ };
+-
+-// The stream error handling is performed by the piping logic above, which cannot be performed before process spawning.
+-// If the process spawning fails (e.g. due to an invalid command), the streams need to be manually destroyed.
+-// We need to create those streams before process spawning, in case their creation fails, e.g. when passing an invalid generator as argument.
+-// Like this, an exception would be thrown, which would prevent spawning a process.
+-export const cleanupStdioStreams = stdioStreamsGroups => {
+-	for (const {value, type} of stdioStreamsGroups.flat()) {
+-		if (type !== 'native' && !isStandardStream(value)) {
+-			value.destroy();
+-		}
+-	}
+-};
+diff --git a/lib/stdio/native.js b/lib/stdio/native.js
+index 67ad67d..f120b17 100644
+--- a/lib/stdio/native.js
++++ b/lib/stdio/native.js
+@@ -1,5 +1,5 @@
++import process from 'node:process';
+ import {isStream as isNodeStream} from 'is-stream';
+-import {STANDARD_STREAMS} from './utils.js';
+ 
+ // When we use multiple `stdio` values for the same streams, we pass 'pipe' to `child_process.spawn()`.
+ // We then emulate the piping done by core Node.js.
+@@ -44,3 +44,5 @@ const getStandardStream = (index, value, optionName) => {
+ 
+ 	return standardStream;
+ };
++
++export const STANDARD_STREAMS = [process.stdin, process.stdout, process.stderr];
+diff --git a/lib/stdio/utils.js b/lib/stdio/utils.js
+index b6c876f..386c6db 100644
+--- a/lib/stdio/utils.js
++++ b/lib/stdio/utils.js
+@@ -1,5 +1,4 @@
+ import {Buffer} from 'node:buffer';
+-import process from 'node:process';
+ import {finished} from 'node:stream/promises';
+ 
+ export const bufferToUint8Array = buffer => new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+@@ -22,6 +21,3 @@ export const pipeStreams = async (source, destination) => {
+ 		destination.destroy();
+ 	}
+ };
+-
+-export const isStandardStream = stream => STANDARD_STREAMS.includes(stream);
+-export const STANDARD_STREAMS = [process.stdin, process.stdout, process.stderr];
+diff --git a/lib/stream.js b/lib/stream.js
+index 6cb0b5e..fb03442 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -4,7 +4,7 @@ import {setImmediate} from 'node:timers/promises';
+ import getStream, {getStreamAsArrayBuffer, getStreamAsArray} from 'get-stream';
+ import mergeStreams from '@sindresorhus/merge-streams';
+ import {throwOnTimeout, cleanupOnExit} from './kill.js';
+-import {isStandardStream} from './stdio/utils.js';
++import {STANDARD_STREAMS} from './stdio/native.js';
+ import {generatorToDuplexStream} from './stdio/generator.js';
+ 
+ // `all` interleaves `stdout` and `stderr`
+@@ -100,7 +100,7 @@ const throwOnCustomStreamsError = customStreams => customStreams
+ 	.map(({value}) => throwOnStreamError(value));
+ 
+ const shouldWaitForCustomStream = (value, type, direction) => (type === 'fileUrl' || type === 'filePath')
+-	|| (direction === 'output' && !isStandardStream(value));
++	|| (direction === 'output' && !STANDARD_STREAMS.includes(value));
+ 
+ const throwIfStreamError = stream => stream === null ? [] : [throwOnStreamError(stream)];
+ 
+diff --git a/test/helpers/generator.js b/test/helpers/generator.js
+index ad465cc..be65c5f 100644
+--- a/test/helpers/generator.js
++++ b/test/helpers/generator.js
+@@ -1,4 +1,4 @@
+-import {setImmediate, setInterval} from 'node:timers/promises';
++import {setImmediate} from 'node:timers/promises';
+ import {foobarObject} from './input.js';
+ 
+ export const noopGenerator = (objectMode, binary) => ({
+@@ -59,9 +59,3 @@ export const convertTransformToFinal = (transform, final) => {
+ 	const generatorOptions = typeof transform === 'function' ? {transform} : transform;
+ 	return ({...generatorOptions, transform: noYieldTransform, final: generatorOptions.transform});
+ };
+-
+-export const infiniteGenerator = async function * () {
+-	for await (const value of setInterval(100, 'foo')) {
+-		yield value;
+-	}
+-};
+diff --git a/test/stdio/generator.js b/test/stdio/generator.js
+index a7e1a19..fd14ad8 100644
+--- a/test/stdio/generator.js
++++ b/test/stdio/generator.js
+@@ -17,7 +17,6 @@ import {
+ 	outputObjectGenerator,
+ 	noYieldGenerator,
+ 	convertTransformToFinal,
+-	infiniteGenerator,
+ } from '../helpers/generator.js';
+ 
+ setFixtureDir();
+@@ -703,7 +702,3 @@ test('Generators errors make process fail even when other input generators do no
+ 	childProcess.stdin.write('foobar\n');
+ 	await t.throwsAsync(childProcess, {message: GENERATOR_ERROR_REGEXP});
+ });
+-
+-test('Generators are canceled on early process exit', async t => {
+-	await t.throwsAsync(execa('noop.js', {stdout: infiniteGenerator, uid: -1}));
+-});
+diff --git a/test/stdio/node-stream.js b/test/stdio/node-stream.js
+index a04c9f8..5f97978 100644
+--- a/test/stdio/node-stream.js
++++ b/test/stdio/node-stream.js
+@@ -131,14 +131,3 @@ test('Wait for custom streams destroy on process errors', async t => {
+ 	t.true(timedOut);
+ 	t.true(waitedForDestroy);
+ });
+-
+-const noopReadable = () => new Readable({read() {}});
+-const noopWritable = () => new Writable({write() {}});
+-
+-const testStreamEarlyExit = async (t, stream, streamName) => {
+-	await t.throwsAsync(execa('noop.js', {[streamName]: [stream, 'pipe'], uid: -1}));
+-	t.true(stream.destroyed);
+-};
+-
+-test('Input streams are canceled on early process exit', testStreamEarlyExit, noopReadable(), 'stdin');
+-test('Output streams are canceled on early process exit', testStreamEarlyExit, noopWritable(), 'stdout');

@@ -1,0 +1,217 @@
+diff --git a/.changeset/cool-berries-build.md b/.changeset/cool-berries-build.md
+new file mode 100644
+index 0000000000..142017c51b
+--- /dev/null
++++ b/.changeset/cool-berries-build.md
+@@ -0,0 +1,25 @@
++---
++'xstate': major
++---
++
++Removed the ability to configure `input` within the implementations object. You no longer can do this:
++
++```ts
++createMachine(
++  {
++    invoke: {
++      src: 'child'
++    }
++  },
++  {
++    actors: {
++      child: {
++        src: childMachine,
++        input: 'foo'
++      }
++    }
++  }
++);
++```
++
++The `input` can only be provided within the config of the machine.
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index c1560c3573..6850f5e18c 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -548,7 +548,7 @@ export class StateMachine<
+       const src = actorData.src;
+ 
+       const logic =
+-        typeof src === 'string' ? resolveReferencedActor(this, src)?.src : src;
++        typeof src === 'string' ? resolveReferencedActor(this, src) : src;
+ 
+       if (!logic) {
+         return;
+diff --git a/packages/core/src/actions/spawn.ts b/packages/core/src/actions/spawn.ts
+index 0a7fee88eb..dd411ff904 100644
+--- a/packages/core/src/actions/spawn.ts
++++ b/packages/core/src/actions/spawn.ts
+@@ -16,7 +16,8 @@ import {
+   ProvidedActor,
+   IsLiteralString,
+   InputFrom,
+-  UnifiedArg
++  UnifiedArg,
++  Mapper
+ } from '../types.ts';
+ import { resolveReferencedActor } from '../utils.ts';
+ 
+@@ -46,30 +47,26 @@ function resolveSpawn(
+     syncSnapshot: boolean;
+   }
+ ) {
+-  const referenced =
+-    typeof src === 'string'
+-      ? resolveReferencedActor(state.machine, src)
+-      : { src, input: undefined };
++  const logic =
++    typeof src === 'string' ? resolveReferencedActor(state.machine, src) : src;
+   const resolvedId = typeof id === 'function' ? id(actionArgs) : id;
+ 
+   let actorRef: AnyActorRef | undefined;
+ 
+-  if (referenced) {
+-    // TODO: inline `input: undefined` should win over the referenced one
+-    const configuredInput = input || referenced.input;
+-    actorRef = createActor(referenced.src, {
++  if (logic) {
++    actorRef = createActor(logic, {
+       id: resolvedId,
+       src,
+       parent: actorScope?.self,
+       systemId,
+       input:
+-        typeof configuredInput === 'function'
+-          ? configuredInput({
++        typeof input === 'function'
++          ? input({
+               context: state.context,
+               event: actionArgs.event,
+               self: actorScope?.self
+             })
+-          : configuredInput
++          : input
+     });
+ 
+     if (syncSnapshot) {
+@@ -155,7 +152,9 @@ type DistributeActors<
+             TActor['id']
+           >;
+           systemId?: string;
+-          input?: InputFrom<TActor['logic']>;
++          input?:
++            | Mapper<TContext, TEvent, InputFrom<TActor['logic']>, TEvent>
++            | InputFrom<TActor['logic']>;
+           syncSnapshot?: boolean;
+         }
+       ]
+@@ -164,7 +163,9 @@ type DistributeActors<
+         options?: {
+           id?: ResolvableActorId<TContext, TExpressionEvent, TEvent, string>;
+           systemId?: string;
+-          input?: InputFrom<TActor['logic']>;
++          input?:
++            | Mapper<TContext, TEvent, InputFrom<TActor['logic']>, TEvent>
++            | InputFrom<TActor['logic']>;
+           syncSnapshot?: boolean;
+         }
+       ]
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index a0a92bd49a..d28004703b 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -65,20 +65,17 @@ export function createSpawner(
+   spawnedChildren: Record<string, AnyActorRef>
+ ): Spawner<any> {
+   const spawn: Spawner<any> = (src, options = {}) => {
+-    const { systemId } = options;
++    const { systemId, input } = options;
+     if (typeof src === 'string') {
+-      const referenced = resolveReferencedActor(machine, src);
++      const logic = resolveReferencedActor(machine, src);
+ 
+-      if (!referenced) {
++      if (!logic) {
+         throw new Error(
+           `Actor logic '${src}' not implemented in machine '${machine.id}'`
+         );
+       }
+ 
+-      const input = 'input' in options ? options.input : referenced.input;
+-
+-      // TODO: this should also receive `src`
+-      const actorRef = createActor(referenced.src, {
++      const actorRef = createActor(logic, {
+         id: options.id,
+         parent: actorScope.self,
+         input:
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index bc920d99c5..233d338213 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -1087,33 +1087,18 @@ type MachineImplementationsActions<
+ };
+ 
+ type MachineImplementationsActors<
+-  TContext extends MachineContext,
++  _TContext extends MachineContext,
+   TResolvedTypesMeta,
+-  TEventsCausingActors = Prop<
+-    Prop<TResolvedTypesMeta, 'resolved'>,
+-    'eventsCausingActors'
+-  >,
+   TIndexedActors = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedActors'>,
+-  TIndexedEvents = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedEvents'>,
+   _TInvokeSrcNameMap = Prop<
+     Prop<TResolvedTypesMeta, 'resolved'>,
+     'invokeSrcNameMap'
+   >
+ > = {
+-  // TODO: this should require `{ src, input }` for required inputs
+-  [K in keyof TIndexedActors]?:
+-    | Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>
+-    | {
+-        src: Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>;
+-        input:
+-          | Mapper<
+-              TContext,
+-              MaybeNarrowedEvent<TIndexedEvents, TEventsCausingActors, K>,
+-              InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>,
+-              Cast<Prop<TIndexedEvents, keyof TIndexedEvents>, EventObject>
+-            >
+-          | InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>;
+-      };
++  [K in keyof TIndexedActors]?: Cast<
++    Prop<TIndexedActors[K], 'logic'>,
++    AnyActorLogic
++  >;
+ };
+ 
+ type MachineImplementationsDelays<
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index ff6e7c6ae5..6cee5a9432 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -407,18 +407,11 @@ export function resolveReferencedActor(machine: AnyStateMachine, src: string) {
+     const [, indexStr] = src.match(/\[(\d+)\]$/)!;
+     const node = machine.getStateNodeById(src.slice(7, -(indexStr.length + 2)));
+     const invokeConfig = node.config.invoke!;
+-    return {
+-      src: (Array.isArray(invokeConfig)
++    return (
++      Array.isArray(invokeConfig)
+         ? invokeConfig[indexStr as any]
+         : (invokeConfig as InvokeConfig<any, any, any, any, any, any>)
+-      ).src,
+-      input: undefined
+-    };
++    ).src;
+   }
+-  const referenced = machine.implementations.actors[src];
+-  return referenced
+-    ? 'transition' in referenced
+-      ? { src: referenced, input: undefined }
+-      : referenced
+-    : undefined;
++  return machine.implementations.actors[src];
+ }

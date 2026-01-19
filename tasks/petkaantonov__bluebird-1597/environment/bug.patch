@@ -1,0 +1,666 @@
+diff --git a/.jshintrc b/.jshintrc
+index 601adc6f..a1c8ee40 100644
+--- a/.jshintrc
++++ b/.jshintrc
+@@ -52,7 +52,6 @@
+         "args": true,
+         "chrome": true,
+         "INLINE_SLICE": false,
+-        "INLINE_SLICE_LEFT_PADDED": false,
+         "BIT_FIELD_CHECK": false,
+         "BIT_FIELD_READ": false,
+         "USE": false,
+diff --git a/src/debuggability.js b/src/debuggability.js
+index 949290b8..9e5f399e 100644
+--- a/src/debuggability.js
++++ b/src/debuggability.js
+@@ -1,6 +1,6 @@
+ "use strict";
+-module.exports = function(Promise, Context,
+-    enableAsyncHooks, disableAsyncHooks) {
++module.exports = function(Promise, Context) {
++var getDomain = Promise._getDomain;
+ var async = Promise._async;
+ var Warning = require("./errors").Warning;
+ var util = require("./util");
+@@ -104,13 +104,19 @@ Promise.prototype._warn = function(message, shouldUseOwnTrace, promise) {
+ };
+ 
+ Promise.onPossiblyUnhandledRejection = function (fn) {
+-    var context = Promise._getContext();
+-    possiblyUnhandledRejection = util.contextBind(context, fn);
++    var domain = getDomain();
++    possiblyUnhandledRejection =
++        typeof fn === "function" ? (domain === null ?
++                                            fn : util.domainBind(domain, fn))
++                                 : undefined;
+ };
+ 
+ Promise.onUnhandledRejectionHandled = function (fn) {
+-    var context = Promise._getContext();
+-    unhandledRejectionHandled = util.contextBind(context, fn);
++    var domain = getDomain();
++    unhandledRejectionHandled =
++        typeof fn === "function" ? (domain === null ?
++                                            fn : util.domainBind(domain, fn))
++                                 : undefined;
+ };
+ 
+ var disableLongStackTraces = function() {};
+@@ -302,18 +308,6 @@ Promise.config = function(opts) {
+             Promise.prototype._fireEvent = defaultFireEvent;
+         }
+     }
+-    if ("asyncHooks" in opts && util.nodeSupportsAsyncResource) {
+-        var prev = config.asyncHooks;
+-        var cur = !!opts.asyncHooks;
+-        if (prev !== cur) {
+-            config.asyncHooks = cur;
+-            if (cur) {
+-                enableAsyncHooks();
+-            } else {
+-                disableAsyncHooks();
+-            }
+-        }
+-    }
+     return Promise;
+ };
+ 
+@@ -939,16 +933,12 @@ var config = {
+     warnings: warnings,
+     longStackTraces: false,
+     cancellation: false,
+-    monitoring: false,
+-    asyncHooks: false
++    monitoring: false
+ };
+ 
+ if (longStackTraces) Promise.longStackTraces();
+ 
+ return {
+-    asyncHooks: function() {
+-        return config.asyncHooks;
+-    },
+     longStackTraces: function() {
+         return config.longStackTraces;
+     },
+diff --git a/src/join.js b/src/join.js
+index b34af43e..db7b6018 100644
+--- a/src/join.js
++++ b/src/join.js
+@@ -1,6 +1,7 @@
+ "use strict";
+ module.exports =
+-function(Promise, PromiseArray, tryConvertToPromise, INTERNAL, async) {
++function(Promise, PromiseArray, tryConvertToPromise, INTERNAL, async,
++         getDomain) {
+ var util = require("./util");
+ var canEvaluate = util.canEvaluate;
+ var tryCatch = util.tryCatch;
+@@ -146,8 +147,10 @@ Promise.join = function () {
+ 
+                 if (!ret._isFateSealed()) {
+                     if (holder.asyncNeeded) {
+-                        var context = Promise._getContext();
+-                        holder.fn = util.contextBind(context, holder.fn);
++                        var domain = getDomain();
++                        if (domain !== null) {
++                            holder.fn = util.domainBind(domain, holder.fn);
++                        }
+                     }
+                     ret._setAsyncGuaranteed();
+                     ret._setOnCancel(holder);
+diff --git a/src/map.js b/src/map.js
+index 7de61635..dd7244e6 100644
+--- a/src/map.js
++++ b/src/map.js
+@@ -6,6 +6,7 @@ module.exports = function(Promise,
+                           INTERNAL,
+                           debug) {
+ var ASSERT = require("./assert");
++var getDomain = Promise._getDomain;
+ var util = require("./util");
+ var tryCatch = util.tryCatch;
+ var errorObj = util.errorObj;
+@@ -14,8 +15,8 @@ var async = Promise._async;
+ function MappingPromiseArray(promises, fn, limit, _filter) {
+     this.constructor$(promises);
+     this._promise._captureStackTrace();
+-    var context = Promise._getContext();
+-    this._callback = util.contextBind(context, fn);
++    var domain = getDomain();
++    this._callback = domain === null ? fn : util.domainBind(domain, fn);
+     this._preservedValues = _filter === INTERNAL
+         ? new Array(this.length())
+         : null;
+diff --git a/src/promise.js b/src/promise.js
+index f2439fbb..af69ea55 100644
+--- a/src/promise.js
++++ b/src/promise.js
+@@ -13,42 +13,20 @@ function Proxyable() {}
+ var UNDEFINED_BINDING = {};
+ var ASSERT = require("./assert");
+ var util = require("./util");
+-util.setReflectHandler(reflectHandler);
+ 
+-var getDomain = function() {
+-    var domain = process.domain;
+-    if (domain === undefined) {
+-        return null;
+-    }
+-    return domain;
+-};
+-var getContextDefault = function() {
+-    return null;
+-};
+-var getContextDomain = function() {
+-    return {
+-        domain: getDomain(),
+-        async: null
++var getDomain;
++if (util.isNode) {
++    getDomain = function() {
++        var ret = process.domain;
++        if (ret === undefined) ret = null;
++        return ret;
+     };
+-};
+-var AsyncResource = util.isNode && util.nodeSupportsAsyncResource ?
+-    require("async_hooks").AsyncResource : null;
+-var getContextAsyncHooks = function() {
+-    return {
+-        domain: getDomain(),
+-        async: new AsyncResource("Bluebird::Promise")
++} else {
++    getDomain = function() {
++        return null;
+     };
+-};
+-var getContext = util.isNode ? getContextDomain : getContextDefault;
+-util.notEnumerableProp(Promise, "_getContext", getContext);
+-var enableAsyncHooks = function() {
+-    getContext = getContextAsyncHooks;
+-    util.notEnumerableProp(Promise, "_getContext", getContextAsyncHooks);
+-};
+-var disableAsyncHooks = function() {
+-    getContext = getContextDomain;
+-    util.notEnumerableProp(Promise, "_getContext", getContextDomain);
+-};
++}
++util.notEnumerableProp(Promise, "_getDomain", getDomain);
+ 
+ var es5 = require("./es5");
+ var Async = require("./async");
+@@ -72,9 +50,7 @@ var PromiseArray =
+ var Context = require("./context")(Promise);
+  /*jshint unused:false*/
+ var createContext = Context.create;
+-
+-var debug = require("./debuggability")(Promise, Context,
+-    enableAsyncHooks, disableAsyncHooks);
++var debug = require("./debuggability")(Promise, Context);
+ var CapturedTrace = debug.CapturedTrace;
+ var PassThroughHandlerContext =
+     require("./finally")(Promise, tryConvertToPromise, NEXT_FILTER);
+@@ -273,7 +249,7 @@ Promise.prototype._then = function (
+         this._fireEvent("promiseChained", this, promise);
+     }
+ 
+-    var context = getContext();
++    var domain = getDomain();
+     if (!BIT_FIELD_CHECK(IS_PENDING_AND_WAITING_NEG)) {
+         var handler, value, settler = target._settlePromiseCtx;
+         if (BIT_FIELD_CHECK(IS_FULFILLED)) {
+@@ -291,14 +267,15 @@ Promise.prototype._then = function (
+         }
+ 
+         async.invoke(settler, target, {
+-            handler: util.contextBind(context, handler),
++            handler: domain === null ? handler
++                : (typeof handler === "function" &&
++                    util.domainBind(domain, handler)),
+             promise: promise,
+             receiver: receiver,
+             value: value
+         });
+     } else {
+-        target._addCallbacks(didFulfill, didReject, promise,
+-                receiver, context);
++        target._addCallbacks(didFulfill, didReject, promise, receiver, domain);
+     }
+ 
+     return promise;
+@@ -424,9 +401,9 @@ Promise.prototype._addCallbacks = function (
+     reject,
+     promise,
+     receiver,
+-    context
++    domain
+ ) {
+-    ASSERT(typeof context === "object");
++    ASSERT(typeof domain === "object");
+     ASSERT(!this._isFateSealed());
+     ASSERT(!this._isFollowing());
+     var index = this._length();
+@@ -445,10 +422,12 @@ Promise.prototype._addCallbacks = function (
+         this._promise0 = promise;
+         this._receiver0 = receiver;
+         if (typeof fulfill === "function") {
+-            this._fulfillmentHandler0 = util.contextBind(context, fulfill);
++            this._fulfillmentHandler0 =
++                domain === null ? fulfill : util.domainBind(domain, fulfill);
+         }
+         if (typeof reject === "function") {
+-            this._rejectionHandler0 = util.contextBind(context, reject);
++            this._rejectionHandler0 =
++                domain === null ? reject : util.domainBind(domain, reject);
+         }
+     } else {
+         ASSERT(this[base + CALLBACK_PROMISE_OFFSET] === undefined);
+@@ -460,11 +439,11 @@ Promise.prototype._addCallbacks = function (
+         this[base + CALLBACK_RECEIVER_OFFSET] = receiver;
+         if (typeof fulfill === "function") {
+             this[base + CALLBACK_FULFILL_OFFSET] =
+-                util.contextBind(context, fulfill);
++                domain === null ? fulfill : util.domainBind(domain, fulfill);
+         }
+         if (typeof reject === "function") {
+             this[base + CALLBACK_REJECT_OFFSET] =
+-                util.contextBind(context, reject);
++                domain === null ? reject : util.domainBind(domain, reject);
+         }
+     }
+     this._setLength(index + 1);
+@@ -812,7 +791,7 @@ require("./cancel")(Promise, PromiseArray, apiRejection, debug);
+ require("./direct_resolve")(Promise);
+ require("./synchronous_inspection")(Promise);
+ require("./join")(
+-    Promise, PromiseArray, tryConvertToPromise, INTERNAL, async);
++    Promise, PromiseArray, tryConvertToPromise, INTERNAL, async, getDomain);
+ Promise.Promise = Promise;
+ Promise.version = "__VERSION__";
+ };
+diff --git a/src/reduce.js b/src/reduce.js
+index a77e7415..4220b58c 100644
+--- a/src/reduce.js
++++ b/src/reduce.js
+@@ -5,13 +5,14 @@ module.exports = function(Promise,
+                           tryConvertToPromise,
+                           INTERNAL,
+                           debug) {
++var getDomain = Promise._getDomain;
+ var util = require("./util");
+ var tryCatch = util.tryCatch;
+ 
+ function ReductionPromiseArray(promises, fn, initialValue, _each) {
+     this.constructor$(promises);
+-    var context = Promise._getContext();
+-    this._fn = util.contextBind(context, fn);
++    var domain = getDomain();
++    this._fn = domain === null ? fn : util.domainBind(domain, fn);
+     if (initialValue !== undefined) {
+         initialValue = Promise.resolve(initialValue);
+         initialValue._attachCancellationCallback(this);
+@@ -31,8 +32,8 @@ function ReductionPromiseArray(promises, fn, initialValue, _each) {
+ util.inherits(ReductionPromiseArray, PromiseArray);
+ 
+ ReductionPromiseArray.prototype._gotAccum = function(accum) {
+-    if (this._eachValues !== undefined &&
+-        this._eachValues !== null &&
++    if (this._eachValues !== undefined && 
++        this._eachValues !== null && 
+         accum !== INTERNAL) {
+         this._eachValues.push(accum);
+     }
+diff --git a/src/util.js b/src/util.js
+index 164bb9f4..2a9ab8da 100644
+--- a/src/util.js
++++ b/src/util.js
+@@ -344,35 +344,11 @@ function getNativePromise() {
+     }
+ }
+ 
+-var reflectHandler;
+-function contextBind(ctx, cb) {
+-    if (ctx === null ||
+-        typeof cb !== "function" ||
+-        cb === reflectHandler) {
+-        return cb;
+-    }
+-
+-    if (ctx.domain !== null) {
+-        cb = ctx.domain.bind(cb);
+-    }
+-
+-    var async = ctx.async;
+-    if (async !== null) {
+-        var old = cb;
+-        cb = function() {
+-            INLINE_SLICE_LEFT_PADDED(2, args, arguments);
+-            args[0] = old;
+-            args[1] = this;
+-            return async.runInAsyncScope.apply(async, args);
+-        };
+-    }
+-    return cb;
++function domainBind(self, cb) {
++    return self.bind(cb);
+ }
+ 
+ var ret = {
+-    setReflectHandler: function(fn) {
+-        reflectHandler = fn;
+-    },
+     isClass: isClass,
+     isIdentifier: isIdentifier,
+     inheritedDataKeys: inheritedDataKeys,
+@@ -406,27 +382,17 @@ var ret = {
+     env: env,
+     global: globalObject,
+     getNativePromise: getNativePromise,
+-    contextBind: contextBind
++    domainBind: domainBind
+ };
+ ret.isRecentNode = ret.isNode && (function() {
+     var version;
+-    if (process.versions && process.versions.node) {
++    if (process.versions && process.versions.node) {    
+         version = process.versions.node.split(".").map(Number);
+     } else if (process.version) {
+         version = process.version.split(".").map(Number);
+     }
+     return (version[0] === 0 && version[1] > 10) || (version[0] > 0);
+ })();
+-ret.nodeSupportsAsyncResource = ret.isNode && (function() {
+-    var supportsAsync = false;
+-    try {
+-        var res = require("async_hooks").AsyncResource;
+-        supportsAsync = typeof res.prototype.runInAsyncScope === "function";
+-    } catch (e) {
+-        supportsAsync = false;
+-    }
+-    return supportsAsync;
+-})();
+ 
+ if (ret.isNode) ret.toFastProperties(process);
+ 
+diff --git a/test/mocha/async_hooks.js b/test/mocha/async_hooks.js
+deleted file mode 100644
+index 15d0eeda..00000000
+--- a/test/mocha/async_hooks.js
++++ /dev/null
+@@ -1,145 +0,0 @@
+-"use strict";
+-
+-var assert = require("assert");
+-
+-var getContextFn = Promise._getContext;
+-Promise.config({ asyncHooks: true });
+-var supportsAsync = Promise._getContext !== getContextFn;
+-Promise.config({ asyncHooks: false });
+-if (supportsAsync) {
+-    runTests();
+-}
+-
+-function runTests() {
+-    var async_hooks = require('async_hooks');
+-
+-    var tree = new Set();
+-    var hook = async_hooks.createHook({
+-        init: function(asyncId, type, triggerId) {
+-            if (tree.has(triggerId)) {
+-                tree.add(asyncId);
+-            }
+-        }
+-    });
+-
+-    var currentId = async_hooks.executionAsyncId;
+-
+-    function getAsyncPromise() {
+-        return new Promise(function(resolve, reject) {
+-            setTimeout(function() {
+-                setTimeout(resolve, 1);
+-            }, 1);
+-        });
+-    }
+-
+-    describe("async_hooks", function() {
+-        beforeEach(function() {
+-            Promise.config({ asyncHooks: true });
+-        })
+-        afterEach(function()  {
+-            tree.clear();
+-            hook.disable();
+-            Promise.config({ asyncHooks: false });
+-        });
+-
+-        it('should preserve async context when using fromNode', function() {
+-            hook.enable()
+-            tree.add(currentId());
+-
+-            return new Promise(function(resolve) {
+-                var globalResolve;
+-                setImmediate(function() {
+-                    hook.enable()
+-                    tree.add(currentId());
+-                    resolve(
+-                        new Promise(function(resolve) { globalResolve = resolve; })
+-                        .then(function() {
+-                            assert.ok(tree.has(currentId()));
+-                        })
+-                    );
+-                })
+-
+-                setTimeout(function() {
+-                    globalResolve();
+-                }, 10);
+-            })
+-        });
+-
+-        it('should preserve async context when using .map', function() {
+-            hook.enable()
+-            tree.add(currentId());
+-            var d1 = getAsyncPromise();
+-
+-            return new Promise(function(resolve, reject) {
+-                resolve(Promise.map([d1, null, Promise.resolve(1), Promise.delay(1)], function() {
+-                    return currentId();
+-                }).then(function(asyncIds) {
+-                    for (var i = 0; i < asyncIds.length; ++i) {
+-                        assert.ok(tree.has(asyncIds[i]));
+-                    }
+-                }));
+-            });
+-        });
+-
+-        it('should preserve async context when using .filter', function() {
+-            hook.enable()
+-            tree.add(currentId());
+-            var d1 = getAsyncPromise();
+-
+-            return new Promise(function(resolve, reject) {
+-                resolve(Promise.filter([d1, null, Promise.resolve(1), Promise.delay(1)], function() {
+-                    assert.ok(tree.has(currentId()));
+-                }));
+-            });
+-        });
+-
+-        it('should preserve async context when using .reduce', function() {
+-            hook.enable()
+-            tree.add(currentId());
+-            var d1 = getAsyncPromise();
+-
+-            return new Promise(function(resolve, reject) {
+-                resolve(Promise.reduce([d1, null, Promise.resolve(1), Promise.delay(1)], function() {
+-                    assert.ok(tree.has(currentId()));
+-                }));
+-            });
+-        });
+-
+-        it('should preserve async context when using .join', function() {
+-            hook.enable()
+-            tree.add(currentId());
+-            var d1 = getAsyncPromise();
+-
+-            return new Promise(function(resolve, reject) {
+-                resolve(Promise.join(d1, Promise.delay(1), function() {
+-                    assert.ok(tree.has(currentId()));
+-                }));
+-            });
+-        });
+-
+-        it('should preserve async context when using .each', function() {
+-            hook.enable()
+-            tree.add(currentId());
+-            var d1 = getAsyncPromise();
+-
+-            return new Promise(function(resolve, reject) {
+-                resolve(Promise.each([d1, null, Promise.resolve(1), Promise.delay(1)], function() {
+-                    assert.ok(tree.has(currentId()));
+-                }));
+-            });
+-        });
+-
+-        it('should be able to disable AsyncResource usage', function() {
+-            Promise.config({ asyncHooks: false });
+-            hook.enable()
+-            tree.add(currentId());
+-            var d1 = getAsyncPromise();
+-
+-            return new Promise(function(resolve, reject) {
+-                resolve(d1.then(function() {
+-                    assert.ok(!tree.has(currentId()));
+-                }));
+-            });
+-        });
+-    });
+-}
+diff --git a/tools/ast_passes.js b/tools/ast_passes.js
+index 833b7a83..6bca724f 100644
+--- a/tools/ast_passes.js
++++ b/tools/ast_passes.js
+@@ -212,8 +212,7 @@ BitFieldCheck.prototype.toString = function() {
+     return "((" + fieldExpr + " & " + this.value + ") " + equality + " 0)";
+ };
+ 
+-function InlineSlice(varExpr, collectionExpression, startExpression, endExpression, start, end, isBrowser,
+-                    pad) {
++function InlineSlice(varExpr, collectionExpression, startExpression, endExpression, start, end, isBrowser) {
+     this.varExpr = varExpr;
+     this.collectionExpression = collectionExpression;
+     this.startExpression = startExpression;
+@@ -221,7 +220,6 @@ function InlineSlice(varExpr, collectionExpression, startExpression, endExpressi
+     this.start = start;
+     this.end = end;
+     this.isBrowser = isBrowser;
+-    this.pad = typeof pad === "number" ? pad : 0;
+ }
+ 
+ InlineSlice.prototype.hasSimpleStartExpression =
+@@ -241,8 +239,6 @@ InlineSlice.prototype.hasSimpleCollection = function InlineSlice$hasSimpleCollec
+ };
+ 
+ InlineSlice.prototype.toString = function InlineSlice$toString() {
+-    var pad = this.pad;
+-
+     var init = this.hasSimpleCollection()
+         ? ""
+         : "var $_collection = " + nodeToString(this.collectionExpression) + ";";
+@@ -251,34 +247,19 @@ InlineSlice.prototype.toString = function InlineSlice$toString() {
+         ? nodeToString(this.collectionExpression)
+         : "$_collection";
+ 
+-    init += "var $_len = " + collectionExpression + ".length";
+ 
+-    if (pad !== 0) {
+-        init += " + " + Math.abs(pad) + ";";
+-    } else {
+-        init += ";";
+-    }
++    init += "var $_len = " + collectionExpression + ".length;";
+ 
+     var varExpr = nodeToString(this.varExpr);
+ 
+     //No offset arguments at all
+     if( this.startExpression === firstElement ) {
+         if (this.isBrowser) {
+-            if (pad > 0) {
+-                return "var " + varExpr + " = (new Array("+pad+")).concat([].slice.call("+collectionExpression+"));";
+-            } else if (pad < 0) {
+-                return "var " + varExpr + " = ([].slice.call("+collectionExpression+")).concat(new Array("+Math.abs(pad)+"));";
+-            } else {
+-                return "var " + varExpr + " = [].slice.call("+collectionExpression+");";
+-            }
++            return "var " + varExpr + " = [].slice.call("+collectionExpression+");";
+         } else {
+-            var startVal = pad > 0 ? String(pad) : "0";
+-            var collectionExpressionVal = pad > 0 ? " - " + pad : "";
+-            var lenVal = pad < 0 ? "- " + Math.abs(pad) : "";
+-
+             return init + "var " + varExpr + " = new Array($_len); " +
+-            "for(var $_i = " + startVal + "; $_i < $_len " + lenVal + "; ++$_i) {" +
+-                    varExpr + "[$_i] = " + collectionExpression + "[$_i " + collectionExpressionVal + "];" +
++            "for(var $_i = 0; $_i < $_len; ++$_i) {" +
++                    varExpr + "[$_i] = " + collectionExpression + "[$_i];" +
+             "}";
+         }
+ 
+@@ -403,7 +384,6 @@ var inlinedFunctions = Object.create(null);
+ 
+ var lastElement = jsp.parse("___input.length").body[0].expression;
+ var firstElement = jsp.parse("0").body[0].expression;
+-
+ inlinedFunctions.INLINE_SLICE = function( node, isBrowser ) {
+     var statement = node;
+     node = node.expression;
+@@ -424,25 +404,6 @@ inlinedFunctions.INLINE_SLICE = function( node, isBrowser ) {
+     return new InlineSlice(varExpression, collectionExpression,
+         startExpression, endExpression, statement.start, statement.end, isBrowser);
+ };
+-
+-inlinedFunctions.INLINE_SLICE_LEFT_PADDED = function( node, isBrowser ) {
+-    var statement = node;
+-    node = node.expression;
+-    var args = node.arguments;
+-
+-    if(args.length !== 3) {
+-        throw new Error("INLINE_SLICE_LEFT_PADDED must have exactly 3 arguments");
+-    }
+-
+-    var padCount = Number(nodeToString(args[0]));
+-    var varExpression = args[1];
+-    var collectionExpression = args[2];
+-    var startExpression = firstElement;
+-    var endExpression = lastElement;
+-    return new InlineSlice(varExpression, collectionExpression,
+-        startExpression, endExpression, statement.start, statement.end, isBrowser, padCount);
+-};
+-
+ inlinedFunctions.BIT_FIELD_READ = function(node) {
+     var statement = node;
+     var args = node.expression.arguments;
+diff --git a/tools/build.js b/tools/build.js
+index 3cef5e26..6ec9b463 100644
+--- a/tools/build.js
++++ b/tools/build.js
+@@ -212,7 +212,7 @@ function buildBrowser(sources, dir, tmpDir, depsRequireCode, minify, npmPackage,
+                     entries: entries,
+                     detectGlobals: false,
+                     standalone: "Promise"
+-                }).exclude('async_hooks');
++                });
+                 return Promise.promisify(b.bundle, b)().then(function(src) {
+                     var alias = "\
+                     ;if (typeof window !== 'undefined' && window !== null) {       \
+diff --git a/tools/jshintrc_generator.js b/tools/jshintrc_generator.js
+index a24a7c34..2065fd71 100644
+--- a/tools/jshintrc_generator.js
++++ b/tools/jshintrc_generator.js
+@@ -18,7 +18,6 @@ var globals = fs.readFileAsync(constantsFile, "utf8").then(function(contents) {
+         args: true,
+         chrome: true,
+         INLINE_SLICE: false,
+-        INLINE_SLICE_LEFT_PADDED: false,
+         BIT_FIELD_CHECK: false,
+         BIT_FIELD_READ: false,
+         USE: false,

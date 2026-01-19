@@ -1,0 +1,195 @@
+diff --git a/docs/expressions/syntax.md b/docs/expressions/syntax.md
+index 8e8681c82..722f8084a 100644
+--- a/docs/expressions/syntax.md
++++ b/docs/expressions/syntax.md
+@@ -121,18 +121,25 @@ See section below                 | Implicit multiplication
+ `to`, `in`                        | Unit conversion
+ `<<`, `>>`, `>>>`                 | Bitwise left shift, bitwise right arithmetic shift, bitwise right logical shift
+ `==`, `!=`, `<`, `>`, `<=`, `>=`  | Relational
+-`&`                               | Bitwise and
++`&`                               | Bitwise and (lazily evaluated)
+ <code>^&#124;</code>              | Bitwise xor
+-<code>&#124;</code>               | Bitwise or
+-`and`                             | Logical and
++<code>&#124;</code>               | Bitwise or (lazily evaluated)
++`and`                             | Logical and (lazily evaluated)
+ `xor`                             | Logical xor
+-`or`                              | Logical or
++`or`                              | Logical or (lazily evaluated)
+ `?`, `:`                          | Conditional expression
+ `=`                               | Assignment
+ `,`                               | Parameter and column separator
+ `;`                               | Row separator
+ `\n`, `;`                         | Statement separators
+ 
++Lazy evaluation is used where logically possible for bitwise and logical
++operators. In the following example, the value of `x` will not even be 
++evaluated because it cannot effect the final result: 
++```js
++math.evaluate('false and x')        // false, no matter what x equals
++```
++
+ 
+ ## Functions
+ 
+diff --git a/src/expression/node/OperatorNode.js b/src/expression/node/OperatorNode.js
+index 21eeeb744..27efdcfcb 100644
+--- a/src/expression/node/OperatorNode.js
++++ b/src/expression/node/OperatorNode.js
+@@ -304,7 +304,14 @@ export const createOperatorNode = /* #__PURE__ */ factory(name, dependencies, ({
+         return arg._compile(math, argNames)
+       })
+ 
+-      if (evalArgs.length === 1) {
++      if (typeof fn === 'function' && fn.rawArgs === true) {
++        // pass unevaluated parameters (nodes) to the function
++        // "raw" evaluation
++        const rawArgs = this.args
++        return function evalOperatorNode (scope, args, context) {
++          return fn(rawArgs, math, scope)
++        }
++      } else if (evalArgs.length === 1) {
+         const evalArg0 = evalArgs[0]
+         return function evalOperatorNode (scope, args, context) {
+           return fn(evalArg0(scope, args, context))
+diff --git a/src/expression/transform/and.transform.js b/src/expression/transform/and.transform.js
+new file mode 100644
+index 000000000..4212eecef
+--- /dev/null
++++ b/src/expression/transform/and.transform.js
+@@ -0,0 +1,23 @@
++import { createAnd } from '../../function/logical/and.js'
++import { factory } from '../../utils/factory.js'
++import { isCollection } from '../../utils/is.js'
++
++const name = 'and'
++const dependencies = ['typed', 'matrix', 'zeros', 'add', 'equalScalar', 'not', 'concat']
++
++export const createAndTransform = /* #__PURE__ */ factory(name, dependencies, ({ typed, matrix, equalScalar, zeros, not, concat }) => {
++  const and = createAnd({ typed, matrix, equalScalar, zeros, not, concat })
++
++  function andTransform (args, math, scope) {
++    const condition1 = args[0].compile().evaluate(scope)
++    if (!isCollection(condition1) && !and(condition1, true)) {
++      return false
++    }
++    const condition2 = args[1].compile().evaluate(scope)
++    return and(condition1, condition2)
++  }
++
++  andTransform.rawArgs = true
++
++  return andTransform
++}, { isTransformFunction: true })
+diff --git a/src/expression/transform/bitAnd.transform.js b/src/expression/transform/bitAnd.transform.js
+new file mode 100644
+index 000000000..ff9e70926
+--- /dev/null
++++ b/src/expression/transform/bitAnd.transform.js
+@@ -0,0 +1,28 @@
++import { createBitAnd } from '../../function/bitwise/bitAnd.js'
++import { factory } from '../../utils/factory.js'
++import { isCollection } from '../../utils/is.js'
++
++const name = 'bitAnd'
++const dependencies = ['typed', 'matrix', 'zeros', 'add', 'equalScalar', 'not', 'concat']
++
++export const createBitAndTransform = /* #__PURE__ */ factory(name, dependencies, ({ typed, matrix, equalScalar, zeros, not, concat }) => {
++  const bitAnd = createBitAnd({ typed, matrix, equalScalar, zeros, not, concat })
++
++  function bitAndTransform (args, math, scope) {
++    const condition1 = args[0].compile().evaluate(scope)
++    if (!isCollection(condition1)) {
++      if (isNaN(condition1)) {
++        return NaN
++      }
++      if (condition1 === 0 || condition1 === false) {
++        return 0
++      }
++    }
++    const condition2 = args[1].compile().evaluate(scope)
++    return bitAnd(condition1, condition2)
++  }
++
++  bitAndTransform.rawArgs = true
++
++  return bitAndTransform
++}, { isTransformFunction: true })
+diff --git a/src/expression/transform/bitOr.transform.js b/src/expression/transform/bitOr.transform.js
+new file mode 100644
+index 000000000..ae04f7de0
+--- /dev/null
++++ b/src/expression/transform/bitOr.transform.js
+@@ -0,0 +1,31 @@
++import { createBitOr } from '../../function/bitwise/bitOr.js'
++import { factory } from '../../utils/factory.js'
++import { isCollection } from '../../utils/is.js'
++
++const name = 'bitOr'
++const dependencies = ['typed', 'matrix', 'equalScalar', 'DenseMatrix', 'concat']
++
++export const createBitOrTransform = /* #__PURE__ */ factory(name, dependencies, ({ typed, matrix, equalScalar, DenseMatrix, concat }) => {
++  const bitOr = createBitOr({ typed, matrix, equalScalar, DenseMatrix, concat })
++
++  function bitOrTransform (args, math, scope) {
++    const condition1 = args[0].compile().evaluate(scope)
++    if (!isCollection(condition1)) {
++      if (isNaN(condition1)) {
++        return NaN
++      }
++      if (condition1 === (-1)) {
++        return -1
++      }
++      if (condition1 === true) {
++        return 1
++      }
++    }
++    const condition2 = args[1].compile().evaluate(scope)
++    return bitOr(condition1, condition2)
++  }
++
++  bitOrTransform.rawArgs = true
++
++  return bitOrTransform
++}, { isTransformFunction: true })
+diff --git a/src/expression/transform/or.transform.js b/src/expression/transform/or.transform.js
+new file mode 100644
+index 000000000..029f19bd4
+--- /dev/null
++++ b/src/expression/transform/or.transform.js
+@@ -0,0 +1,23 @@
++import { createOr } from '../../function/logical/or.js'
++import { factory } from '../../utils/factory.js'
++import { isCollection } from '../../utils/is.js'
++
++const name = 'or'
++const dependencies = ['typed', 'matrix', 'equalScalar', 'DenseMatrix', 'concat']
++
++export const createOrTransform = /* #__PURE__ */ factory(name, dependencies, ({ typed, matrix, equalScalar, DenseMatrix, concat }) => {
++  const or = createOr({ typed, matrix, equalScalar, DenseMatrix, concat })
++
++  function orTransform (args, math, scope) {
++    const condition1 = args[0].compile().evaluate(scope)
++    if (!isCollection(condition1) && or(condition1, false)) {
++      return true
++    }
++    const condition2 = args[1].compile().evaluate(scope)
++    return or(condition1, condition2)
++  }
++
++  orTransform.rawArgs = true
++
++  return orTransform
++}, { isTransformFunction: true })
+diff --git a/src/factoriesAny.js b/src/factoriesAny.js
+index 74ab542b7..e9ae77caa 100644
+--- a/src/factoriesAny.js
++++ b/src/factoriesAny.js
+@@ -359,3 +359,7 @@ export { createQuantileSeqTransform } from './expression/transform/quantileSeq.t
+ export { createCumSumTransform } from './expression/transform/cumsum.transform.js'
+ export { createVarianceTransform } from './expression/transform/variance.transform.js'
+ export { createPrintTransform } from './expression/transform/print.transform.js'
++export { createAndTransform } from './expression/transform/and.transform.js'
++export { createOrTransform } from './expression/transform/or.transform.js'
++export { createBitAndTransform } from './expression/transform/bitAnd.transform.js'
++export { createBitOrTransform } from './expression/transform/bitOr.transform.js'

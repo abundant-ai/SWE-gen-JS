@@ -1,0 +1,142 @@
+diff --git a/doc/ws.md b/doc/ws.md
+index d657ceee..22c71203 100644
+--- a/doc/ws.md
++++ b/doc/ws.md
+@@ -78,6 +78,9 @@ This class represents a WebSocket server. It extends the `EventEmitter`.
+   - `clientTracking` {Boolean} Specifies whether or not to track clients.
+   - `perMessageDeflate` {Boolean|Object} Enable/disable permessage-deflate.
+   - `maxPayload` {Number} The maximum allowed message size in bytes.
++  - `skipUTF8Validation` {Boolean} Specifies whether or not to skip UTF-8
++    validation for text and close messages. Defaults to `false`. Set to `true`
++    only if clients are trusted.
+ - `callback` {Function}
+ 
+ Create a new server instance. One and only one of `port`, `server` or `noServer`
+@@ -273,6 +276,9 @@ This class represents a WebSocket. It extends the `EventEmitter`.
+   - `origin` {String} Value of the `Origin` or `Sec-WebSocket-Origin` header
+     depending on the `protocolVersion`.
+   - `maxPayload` {Number} The maximum allowed message size in bytes.
++  - `skipUTF8Validation` {Boolean} Specifies whether or not to skip UTF-8
++    validation for text and close messages. Defaults to `false`. Set to `true`
++    only if the server is trusted.
+   - Any other option allowed in [http.request()][] or [https.request()][].
+     Options given do not have any effect if parsed from the URL given with the
+     `address` parameter.
+diff --git a/lib/receiver.js b/lib/receiver.js
+index 2cbb48a7..11ac0bba 100644
+--- a/lib/receiver.js
++++ b/lib/receiver.js
+@@ -43,6 +43,7 @@ class Receiver extends Writable {
+     this._extensions = options.extensions || {};
+     this._isServer = !!options.isServer;
+     this._maxPayload = options.maxPayload | 0;
++    this._skipUTF8Validation = !!options.skipUTF8Validation;
+     this[kWebSocket] = undefined;
+ 
+     this._bufferedBytes = 0;
+@@ -505,7 +506,7 @@ class Receiver extends Writable {
+       } else {
+         const buf = concat(fragments, messageLength);
+ 
+-        if (!isValidUTF8(buf)) {
++        if (!this._skipUTF8Validation && !isValidUTF8(buf)) {
+           this._loop = false;
+           return error(
+             Error,
+@@ -560,7 +561,7 @@ class Receiver extends Writable {
+ 
+         const buf = data.slice(2);
+ 
+-        if (!isValidUTF8(buf)) {
++        if (!this._skipUTF8Validation && !isValidUTF8(buf)) {
+           return error(
+             Error,
+             'invalid UTF-8 sequence',
+diff --git a/lib/websocket-server.js b/lib/websocket-server.js
+index b147fe5d..3c7939f2 100644
+--- a/lib/websocket-server.js
++++ b/lib/websocket-server.js
+@@ -46,6 +46,8 @@ class WebSocketServer extends EventEmitter {
+    * @param {Number} [options.port] The port where to bind the server
+    * @param {(http.Server|https.Server)} [options.server] A pre-created HTTP/S
+    *     server to use
++   * @param {Boolean} [options.skipUTF8Validation=false] Specifies whether or
++   *     not to skip UTF-8 validation for text and close messages
+    * @param {Function} [options.verifyClient] A hook to reject connections
+    * @param {Function} [callback] A listener for the `listening` event
+    */
+@@ -54,6 +56,7 @@ class WebSocketServer extends EventEmitter {
+ 
+     options = {
+       maxPayload: 100 * 1024 * 1024,
++      skipUTF8Validation: false,
+       perMessageDeflate: false,
+       handleProtocols: null,
+       clientTracking: true,
+@@ -386,7 +389,10 @@ class WebSocketServer extends EventEmitter {
+     socket.write(headers.concat('\r\n').join('\r\n'));
+     socket.removeListener('error', socketOnError);
+ 
+-    ws.setSocket(socket, head, this.options.maxPayload);
++    ws.setSocket(socket, head, {
++      maxPayload: this.options.maxPayload,
++      skipUTF8Validation: this.options.skipUTF8Validation
++    });
+ 
+     if (this.clients) {
+       this.clients.add(ws);
+diff --git a/lib/websocket.js b/lib/websocket.js
+index 2d7b5c43..77ebe5ff 100644
+--- a/lib/websocket.js
++++ b/lib/websocket.js
+@@ -180,15 +180,19 @@ class WebSocket extends EventEmitter {
+    * @param {(net.Socket|tls.Socket)} socket The network socket between the
+    *     server and client
+    * @param {Buffer} head The first packet of the upgraded stream
+-   * @param {Number} [maxPayload=0] The maximum allowed message size
++   * @param {Object} [options] Options object
++   * @param {Number} [options.maxPayload=0] The maximum allowed message size
++   * @param {Boolean} [options.skipUTF8Validation=false] Specifies whether or
++   *     not to skip UTF-8 validation for text and close messages
+    * @private
+    */
+-  setSocket(socket, head, maxPayload) {
++  setSocket(socket, head, options = {}) {
+     const receiver = new Receiver({
+       binaryType: this.binaryType,
+       extensions: this._extensions,
+       isServer: this._isServer,
+-      maxPayload
++      maxPayload: options.maxPayload,
++      skipUTF8Validation: options.skipUTF8Validation
+     });
+ 
+     this._sender = new Sender(socket, this._extensions);
+@@ -575,12 +579,15 @@ module.exports = WebSocket;
+  *     redirects
+  * @param {Number} [options.maxRedirects=10] The maximum number of redirects
+  *     allowed
++ * @param {Boolean} [options.skipUTF8Validation=false] Specifies whether or
++ *     not to skip UTF-8 validation for text and close messages
+  * @private
+  */
+ function initAsClient(websocket, address, protocols, options) {
+   const opts = {
+     protocolVersion: protocolVersions[1],
+     maxPayload: 100 * 1024 * 1024,
++    skipUTF8Validation: false,
+     perMessageDeflate: true,
+     followRedirects: false,
+     maxRedirects: 10,
+@@ -832,7 +839,10 @@ function initAsClient(websocket, address, protocols, options) {
+         perMessageDeflate;
+     }
+ 
+-    websocket.setSocket(socket, head, opts.maxPayload);
++    websocket.setSocket(socket, head, {
++      maxPayload: opts.maxPayload,
++      skipUTF8Validation: opts.skipUTF8Validation
++    });
+   });
+ }
+ 

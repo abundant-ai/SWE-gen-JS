@@ -1,0 +1,276 @@
+diff --git a/.changeset/modern-moles-greet.md b/.changeset/modern-moles-greet.md
+deleted file mode 100644
+index a1e17caed4..0000000000
+--- a/.changeset/modern-moles-greet.md
++++ /dev/null
+@@ -1,20 +0,0 @@
+----
+-'xstate': major
+----
+-
+-Removed the ability to define delayed transitions using an array. Only object variant is supported now:
+-
+-```ts
+-createMachine({
+-  initial: 'a',
+-  states: {
+-    a: {
+-      after: {
+-        10000: 'b',
+-        noon: 'c'
+-      }
+-    }
+-    // ...
+-  }
+-});
+-```
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 2afd557af6..854ca982de 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -326,20 +326,25 @@ export function getDelayedTransitions(
+     return eventType;
+   };
+ 
+-  const delayedTransitions = Object.keys(afterConfig).flatMap((delay, i) => {
+-    const configTransition = afterConfig[delay];
+-    const resolvedTransition =
+-      typeof configTransition === 'string'
+-        ? { target: configTransition }
+-        : configTransition;
+-    const resolvedDelay = !isNaN(+delay) ? +delay : delay;
+-    const eventType = mutateEntryExit(resolvedDelay, i);
+-    return toArray(resolvedTransition).map((transition) => ({
+-      ...transition,
+-      event: eventType,
+-      delay: resolvedDelay
+-    }));
+-  });
++  const delayedTransitions = isArray(afterConfig)
++    ? afterConfig.map((transition, i) => {
++        const eventType = mutateEntryExit(transition.delay, i);
++        return { ...transition, event: eventType };
++      })
++    : Object.keys(afterConfig).flatMap((delay, i) => {
++        const configTransition = afterConfig[delay];
++        const resolvedTransition =
++          typeof configTransition === 'string'
++            ? { target: configTransition }
++            : configTransition;
++        const resolvedDelay = !isNaN(+delay) ? +delay : delay;
++        const eventType = mutateEntryExit(resolvedDelay, i);
++        return toArray(resolvedTransition).map((transition) => ({
++          ...transition,
++          event: eventType,
++          delay: resolvedDelay
++        }));
++      });
+   return delayedTransitions.map((delayedTransition) => {
+     const { delay } = delayedTransition;
+     return {
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index e6d28433d5..999e173e46 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -442,7 +442,22 @@ export type DelayedTransitions<
+               TDelay
+             >
+           >;
+-    };
++    }
++  | Array<
++      TransitionConfig<
++        TContext,
++        TEvent,
++        TEvent,
++        TActor,
++        TAction,
++        TGuard,
++        TDelay
++      > & {
++        delay:
++          | Delay<TDelay>
++          | ((args: UnifiedArg<TContext, TEvent, TEvent>) => Delay<TDelay>);
++      }
++    >;
+ 
+ export type StateTypes =
+   | 'atomic'
+diff --git a/packages/core/test/after.test.ts b/packages/core/test/after.test.ts
+index 7cfa899024..52a4191cf8 100644
+--- a/packages/core/test/after.test.ts
++++ b/packages/core/test/after.test.ts
+@@ -18,9 +18,7 @@ const lightMachine = createMachine({
+       }
+     },
+     red: {
+-      after: {
+-        1000: 'green'
+-      }
++      after: [{ delay: 1000, target: 'green' }]
+     }
+   }
+ });
+@@ -231,26 +229,24 @@ describe('delayed transitions', () => {
+       const context = {
+         delay: 500
+       };
+-      const machine = createMachine(
+-        {
+-          initial: 'inactive',
+-          context,
+-          states: {
+-            inactive: {
+-              after: { myDelay: 'active' }
+-            },
+-            active: {}
+-          }
+-        },
+-        {
+-          delays: {
+-            myDelay: ({ context }) => {
+-              spy(context);
+-              return context.delay;
+-            }
+-          }
++      const machine = createMachine({
++        initial: 'inactive',
++        context,
++        states: {
++          inactive: {
++            after: [
++              {
++                delay: ({ context }) => {
++                  spy(context);
++                  return context.delay;
++                },
++                target: 'active'
++              }
++            ]
++          },
++          active: {}
+         }
+-      );
++      });
+ 
+       const actor = createActor(machine).start();
+ 
+@@ -277,9 +273,12 @@ describe('delayed transitions', () => {
+               }
+             },
+             active: {
+-              after: {
+-                someDelay: 'inactive'
+-              }
++              after: [
++                {
++                  delay: 'someDelay',
++                  target: 'inactive'
++                }
++              ]
+             }
+           }
+         },
+diff --git a/packages/core/test/interpreter.test.ts b/packages/core/test/interpreter.test.ts
+index d13669a157..ae1d0b7a2e 100644
+--- a/packages/core/test/interpreter.test.ts
++++ b/packages/core/test/interpreter.test.ts
+@@ -382,9 +382,6 @@ describe('interpreter', () => {
+       const clock = new SimulatedClock();
+       const letterMachine = createMachine(
+         {
+-          types: {} as {
+-            events: { type: 'FIRE_DELAY'; value: number };
+-          },
+           id: 'letter',
+           context: {
+             delay: 100
+@@ -392,9 +389,12 @@ describe('interpreter', () => {
+           initial: 'a',
+           states: {
+             a: {
+-              after: {
+-                delayA: 'b'
+-              }
++              after: [
++                {
++                  delay: ({ context }) => context.delay,
++                  target: 'b'
++                }
++              ]
+             },
+             b: {
+               after: {
+@@ -408,12 +408,21 @@ describe('interpreter', () => {
+               }
+             },
+             d: {
+-              after: {
+-                delayD: 'e'
+-              }
++              after: [
++                {
++                  delay: ({ context, event }) =>
++                    context.delay + (event as any).value,
++                  target: 'e'
++                }
++              ]
+             },
+             e: {
+-              after: { someDelay: 'f' }
++              after: [
++                {
++                  delay: 'someDelay',
++                  target: 'f'
++                }
++              ]
+             },
+             f: {
+               type: 'final'
+@@ -424,9 +433,7 @@ describe('interpreter', () => {
+           delays: {
+             someDelay: ({ context }) => {
+               return context.delay + 50;
+-            },
+-            delayA: ({ context }) => context.delay,
+-            delayD: ({ context, event }) => context.delay + (event as any).value
++            }
+           }
+         }
+       );
+diff --git a/packages/core/test/smoke.test.ts b/packages/core/test/smoke.test.ts
+new file mode 100644
+index 0000000000..c157ae1700
+--- /dev/null
++++ b/packages/core/test/smoke.test.ts
+@@ -0,0 +1,30 @@
++import { createMachine } from '../src/index.ts';
++
++describe('smoke test', () => {
++  it('should work with built files', () => {
++    expect(() => {
++      return createMachine({
++        id: 'light',
++        initial: 'green',
++        context: {
++          canTurnGreen: true
++        },
++        states: {
++          green: {
++            after: {
++              1000: 'yellow'
++            }
++          },
++          yellow: {
++            after: {
++              1000: [{ target: 'red' }]
++            }
++          },
++          red: {
++            after: [{ delay: 1000, target: 'green' }]
++          }
++        }
++      });
++    }).not.toThrow();
++  });
++});

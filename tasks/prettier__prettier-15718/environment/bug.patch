@@ -1,0 +1,695 @@
+diff --git a/changelog_unreleased/typescript/15718.md b/changelog_unreleased/typescript/15718.md
+deleted file mode 100644
+index 008780346..000000000
+--- a/changelog_unreleased/typescript/15718.md
++++ /dev/null
+@@ -1,7 +0,0 @@
+-#### Support "Import Attributes" (#15718 by @fisker)
+-
+-[TypeScript 5.3](https://devblogs.microsoft.com/typescript/announcing-typescript-5-3/#import-attributes) supports the latest updates to the [import attributes](https://github.com/tc39/proposal-import-attributes) proposal.
+-
+-```tsx
+-import something from "./something.json" with { type: "json" };
+-```
+diff --git a/package.json b/package.json
+index fcf9a6ed3..2f9a4edc9 100644
+--- a/package.json
++++ b/package.json
+@@ -38,8 +38,8 @@
+     "@iarna/toml": "2.2.5",
+     "@prettier/is-es5-identifier-name": "0.2.0",
+     "@prettier/parse-srcset": "3.1.0",
+-    "@typescript-eslint/typescript-estree": "6.13.2",
+-    "@typescript-eslint/visitor-keys": "6.13.2",
++    "@typescript-eslint/typescript-estree": "6.10.0",
++    "@typescript-eslint/visitor-keys": "6.10.0",
+     "acorn": "8.11.2",
+     "acorn-jsx": "5.3.2",
+     "angular-estree-parser": "9.0.0",
+@@ -98,7 +98,7 @@
+     "sdbm": "2.0.0",
+     "strip-ansi": "7.1.0",
+     "to-fast-properties": "4.0.0",
+-    "typescript": "5.3.2",
++    "typescript": "5.2.2",
+     "unicode-regex": "4.0.0",
+     "unified": "9.2.2",
+     "url-or-path": "2.3.0",
+@@ -113,7 +113,7 @@
+     "@types/file-entry-cache": "5.0.4",
+     "@types/find-cache-dir": "3.2.1",
+     "@types/jest": "29.5.8",
+-    "@typescript-eslint/eslint-plugin": "6.13.2",
++    "@typescript-eslint/eslint-plugin": "6.10.0",
+     "benchmark": "2.1.4",
+     "browserslist-to-esbuild": "1.2.0",
+     "c8": "8.0.1",
+diff --git a/scripts/build/modify-typescript-module.js b/scripts/build/modify-typescript-module.js
+index 043a09a7d..5fe145562 100644
+--- a/scripts/build/modify-typescript-module.js
++++ b/scripts/build/modify-typescript-module.js
+@@ -198,13 +198,6 @@ function modifyTypescriptModule(text) {
+     }
+   }
+ 
+-  // server
+-  for (const module of source.modules) {
+-    if (module.path.startsWith("src/server/")) {
+-      source.removeModule(module);
+-    }
+-  }
+-
+   // `transformers`
+   source.removeModule("src/compiler/transformer.ts");
+   for (const module of source.modules) {
+@@ -275,9 +268,6 @@ function modifyTypescriptModule(text) {
+     `,
+   );
+ 
+-  // `pnp`
+-  source.removeModule("src/compiler/pnp.ts");
+-
+   /* spell-checker: disable */
+   // `ts.createParenthesizerRules`
+   source.replaceAlignedCode({
+diff --git a/src/language-js/parse/postprocess/index.js b/src/language-js/parse/postprocess/index.js
+index fc52dc4b8..80cb5bf95 100644
+--- a/src/language-js/parse/postprocess/index.js
++++ b/src/language-js/parse/postprocess/index.js
+@@ -97,10 +97,10 @@ function postprocess(ast, options) {
+         ast.extra = { ...ast.extra, __isUsingHackPipeline: true };
+         break;
+ 
+-      case "ExportAllDeclaration":
+-        // TODO: Remove this when https://github.com/meriyah/meriyah/issues/200 get fixed
+-        if (parser === "meriyah" && node.exported?.type === "Identifier") {
+-          const { exported } = node;
++      // TODO: Remove this when https://github.com/meriyah/meriyah/issues/200 get fixed
++      case "ExportAllDeclaration": {
++        const { exported } = node;
++        if (parser === "meriyah" && exported?.type === "Identifier") {
+           const raw = text.slice(locStart(exported), locEnd(exported));
+           if (raw.startsWith('"') || raw.startsWith("'")) {
+             node.exported = {
+@@ -112,7 +112,7 @@ function postprocess(ast, options) {
+           }
+         }
+         break;
+-
++      }
+       // In Flow parser, it doesn't generate union/intersection types for single type
+       case "TSUnionType":
+       case "TSIntersectionType":
+diff --git a/src/language-js/parse/typescript.js b/src/language-js/parse/typescript.js
+index d751bce6c..c0773a3c8 100644
+--- a/src/language-js/parse/typescript.js
++++ b/src/language-js/parse/typescript.js
+@@ -17,7 +17,6 @@ const baseParseOptions = {
+   tokens: true,
+   loggerFn: false,
+   project: [],
+-  jsDocParsingMode: "none",
+   // TODO: Use new properties when update printer
+   suppressDeprecatedPropertyWarnings: true,
+ };
+diff --git a/src/language-js/print/module.js b/src/language-js/print/module.js
+index 99cb85e19..4b83d8be4 100644
+--- a/src/language-js/print/module.js
++++ b/src/language-js/print/module.js
+@@ -1,4 +1,3 @@
+-import assert from "node:assert";
+ import isNonEmptyArray from "../../utils/is-non-empty-array.js";
+ import UnexpectedNodeError from "../../utils/unexpected-node-error.js";
+ import {
+@@ -21,7 +20,7 @@ import {
+   rawText,
+   createTypeCheckFunction,
+ } from "../utils/index.js";
+-import { locStart, hasSameLoc, locEnd } from "../loc.js";
++import { locStart, hasSameLoc } from "../loc.js";
+ import { printDecoratorsBeforeExport } from "./decorators.js";
+ import { printDeclareToken } from "./misc.js";
+ 
+@@ -248,57 +247,6 @@ function shouldNotPrintSpecifiers(node, options) {
+   );
+ }
+ 
+-function getTextWithoutComments(options, start, end) {
+-  let text = options.originalText.slice(start, end);
+-
+-  for (const comment of options[Symbol.for("comments")]) {
+-    const commentStart = locStart(comment);
+-    // Comments are sorted, we can escape if the comment is after the range
+-    if (commentStart > end) {
+-      break;
+-    }
+-
+-    const commentEnd = locEnd(comment);
+-    if (commentEnd < start) {
+-      continue;
+-    }
+-
+-    const commentLength = commentEnd - commentStart;
+-    text =
+-      text.slice(0, commentStart - start) +
+-      " ".repeat(commentLength) +
+-      text.slice(commentEnd - start);
+-  }
+-
+-  if (process.env.NODE_ENV !== "production") {
+-    assert(text.length === end - start);
+-  }
+-
+-  return text;
+-}
+-
+-function getImportAttributesOrAssertionsKeyword(node, options) {
+-  if (
+-    // Babel parser add this property to indicate the keyword is `assert`
+-    node.extra?.deprecatedAssertSyntax ||
+-    !isNonEmptyArray(node.attributes)
+-  ) {
+-    return "assert";
+-  }
+-
+-  const textBetweenSourceAndAttributes = getTextWithoutComments(
+-    options,
+-    node.source.range[1],
+-    node.attributes[0].range[0],
+-  );
+-
+-  if (textBetweenSourceAndAttributes.trimStart().startsWith("assert")) {
+-    return "assert";
+-  }
+-
+-  return "with";
+-}
+-
+ /**
+  * Print Import Attributes syntax.
+  * If old ImportAssertions syntax is used, print them here.
+@@ -316,7 +264,10 @@ function printImportAttributes(path, options, print) {
+     return "";
+   }
+ 
+-  const keyword = getImportAttributesOrAssertionsKeyword(node, options);
++  const keyword =
++    property === "assertions" || node.extra?.deprecatedAssertSyntax
++      ? "assert"
++      : "with";
+   return [
+     ` ${keyword} {`,
+     options.bracketSpacing ? " " : "",
+diff --git a/tests/format/js/explicit-resource-management/__snapshots__/jsfmt.spec.js.snap b/tests/format/js/explicit-resource-management/__snapshots__/jsfmt.spec.js.snap
+index 5af60a31d..b68238451 100644
+--- a/tests/format/js/explicit-resource-management/__snapshots__/jsfmt.spec.js.snap
++++ b/tests/format/js/explicit-resource-management/__snapshots__/jsfmt.spec.js.snap
+@@ -742,6 +742,17 @@ exports[`valid-for-using-binding-of-of.js [meriyah] format 1`] = `
+ Cause: [2:21]: Invalid left-hand side in for-of"
+ `;
+ 
++exports[`valid-for-using-binding-of-of.js [typescript] format 1`] = `
++"')' expected. (2:26)
++  1 | async function f() {
++> 2 |   for (await using of of of);
++    |                          ^
++  3 |   for await (await using of of of);
++  4 | }
++  5 |
++Cause: ')' expected."
++`;
++
+ exports[`valid-for-using-binding-of-of.js format 1`] = `
+ ====================================options=====================================
+ parsers: ["babel", "flow", "typescript"]
+diff --git a/tests/format/js/explicit-resource-management/jsfmt.spec.js b/tests/format/js/explicit-resource-management/jsfmt.spec.js
+index 1a962d686..e97824449 100644
+--- a/tests/format/js/explicit-resource-management/jsfmt.spec.js
++++ b/tests/format/js/explicit-resource-management/jsfmt.spec.js
+@@ -32,6 +32,9 @@ run_spec(import.meta, ["babel", "flow", "typescript"], {
+       "valid-await-using-comments.js",
+       "using-declarations.js",
+ 
++      // https://github.com/microsoft/TypeScript/issues/55555
++      "valid-for-using-binding-of-of.js",
++
+       // TypeScript does not support module expr
+       "valid-module-block-top-level-using-binding.js",
+       "valid-module-block-top-level-await-using-binding.js",
+diff --git a/tests/format/js/import-attributes/__snapshots__/jsfmt.spec.js.snap b/tests/format/js/import-attributes/__snapshots__/jsfmt.spec.js.snap
+index f08aa1276..9024e0269 100644
+--- a/tests/format/js/import-attributes/__snapshots__/jsfmt.spec.js.snap
++++ b/tests/format/js/import-attributes/__snapshots__/jsfmt.spec.js.snap
+@@ -71,6 +71,17 @@ exports[`empty.js [meriyah] format 1`] = `
+ Cause: [2:36]: Unexpected token: 'with'"
+ `;
+ 
++exports[`empty.js [typescript] format 1`] = `
++"';' expected. (2:33)
++  1 | export * as foo from "foo.json"
++> 2 | export * as bar from "bar.json" with { }
++    |                                 ^
++  3 | export * as baz from "baz.json" with { /* comment */ }
++  4 |
++  5 | import * as foo from "foo.json"
++Cause: ';' expected."
++`;
++
+ exports[`empty.js format 1`] = `
+ ====================================options=====================================
+ parsers: ["babel", "typescript"]
+@@ -97,68 +108,6 @@ import * as baz from "baz.json" /* comment */;
+ ================================================================================
+ `;
+ 
+-exports[`keyword-detect.js [acorn] format 1`] = `
+-"Unexpected token (1:35)
+-> 1 | import "./test.json" /* assert */ with /* assert */  { type: "json" }
+-    |                                   ^
+-  2 | import {} from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-  3 | import "./test.json" /* with */ assert /* with */  { type: "json" }
+-  4 | import {} from "./test.json" /* with */ assert /* with */  { type: "json" }
+-Cause: Unexpected token (1:34)"
+-`;
+-
+-exports[`keyword-detect.js [espree] format 1`] = `
+-"Unexpected token with (1:35)
+-> 1 | import "./test.json" /* assert */ with /* assert */  { type: "json" }
+-    |                                   ^
+-  2 | import {} from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-  3 | import "./test.json" /* with */ assert /* with */  { type: "json" }
+-  4 | import {} from "./test.json" /* with */ assert /* with */  { type: "json" }
+-Cause: Unexpected token with"
+-`;
+-
+-exports[`keyword-detect.js [meriyah] format 1`] = `
+-"Unexpected token: 'with' (1:38)
+-> 1 | import "./test.json" /* assert */ with /* assert */  { type: "json" }
+-    |                                      ^
+-  2 | import {} from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-  3 | import "./test.json" /* with */ assert /* with */  { type: "json" }
+-  4 | import {} from "./test.json" /* with */ assert /* with */  { type: "json" }
+-Cause: [1:38]: Unexpected token: 'with'"
+-`;
+-
+-exports[`keyword-detect.js format 1`] = `
+-====================================options=====================================
+-parsers: ["babel", "typescript"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-import "./test.json" /* assert */ with /* assert */  { type: "json" }
+-import {} from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-import "./test.json" /* with */ assert /* with */  { type: "json" }
+-import {} from "./test.json" /* with */ assert /* with */  { type: "json" }
+-
+-export {} from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-export {} from "./test.json" /* with */ assert /* with */  { type: "json" }
+-
+-export * from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-export * from "./test.json" /* with */ assert /* with */  { type: "json" }
+-
+-=====================================output=====================================
+-import "./test.json" /* assert */ /* assert */ with { type: "json" };
+-import {} from "./test.json" /* assert */ /* assert */ with { type: "json" };
+-import "./test.json" /* with */ /* with */ assert { type: "json" };
+-import {} from "./test.json" /* with */ /* with */ assert { type: "json" };
+-
+-export {} from "./test.json" /* assert */ /* assert */ with { type: "json" };
+-export {} from "./test.json" /* with */ /* with */ assert { type: "json" };
+-
+-export * from "./test.json" /* assert */ /* assert */ with { type: "json" };
+-export * from "./test.json" /* with */ /* with */ assert { type: "json" };
+-
+-================================================================================
+-`;
+-
+ exports[`multi-types.js [acorn] format 1`] = `
+ "Unexpected token (1:31)
+ > 1 | import json from "./foo.json" with { type: "json", type: "bar" };
+@@ -183,6 +132,14 @@ exports[`multi-types.js [meriyah] format 1`] = `
+ Cause: [1:34]: Unexpected token: 'with'"
+ `;
+ 
++exports[`multi-types.js [typescript] format 1`] = `
++"';' expected. (1:31)
++> 1 | import json from "./foo.json" with { type: "json", type: "bar" };
++    |                               ^
++  2 |
++Cause: ';' expected."
++`;
++
+ exports[`multi-types.js format 1`] = `
+ ====================================options=====================================
+ parsers: ["babel", "typescript"]
+@@ -221,6 +178,14 @@ exports[`non-type.js [meriyah] format 1`] = `
+ Cause: [1:31]: Unexpected token: 'with'"
+ `;
+ 
++exports[`non-type.js [typescript] format 1`] = `
++"';' expected. (1:28)
++> 1 | import foo from "foo.json" with { lazy: "true" };
++    |                            ^
++  2 |
++Cause: ';' expected."
++`;
++
+ exports[`non-type.js format 1`] = `
+ ====================================options=====================================
+ parsers: ["babel", "typescript"]
+@@ -265,6 +230,16 @@ exports[`re-export.js [meriyah] format 1`] = `
+ Cause: [1:47]: Unexpected token: 'with'"
+ `;
+ 
++exports[`re-export.js [typescript] format 1`] = `
++"';' expected. (1:44)
++> 1 | export { default as foo2 } from "foo.json" with { type: "json" };
++    |                                            ^
++  2 | export * from "foo.json" with { type: "json" };
++  3 | export * as foo3 from "foo.json" with { type: "json" };
++  4 |
++Cause: ';' expected."
++`;
++
+ exports[`re-export.js format 1`] = `
+ ====================================options=====================================
+ parsers: ["babel", "typescript"]
+@@ -307,6 +282,14 @@ exports[`static-import.js [meriyah] format 1`] = `
+ Cause: [1:34]: Unexpected token: 'with'"
+ `;
+ 
++exports[`static-import.js [typescript] format 1`] = `
++"';' expected. (1:31)
++> 1 | import json from "./foo.json" with { type: "json" };
++    |                               ^
++  2 |
++Cause: ';' expected."
++`;
++
+ exports[`static-import.js format 1`] = `
+ ====================================options=====================================
+ parsers: ["babel", "typescript"]
+@@ -345,6 +328,14 @@ exports[`without-from.js [meriyah] format 1`] = `
+ Cause: [1:17]: Unexpected token: 'with'"
+ `;
+ 
++exports[`without-from.js [typescript] format 1`] = `
++"';' expected. (1:14)
++> 1 | import "foo" with { type: "json" }
++    |              ^
++  2 |
++Cause: ';' expected."
++`;
++
+ exports[`without-from.js format 1`] = `
+ ====================================options=====================================
+ parsers: ["babel", "typescript"]
+diff --git a/tests/format/js/import-attributes/jsfmt.spec.js b/tests/format/js/import-attributes/jsfmt.spec.js
+index 7e4f7ab95..168477a66 100644
+--- a/tests/format/js/import-attributes/jsfmt.spec.js
++++ b/tests/format/js/import-attributes/jsfmt.spec.js
+@@ -8,7 +8,6 @@ run_spec(import.meta, ["babel", "typescript"], {
+       "re-export.js",
+       "without-from.js",
+       "non-type.js",
+-      "keyword-detect.js",
+     ],
+     espree: [
+       "dynamic-import.js",
+@@ -18,7 +17,6 @@ run_spec(import.meta, ["babel", "typescript"], {
+       "re-export.js",
+       "without-from.js",
+       "non-type.js",
+-      "keyword-detect.js",
+     ],
+     meriyah: [
+       "dynamic-import.js",
+@@ -28,7 +26,14 @@ run_spec(import.meta, ["babel", "typescript"], {
+       "re-export.js",
+       "without-from.js",
+       "non-type.js",
+-      "keyword-detect.js",
++    ],
++    typescript: [
++      "empty.js",
++      "multi-types.js",
++      "static-import.js",
++      "re-export.js",
++      "without-from.js",
++      "non-type.js",
+     ],
+   },
+ });
+diff --git a/tests/format/js/import-attributes/keyword-detect.js b/tests/format/js/import-attributes/keyword-detect.js
+deleted file mode 100644
+index 4d0ed0657..000000000
+--- a/tests/format/js/import-attributes/keyword-detect.js
++++ /dev/null
+@@ -1,10 +0,0 @@
+-import "./test.json" /* assert */ with /* assert */  { type: "json" }
+-import {} from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-import "./test.json" /* with */ assert /* with */  { type: "json" }
+-import {} from "./test.json" /* with */ assert /* with */  { type: "json" }
+-
+-export {} from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-export {} from "./test.json" /* with */ assert /* with */  { type: "json" }
+-
+-export * from "./test.json" /* assert */ with /* assert */  { type: "json" }
+-export * from "./test.json" /* with */ assert /* with */  { type: "json" }
+diff --git a/tests/format/misc/errors/typescript/__snapshots__/jsfmt.spec.js.snap b/tests/format/misc/errors/typescript/__snapshots__/jsfmt.spec.js.snap
+index 8bbbfec42..fb4a8a9f7 100644
+--- a/tests/format/misc/errors/typescript/__snapshots__/jsfmt.spec.js.snap
++++ b/tests/format/misc/errors/typescript/__snapshots__/jsfmt.spec.js.snap
+@@ -47,11 +47,11 @@ Cause: Unexpected token. Did you mean \`{'>'}\` or \`&gt;\`?"
+ `;
+ 
+ exports[`module-attributes-static.ts [typescript] format 1`] = `
+-"'{' expected. (1:33)
++"';' expected. (1:28)
+ > 1 | import foo from "foo.json" with type: "json";
+-    |                                 ^
++    |                            ^
+   2 |
+-Cause: '{' expected."
++Cause: ';' expected."
+ `;
+ 
+ exports[`newline-before-arrow.ts [typescript] format 1`] = `
+diff --git a/yarn.lock b/yarn.lock
+index 1f7632064..6258c6fdd 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -1909,15 +1909,15 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@typescript-eslint/eslint-plugin@npm:6.13.2":
+-  version: 6.13.2
+-  resolution: "@typescript-eslint/eslint-plugin@npm:6.13.2"
++"@typescript-eslint/eslint-plugin@npm:6.10.0":
++  version: 6.10.0
++  resolution: "@typescript-eslint/eslint-plugin@npm:6.10.0"
+   dependencies:
+     "@eslint-community/regexpp": ^4.5.1
+-    "@typescript-eslint/scope-manager": 6.13.2
+-    "@typescript-eslint/type-utils": 6.13.2
+-    "@typescript-eslint/utils": 6.13.2
+-    "@typescript-eslint/visitor-keys": 6.13.2
++    "@typescript-eslint/scope-manager": 6.10.0
++    "@typescript-eslint/type-utils": 6.10.0
++    "@typescript-eslint/utils": 6.10.0
++    "@typescript-eslint/visitor-keys": 6.10.0
+     debug: ^4.3.4
+     graphemer: ^1.4.0
+     ignore: ^5.2.4
+@@ -1930,7 +1930,7 @@ __metadata:
+   peerDependenciesMeta:
+     typescript:
+       optional: true
+-  checksum: e50cbbe7104eecef59faf3355ab981d9f353b19327f0b4607dfd829b4726f9e694b536fe43ab55f50bb00fbfdd2e4268a7e2a568b28d5fcd0d2a32a8d2466218
++  checksum: eaf1f66ae1915426dad8d229c8cb80d2b320572a30c3fbc57d560d40edc2d17d004101a2fcbe331bc458df19a00f8b705f2442ee02e028bb595f4e9f9152e99d
+   languageName: node
+   linkType: hard
+ 
+@@ -1944,22 +1944,22 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@typescript-eslint/scope-manager@npm:6.13.2":
+-  version: 6.13.2
+-  resolution: "@typescript-eslint/scope-manager@npm:6.13.2"
++"@typescript-eslint/scope-manager@npm:6.10.0":
++  version: 6.10.0
++  resolution: "@typescript-eslint/scope-manager@npm:6.10.0"
+   dependencies:
+-    "@typescript-eslint/types": 6.13.2
+-    "@typescript-eslint/visitor-keys": 6.13.2
+-  checksum: ff8fd64ddf324e296e2e0e34a8f73149c9a5f14d1761ea8e8665fc5998faa2b0bbbd1a5d416aa10d725f13c804032d532f68e39a0ca6cc36d1c9b9c0aea94311
++    "@typescript-eslint/types": 6.10.0
++    "@typescript-eslint/visitor-keys": 6.10.0
++  checksum: c9b9483082ae853f10b888cf04d4a14f666ac55e749bfdb7b7f726fc51127a6340b5e2f50d93f134a8854ddcc41f7b116b214753251a8b033d0d84c600439c54
+   languageName: node
+   linkType: hard
+ 
+-"@typescript-eslint/type-utils@npm:6.13.2":
+-  version: 6.13.2
+-  resolution: "@typescript-eslint/type-utils@npm:6.13.2"
++"@typescript-eslint/type-utils@npm:6.10.0":
++  version: 6.10.0
++  resolution: "@typescript-eslint/type-utils@npm:6.10.0"
+   dependencies:
+-    "@typescript-eslint/typescript-estree": 6.13.2
+-    "@typescript-eslint/utils": 6.13.2
++    "@typescript-eslint/typescript-estree": 6.10.0
++    "@typescript-eslint/utils": 6.10.0
+     debug: ^4.3.4
+     ts-api-utils: ^1.0.1
+   peerDependencies:
+@@ -1967,7 +1967,7 @@ __metadata:
+   peerDependenciesMeta:
+     typescript:
+       optional: true
+-  checksum: ba54e5746139f778c35e4058e523ec8c20b68cf6472b3a7784170328e48c228f0761d2fc7e43dab053ca7d85ac4378b6965567774e6afedf551e600638404215
++  checksum: cfe9520cf0c0f50b115d2591acb2abf99ffe5789b3536268ca65b624c8498812d91f187e80c41bea7cf2cebad9c38f69ef27440f872a20fb53c59856d8f5df38
+   languageName: node
+   linkType: hard
+ 
+@@ -1978,10 +1978,10 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@typescript-eslint/types@npm:6.13.2":
+-  version: 6.13.2
+-  resolution: "@typescript-eslint/types@npm:6.13.2"
+-  checksum: 4493ff06fa07c68c5adbcbd842f6dd6f5c88f14d160b53c3379b6b703e6f62808fab7fdebcc06ff06a56f20ab432b6ceeb0afb8931dc97d4061cb417e787f2c1
++"@typescript-eslint/types@npm:6.10.0":
++  version: 6.10.0
++  resolution: "@typescript-eslint/types@npm:6.10.0"
++  checksum: e63a9e05eb3d736d02a09131627d5cb89394bf0d9d6b46fb4b620be902d89d73554720be65acbc194787bff9ffcd518c9a6cf88fd63e418232b4181e8d8438df
+   languageName: node
+   linkType: hard
+ 
+@@ -2003,12 +2003,12 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@typescript-eslint/typescript-estree@npm:6.13.2":
+-  version: 6.13.2
+-  resolution: "@typescript-eslint/typescript-estree@npm:6.13.2"
++"@typescript-eslint/typescript-estree@npm:6.10.0":
++  version: 6.10.0
++  resolution: "@typescript-eslint/typescript-estree@npm:6.10.0"
+   dependencies:
+-    "@typescript-eslint/types": 6.13.2
+-    "@typescript-eslint/visitor-keys": 6.13.2
++    "@typescript-eslint/types": 6.10.0
++    "@typescript-eslint/visitor-keys": 6.10.0
+     debug: ^4.3.4
+     globby: ^11.1.0
+     is-glob: ^4.0.3
+@@ -2017,24 +2017,24 @@ __metadata:
+   peerDependenciesMeta:
+     typescript:
+       optional: true
+-  checksum: 0c18ee5ef594a2411a788fe9d7bc6d51a03bce38d9d764bcb24ab557e5bc1942c2ddf9bd6fb4877eb102b0ae488974fb7b7fe72daa70a2054bf04d3cc6803546
++  checksum: 15bd8d9239a557071d6b03e7aa854b769fcc2dbdff587ed94be7ee8060dabdb05bcae4251df22432f625f82087e7f6986e9aab04f7eea35af694d4edd76a21af
+   languageName: node
+   linkType: hard
+ 
+-"@typescript-eslint/utils@npm:6.13.2":
+-  version: 6.13.2
+-  resolution: "@typescript-eslint/utils@npm:6.13.2"
++"@typescript-eslint/utils@npm:6.10.0":
++  version: 6.10.0
++  resolution: "@typescript-eslint/utils@npm:6.10.0"
+   dependencies:
+     "@eslint-community/eslint-utils": ^4.4.0
+     "@types/json-schema": ^7.0.12
+     "@types/semver": ^7.5.0
+-    "@typescript-eslint/scope-manager": 6.13.2
+-    "@typescript-eslint/types": 6.13.2
+-    "@typescript-eslint/typescript-estree": 6.13.2
++    "@typescript-eslint/scope-manager": 6.10.0
++    "@typescript-eslint/types": 6.10.0
++    "@typescript-eslint/typescript-estree": 6.10.0
+     semver: ^7.5.4
+   peerDependencies:
+     eslint: ^7.0.0 || ^8.0.0
+-  checksum: b66bcf2a945e9c55f3dccb48af49565863d974837ee23b2f01ce7f3fb2462eb8a5871784d4a2fcc80dac7d5cd4ed90c8d01431cd177c0249de89a448f6663fc8
++  checksum: b6bd4d68623fb8d616ae63a88f2954258411a0cc113029fba801d1e74b4c0319fdfbcac0070527afe5cc38c012c8718e4faecd1603000924d7b89e8fefc3f24d
+   languageName: node
+   linkType: hard
+ 
+@@ -2066,13 +2066,13 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@typescript-eslint/visitor-keys@npm:6.13.2":
+-  version: 6.13.2
+-  resolution: "@typescript-eslint/visitor-keys@npm:6.13.2"
++"@typescript-eslint/visitor-keys@npm:6.10.0":
++  version: 6.10.0
++  resolution: "@typescript-eslint/visitor-keys@npm:6.10.0"
+   dependencies:
+-    "@typescript-eslint/types": 6.13.2
++    "@typescript-eslint/types": 6.10.0
+     eslint-visitor-keys: ^3.4.1
+-  checksum: 4b4def7acd7451e6a18dab3ee13f06504b3d23e51f195fced7c544f2203ee8a83426c82fa57ab6b58725c70fdedaf7a3eccb69793180be35756eed0f2c69fe04
++  checksum: 9640bfae41e6109ffba31e68b1720382de0538d021261e2fc9e514c83c703084393c0818ca77ed26b950273e45e593371120281e8d4bbd09cb8c2d46c9fe4f03
+   languageName: node
+   linkType: hard
+ 
+@@ -7299,9 +7299,9 @@ __metadata:
+     "@types/file-entry-cache": 5.0.4
+     "@types/find-cache-dir": 3.2.1
+     "@types/jest": 29.5.8
+-    "@typescript-eslint/eslint-plugin": 6.13.2
+-    "@typescript-eslint/typescript-estree": 6.13.2
+-    "@typescript-eslint/visitor-keys": 6.13.2
++    "@typescript-eslint/eslint-plugin": 6.10.0
++    "@typescript-eslint/typescript-estree": 6.10.0
++    "@typescript-eslint/visitor-keys": 6.10.0
+     acorn: 8.11.2
+     acorn-jsx: 5.3.2
+     angular-estree-parser: 9.0.0
+@@ -7397,7 +7397,7 @@ __metadata:
+     tempy: 3.1.0
+     to-fast-properties: 4.0.0
+     ts-expect: 1.3.0
+-    typescript: 5.3.2
++    typescript: 5.2.2
+     unicode-regex: 4.0.0
+     unified: 9.2.2
+     url-or-path: 2.3.0
+@@ -8707,23 +8707,23 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"typescript@npm:5.3.2":
+-  version: 5.3.2
+-  resolution: "typescript@npm:5.3.2"
++"typescript@npm:5.2.2":
++  version: 5.2.2
++  resolution: "typescript@npm:5.2.2"
+   bin:
+     tsc: bin/tsc
+     tsserver: bin/tsserver
+-  checksum: d92534dda639eb825db013203404c1fabca8ac630564283c9e7dc9e64fd9c9346c2de95ecebdf3e6e8c1c32941bca1cfe0da37877611feb9daf8feeaea58d230
++  checksum: 7912821dac4d962d315c36800fe387cdc0a6298dba7ec171b350b4a6e988b51d7b8f051317786db1094bd7431d526b648aba7da8236607febb26cf5b871d2d3c
+   languageName: node
+   linkType: hard
+ 
+-"typescript@patch:typescript@5.3.2#~builtin<compat/typescript>":
+-  version: 5.3.2
+-  resolution: "typescript@patch:typescript@npm%3A5.3.2#~builtin<compat/typescript>::version=5.3.2&hash=e012d7"
++"typescript@patch:typescript@5.2.2#~builtin<compat/typescript>":
++  version: 5.2.2
++  resolution: "typescript@patch:typescript@npm%3A5.2.2#~builtin<compat/typescript>::version=5.2.2&hash=f3b441"
+   bin:
+     tsc: bin/tsc
+     tsserver: bin/tsserver
+-  checksum: 47b2e63418ea7ef7dd0bf359ee41c6fca852c680826089269c5d03673ead471e052b172561f377f9e51212054e5f0fe19dd58085ff7db7b168449a6af704c784
++  checksum: 0f4da2f15e6f1245e49db15801dbee52f2bbfb267e1c39225afdab5afee1a72839cd86000e65ee9d7e4dfaff12239d28beaf5ee431357fcced15fb08583d72ca
+   languageName: node
+   linkType: hard
+ 

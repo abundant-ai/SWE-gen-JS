@@ -1,0 +1,103 @@
+diff --git a/packages/core/router/router-execution-context.ts b/packages/core/router/router-execution-context.ts
+index f971cf2df..d2806f61c 100644
+--- a/packages/core/router/router-execution-context.ts
++++ b/packages/core/router/router-execution-context.ts
+@@ -444,6 +444,7 @@ export class RouterExecutionContext {
+           result,
+           (res as any).raw || res,
+           (req as any).raw || req,
++          { additionalHeaders: res.getHeaders?.() },
+         );
+       };
+     }
+diff --git a/packages/core/router/router-response-controller.ts b/packages/core/router/router-response-controller.ts
+index aab864095..68f2ef052 100644
+--- a/packages/core/router/router-response-controller.ts
++++ b/packages/core/router/router-response-controller.ts
+@@ -3,7 +3,11 @@ import { isFunction, isObject } from '@nestjs/common/utils/shared.utils';
+ import { IncomingMessage } from 'http';
+ import { lastValueFrom, Observable } from 'rxjs';
+ import { debounce } from 'rxjs/operators';
+-import { HeaderStream, SseStream } from './sse-stream';
++import {
++  AdditionalHeaders,
++  WritableHeaderStream,
++  SseStream,
++} from './sse-stream';
+ 
+ export interface CustomHeader {
+   name: string;
+@@ -85,9 +89,14 @@ export class RouterResponseController {
+ 
+   public async sse<
+     TInput extends Observable<unknown> = any,
+-    TResponse extends HeaderStream = any,
++    TResponse extends WritableHeaderStream = any,
+     TRequest extends IncomingMessage = any,
+-  >(result: TInput, response: TResponse, request: TRequest) {
++  >(
++    result: TInput,
++    response: TResponse,
++    request: TRequest,
++    options?: { additionalHeaders: AdditionalHeaders },
++  ) {
+     // It's possible that we sent headers already so don't use a stream
+     if (response.writableEnded) {
+       return;
+@@ -96,7 +105,7 @@ export class RouterResponseController {
+     this.assertObservable(result);
+ 
+     const stream = new SseStream(request);
+-    stream.pipe(response);
++    stream.pipe(response, options);
+ 
+     const subscription = result
+       .pipe(
+diff --git a/packages/core/router/sse-stream.ts b/packages/core/router/sse-stream.ts
+index 489b7bc67..22327e6c8 100644
+--- a/packages/core/router/sse-stream.ts
++++ b/packages/core/router/sse-stream.ts
+@@ -13,6 +13,15 @@ function toDataString(data: string | object): string {
+     .join('');
+ }
+ 
++export type AdditionalHeaders = Record<
++  string,
++  string[] | string | number | undefined
++>;
++
++interface ReadHeaders {
++  getHeaders?(): AdditionalHeaders;
++}
++
+ interface WriteHeaders {
+   writableEnded?: boolean;
+   writeHead?(
+@@ -24,7 +33,8 @@ interface WriteHeaders {
+   flushHeaders?(): void;
+ }
+ 
+-export type HeaderStream = NodeJS.WritableStream & WriteHeaders;
++export type WritableHeaderStream = NodeJS.WritableStream & WriteHeaders;
++export type HeaderStream = WritableHeaderStream & ReadHeaders;
+ 
+ /**
+  * Adapted from https://raw.githubusercontent.com/EventSource/node-ssestream
+@@ -51,9 +61,16 @@ export class SseStream extends Transform {
+     }
+   }
+ 
+-  pipe<T extends HeaderStream>(destination: T, options?: { end?: boolean }): T {
++  pipe<T extends WritableHeaderStream>(
++    destination: T,
++    options?: {
++      additionalHeaders?: AdditionalHeaders;
++      end?: boolean;
++    },
++  ): T {
+     if (destination.writeHead) {
+       destination.writeHead(200, {
++        ...options?.additionalHeaders,
+         // See https://github.com/dunglas/mercure/blob/master/hub/subscribe.go#L124-L130
+         'Content-Type': 'text/event-stream',
+         Connection: 'keep-alive',

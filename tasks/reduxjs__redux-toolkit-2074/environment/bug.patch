@@ -1,0 +1,237 @@
+diff --git a/packages/toolkit/src/listenerMiddleware/exceptions.ts b/packages/toolkit/src/listenerMiddleware/exceptions.ts
+index ab93a787..83740856 100644
+--- a/packages/toolkit/src/listenerMiddleware/exceptions.ts
++++ b/packages/toolkit/src/listenerMiddleware/exceptions.ts
+@@ -6,15 +6,15 @@ const completed = 'completed'
+ const cancelled = 'cancelled'
+ 
+ /* TaskAbortError error codes  */
+-export const taskCancelled = `task-${cancelled}` as const
+-export const taskCompleted = `task-${completed}` as const
++export const taskCancelled = `${task}-${cancelled}` as const
++export const taskCompleted = `${task}-${completed}` as const
+ export const listenerCancelled = `${listener}-${cancelled}` as const
+ export const listenerCompleted = `${listener}-${completed}` as const
+ 
+ export class TaskAbortError implements SerializedError {
+   name = 'TaskAbortError'
+-  message: string
+-  constructor(public code: string | undefined) {
+-    this.message = `${task} ${cancelled} (reason: ${code})`
++  message = ''
++  constructor(public code = 'unknown') {
++    this.message = `task cancelled (reason: ${code})`
+   }
+ }
+diff --git a/packages/toolkit/src/listenerMiddleware/index.ts b/packages/toolkit/src/listenerMiddleware/index.ts
+index 3ea82c08..47c7024f 100644
+--- a/packages/toolkit/src/listenerMiddleware/index.ts
++++ b/packages/toolkit/src/listenerMiddleware/index.ts
+@@ -21,11 +21,9 @@ import type {
+   ForkedTask,
+   TypedRemoveListener,
+   TaskResult,
+-  AbortSignalWithReason,
+ } from './types'
+ import {
+   abortControllerWithReason,
+-  addAbortSignalListener,
+   assertFunction,
+   catchRejection,
+ } from './utils'
+@@ -76,18 +74,11 @@ const INTERNAL_NIL_TOKEN = {} as const
+ 
+ const alm = 'listenerMiddleware' as const
+ 
+-const createFork = (parentAbortSignal: AbortSignalWithReason<unknown>) => {
+-  const linkControllers = (controller: AbortController) =>
+-    addAbortSignalListener(parentAbortSignal, () =>
+-      abortControllerWithReason(controller, parentAbortSignal.reason)
+-    )
+-
++const createFork = (parentAbortSignal: AbortSignal) => {
+   return <T>(taskExecutor: ForkedTaskExecutor<T>): ForkedTask<T> => {
+     assertFunction(taskExecutor, 'taskExecutor')
+     const childAbortController = new AbortController()
+ 
+-    linkControllers(childAbortController)
+-
+     const result = runTask<T>(
+       async (): Promise<T> => {
+         validateActive(parentAbortSignal)
+diff --git a/packages/toolkit/src/listenerMiddleware/task.ts b/packages/toolkit/src/listenerMiddleware/task.ts
+index ca57aad4..21839aba 100644
+--- a/packages/toolkit/src/listenerMiddleware/task.ts
++++ b/packages/toolkit/src/listenerMiddleware/task.ts
+@@ -1,6 +1,6 @@
+ import { TaskAbortError } from './exceptions'
+ import type { AbortSignalWithReason, TaskResult } from './types'
+-import { addAbortSignalListener, catchRejection } from './utils'
++import { catchRejection } from './utils'
+ 
+ /**
+  * Synchronously raises {@link TaskAbortError} if the task tied to the input `signal` has been cancelled.
+@@ -29,7 +29,7 @@ export const promisifyAbortSignal = (
+       if (signal.aborted) {
+         notifyRejection()
+       } else {
+-        addAbortSignalListener(signal, notifyRejection)
++        signal.addEventListener('abort', notifyRejection, { once: true })
+       }
+     })
+   )
+diff --git a/packages/toolkit/src/listenerMiddleware/tests/fork.test.ts b/packages/toolkit/src/listenerMiddleware/tests/fork.test.ts
+index 2756e09f..c54285d1 100644
+--- a/packages/toolkit/src/listenerMiddleware/tests/fork.test.ts
++++ b/packages/toolkit/src/listenerMiddleware/tests/fork.test.ts
+@@ -2,17 +2,9 @@ import type { EnhancedStore } from '@reduxjs/toolkit'
+ import { configureStore, createSlice, createAction } from '@reduxjs/toolkit'
+ 
+ import type { PayloadAction } from '@reduxjs/toolkit'
+-import type {
+-  AbortSignalWithReason,
+-  ForkedTaskExecutor,
+-  TaskResult,
+-} from '../types'
++import type { ForkedTaskExecutor, TaskResult } from '../types'
+ import { createListenerMiddleware, TaskAbortError } from '../index'
+-import {
+-  listenerCancelled,
+-  listenerCompleted,
+-  taskCancelled,
+-} from '../exceptions'
++import { listenerCancelled, taskCancelled } from '../exceptions'
+ 
+ function delay(ms: number) {
+   return new Promise((resolve) => setTimeout(resolve, ms))
+@@ -320,58 +312,6 @@ describe('fork', () => {
+       })
+     })
+ 
+-    test('forkApi.delay rejects as soon as the parent listener is cancelled', async () => {
+-      let deferredResult = deferred()
+-
+-      startListening({
+-        actionCreator: increment,
+-        effect: async (_, listenerApi) => {
+-          listenerApi.cancelActiveListeners()
+-          await listenerApi.fork(async (forkApi) => {
+-            await forkApi
+-              .delay(100)
+-              .then(deferredResult.resolve, deferredResult.resolve)
+-
+-            return 4
+-          }).result
+-
+-          deferredResult.resolve(new Error('unreachable'))
+-        },
+-      })
+-
+-      store.dispatch(increment())
+-
+-      await Promise.resolve()
+-
+-      store.dispatch(increment())
+-      expect(await deferredResult).toEqual(
+-        new TaskAbortError(listenerCancelled)
+-      )
+-    })
+-
+-    test('forkApi.signal listener is invoked as soon as the parent listener is cancelled or completed', async () => {
+-      let deferredResult = deferred()
+-
+-      startListening({
+-        actionCreator: increment,
+-        async effect(_, listenerApi) {
+-          const wronglyDoNotAwaitResultOfTask = listenerApi.fork(
+-            async (forkApi) => {
+-              forkApi.signal.addEventListener('abort', () => {
+-                deferredResult.resolve(
+-                  (forkApi.signal as AbortSignalWithReason<unknown>).reason
+-                )
+-              })
+-            }
+-          )
+-        },
+-      })
+-
+-      store.dispatch(increment)
+-
+-      expect(await deferredResult).toBe(listenerCompleted)
+-    })
+-
+     test('fork.delay does not trigger unhandledRejections for completed or cancelled tasks', async () => {
+       let deferredCompletedEvt = deferred()
+       let deferredCancelledEvt = deferred()
+@@ -444,34 +384,6 @@ describe('fork', () => {
+     })
+   })
+ 
+-  test('forkApi.pause rejects as soon as the parent listener is cancelled', async () => {
+-    let deferredResult = deferred()
+-
+-    startListening({
+-      actionCreator: increment,
+-      effect: async (_, listenerApi) => {
+-        listenerApi.cancelActiveListeners()
+-        const forkedTask = listenerApi.fork(async (forkApi) => {
+-          await forkApi
+-            .pause(delay(100))
+-            .then(deferredResult.resolve, deferredResult.resolve)
+-
+-          return 4
+-        })
+-
+-        await forkedTask.result
+-        deferredResult.resolve(new Error('unreachable'))
+-      },
+-    })
+-
+-    store.dispatch(increment())
+-
+-    await Promise.resolve()
+-
+-    store.dispatch(increment())
+-    expect(await deferredResult).toEqual(new TaskAbortError(listenerCancelled))
+-  })
+-
+   test('forkApi.pause rejects if listener is cancelled', async () => {
+     const incrementByInListener = createAction<number>('incrementByInListener')
+ 
+diff --git a/packages/toolkit/src/listenerMiddleware/types.ts b/packages/toolkit/src/listenerMiddleware/types.ts
+index e4418283..25fca902 100644
+--- a/packages/toolkit/src/listenerMiddleware/types.ts
++++ b/packages/toolkit/src/listenerMiddleware/types.ts
+@@ -54,12 +54,12 @@ export type MatchFunction<T> = (v: any) => v is T
+ export interface ForkedTaskAPI {
+   /**
+    * Returns a promise that resolves when `waitFor` resolves or
+-   * rejects if the task or the parent listener has been cancelled or is completed.
++   * rejects if the task has been cancelled or completed.
+    */
+   pause<W>(waitFor: Promise<W>): Promise<W>
+   /**
+    * Returns a promise resolves after `timeoutMs` or
+-   * rejects if the task or the parent listener has been cancelled or is completed.
++   * rejects if the task has been cancelled or is completed.
+    * @param timeoutMs
+    */
+   delay(timeoutMs: number): Promise<void>
+diff --git a/packages/toolkit/src/listenerMiddleware/utils.ts b/packages/toolkit/src/listenerMiddleware/utils.ts
+index 3f863487..0d12eb8e 100644
+--- a/packages/toolkit/src/listenerMiddleware/utils.ts
++++ b/packages/toolkit/src/listenerMiddleware/utils.ts
+@@ -23,13 +23,6 @@ export const catchRejection = <T>(
+   return promise
+ }
+ 
+-export const addAbortSignalListener = (
+-  abortSignal: AbortSignal,
+-  callback: (evt: Event) => void
+-) => {
+-  abortSignal.addEventListener('abort', callback, { once: true })
+-}
+-
+ /**
+  * Calls `abortController.abort(reason)` and patches `signal.reason`.
+  * if it is not supported.

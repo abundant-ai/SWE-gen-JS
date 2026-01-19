@@ -1,0 +1,426 @@
+diff --git a/.changeset/tidy-pots-double.md b/.changeset/tidy-pots-double.md
+deleted file mode 100644
+index 08abf00480..0000000000
+--- a/.changeset/tidy-pots-double.md
++++ /dev/null
+@@ -1,7 +0,0 @@
+----
+-'xstate': major
+----
+-
+-All transitions became internal by default. The style of the `target` pattern (`.child`, `sibling`, `#id`) has now no effect on the transition type.
+-
+-Internal transitions don't reenter their source state when the target lies within it. You can still create external transitions (ones that reenter the source state under the mentioned circumstances) by explicitly setting `external: true` on the given transition.
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index e2f70831cb..0f66155402 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -221,7 +221,6 @@ export class StateNode<
+             source: this,
+             actions: this.initial.actions,
+             eventType: null as any,
+-            external: false,
+             toJSON: () => ({
+               target: this.initial!.target!.map((t) => `#${t.id}`),
+               source: `#${this.id}`,
+@@ -449,7 +448,7 @@ export class StateNode<
+           return !(
+             !transition.target &&
+             !transition.actions.length &&
+-            !transition.external
++            transition.internal
+           );
+         })
+         .map((transition) => transition.eventType)
+diff --git a/packages/core/src/scxml.ts b/packages/core/src/scxml.ts
+index dc855596f0..1172f64cb2 100644
+--- a/packages/core/src/scxml.ts
++++ b/packages/core/src/scxml.ts
+@@ -404,7 +404,7 @@ function toConfig(
+           target: getTargets(targets),
+           ...(value.elements ? executableContent(value.elements) : undefined),
+           ...guardObject,
+-          external: !internal
++          internal
+         };
+ 
+         if (eventType === NULL_EVENT) {
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 9833b37900..29a3cedea1 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -363,7 +363,17 @@ export function formatTransition<
+   }
+ ): AnyTransitionDefinition {
+   const normalizedTarget = normalizeTarget(transitionConfig.target);
+-  const external = transitionConfig.external ?? false;
++  const internal =
++    stateNode === stateNode.machine.root
++      ? true // always internal for root
++      : 'internal' in transitionConfig
++      ? transitionConfig.internal
++      : normalizedTarget
++      ? normalizedTarget.some(
++          (_target) =>
++            isString(_target) && _target[0] === stateNode.machine.delimiter
++        )
++      : true;
+   const { guards } = stateNode.machine.options;
+   const target = resolveTarget(stateNode, normalizedTarget);
+ 
+@@ -384,7 +394,7 @@ export function formatTransition<
+       : undefined,
+     target,
+     source: stateNode,
+-    external,
++    internal,
+     eventType: transitionConfig.event,
+     toJSON: () => ({
+       ...transition,
+@@ -527,7 +537,6 @@ export function formatInitialTransition<
+       source: stateNode,
+       actions: [],
+       eventType: null as any,
+-      external: false,
+       target: resolvedTarget!,
+       toJSON: () => ({
+         ...transition,
+@@ -987,7 +996,7 @@ function getTransitionDomain(
+   }
+ 
+   if (
+-    !transition.external &&
++    transition.internal &&
+     transition.source.type === 'compound' &&
+     targetStates.every((targetStateNode) =>
+       isDescendant(targetStateNode, transition.source)
+@@ -1066,7 +1075,6 @@ export function microstep<
+           {
+             target: [...currentState.configuration].filter(isAtomicStateNode),
+             source: machine.root,
+-            external: true,
+             actions: [],
+             eventType: null as any,
+             toJSON: null as any // TODO: fix
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 44b8bca38d..ef5eef6c8e 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -307,7 +307,7 @@ export interface TransitionConfig<
+ > {
+   guard?: GuardConfig<TContext, TExpressionEvent>;
+   actions?: BaseActions<TContext, TExpressionEvent, TEvent, TAction>;
+-  external?: boolean;
++  internal?: boolean;
+   target?: TransitionTarget | undefined;
+   meta?: Record<string, any>;
+   description?: string;
+@@ -1444,7 +1444,6 @@ export interface TransitionDefinition<
+   target: Array<StateNode<TContext, TEvent>> | undefined;
+   source: StateNode<TContext, TEvent>;
+   actions: BaseActionObject[];
+-  external: boolean;
+   guard?: GuardDefinition<TContext, TEvent>;
+   eventType: TEvent['type'] | '*';
+   toJSON: () => {
+diff --git a/packages/core/test/actions.test.ts b/packages/core/test/actions.test.ts
+index 78f9c0e01e..e871bc53d1 100644
+--- a/packages/core/test/actions.test.ts
++++ b/packages/core/test/actions.test.ts
+@@ -548,7 +548,7 @@ describe('entry/exit actions', () => {
+       expect(called).toBe(true);
+     });
+ 
+-    it('root entry/exit actions should be called on root external transitions', () => {
++    it('root entry/exit actions should not be called on root external transitions', () => {
+       let entrySpy = jest.fn();
+       let exitSpy = jest.fn();
+ 
+@@ -559,7 +559,7 @@ describe('entry/exit actions', () => {
+         on: {
+           EVENT: {
+             target: '#two',
+-            external: true
++            internal: false
+           }
+         },
+         initial: 'one',
+@@ -578,8 +578,8 @@ describe('entry/exit actions', () => {
+ 
+       service.send({ type: 'EVENT' });
+ 
+-      expect(entrySpy).toHaveBeenCalled();
+-      expect(exitSpy).toHaveBeenCalled();
++      expect(entrySpy).not.toHaveBeenCalled();
++      expect(exitSpy).not.toHaveBeenCalled();
+     });
+ 
+     describe('should ignore same-parent state actions (sparse)', () => {
+@@ -781,7 +781,7 @@ describe('entry/exit actions', () => {
+       ]);
+     });
+ 
+-    it('should enter all descendents when target is a descendent of the source when using an external transition', () => {
++    it('should enter all descendents when target is a descendent of current', () => {
+       const machine = createMachine({
+         initial: 'A',
+         states: {
+@@ -789,7 +789,7 @@ describe('entry/exit actions', () => {
+             initial: 'A1',
+             on: {
+               NEXT: {
+-                external: true,
++                internal: false,
+                 target: '.A2'
+               }
+             },
+diff --git a/packages/core/test/activities.test.ts b/packages/core/test/activities.test.ts
+index 65510ec453..58e5676866 100644
+--- a/packages/core/test/activities.test.ts
++++ b/packages/core/test/activities.test.ts
+@@ -371,7 +371,7 @@ describe('invocations (activities)', () => {
+             on: {
+               NEXT: {
+                 target: 'a',
+-                external: true
++                internal: false
+               }
+             }
+           }
+diff --git a/packages/core/test/history.test.ts b/packages/core/test/history.test.ts
+index bc260360c3..62fb7792b6 100644
+--- a/packages/core/test/history.test.ts
++++ b/packages/core/test/history.test.ts
+@@ -130,10 +130,7 @@ describe('history states', () => {
+       states: {
+         a: {
+           on: {
+-            REENTER: {
+-              target: '#b_hist',
+-              external: true
+-            }
++            REENTER: '#b_hist'
+           },
+           initial: 'a1',
+           states: {
+diff --git a/packages/core/test/internalTransitions.test.ts b/packages/core/test/internalTransitions.test.ts
+index 7ffe6b1d07..ae00640825 100644
+--- a/packages/core/test/internalTransitions.test.ts
++++ b/packages/core/test/internalTransitions.test.ts
+@@ -19,14 +19,14 @@ const wordMachine = createMachine({
+         RIGHT_CLICK: '.right',
+         RIGHT_CLICK_EXTERNAL: {
+           target: '.right',
+-          external: true
++          internal: false
+         },
+         CENTER_CLICK: '.center',
+         JUSTIFY_CLICK: '.justify',
+         RESET: 'direction', // explicit self-transition
+         RESET_TO_CENTER: {
+           target: 'direction.center',
+-          external: true
++          internal: false
+         }
+       }
+     }
+diff --git a/packages/core/test/invoke.test.ts b/packages/core/test/invoke.test.ts
+index 856d2566bc..f0717d41c0 100644
+--- a/packages/core/test/invoke.test.ts
++++ b/packages/core/test/invoke.test.ts
+@@ -786,6 +786,7 @@ describe('invoke', () => {
+         entry: () => entryActionsCount++,
+         on: {
+           UPDATE: {
++            internal: true,
+             actions: () => {
+               actionsCount++;
+             }
+@@ -3251,8 +3252,8 @@ describe('invoke', () => {
+     service.send({ type: 'FINISH' });
+     expect(disposed).toBe(true);
+   });
+-
+-  it('root invocations should restart on root external transitions', () => {
++  // https://github.com/statelyai/xstate/issues/3072
++  it('root invocations should not restart on root external transitions', () => {
+     let count = 0;
+ 
+     const machine = createMachine({
+@@ -3267,7 +3268,7 @@ describe('invoke', () => {
+       on: {
+         EVENT: {
+           target: '#two',
+-          external: true
++          internal: false
+         }
+       },
+       initial: 'one',
+@@ -3283,7 +3284,7 @@ describe('invoke', () => {
+ 
+     service.send({ type: 'EVENT' });
+ 
+-    expect(count).toEqual(2);
++    expect(count).toEqual(1);
+   });
+ });
+ 
+diff --git a/packages/core/test/json.test.ts b/packages/core/test/json.test.ts
+index e8905e188e..edc0df4eb3 100644
+--- a/packages/core/test/json.test.ts
++++ b/packages/core/test/json.test.ts
+@@ -145,8 +145,8 @@ describe('json', () => {
+           "actions": [],
+           "event": "done.invoke.active:invocation[0]",
+           "eventType": "done.invoke.active:invocation[0]",
+-          "external": false,
+           "guard": undefined,
++          "internal": false,
+           "source": "#active",
+           "target": [
+             "#(machine).foo",
+@@ -157,8 +157,8 @@ describe('json', () => {
+           "actions": [],
+           "event": "error.platform.active:invocation[0]",
+           "eventType": "error.platform.active:invocation[0]",
+-          "external": false,
+           "guard": undefined,
++          "internal": false,
+           "source": "#active",
+           "target": [
+             "#(machine).bar",
+@@ -169,8 +169,8 @@ describe('json', () => {
+           "actions": [],
+           "event": "EVENT",
+           "eventType": "EVENT",
+-          "external": false,
+           "guard": undefined,
++          "internal": false,
+           "source": "#active",
+           "target": [
+             "#(machine).foo",
+diff --git a/packages/core/test/predictableExec.test.ts b/packages/core/test/predictableExec.test.ts
+index e81b35452f..9aa960b48a 100644
+--- a/packages/core/test/predictableExec.test.ts
++++ b/packages/core/test/predictableExec.test.ts
+@@ -517,7 +517,7 @@ describe('predictableExec', () => {
+           on: {
+             REENTER: {
+               target: 'active',
+-              external: true
++              internal: false
+             }
+           }
+         }
+diff --git a/packages/core/test/state.test.ts b/packages/core/test/state.test.ts
+index 20a1c9f779..754757890a 100644
+--- a/packages/core/test/state.test.ts
++++ b/packages/core/test/state.test.ts
+@@ -29,7 +29,7 @@ const exampleMachine = createMachine<any, Events>({
+       on: {
+         EXTERNAL: {
+           target: 'one',
+-          external: true
++          internal: false
+         },
+         INERT: {},
+         INTERNAL: {
+diff --git a/packages/xstate-inspect/test/inspect.test.ts b/packages/xstate-inspect/test/inspect.test.ts
+index 68d2a535a9..96c45dc202 100644
+--- a/packages/xstate-inspect/test/inspect.test.ts
++++ b/packages/xstate-inspect/test/inspect.test.ts
+@@ -294,7 +294,7 @@ describe('@xstate/inspect', () => {
+         },
+         {
+           "sessionId": "x:7",
+-          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"actions":[{"type":"xstate.assign","params":{"context":{"value":{"unsafe":"[unsafe]"}},"actions":[]}}],"event":{"type":"EV","value":{"unsafe":"[unsafe]"}},"_event":{"name":"EV","data":{"type":"EV","value":{"unsafe":"[unsafe]"}},"$$type":"scxml","type":"external"},"_sessionid":"x:7","_initial":false,"changed":true,"transitions":[{"actions":[{"type":"xstate.assign","params":{"assignment":{}}}],"event":"EV","source":"#(machine)","external":false,"eventType":"EV"}],"children":{},"tags":[]}",
++          "state": "{"value":{},"done":false,"context":{"value":{"unsafe":"[unsafe]"}},"historyValue":{},"actions":[{"type":"xstate.assign","params":{"context":{"value":{"unsafe":"[unsafe]"}},"actions":[]}}],"event":{"type":"EV","value":{"unsafe":"[unsafe]"}},"_event":{"name":"EV","data":{"type":"EV","value":{"unsafe":"[unsafe]"}},"$$type":"scxml","type":"external"},"_sessionid":"x:7","_initial":false,"changed":true,"transitions":[{"actions":[{"type":"xstate.assign","params":{"assignment":{}}}],"event":"EV","source":"#(machine)","internal":true,"eventType":"EV"}],"children":{},"tags":[]}",
+           "type": "service.state",
+         },
+       ]
+diff --git a/packages/xstate-scxml/src/index.ts b/packages/xstate-scxml/src/index.ts
+index c2358f6c7d..3ca3655ca5 100644
+--- a/packages/xstate-scxml/src/index.ts
++++ b/packages/xstate-scxml/src/index.ts
+@@ -71,7 +71,7 @@ export function transitionToSCXML(
+       target: (transition.target || [])
+         .map((stateNode) => stateNode.id)
+         .join(' '),
+-      type: !transition.external ? 'internal' : undefined
++      type: transition.internal ? 'internal' : undefined
+     }),
+     elements: elements.length ? elements : undefined
+   };
+diff --git a/packages/xstate-scxml/test/fixtures.test.ts b/packages/xstate-scxml/test/fixtures.test.ts
+index 093f42a748..05e4f102ac 100644
+--- a/packages/xstate-scxml/test/fixtures.test.ts
++++ b/packages/xstate-scxml/test/fixtures.test.ts
+@@ -18,8 +18,8 @@ describe('toSCXML', () => {
+         encoding: 'utf-8'
+       });
+ 
+-      const machine =
+-        require(`./fixtures/${testGroupName}/${testName}`).default;
++      const machine = require(`./fixtures/${testGroupName}/${testName}`)
++        .default;
+ 
+       it(`${testGroupName}/${testName}`, () => {
+         expect(xml2js(toSCXML(machine))).toEqual(
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send1.ts b/packages/xstate-scxml/test/fixtures/actionSend/send1.ts
+index 2cf05f3696..85c814c7a9 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send1.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send1.ts
+@@ -8,18 +8,14 @@ export default createMachine({
+       on: {
+         t: {
+           target: '#b',
+-          actions: actions.raise({ type: 's' }),
+-          external: true
++          actions: actions.raise({ type: 's' })
+         }
+       }
+     },
+     b: {
+       id: 'b',
+       on: {
+-        s: {
+-          target: '#c',
+-          external: true
+-        }
++        s: '#c'
+       }
+     },
+     c: {
+diff --git a/packages/xstate-scxml/test/scxml.test.ts b/packages/xstate-scxml/test/scxml.test.ts
+index 627a92442c..4242e64660 100644
+--- a/packages/xstate-scxml/test/scxml.test.ts
++++ b/packages/xstate-scxml/test/scxml.test.ts
+@@ -85,8 +85,8 @@ describe('scxml', () => {
+ 
+   testGroupKeys.forEach((testGroupName) => {
+     testGroups[testGroupName].forEach((testName) => {
+-      const originalMachine =
+-        require(`./fixtures/${testGroupName}/${testName}`).default;
++      const originalMachine = require(`./fixtures/${testGroupName}/${testName}`)
++        .default;
+       const scxmlDefinition = toSCXML(originalMachine);
+ 
+       const scxmlTest = JSON.parse(
+@@ -209,7 +209,8 @@ const lightMachine = createMachine({
+       on: {
+         TIMER: 'green',
+         POWER_OUTAGE: {
+-          target: 'red'
++          target: 'red',
++          internal: true
+         }
+       },
+       ...pedestrianStates
+@@ -237,6 +238,7 @@ xdescribe('transition to SCXML', () => {
+           on: {
+             SOME_EVENT: {
+               target: 'next',
++              internal: true,
+               guard: () => true,
+               actions: ['foo', 'bar']
+             }

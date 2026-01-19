@@ -1,0 +1,601 @@
+diff --git a/docs/api/autoBatchEnhancer.mdx b/docs/api/autoBatchEnhancer.mdx
+index e0d9e0de..43378b80 100644
+--- a/docs/api/autoBatchEnhancer.mdx
++++ b/docs/api/autoBatchEnhancer.mdx
+@@ -51,9 +51,9 @@ const { incrementBatched, decrementUnbatched } = counterSlice.actions
+ const store = configureStore({
+   reducer: counterSlice.reducer,
+   // highlight-start
+-  enhancers: (existingEnhancers) => {
++  enhancers: (getDefaultEnhancers) => {
+     // Add the autobatch enhancer to the store setup
+-    return existingEnhancers.concat(autoBatchEnhancer())
++    return getDefaultEnhancers().concat(autoBatchEnhancer())
+   },
+   // highlight-end
+ })
+diff --git a/docs/api/configureStore.mdx b/docs/api/configureStore.mdx
+index e3199c66..7abd6155 100644
+--- a/docs/api/configureStore.mdx
++++ b/docs/api/configureStore.mdx
+@@ -17,14 +17,12 @@ to the store setup for a better development experience.
+ `configureStore` accepts a single configuration object parameter, with the following options:
+ 
+ ```ts no-transpile
+-type ConfigureEnhancersCallback = (
+-  defaultEnhancers: EnhancerArray<[StoreEnhancer]>
+-) => StoreEnhancer[]
+ 
+ interface ConfigureStoreOptions<
+   S = any,
+   A extends Action = AnyAction,
+   M extends Middlewares<S> = Middlewares<S>
++  E extends Enhancers = Enhancers
+ > {
+   /**
+    * A single reducer function that will be used as the root reducer, or an
+@@ -59,11 +57,11 @@ interface ConfigureStoreOptions<
+    * The store enhancers to apply. See Redux's `createStore()`.
+    * All enhancers will be included before the DevTools Extension enhancer.
+    * If you need to customize the order of enhancers, supply a callback
+-   * function that will receive the original array (ie, `[applyMiddleware]`),
+-   * and should return a new array (such as `[applyMiddleware, offline]`).
++   * function that will receive the getDefaultEnhancers,
++   * and should return a new array (such as `getDefaultEnhancers().concat(offline)`).
+    * If you only need to add middleware, you can use the `middleware` parameter instead.
+    */
+-  enhancers?: StoreEnhancer[] | ConfigureEnhancersCallback
++  enhancers?: (getDefaultEnhancers: GetDefaultEnhancers<M>) => E | E
+ }
+ 
+ function configureStore<S = any, A extends Action = AnyAction>(
+@@ -203,7 +201,10 @@ const store = configureStore({
+   middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(logger),
+   devTools: process.env.NODE_ENV !== 'production',
+   preloadedState,
+-  enhancers: [batchedSubscribe(debounceNotify)],
++  enhancers: (getDefaultEnhancers) =>
++    getDefaultEnhancers({
++      autoBatch: false,
++    }).concat(batchedSubscribe(debounceNotify)),
+ })
+ 
+ // The store has been created with these options:
+diff --git a/docs/usage/usage-guide.md b/docs/usage/usage-guide.md
+index 6b465ff7..bcd93f8f 100644
+--- a/docs/usage/usage-guide.md
++++ b/docs/usage/usage-guide.md
+@@ -128,7 +128,8 @@ export default function configureAppStore(preloadedState) {
+     middleware: (getDefaultMiddleware) =>
+       getDefaultMiddleware().concat(loggerMiddleware),
+     preloadedState,
+-    enhancers: [monitorReducersEnhancer],
++    enhancers: (getDefaultEnhancers) =>
++      getDefaultEnhancers().concat(monitorReducersEnhancer),
+   })
+ 
+   if (process.env.NODE_ENV !== 'production' && module.hot) {
+@@ -619,17 +620,17 @@ A typical implementation might look like:
+ 
+ ```js
+ const getRepoDetailsStarted = () => ({
+-  type: "repoDetails/fetchStarted"
++  type: 'repoDetails/fetchStarted',
+ })
+ const getRepoDetailsSuccess = (repoDetails) => ({
+-  type: "repoDetails/fetchSucceeded",
+-  payload: repoDetails
++  type: 'repoDetails/fetchSucceeded',
++  payload: repoDetails,
+ })
+ const getRepoDetailsFailed = (error) => ({
+-  type: "repoDetails/fetchFailed",
+-  error
++  type: 'repoDetails/fetchFailed',
++  error,
+ })
+-const fetchIssuesCount = (org, repo) => async dispatch => {
++const fetchIssuesCount = (org, repo) => async (dispatch) => {
+   dispatch(getRepoDetailsStarted())
+   try {
+     const repoDetails = await getRepoDetails(org, repo)
+@@ -1118,11 +1119,11 @@ It is also strongly recommended to blacklist any api(s) that you have configured
+ 
+ ```ts
+ const persistConfig = {
+-  key: "root",
++  key: 'root',
+   version: 1,
+   storage,
+   blacklist: [pokemonApi.reducerPath],
+-};
++}
+ ```
+ 
+ See [Redux Toolkit #121: How to use this with Redux-Persist?](https://github.com/reduxjs/redux-toolkit/issues/121) and [Redux-Persist #988: non-serializable value error](https://github.com/rt2zz/redux-persist/issues/988#issuecomment-552242978) for further discussion.
+diff --git a/packages/toolkit/src/autoBatchEnhancer.ts b/packages/toolkit/src/autoBatchEnhancer.ts
+index 65a77bb8..eb4dd8ca 100644
+--- a/packages/toolkit/src/autoBatchEnhancer.ts
++++ b/packages/toolkit/src/autoBatchEnhancer.ts
+@@ -9,26 +9,6 @@ export const prepareAutoBatched =
+     meta: { [SHOULD_AUTOBATCH]: true },
+   })
+ 
+-// TODO Remove this in 2.0
+-// Copied from https://github.com/feross/queue-microtask
+-let promise: Promise<any>
+-const queueMicrotaskShim =
+-  typeof queueMicrotask === 'function'
+-    ? queueMicrotask.bind(
+-        typeof window !== 'undefined'
+-          ? window
+-          : typeof global !== 'undefined'
+-          ? global
+-          : globalThis
+-      )
+-    : // reuse resolved promise, and allocate it lazily
+-      (cb: () => void) =>
+-        (promise || (promise = Promise.resolve())).then(cb).catch((err: any) =>
+-          setTimeout(() => {
+-            throw err
+-          }, 0)
+-        )
+-
+ const createQueueWithTimer = (timeout: number) => {
+   return (notify: () => void) => {
+     setTimeout(notify, timeout)
+@@ -63,10 +43,10 @@ export type AutoBatchOptions =
+  *
+  * By default, it will queue a notification for the end of the event loop tick.
+  * However, you can pass several other options to configure the behavior:
+- * - `{type: 'tick'}: queues using `queueMicrotask` (default)
++ * - `{type: 'tick'}`: queues using `queueMicrotask`
+  * - `{type: 'timer, timeout: number}`: queues using `setTimeout`
+- * - `{type: 'raf'}`: queues using `requestAnimationFrame`
+- * - `{type: 'callback', queueNotification: (notify: () => void) => void}: lets you provide your own callback
++ * - `{type: 'raf'}`: queues using `requestAnimationFrame` (default)
++ * - `{type: 'callback', queueNotification: (notify: () => void) => void}`: lets you provide your own callback
+  *
+  *
+  */
+@@ -84,7 +64,7 @@ export const autoBatchEnhancer =
+ 
+     const queueCallback =
+       options.type === 'tick'
+-        ? queueMicrotaskShim
++        ? queueMicrotask
+         : options.type === 'raf'
+         ? rAF
+         : options.type === 'callback'
+diff --git a/packages/toolkit/src/configureStore.ts b/packages/toolkit/src/configureStore.ts
+index bb7e6e62..f08130e7 100644
+--- a/packages/toolkit/src/configureStore.ts
++++ b/packages/toolkit/src/configureStore.ts
+@@ -8,34 +8,27 @@ import type {
+   Store,
+   Dispatch,
+ } from 'redux'
+-import { createStore, compose, applyMiddleware, combineReducers } from 'redux'
++import { applyMiddleware, createStore, compose, combineReducers } from 'redux'
+ import type { DevToolsEnhancerOptions as DevToolsOptions } from './devtoolsExtension'
+ import { composeWithDevTools } from './devtoolsExtension'
+ 
+ import isPlainObject from './isPlainObject'
+ import type {
+   ThunkMiddlewareFor,
+-  CurriedGetDefaultMiddleware,
++  GetDefaultMiddleware,
+ } from './getDefaultMiddleware'
+-import { curryGetDefaultMiddleware } from './getDefaultMiddleware'
++import { buildGetDefaultMiddleware } from './getDefaultMiddleware'
+ import type {
+   ExtractDispatchExtensions,
+   ExtractStoreExtensions,
+   ExtractStateExtensions,
+ } from './tsHelpers'
+-import { EnhancerArray } from './utils'
++import type { EnhancerArray, MiddlewareArray } from './utils'
++import type { GetDefaultEnhancers } from './getDefaultEnhancers'
++import { buildGetDefaultEnhancers } from './getDefaultEnhancers'
+ 
+ const IS_PRODUCTION = process.env.NODE_ENV === 'production'
+ 
+-/**
+- * Callback function type, to be used in `ConfigureStoreOptions.enhancers`
+- *
+- * @public
+- */
+-export type ConfigureEnhancersCallback<E extends Enhancers = Enhancers> = (
+-  defaultEnhancers: EnhancerArray<[StoreEnhancer<{}, {}>]>
+-) => E
+-
+ /**
+  * Options for `configureStore()`.
+  *
+@@ -61,7 +54,7 @@ export interface ConfigureStoreOptions<
+    * @example `middleware: (gDM) => gDM().concat(logger, apiMiddleware, yourCustomMiddleware)`
+    * @see https://redux-toolkit.js.org/api/getDefaultMiddleware#intended-usage
+    */
+-  middleware?: ((getDefaultMiddleware: CurriedGetDefaultMiddleware<S>) => M) | M
++  middleware?: ((getDefaultMiddleware: GetDefaultMiddleware<S>) => M) | M
+ 
+   /**
+    * Whether to enable Redux DevTools integration. Defaults to `true`.
+@@ -85,30 +78,17 @@ export interface ConfigureStoreOptions<
+    * The store enhancers to apply. See Redux's `createStore()`.
+    * All enhancers will be included before the DevTools Extension enhancer.
+    * If you need to customize the order of enhancers, supply a callback
+-   * function that will receive the original array (ie, `[applyMiddleware]`),
+-   * and should return a new array (such as `[applyMiddleware, offline]`).
++   * function that will receive a `getDefaultEnhancers` function that returns an EnhancerArray,
++   * and should return a new array (such as `getDefaultEnhancers().concat(offline)`).
+    * If you only need to add middleware, you can use the `middleware` parameter instead.
+    */
+-  enhancers?: E | ConfigureEnhancersCallback<E>
++  enhancers?: ((getDefaultEnhancers: GetDefaultEnhancers<M>) => E) | E
+ }
+ 
+-type Middlewares<S> = ReadonlyArray<Middleware<{}, S>>
++export type Middlewares<S> = ReadonlyArray<Middleware<{}, S>>
+ 
+ type Enhancers = ReadonlyArray<StoreEnhancer>
+ 
+-export interface ToolkitStore<
+-  S = any,
+-  A extends Action = AnyAction,
+-  M extends Middlewares<S> = Middlewares<S>
+-> extends Store<S, A> {
+-  /**
+-   * The `dispatch` method of your store, enhanced by all its middlewares.
+-   *
+-   * @inheritdoc
+-   */
+-  dispatch: ExtractDispatchExtensions<M> & Dispatch<A>
+-}
+-
+ /**
+  * A Redux store returned by `configureStore()`. Supports dispatching
+  * side-effectful _thunks_ in addition to plain actions.
+@@ -118,10 +98,8 @@ export interface ToolkitStore<
+ export type EnhancedStore<
+   S = any,
+   A extends Action = AnyAction,
+-  M extends Middlewares<S> = Middlewares<S>,
+   E extends Enhancers = Enhancers
+-> = ToolkitStore<S & ExtractStateExtensions<E>, A, M> &
+-  ExtractStoreExtensions<E>
++> = ExtractStoreExtensions<E> & Store<S & ExtractStateExtensions<E>, A>
+ 
+ /**
+  * A friendly abstraction over the standard Redux `createStore()` function.
+@@ -134,15 +112,17 @@ export type EnhancedStore<
+ export function configureStore<
+   S = any,
+   A extends Action = AnyAction,
+-  M extends Middlewares<S> = [ThunkMiddlewareFor<S>],
+-  E extends Enhancers = [StoreEnhancer],
++  M extends Middlewares<S> = MiddlewareArray<[ThunkMiddlewareFor<S>]>,
++  E extends Enhancers = EnhancerArray<
++    [StoreEnhancer<{ dispatch: ExtractDispatchExtensions<M> }>, StoreEnhancer]
++  >,
+   P = S
+->(options: ConfigureStoreOptions<S, A, M, E, P>): EnhancedStore<S, A, M, E> {
+-  const curriedGetDefaultMiddleware = curryGetDefaultMiddleware<S>()
++>(options: ConfigureStoreOptions<S, A, M, E, P>): EnhancedStore<S, A, E> {
++  const getDefaultMiddleware = buildGetDefaultMiddleware<S>()
+ 
+   const {
+     reducer = undefined,
+-    middleware = curriedGetDefaultMiddleware(),
++    middleware = getDefaultMiddleware(),
+     devTools = true,
+     preloadedState = undefined,
+     enhancers = undefined,
+@@ -162,7 +142,7 @@ export function configureStore<
+ 
+   let finalMiddleware = middleware
+   if (typeof finalMiddleware === 'function') {
+-    finalMiddleware = finalMiddleware(curriedGetDefaultMiddleware)
++    finalMiddleware = finalMiddleware(getDefaultMiddleware)
+ 
+     if (!IS_PRODUCTION && !Array.isArray(finalMiddleware)) {
+       throw new Error(
+@@ -179,8 +159,6 @@ export function configureStore<
+     )
+   }
+ 
+-  const middlewareEnhancer: StoreEnhancer = applyMiddleware(...finalMiddleware)
+-
+   let finalCompose = compose
+ 
+   if (devTools) {
+@@ -191,16 +169,36 @@ export function configureStore<
+     })
+   }
+ 
+-  const defaultEnhancers = new EnhancerArray(middlewareEnhancer)
+-  let storeEnhancers: Enhancers = defaultEnhancers
++  const middlewareEnhancer = applyMiddleware(...finalMiddleware)
++
++  const getDefaultEnhancers = buildGetDefaultEnhancers<M>(middlewareEnhancer)
++  let storeEnhancers =
++    (typeof enhancers === 'function'
++      ? enhancers(getDefaultEnhancers)
++      : enhancers) ?? getDefaultEnhancers()
+ 
+-  if (Array.isArray(enhancers)) {
+-    storeEnhancers = [middlewareEnhancer, ...enhancers]
+-  } else if (typeof enhancers === 'function') {
+-    storeEnhancers = enhancers(defaultEnhancers)
++  if (!IS_PRODUCTION && !Array.isArray(storeEnhancers)) {
++    throw new Error('enhancers must be an array')
++  }
++  if (
++    !IS_PRODUCTION &&
++    storeEnhancers.some((item: any) => typeof item !== 'function')
++  ) {
++    throw new Error(
++      'each enhancer provided to configureStore must be a function'
++    )
++  }
++  if (
++    !IS_PRODUCTION &&
++    finalMiddleware.length &&
++    !storeEnhancers.includes(middlewareEnhancer)
++  ) {
++    console.error(
++      'middlewares were provided, but middleware enhancer was not included in final enhancers'
++    )
+   }
+ 
+-  const composedEnhancer = finalCompose(...storeEnhancers) as StoreEnhancer<any>
++  const composedEnhancer: StoreEnhancer<any> = finalCompose(...storeEnhancers)
+ 
+   return createStore(rootReducer, preloadedState, composedEnhancer)
+ }
+diff --git a/packages/toolkit/src/getDefaultEnhancers.ts b/packages/toolkit/src/getDefaultEnhancers.ts
+new file mode 100644
+index 00000000..faf27654
+--- /dev/null
++++ b/packages/toolkit/src/getDefaultEnhancers.ts
+@@ -0,0 +1,29 @@
++import type { StoreEnhancer } from 'redux'
++import type { AutoBatchOptions } from './autoBatchEnhancer'
++import { autoBatchEnhancer } from './autoBatchEnhancer'
++import { EnhancerArray } from './utils'
++import type { Middlewares } from './configureStore'
++import type { ExtractDispatchExtensions } from './tsHelpers'
++
++type GetDefaultEnhancersOptions = {
++  autoBatch?: boolean | AutoBatchOptions
++}
++
++export type GetDefaultEnhancers<M extends Middlewares<any>> = (
++  options?: GetDefaultEnhancersOptions
++) => EnhancerArray<[StoreEnhancer<{ dispatch: ExtractDispatchExtensions<M> }>]>
++
++export const buildGetDefaultEnhancers = <M extends Middlewares<any>>(
++  middlewareEnhancer: StoreEnhancer<{ dispatch: ExtractDispatchExtensions<M> }>
++): GetDefaultEnhancers<M> =>
++  function getDefaultEnhancers(options) {
++    const { autoBatch = true } = options ?? {}
++
++    let enhancerArray = new EnhancerArray<StoreEnhancer[]>(middlewareEnhancer)
++    if (autoBatch) {
++      enhancerArray.push(
++        autoBatchEnhancer(typeof autoBatch === 'object' ? autoBatch : undefined)
++      )
++    }
++    return enhancerArray as any
++  }
+diff --git a/packages/toolkit/src/getDefaultMiddleware.ts b/packages/toolkit/src/getDefaultMiddleware.ts
+index c7990bf3..12ce3ad9 100644
+--- a/packages/toolkit/src/getDefaultMiddleware.ts
++++ b/packages/toolkit/src/getDefaultMiddleware.ts
+@@ -39,8 +39,8 @@ export type ThunkMiddlewareFor<
+   ? ThunkMiddleware<S, AnyAction, E>
+   : ThunkMiddleware<S, AnyAction>
+ 
+-export type CurriedGetDefaultMiddleware<S = any> = <
+-  O extends Partial<GetDefaultMiddlewareOptions> = {
++export type GetDefaultMiddleware<S = any> = <
++  O extends GetDefaultMiddlewareOptions = {
+     thunk: true
+     immutableCheck: true
+     serializableCheck: true
+@@ -50,92 +50,64 @@ export type CurriedGetDefaultMiddleware<S = any> = <
+   options?: O
+ ) => MiddlewareArray<ExcludeFromTuple<[ThunkMiddlewareFor<S, O>], never>>
+ 
+-export function curryGetDefaultMiddleware<
+-  S = any
+->(): CurriedGetDefaultMiddleware<S> {
+-  return function curriedGetDefaultMiddleware(options) {
+-    return getDefaultMiddleware(options)
+-  }
+-}
+-
+-/**
+- * Returns any array containing the default middleware installed by
+- * `configureStore()`. Useful if you want to configure your store with a custom
+- * `middleware` array but still keep the default set.
+- *
+- * @return The default middleware used by `configureStore()`.
+- *
+- * @public
+- *
+- * @deprecated Prefer to use the callback notation for the `middleware` option in `configureStore`
+- * to access a pre-typed `getDefaultMiddleware` instead.
+- */
+-export function getDefaultMiddleware<
+-  S = any,
+-  O extends Partial<GetDefaultMiddlewareOptions> = {
+-    thunk: true
+-    immutableCheck: true
+-    serializableCheck: true
+-    actionCreatorCheck: true
+-  }
+->(
+-  options: O = {} as O
+-): MiddlewareArray<ExcludeFromTuple<[ThunkMiddlewareFor<S, O>], never>> {
+-  const {
+-    thunk = true,
+-    immutableCheck = true,
+-    serializableCheck = true,
+-    actionCreatorCheck = true,
+-  } = options
+-
+-  let middlewareArray = new MiddlewareArray<Middleware[]>()
+-
+-  if (thunk) {
+-    if (isBoolean(thunk)) {
+-      middlewareArray.push(thunkMiddleware)
+-    } else {
+-      middlewareArray.push(withExtraArgument(thunk.extraArgument))
++export const buildGetDefaultMiddleware = <S = any>(): GetDefaultMiddleware<S> =>
++  function getDefaultMiddleware(options) {
++    const {
++      thunk = true,
++      immutableCheck = true,
++      serializableCheck = true,
++      actionCreatorCheck = true,
++    } = options ?? {}
++
++    let middlewareArray = new MiddlewareArray<Middleware[]>()
++
++    if (thunk) {
++      if (isBoolean(thunk)) {
++        middlewareArray.push(thunkMiddleware)
++      } else {
++        middlewareArray.push(withExtraArgument(thunk.extraArgument))
++      }
+     }
+-  }
+ 
+-  if (process.env.NODE_ENV !== 'production') {
+-    if (immutableCheck) {
+-      /* PROD_START_REMOVE_UMD */
+-      let immutableOptions: ImmutableStateInvariantMiddlewareOptions = {}
++    if (process.env.NODE_ENV !== 'production') {
++      if (immutableCheck) {
++        /* PROD_START_REMOVE_UMD */
++        let immutableOptions: ImmutableStateInvariantMiddlewareOptions = {}
++
++        if (!isBoolean(immutableCheck)) {
++          immutableOptions = immutableCheck
++        }
+ 
+-      if (!isBoolean(immutableCheck)) {
+-        immutableOptions = immutableCheck
++        middlewareArray.unshift(
++          createImmutableStateInvariantMiddleware(immutableOptions)
++        )
++        /* PROD_STOP_REMOVE_UMD */
+       }
+ 
+-      middlewareArray.unshift(
+-        createImmutableStateInvariantMiddleware(immutableOptions)
+-      )
+-      /* PROD_STOP_REMOVE_UMD */
+-    }
++      if (serializableCheck) {
++        let serializableOptions: SerializableStateInvariantMiddlewareOptions =
++          {}
+ 
+-    if (serializableCheck) {
+-      let serializableOptions: SerializableStateInvariantMiddlewareOptions = {}
++        if (!isBoolean(serializableCheck)) {
++          serializableOptions = serializableCheck
++        }
+ 
+-      if (!isBoolean(serializableCheck)) {
+-        serializableOptions = serializableCheck
++        middlewareArray.push(
++          createSerializableStateInvariantMiddleware(serializableOptions)
++        )
+       }
++      if (actionCreatorCheck) {
++        let actionCreatorOptions: ActionCreatorInvariantMiddlewareOptions = {}
+ 
+-      middlewareArray.push(
+-        createSerializableStateInvariantMiddleware(serializableOptions)
+-      )
+-    }
+-    if (actionCreatorCheck) {
+-      let actionCreatorOptions: ActionCreatorInvariantMiddlewareOptions = {}
++        if (!isBoolean(actionCreatorCheck)) {
++          actionCreatorOptions = actionCreatorCheck
++        }
+ 
+-      if (!isBoolean(actionCreatorCheck)) {
+-        actionCreatorOptions = actionCreatorCheck
++        middlewareArray.unshift(
++          createActionCreatorInvariantMiddleware(actionCreatorOptions)
++        )
+       }
+-
+-      middlewareArray.unshift(
+-        createActionCreatorInvariantMiddleware(actionCreatorOptions)
+-      )
+     }
+-  }
+ 
+-  return middlewareArray as any
+-}
++    return middlewareArray as any
++  }
+diff --git a/packages/toolkit/src/index.ts b/packages/toolkit/src/index.ts
+index dc1f3337..656df6b8 100644
+--- a/packages/toolkit/src/index.ts
++++ b/packages/toolkit/src/index.ts
+@@ -23,7 +23,6 @@ export {
+ } from './configureStore'
+ export type {
+   // types
+-  ConfigureEnhancersCallback,
+   ConfigureStoreOptions,
+   EnhancedStore,
+ } from './configureStore'
+diff --git a/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts b/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
+index f3ce76d3..d50bafea 100644
+--- a/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
++++ b/packages/toolkit/src/query/core/buildMiddleware/batchActions.ts
+@@ -6,28 +6,9 @@ import type {
+   Subscribers,
+ } from '../apiState'
+ import { produceWithPatches } from 'immer'
+-import type { AnyAction } from '@reduxjs/toolkit';
++import type { AnyAction } from '@reduxjs/toolkit'
+ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
+ 
+-// Copied from https://github.com/feross/queue-microtask
+-let promise: Promise<any>
+-const queueMicrotaskShim =
+-  typeof queueMicrotask === 'function'
+-    ? queueMicrotask.bind(
+-        typeof window !== 'undefined'
+-          ? window
+-          : typeof global !== 'undefined'
+-          ? global
+-          : globalThis
+-      )
+-    : // reuse resolved promise, and allocate it lazily
+-      (cb: () => void) =>
+-        (promise || (promise = Promise.resolve())).then(cb).catch((err: any) =>
+-          setTimeout(() => {
+-            throw err
+-          }, 0)
+-        )
+-
+ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+   [actionShouldContinue: boolean, subscriptionExists: boolean]
+ > = ({ api, queryThunk, internalState }) => {
+@@ -124,7 +105,7 @@ export const buildBatchedActionsHandler: InternalHandlerBuilder<
+ 
+     if (didMutate) {
+       if (!dispatchQueued) {
+-        queueMicrotaskShim(() => {
++        queueMicrotask(() => {
+           // Deep clone the current subscription data
+           const newSubscriptions: SubscriptionState = JSON.parse(
+             JSON.stringify(internalState.currentSubscriptions)

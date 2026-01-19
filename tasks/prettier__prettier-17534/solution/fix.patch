@@ -1,0 +1,656 @@
+diff --git a/changelog_unreleased/angular/17534.md b/changelog_unreleased/angular/17534.md
+new file mode 100644
+index 000000000..55e22a69d
+--- /dev/null
++++ b/changelog_unreleased/angular/17534.md
+@@ -0,0 +1,25 @@
++#### Support Angular 20 (#17534 by @fisker)
++
++<!-- prettier-ignore -->
++```angular
++// Input
++{{
++  ( (a in  (b)))
++}}
++{{
++  ( (tag ` a ${ b } \u0063 `))
++}}
++{{
++  (  (` a ${ b } \u0063 `))
++}}
++{{ void(1 + 2) }}
++
++// Prettier stable
++The new syntax not corretly recognized.
++
++// Prettier main
++{{ a in b }}
++{{ tag` a ${b} \u0063 ` }}
++{{ ` a ${b} \u0063 ` }}
++{{ void (1 + 2) }}
++```
+diff --git a/package.json b/package.json
+index 29ebcf299..01bb36b89 100644
+--- a/package.json
++++ b/package.json
+@@ -32,7 +32,7 @@
+     "bin"
+   ],
+   "dependencies": {
+-    "@angular/compiler": "19.2.8",
++    "@angular/compiler": "20.0.0",
+     "@babel/code-frame": "7.27.1",
+     "@babel/parser": "7.27.3",
+     "@babel/types": "7.27.3",
+@@ -44,7 +44,7 @@
+     "@typescript-eslint/visitor-keys": "8.33.0",
+     "acorn": "8.14.1",
+     "acorn-jsx": "5.3.2",
+-    "angular-estree-parser": "11.1.1",
++    "angular-estree-parser": "12.1.0",
+     "angular-html-parser": "8.1.0",
+     "camelcase": "8.0.0",
+     "ci-info": "4.2.0",
+diff --git a/src/language-js/parse/acorn.js b/src/language-js/parse/acorn.js
+index 6b194e618..de872d2cd 100644
+--- a/src/language-js/parse/acorn.js
++++ b/src/language-js/parse/acorn.js
+@@ -4,11 +4,7 @@ import createError from "../../common/parser-create-error.js";
+ import tryCombinations from "../../utils/try-combinations.js";
+ import postprocess from "./postprocess/index.js";
+ import createParser from "./utils/create-parser.js";
+-import {
+-  getSourceType,
+-  SOURCE_TYPE_COMBINATIONS,
+-  SOURCE_TYPE_MODULE,
+-} from "./utils/source-types.js";
++import getSourceType from "./utils/get-source-type.js";
+ 
+ /** @import {Options} from "acorn" */
+ 
+@@ -57,7 +53,7 @@ function parseWithOptions(text, sourceType) {
+   const ast = parser.parse(text, {
+     ...parseOptions,
+     sourceType,
+-    allowImportExportEverywhere: sourceType === SOURCE_TYPE_MODULE,
++    allowImportExportEverywhere: sourceType === "module",
+     onComment: comments,
+   });
+ 
+@@ -67,11 +63,11 @@ function parseWithOptions(text, sourceType) {
+   return ast;
+ }
+ 
+-function parse(text, options) {
+-  const sourceType = getSourceType(options?.filepath);
+-  const combinations = (
+-    sourceType ? [sourceType] : SOURCE_TYPE_COMBINATIONS
+-  ).map((sourceType) => () => parseWithOptions(text, sourceType));
++function parse(text, options = {}) {
++  const sourceType = getSourceType(options);
++  const combinations = (sourceType ? [sourceType] : ["module", "script"]).map(
++    (sourceType) => () => parseWithOptions(text, sourceType),
++  );
+ 
+   let ast;
+   try {
+diff --git a/src/language-js/parse/babel.js b/src/language-js/parse/babel.js
+index fa6d993e5..312c328e7 100644
+--- a/src/language-js/parse/babel.js
++++ b/src/language-js/parse/babel.js
+@@ -5,11 +5,7 @@ import getShebang from "../utils/get-shebang.js";
+ import postprocess from "./postprocess/index.js";
+ import createBabelParseError from "./utils/create-babel-parse-error.js";
+ import createParser from "./utils/create-parser.js";
+-import {
+-  getSourceType,
+-  SOURCE_TYPE_MODULE,
+-  SOURCE_TYPE_SCRIPT,
+-} from "./utils/source-types.js";
++import getSourceType from "./utils/get-source-type.js";
+ import wrapBabelExpression from "./utils/wrap-babel-expression.js";
+ 
+ const createBabelParser = (options) => createParser(createParse(options));
+@@ -22,7 +18,7 @@ const createBabelParser = (options) => createParser(createParse(options));
+ 
+ /** @type {ParserOptions} */
+ const parseOptions = {
+-  sourceType: SOURCE_TYPE_MODULE,
++  sourceType: "module",
+   allowImportExportEverywhere: true,
+   allowReturnOutsideFunction: true,
+   allowNewTargetOutsideFunction: true,
+@@ -74,8 +70,8 @@ const appendPlugins = (plugins, options = parseOptions) => ({
+ // Similar to babel
+ // https://github.com/babel/babel/pull/7934/files#diff-a739835084910b0ee3ea649df5a4d223R67
+ const FLOW_PRAGMA_REGEX = /@(?:no)?flow\b/u;
+-function isFlowFile(text, filepath) {
+-  if (filepath?.endsWith(".js.flow")) {
++function isFlowFile(text, options) {
++  if (options.filepath?.endsWith(".js.flow")) {
+     return true;
+   }
+ 
+@@ -107,25 +103,20 @@ function parseWithOptions(parse, text, options) {
+ 
+ function createParse({ isExpression = false, optionsCombinations }) {
+   return (text, options = {}) => {
+-    let { filepath } = options;
+-    if (typeof filepath !== "string") {
+-      filepath = undefined;
+-    }
+-
+     if (
+       (options.parser === "babel" || options.parser === "__babel_estree") &&
+-      isFlowFile(text, filepath)
++      isFlowFile(text, options)
+     ) {
+       options.parser = "babel-flow";
+       return babelFlow.parse(text, options);
+     }
+ 
+     let combinations = optionsCombinations;
+-    const sourceType = options.__babelSourceType ?? getSourceType(filepath);
+-    if (sourceType === SOURCE_TYPE_SCRIPT) {
++    const sourceType = options.__babelSourceType ?? getSourceType(options);
++    if (sourceType === "script") {
+       combinations = combinations.map((options) => ({
+         ...options,
+-        sourceType,
++        sourceType: "script",
+       }));
+     }
+ 
+diff --git a/src/language-js/parse/espree.js b/src/language-js/parse/espree.js
+index 1df42d7e7..0ee0e4812 100644
+--- a/src/language-js/parse/espree.js
++++ b/src/language-js/parse/espree.js
+@@ -3,10 +3,7 @@ import createError from "../../common/parser-create-error.js";
+ import tryCombinations from "../../utils/try-combinations.js";
+ import postprocess from "./postprocess/index.js";
+ import createParser from "./utils/create-parser.js";
+-import {
+-  getSourceType,
+-  SOURCE_TYPE_COMBINATIONS,
+-} from "./utils/source-types.js";
++import getSourceType from "./utils/get-source-type.js";
+ 
+ /** @import {Options} from "espree" */
+ 
+@@ -17,6 +14,7 @@ const parseOptions = {
+   loc: false,
+   comment: true,
+   tokens: false,
++  sourceType: "module",
+   ecmaFeatures: {
+     jsx: true,
+     globalReturn: true,
+@@ -38,12 +36,15 @@ function createParseError(error) {
+   });
+ }
+ 
+-function parse(text, options) {
+-  const sourceType = getSourceType(options?.filepath);
++function parse(text, options = {}) {
++  const sourceType = getSourceType(options);
++  // prettier-ignore
+   const combinations = (
+-    sourceType ? [sourceType] : SOURCE_TYPE_COMBINATIONS
++    sourceType
++      ? /** @type {const} */([sourceType])
++      : /** @type {const} */(["module", "script"])
+   ).map(
+-    (sourceType) => () => espreeParse(text, { ...parseOptions, sourceType }),
++    (sourceType) => () => espreeParse(text, { ...parseOptions, sourceType })
+   );
+ 
+   let ast;
+diff --git a/src/language-js/parse/meriyah.js b/src/language-js/parse/meriyah.js
+index 0f45f5b92..26c68f6ef 100644
+--- a/src/language-js/parse/meriyah.js
++++ b/src/language-js/parse/meriyah.js
+@@ -3,11 +3,7 @@ import createError from "../../common/parser-create-error.js";
+ import tryCombinations from "../../utils/try-combinations.js";
+ import postprocess from "./postprocess/index.js";
+ import createParser from "./utils/create-parser.js";
+-import {
+-  getSourceType,
+-  SOURCE_TYPE_COMBINATIONS,
+-  SOURCE_TYPE_MODULE,
+-} from "./utils/source-types.js";
++import getSourceType from "./utils/get-source-type.js";
+ 
+ // https://github.com/meriyah/meriyah/blob/4676f60b6c149d7082bde2c9147f9ae2359c8075/src/parser.ts#L185
+ const parseOptions = {
+@@ -47,7 +43,7 @@ function parseWithOptions(text, sourceType) {
+   /** @type {any} */
+   const ast = meriyahParse(text, {
+     ...parseOptions,
+-    module: sourceType === SOURCE_TYPE_MODULE,
++    module: sourceType === "module",
+     onComment: comments,
+   });
+   ast.comments = comments;
+@@ -83,11 +79,11 @@ function createParseError(error) {
+   });
+ }
+ 
+-function parse(text, options) {
+-  const sourceType = getSourceType(options?.filepath);
+-  const combinations = (
+-    sourceType ? [sourceType] : SOURCE_TYPE_COMBINATIONS
+-  ).map((sourceType) => () => parseWithOptions(text, sourceType));
++function parse(text, options = {}) {
++  const sourceType = getSourceType(options);
++  const combinations = (sourceType ? [sourceType] : ["module", "script"]).map(
++    (sourceType) => () => parseWithOptions(text, sourceType),
++  );
+ 
+   let ast;
+   try {
+diff --git a/src/language-js/parse/oxc.js b/src/language-js/parse/oxc.js
+index 3b96e6d2e..44b9fdc96 100644
+--- a/src/language-js/parse/oxc.js
++++ b/src/language-js/parse/oxc.js
+@@ -4,8 +4,7 @@ import createError from "../../common/parser-create-error.js";
+ import { tryCombinationsAsync } from "../../utils/try-combinations.js";
+ import postprocess from "./postprocess/index.js";
+ import createParser from "./utils/create-parser.js";
+-import jsxRegexp from "./utils/jsx-regexp.evaluate.js";
+-import { getSourceType } from "./utils/source-types.js";
++import getSourceType from "./utils/get-source-type.js";
+ 
+ function createParseError(error, { text }) {
+   const {
+@@ -26,11 +25,16 @@ function createParseError(error, { text }) {
+   });
+ }
+ 
+-async function parseWithOptions(filepath, text, options) {
+-  const result = await oxcParse(filepath, text, {
++let cachedIsRawTransferSupported;
++const isRawTransferSupported = () => {
++  cachedIsRawTransferSupported ??= rawTransferSupported();
++  return cachedIsRawTransferSupported;
++};
++
++async function parseWithOptions(filename, text, options) {
++  const result = await oxcParse(filename, text, {
+     preserveParens: true,
+-    experimentalRawTransfer: rawTransferSupported(),
+-    showSemanticErrors: false,
++    experimentalRawTransfer: isRawTransferSupported(),
+     ...options,
+   });
+ 
+@@ -50,45 +54,59 @@ async function parseWithOptions(filepath, text, options) {
+   return result;
+ }
+ 
+-async function parseJs(text, options) {
+-  const filepath = options?.filepath;
+-  const sourceType = getSourceType(filepath);
++async function parseJs(text, options = {}) {
++  const sourceType = getSourceType(options);
++  let { filepath } = options;
++  if (typeof filepath !== "string") {
++    filepath = "prettier.jsx";
++  }
+ 
+-  const { program: ast, comments } = await parseWithOptions(
+-    typeof filepath === "string" ? filepath : "prettier.jsx",
+-    text,
+-    {
+-      sourceType,
+-      lang: "jsx",
+-    },
++  const combinations = (sourceType ? [sourceType] : ["module", "script"]).map(
++    (sourceType) => () =>
++      parseWithOptions(filepath, text, { sourceType, lang: "jsx" }),
+   );
+ 
++  let result;
++  try {
++    result = await tryCombinationsAsync(combinations);
++  } catch (/** @type {any} */ { errors: [error] }) {
++    throw error;
++  }
++
++  const { program: ast, comments } = result;
+   // @ts-expect-error -- expected
+   ast.comments = comments;
+ 
+   return postprocess(ast, { text, parser: "oxc" });
+ }
+ 
+-async function parseTs(text, options) {
+-  let filepath = options?.filepath;
+-  const sourceType = getSourceType(filepath);
+-  const parseOptions = { sourceType, astType: "ts" };
+-  const isKnownJsx =
+-    typeof filepath === "string" && /\.(?:jsx|tsx)$/iu.test(filepath);
++function getTsParseOptionsCombinations(text, options) {
++  const sourceType = getSourceType(options);
++  /** @type {("module" | "script") []} */
++  const sourceTypes = sourceType ? [sourceType] : ["module", "script"];
++  const combinations = sourceTypes.map((sourceType) => ({ sourceType }));
++
++  const extension = options.filepath?.toLowerCase().split(".").at(-1);
++  const isKnownJsx = extension === "jsx" || extension === "tsx";
+ 
+-  let parseOptionsCombinations = [];
+   if (isKnownJsx) {
+-    parseOptionsCombinations = [{ ...parseOptions, lang: "tsx" }];
+-  } else {
+-    const shouldEnableJsx = jsxRegexp.test(text);
+-    parseOptionsCombinations = [shouldEnableJsx, !shouldEnableJsx].map(
+-      (shouldEnableJsx) => ({
+-        ...parseOptions,
+-        lang: shouldEnableJsx ? "tsx" : "ts",
+-      }),
+-    );
++    return combinations.map((parseOptions) => ({
++      ...parseOptions,
++      lang: "tsx",
++    }));
+   }
+ 
++  const shouldEnableJsx = isProbablyJsx(text);
++  return combinations.flatMap((parseOptions) =>
++    [shouldEnableJsx, !shouldEnableJsx].map((jsx) =>
++      jsx ? { ...parseOptions, lang: "tsx" } : { ...parseOptions, lang: "ts" },
++    ),
++  );
++}
++
++async function parseTs(text, options = {}) {
++  const parseOptionsCombinations = getTsParseOptionsCombinations(text, options);
++  let { filepath } = options;
+   if (typeof filepath !== "string") {
+     filepath = "prettier.tsx";
+   }
+@@ -97,7 +115,8 @@ async function parseTs(text, options) {
+   try {
+     result = await tryCombinationsAsync(
+       parseOptionsCombinations.map(
+-        (parseOptions) => () => parseWithOptions(filepath, text, parseOptions),
++        (parseOptions) => () =>
++          parseWithOptions(filepath, text, { ...parseOptions, astType: "ts" }),
+       ),
+     );
+   } catch ({
+@@ -113,6 +132,22 @@ async function parseTs(text, options) {
+   return postprocess(ast, { text, parser: "oxc", oxcAstType: "ts" });
+ }
+ 
++/**
++ * Use a naive regular expression to detect JSX
++ * copied from typescript.js
++ */
++function isProbablyJsx(text) {
++  return new RegExp(
++    // eslint-disable-next-line regexp/no-useless-non-capturing-group -- possible bug
++    [
++      "(?:^[^\"'`]*</)", // Contains "</" when probably not in a string
++      "|",
++      "(?:^[^/]{2}.*/>)", // Contains "/>" on line not starting with "//"
++    ].join(""),
++    "mu",
++  ).test(text);
++}
++
+ const oxc = createParser(parseJs);
+ const oxcTs = createParser(parseTs);
+ 
+diff --git a/src/language-js/parse/typescript.js b/src/language-js/parse/typescript.js
+index c0a555112..5b0c66b43 100644
+--- a/src/language-js/parse/typescript.js
++++ b/src/language-js/parse/typescript.js
+@@ -3,12 +3,8 @@ import createError from "../../common/parser-create-error.js";
+ import tryCombinations from "../../utils/try-combinations.js";
+ import postprocess from "./postprocess/index.js";
+ import createParser from "./utils/create-parser.js";
+-import jsxRegexp from "./utils/jsx-regexp.evaluate.js";
++import getSourceType from "./utils/get-source-type.js";
+ import replaceHashbang from "./utils/replace-hashbang.js";
+-import {
+-  getSourceType,
+-  SOURCE_TYPE_COMBINATIONS,
+-} from "./utils/source-types.js";
+ 
+ /** @import {TSESTreeOptions} from "@typescript-eslint/typescript-estree" */
+ 
+@@ -51,41 +47,40 @@ function createParseError(error) {
+ 
+ // https://typescript-eslint.io/packages/parser/#jsx
+ const isKnownFileType = (filepath) =>
+-  filepath && /\.(?:js|mjs|cjs|jsx|ts|mts|cts|tsx)$/iu.test(filepath);
++  /\.(?:js|mjs|cjs|jsx|ts|mts|cts|tsx)$/iu.test(filepath);
++
++function getParseOptionsCombinations(text, options) {
++  const filepath = options?.filepath;
+ 
+-function getParseOptionsCombinations(text, filepath) {
+   let combinations = [{ ...baseParseOptions, filePath: filepath }];
+ 
+-  const sourceType = getSourceType(filepath);
++  const sourceType = getSourceType(options);
+   if (sourceType) {
+     combinations = combinations.map((parseOptions) => ({
+       ...parseOptions,
+       sourceType,
+     }));
+   } else {
+-    combinations = SOURCE_TYPE_COMBINATIONS.flatMap((sourceType) =>
++    /** @type {("module" | "script") []} */
++    const sourceTypes = ["module", "script"];
++    combinations = sourceTypes.flatMap((sourceType) =>
+       combinations.map((parseOptions) => ({ ...parseOptions, sourceType })),
+     );
+   }
+ 
+-  if (isKnownFileType(filepath)) {
++  if (filepath && isKnownFileType(filepath)) {
+     return combinations;
+   }
+ 
+-  const shouldEnableJsx = jsxRegexp.test(text);
++  const shouldEnableJsx = isProbablyJsx(text);
+   return [shouldEnableJsx, !shouldEnableJsx].flatMap((jsx) =>
+     combinations.map((parseOptions) => ({ ...parseOptions, jsx })),
+   );
+ }
+ 
+-function parse(text, options) {
+-  let filepath = options?.filepath;
+-  if (typeof filepath !== "string") {
+-    filepath = undefined;
+-  }
+-
++function parse(text, options = {}) {
+   const textToParse = replaceHashbang(text);
+-  const parseOptionsCombinations = getParseOptionsCombinations(text, filepath);
++  const parseOptionsCombinations = getParseOptionsCombinations(text, options);
+ 
+   let ast;
+   try {
+@@ -107,4 +102,19 @@ function parse(text, options) {
+   return postprocess(ast, { parser: "typescript", text });
+ }
+ 
++/**
++ * Use a naive regular expression to detect JSX
++ */
++function isProbablyJsx(text) {
++  return new RegExp(
++    // eslint-disable-next-line regexp/no-useless-non-capturing-group -- possible bug
++    [
++      "(?:^[^\"'`]*</)", // Contains "</" when probably not in a string
++      "|",
++      "(?:^[^/]{2}.*/>)", // Contains "/>" on line not starting with "//"
++    ].join(""),
++    "mu",
++  ).test(text);
++}
++
+ export const typescript = createParser(parse);
+diff --git a/src/language-js/parse/utils/get-source-type.js b/src/language-js/parse/utils/get-source-type.js
+new file mode 100644
+index 000000000..a8ac05c21
+--- /dev/null
++++ b/src/language-js/parse/utils/get-source-type.js
+@@ -0,0 +1,18 @@
++/** @returns {"module" | "script" | undefined} */
++function getSourceType(options) {
++  let { filepath } = options;
++  if (!filepath) {
++    return;
++  }
++  filepath = filepath.toLowerCase();
++
++  if (filepath.endsWith(".cjs") || filepath.endsWith(".cts")) {
++    return "script";
++  }
++
++  if (filepath.endsWith(".mjs") || filepath.endsWith(".mts")) {
++    return "module";
++  }
++}
++
++export default getSourceType;
+diff --git a/src/language-js/parse/utils/jsx-regexp.evaluate.js b/src/language-js/parse/utils/jsx-regexp.evaluate.js
+deleted file mode 100644
+index 12e70b269..000000000
+--- a/src/language-js/parse/utils/jsx-regexp.evaluate.js
++++ /dev/null
+@@ -1,12 +0,0 @@
+-/**
+- * Use a naive regular expression to detect JSX
+- * copied from typescript.js
+- */
+-export default new RegExp(
+-  [
+-    "^[^\"'`]*</", // Contains "</" when probably not in a string
+-    "|",
+-    "^[^/]{2}.*/>", // Contains "/>" on line not starting with "//"
+-  ].join(""),
+-  "mu",
+-);
+diff --git a/src/language-js/parse/utils/source-types.js b/src/language-js/parse/utils/source-types.js
+deleted file mode 100644
+index e09a2d387..000000000
+--- a/src/language-js/parse/utils/source-types.js
++++ /dev/null
+@@ -1,25 +0,0 @@
+-export const SOURCE_TYPE_MODULE = "module";
+-export const SOURCE_TYPE_SCRIPT = "script";
+-
+-/** @type {["module", "script"]} */
+-export const SOURCE_TYPE_COMBINATIONS = [
+-  SOURCE_TYPE_MODULE,
+-  SOURCE_TYPE_SCRIPT,
+-];
+-
+-/** @returns {"module" | "script" | undefined} */
+-export function getSourceType(filepath) {
+-  if (typeof filepath !== "string") {
+-    return;
+-  }
+-
+-  filepath = filepath.toLowerCase();
+-
+-  if (/\.(?:mjs|mts)$/iu.test(filepath)) {
+-    return SOURCE_TYPE_MODULE;
+-  }
+-
+-  if (/\.(?:cjs|cts)$/iu.test(filepath)) {
+-    return SOURCE_TYPE_SCRIPT;
+-  }
+-}
+diff --git a/src/language-js/traverse/visitor-keys.evaluate.js b/src/language-js/traverse/visitor-keys.evaluate.js
+index a0a64a80f..624561a32 100644
+--- a/src/language-js/traverse/visitor-keys.evaluate.js
++++ b/src/language-js/traverse/visitor-keys.evaluate.js
+@@ -1,23 +1,12 @@
+ import { VISITOR_KEYS as babelVisitorKeys } from "@babel/types";
+ import { visitorKeys as tsVisitorKeys } from "@typescript-eslint/visitor-keys";
++import { visitorKeys as angularVisitorKeys } from "angular-estree-parser";
+ import flowVisitorKeys from "hermes-parser/dist/generated/ESTreeVisitorKeys.js";
+ import unionVisitorKeys from "./union-visitor-keys.js";
+ 
+-const angularVisitorKeys = {
+-  NGRoot: ["node"],
+-  NGPipeExpression: ["left", "right", "arguments"],
+-  NGChainedExpression: ["expressions"],
+-  NGEmptyExpression: [],
+-  NGMicrosyntax: ["body"],
+-  NGMicrosyntaxKey: [],
+-  NGMicrosyntaxExpression: ["expression", "alias"],
+-  NGMicrosyntaxKeyedExpression: ["key", "expression"],
+-  NGMicrosyntaxLet: ["key", "value"],
+-  NGMicrosyntaxAs: ["key", "alias"],
+-};
+-
+ const additionalVisitorKeys = {
+   // Prettier
++  NGRoot: ["node"],
+   JsExpressionRoot: ["node"],
+   JsonRoot: ["node"],
+ 
+diff --git a/yarn.lock b/yarn.lock
+index b1d895133..de3414d74 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -15,12 +15,12 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@angular/compiler@npm:19.2.8":
+-  version: 19.2.8
+-  resolution: "@angular/compiler@npm:19.2.8"
++"@angular/compiler@npm:20.0.0":
++  version: 20.0.0
++  resolution: "@angular/compiler@npm:20.0.0"
+   dependencies:
+     tslib: "npm:^2.3.0"
+-  checksum: 10/829585e245591d84ac2369c1e3089216b2c393e41b7eb5efc527b30404b7b70bdb62b10f36e3cbdbfdc714692a1973eaa51588fddf60b34198322b2f7035b153
++  checksum: 10/227eb7dc6dbb40f12884840daebcc85be0d8aca2d9c5c9c2b97921a2b56c65046d21f3a1841236abe09287818da6c776c908927465aa09fb0a78f0d1937623ea
+   languageName: node
+   linkType: hard
+ 
+@@ -2538,12 +2538,12 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"angular-estree-parser@npm:11.1.1":
+-  version: 11.1.1
+-  resolution: "angular-estree-parser@npm:11.1.1"
++"angular-estree-parser@npm:12.1.0":
++  version: 12.1.0
++  resolution: "angular-estree-parser@npm:12.1.0"
+   peerDependencies:
+-    "@angular/compiler": ">=19.2.2"
+-  checksum: 10/b1a6dfc7761de40814e1d85f773ac0aaef4e7ed0e4f94f905d1b460cc91c0e94005e85d47d3e99f6bc0f12433291e556d3cbf198339ce3fb7d888e1f5699f036
++    "@angular/compiler": ^20.0.0
++  checksum: 10/a24f03c49133ab07ccc6c9fac78627deddc04511387e51809f322c27afbde3816099f33e2f846ef6d3d0ed97aa819717b6c95af4dfb19a3ad8dc430043c7ee46
+   languageName: node
+   linkType: hard
+ 
+@@ -7210,7 +7210,7 @@ __metadata:
+   version: 0.0.0-use.local
+   resolution: "prettier@workspace:."
+   dependencies:
+-    "@angular/compiler": "npm:19.2.8"
++    "@angular/compiler": "npm:20.0.0"
+     "@babel/code-frame": "npm:7.27.1"
+     "@babel/generator": "npm:7.27.3"
+     "@babel/parser": "npm:7.27.3"
+@@ -7229,7 +7229,7 @@ __metadata:
+     "@typescript-eslint/visitor-keys": "npm:8.33.0"
+     acorn: "npm:8.14.1"
+     acorn-jsx: "npm:5.3.2"
+-    angular-estree-parser: "npm:11.1.1"
++    angular-estree-parser: "npm:12.1.0"
+     angular-html-parser: "npm:8.1.0"
+     browserslist: "npm:4.24.5"
+     browserslist-to-esbuild: "npm:2.1.1"

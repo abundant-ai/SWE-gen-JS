@@ -1,0 +1,1261 @@
+diff --git a/docs/developer-guide/nodejs-api.md b/docs/developer-guide/nodejs-api.md
+index fd000f8fc..ec53551c5 100644
+--- a/docs/developer-guide/nodejs-api.md
++++ b/docs/developer-guide/nodejs-api.md
+@@ -1079,12 +1079,14 @@ const isIgnored = cli.isPathIgnored("foo/bar.js");
+ Retrieves a formatter, which you can then use to format a report object. The argument is either the name of a built-in formatter:
+ 
+ * "[checkstyle](../user-guide/formatters#checkstyle)"
++* "[codeframe](../user-guide/formatters#codeframe)"
+ * "[compact](../user-guide/formatters#compact)"
+ * "[html](../user-guide/formatters#html)"
+ * "[jslint-xml](../user-guide/formatters#jslint-xml)"
+ * "[json](../user-guide/formatters#json)"
+ * "[junit](../user-guide/formatters#junit)"
+ * "[stylish](../user-guide/formatters#stylish)" (the default)
++* "[table](../user-guide/formatters#table)"
+ * "[tap](../user-guide/formatters#tap)"
+ * "[unix](../user-guide/formatters#unix)"
+ * "[visualstudio](../user-guide/formatters#visualstudio)"
+diff --git a/docs/user-guide/command-line-interface.md b/docs/user-guide/command-line-interface.md
+index 526b4036b..99fd61eb9 100644
+--- a/docs/user-guide/command-line-interface.md
++++ b/docs/user-guide/command-line-interface.md
+@@ -337,12 +337,14 @@ When specified, the given format is output into the provided file name.
+ This option specifies the output format for the console. Possible formats are:
+ 
+ * [checkstyle](formatters.md/#checkstyle)
++* [codeframe](formatters.md/#codeframe)
+ * [compact](formatters.md/#compact)
+ * [html](formatters.md/#html)
+ * [jslint-xml](formatters.md/#jslint-xml)
+ * [json](formatters.md/#json)
+ * [junit](formatters.md/#junit)
+ * [stylish](formatters.md/#stylish) (the default)
++* [table](formatters.md/#table)
+ * [tap](formatters.md/#tap)
+ * [unix](formatters.md/#unix)
+ * [visualstudio](formatters.md/#visualstudio)
+diff --git a/lib/cli-engine/cli-engine.js b/lib/cli-engine/cli-engine.js
+index ebb456949..ca298f9c3 100644
+--- a/lib/cli-engine/cli-engine.js
++++ b/lib/cli-engine/cli-engine.js
+@@ -1013,11 +1013,7 @@ class CLIEngine {
+             try {
+                 return require(formatterPath);
+             } catch (ex) {
+-                if (format === "table" || format === "codeframe") {
+-                    ex.message = `The ${format} formatter is no longer part of core ESLint. Install it manually with \`npm install -D eslint-formatter-${format}\``;
+-                } else {
+-                    ex.message = `There was a problem loading formatter: ${formatterPath}\nError: ${ex.message}`;
+-                }
++                ex.message = `There was a problem loading formatter: ${formatterPath}\nError: ${ex.message}`;
+                 throw ex;
+             }
+ 
+diff --git a/lib/cli-engine/formatters/codeframe.js b/lib/cli-engine/formatters/codeframe.js
+new file mode 100644
+index 000000000..41e3ab7b0
+--- /dev/null
++++ b/lib/cli-engine/formatters/codeframe.js
+@@ -0,0 +1,138 @@
++/**
++ * @fileoverview Codeframe reporter
++ * @author Vitor Balocco
++ */
++"use strict";
++
++const chalk = require("chalk");
++const { codeFrameColumns } = require("@babel/code-frame");
++const path = require("path");
++
++//------------------------------------------------------------------------------
++// Helpers
++//------------------------------------------------------------------------------
++
++/**
++ * Given a word and a count, append an s if count is not one.
++ * @param   {string} word  A word in its singular form.
++ * @param   {number} count A number controlling whether word should be pluralized.
++ * @returns {string}       The original word with an s on the end if count is not one.
++ */
++function pluralize(word, count) {
++    return (count === 1 ? word : `${word}s`);
++}
++
++/**
++ * Gets a formatted relative file path from an absolute path and a line/column in the file.
++ * @param   {string} filePath The absolute file path to format.
++ * @param   {number} line     The line from the file to use for formatting.
++ * @param   {number} column   The column from the file to use for formatting.
++ * @returns {string}          The formatted file path.
++ */
++function formatFilePath(filePath, line, column) {
++    let relPath = path.relative(process.cwd(), filePath);
++
++    if (line && column) {
++        relPath += `:${line}:${column}`;
++    }
++
++    return chalk.green(relPath);
++}
++
++/**
++ * Gets the formatted output for a given message.
++ * @param   {Object} message      The object that represents this message.
++ * @param   {Object} parentResult The result object that this message belongs to.
++ * @returns {string}              The formatted output.
++ */
++function formatMessage(message, parentResult) {
++    const type = (message.fatal || message.severity === 2) ? chalk.red("error") : chalk.yellow("warning");
++    const msg = `${chalk.bold(message.message.replace(/([^ ])\.$/u, "$1"))}`;
++    const ruleId = message.fatal ? "" : chalk.dim(`(${message.ruleId})`);
++    const filePath = formatFilePath(parentResult.filePath, message.line, message.column);
++    const sourceCode = parentResult.output ? parentResult.output : parentResult.source;
++
++    const firstLine = [
++        `${type}:`,
++        `${msg}`,
++        ruleId ? `${ruleId}` : "",
++        sourceCode ? `at ${filePath}:` : `at ${filePath}`
++    ].filter(String).join(" ");
++
++    const result = [firstLine];
++
++    if (sourceCode) {
++        result.push(
++            codeFrameColumns(sourceCode, { start: { line: message.line, column: message.column } }, { highlightCode: false })
++        );
++    }
++
++    return result.join("\n");
++}
++
++/**
++ * Gets the formatted output summary for a given number of errors and warnings.
++ * @param   {number} errors   The number of errors.
++ * @param   {number} warnings The number of warnings.
++ * @param   {number} fixableErrors The number of fixable errors.
++ * @param   {number} fixableWarnings The number of fixable warnings.
++ * @returns {string}          The formatted output summary.
++ */
++function formatSummary(errors, warnings, fixableErrors, fixableWarnings) {
++    const summaryColor = errors > 0 ? "red" : "yellow";
++    const summary = [];
++    const fixablesSummary = [];
++
++    if (errors > 0) {
++        summary.push(`${errors} ${pluralize("error", errors)}`);
++    }
++
++    if (warnings > 0) {
++        summary.push(`${warnings} ${pluralize("warning", warnings)}`);
++    }
++
++    if (fixableErrors > 0) {
++        fixablesSummary.push(`${fixableErrors} ${pluralize("error", fixableErrors)}`);
++    }
++
++    if (fixableWarnings > 0) {
++        fixablesSummary.push(`${fixableWarnings} ${pluralize("warning", fixableWarnings)}`);
++    }
++
++    let output = chalk[summaryColor].bold(`${summary.join(" and ")} found.`);
++
++    if (fixableErrors || fixableWarnings) {
++        output += chalk[summaryColor].bold(`\n${fixablesSummary.join(" and ")} potentially fixable with the \`--fix\` option.`);
++    }
++
++    return output;
++}
++
++//------------------------------------------------------------------------------
++// Public Interface
++//------------------------------------------------------------------------------
++
++module.exports = function(results) {
++    let errors = 0;
++    let warnings = 0;
++    let fixableErrors = 0;
++    let fixableWarnings = 0;
++
++    const resultsWithMessages = results.filter(result => result.messages.length > 0);
++
++    let output = resultsWithMessages.reduce((resultsOutput, result) => {
++        const messages = result.messages.map(message => `${formatMessage(message, result)}\n\n`);
++
++        errors += result.errorCount;
++        warnings += result.warningCount;
++        fixableErrors += result.fixableErrorCount;
++        fixableWarnings += result.fixableWarningCount;
++
++        return resultsOutput.concat(messages);
++    }, []).join("\n");
++
++    output += "\n";
++    output += formatSummary(errors, warnings, fixableErrors, fixableWarnings);
++
++    return (errors + warnings) > 0 ? output : "";
++};
+diff --git a/lib/cli-engine/formatters/table.js b/lib/cli-engine/formatters/table.js
+new file mode 100644
+index 000000000..a74cce0d5
+--- /dev/null
++++ b/lib/cli-engine/formatters/table.js
+@@ -0,0 +1,159 @@
++/**
++ * @fileoverview "table reporter.
++ * @author Gajus Kuizinas <gajus@gajus.com>
++ */
++"use strict";
++
++//------------------------------------------------------------------------------
++// Requirements
++//------------------------------------------------------------------------------
++
++const chalk = require("chalk"),
++    table = require("table").table;
++
++//------------------------------------------------------------------------------
++// Helpers
++//------------------------------------------------------------------------------
++
++/**
++ * Given a word and a count, append an "s" if count is not one.
++ * @param {string} word A word.
++ * @param {number} count Quantity.
++ * @returns {string} The original word with an s on the end if count is not one.
++ */
++function pluralize(word, count) {
++    return (count === 1 ? word : `${word}s`);
++}
++
++/**
++ * Draws text table.
++ * @param {Array<Object>} messages Error messages relating to a specific file.
++ * @returns {string} A text table.
++ */
++function drawTable(messages) {
++    const rows = [];
++
++    if (messages.length === 0) {
++        return "";
++    }
++
++    rows.push([
++        chalk.bold("Line"),
++        chalk.bold("Column"),
++        chalk.bold("Type"),
++        chalk.bold("Message"),
++        chalk.bold("Rule ID")
++    ]);
++
++    messages.forEach(message => {
++        let messageType;
++
++        if (message.fatal || message.severity === 2) {
++            messageType = chalk.red("error");
++        } else {
++            messageType = chalk.yellow("warning");
++        }
++
++        rows.push([
++            message.line || 0,
++            message.column || 0,
++            messageType,
++            message.message,
++            message.ruleId || ""
++        ]);
++    });
++
++    return table(rows, {
++        columns: {
++            0: {
++                width: 8,
++                wrapWord: true
++            },
++            1: {
++                width: 8,
++                wrapWord: true
++            },
++            2: {
++                width: 8,
++                wrapWord: true
++            },
++            3: {
++                paddingRight: 5,
++                width: 50,
++                wrapWord: true
++            },
++            4: {
++                width: 20,
++                wrapWord: true
++            }
++        },
++        drawHorizontalLine(index) {
++            return index === 1;
++        }
++    });
++}
++
++/**
++ * Draws a report (multiple tables).
++ * @param {Array} results Report results for every file.
++ * @returns {string} A column of text tables.
++ */
++function drawReport(results) {
++    let files;
++
++    files = results.map(result => {
++        if (!result.messages.length) {
++            return "";
++        }
++
++        return `\n${result.filePath}\n\n${drawTable(result.messages)}`;
++    });
++
++    files = files.filter(content => content.trim());
++
++    return files.join("");
++}
++
++//------------------------------------------------------------------------------
++// Public Interface
++//------------------------------------------------------------------------------
++
++module.exports = function(report) {
++    let result,
++        errorCount,
++        warningCount;
++
++    result = "";
++    errorCount = 0;
++    warningCount = 0;
++
++    report.forEach(fileReport => {
++        errorCount += fileReport.errorCount;
++        warningCount += fileReport.warningCount;
++    });
++
++    if (errorCount || warningCount) {
++        result = drawReport(report);
++    }
++
++    result += `\n${table([
++        [
++            chalk.red(pluralize(`${errorCount} Error`, errorCount))
++        ],
++        [
++            chalk.yellow(pluralize(`${warningCount} Warning`, warningCount))
++        ]
++    ], {
++        columns: {
++            0: {
++                width: 110,
++                wrapWord: true
++            }
++        },
++        drawHorizontalLine() {
++            return true;
++        }
++    })}`;
++
++    return result;
++};
+diff --git a/package.json b/package.json
+index 94f6669a7..ea08a90ef 100644
+--- a/package.json
++++ b/package.json
+@@ -43,6 +43,7 @@
+   "homepage": "https://eslint.org",
+   "bugs": "https://github.com/eslint/eslint/issues/",
+   "dependencies": {
++    "@babel/code-frame": "7.12.11",
+     "@eslint/eslintrc": "^0.4.3",
+     "@humanwhocodes/config-array": "^0.5.0",
+     "ajv": "^6.10.0",
+@@ -79,6 +80,7 @@
+     "semver": "^7.2.1",
+     "strip-ansi": "^6.0.0",
+     "strip-json-comments": "^3.1.0",
++    "table": "^6.0.9",
+     "text-table": "^0.2.0",
+     "v8-compile-cache": "^2.0.3"
+   },
+diff --git a/templates/formatter-examples.md.ejs b/templates/formatter-examples.md.ejs
+index b5583957f..3231ea44d 100644
+--- a/templates/formatter-examples.md.ejs
++++ b/templates/formatter-examples.md.ejs
+@@ -6,7 +6,7 @@ layout: doc
+ 
+ ESLint comes with several built-in formatters to control the appearance of the linting results, and supports third-party formatters as well.
+ 
+-You can specify a formatter using the `--format` or `-f` flag on the command line. For example, `--format json` uses the `json` formatter.
++You can specify a formatter using the `--format` or `-f` flag on the command line. For example, `--format codeframe` uses the `codeframe` formatter.
+ 
+ The built-in formatter options are:
+ 
+diff --git a/tests/lib/cli-engine/cli-engine.js b/tests/lib/cli-engine/cli-engine.js
+index 91838ceef..59243b0b7 100644
+--- a/tests/lib/cli-engine/cli-engine.js
++++ b/tests/lib/cli-engine/cli-engine.js
+@@ -4628,7 +4628,7 @@ describe("CLIEngine", () => {
+             assert.isFunction(formatter);
+         });
+ 
+-        it("should return null when a custom formatter doesn't exist", () => {
++        it("should return null when a customer formatter doesn't exist", () => {
+             const engine = new CLIEngine(),
+                 formatterPath = getFixturePath("formatters", "doesntexist.js"),
+                 fullFormatterPath = path.resolve(formatterPath);
+@@ -4647,18 +4647,6 @@ describe("CLIEngine", () => {
+             }, `There was a problem loading formatter: ${fullFormatterPath}\nError: Cannot find module '${fullFormatterPath}'`);
+         });
+ 
+-        it("should throw when a built-in formatter no longer exists", () => {
+-            const engine = new CLIEngine();
+-
+-            assert.throws(() => {
+-                engine.getFormatter("table");
+-            }, "The table formatter is no longer part of core ESLint. Install it manually with `npm install -D eslint-formatter-table`");
+-
+-            assert.throws(() => {
+-                engine.getFormatter("codeframe");
+-            }, "The codeframe formatter is no longer part of core ESLint. Install it manually with `npm install -D eslint-formatter-codeframe`");
+-        });
+-
+         it("should throw if the required formatter exists but has an error", () => {
+             const engine = new CLIEngine(),
+                 formatterPath = getFixturePath("formatters", "broken.js");
+diff --git a/tests/lib/cli-engine/formatters/codeframe.js b/tests/lib/cli-engine/formatters/codeframe.js
+new file mode 100644
+index 000000000..398d6b8c7
+--- /dev/null
++++ b/tests/lib/cli-engine/formatters/codeframe.js
+@@ -0,0 +1,483 @@
++/**
++ * @fileoverview Tests for codeframe reporter.
++ * @author Vitor Balocco
++ */
++
++"use strict";
++
++//------------------------------------------------------------------------------
++// Requirements
++//------------------------------------------------------------------------------
++
++const assert = require("chai").assert;
++const sinon = require("sinon");
++const proxyquire = require("proxyquire");
++const chalk = require("chalk");
++const path = require("path");
++const stripAnsi = require("strip-ansi");
++
++// Chalk protects its methods so we need to inherit from it for Sinon to work.
++const chalkStub = Object.create(chalk, {
++    yellow: {
++        value(str) {
++            return chalk.yellow(str);
++        },
++        writable: true
++    },
++    red: {
++        value(str) {
++            return chalk.red(str);
++        },
++        writable: true
++    }
++});
++
++chalkStub.yellow.bold = chalk.yellow.bold;
++chalkStub.red.bold = chalk.red.bold;
++
++const formatter = proxyquire("../../../../lib/cli-engine/formatters/codeframe", { chalk: chalkStub });
++
++//------------------------------------------------------------------------------
++// Tests
++//------------------------------------------------------------------------------
++
++describe("formatter:codeframe", () => {
++    afterEach(() => {
++        sinon.verifyAndRestore();
++    });
++
++    describe("when passed no messages", () => {
++        const code = [{
++            filePath: "foo.js",
++            messages: [],
++            errorCount: 0,
++            warningCount: 0
++        }];
++
++        it("should return nothing", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(result, "");
++        });
++    });
++
++    describe("when passed a single warning message", () => {
++        const code = [{
++            filePath: path.join(process.cwd(), "lib", "foo.js"),
++            source: "var foo = 1;\n var bar = 2;\n",
++            messages: [{
++                message: "Unexpected foo.",
++                severity: 1,
++                line: 1,
++                column: 5,
++                ruleId: "foo"
++            }],
++            errorCount: 0,
++            warningCount: 1,
++            fixableErrorCount: 0,
++            fixableWarningCount: 0
++        }];
++
++        it("should return a string in the correct format for warnings", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), [
++                `warning: Unexpected foo (foo) at ${path.join("lib", "foo.js")}:1:5:`,
++                "> 1 | var foo = 1;",
++                "    |     ^",
++                "  2 |  var bar = 2;",
++                "  3 | ",
++                "\n",
++                "1 warning found."
++            ].join("\n"));
++        });
++
++        it("should return bold yellow summary when there are only warnings", () => {
++            sinon.spy(chalkStub.yellow, "bold");
++            sinon.spy(chalkStub.red, "bold");
++
++            formatter(code);
++
++            assert.strictEqual(chalkStub.yellow.bold.callCount, 1);
++            assert.strictEqual(chalkStub.red.bold.callCount, 0);
++        });
++
++        describe("when the warning is fixable", () => {
++            beforeEach(() => {
++                code[0].fixableWarningCount = 1;
++            });
++
++            it("should return a string in the correct format", () => {
++                const result = formatter(code);
++
++                assert.strictEqual(stripAnsi(result), [
++                    `warning: Unexpected foo (foo) at ${path.join("lib", "foo.js")}:1:5:`,
++                    "> 1 | var foo = 1;",
++                    "    |     ^",
++                    "  2 |  var bar = 2;",
++                    "  3 | ",
++                    "\n",
++                    "1 warning found.",
++                    "1 warning potentially fixable with the `--fix` option."
++                ].join("\n"));
++            });
++        });
++    });
++
++    describe("when passed a single error message", () => {
++        const code = [{
++            filePath: path.join(process.cwd(), "lib", "foo.js"),
++            source: "var foo = 1;\n var bar = 2;\n",
++            messages: [{
++                message: "Unexpected foo.",
++                severity: 2,
++                line: 1,
++                column: 5,
++                ruleId: "foo"
++            }],
++            errorCount: 1,
++            warningCount: 0
++        }];
++
++        it("should return a string in the correct format for errors", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), [
++                `error: Unexpected foo (foo) at ${path.join("lib", "foo.js")}:1:5:`,
++                "> 1 | var foo = 1;",
++                "    |     ^",
++                "  2 |  var bar = 2;",
++                "  3 | ",
++                "\n",
++                "1 error found."
++            ].join("\n"));
++        });
++
++        it("should return bold red summary when there are errors", () => {
++            sinon.spy(chalkStub.yellow, "bold");
++            sinon.spy(chalkStub.red, "bold");
++
++            formatter(code);
++
++            assert.strictEqual(chalkStub.yellow.bold.callCount, 0);
++            assert.strictEqual(chalkStub.red.bold.callCount, 1);
++        });
++    });
++
++    describe("when passed a message that ends with ' .'", () => {
++        const code = [{
++            filePath: "foo.js",
++            messages: [{
++                ruleId: "foo",
++                message: "Unexpected .",
++                severity: 2,
++                source: "foo"
++            }],
++            errorCount: 1,
++            warningCount: 0
++        }];
++
++        it("should return a string in the correct format (retaining the ' .')", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), "error: Unexpected . (foo) at foo.js\n\n\n1 error found.");
++        });
++    });
++
++    describe("when passed multiple messages", () => {
++        const code = [{
++            filePath: "foo.js",
++            source: "const foo = 1\n",
++            messages: [{
++                message: "Missing semicolon.",
++                severity: 2,
++                line: 1,
++                column: 14,
++                ruleId: "semi"
++            }, {
++                message: "'foo' is assigned a value but never used.",
++                severity: 2,
++                line: 1,
++                column: 7,
++                ruleId: "no-unused-vars"
++            }],
++            errorCount: 2,
++            warningCount: 0
++        }];
++
++        it("should return a string with multiple entries", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), [
++                "error: Missing semicolon (semi) at foo.js:1:14:",
++                "> 1 | const foo = 1",
++                "    |              ^",
++                "  2 | ",
++                "\n",
++                "error: 'foo' is assigned a value but never used (no-unused-vars) at foo.js:1:7:",
++                "> 1 | const foo = 1",
++                "    |       ^",
++                "  2 | ",
++                "\n",
++                "2 errors found."
++            ].join("\n"));
++        });
++
++        it("should return bold red summary when at least 1 of the messages is an error", () => {
++            sinon.spy(chalkStub.yellow, "bold");
++            sinon.spy(chalkStub.red, "bold");
++            code[0].messages[0].severity = 1;
++            code[0].warningCount = 1;
++            code[0].errorCount = 1;
++
++            formatter(code);
++
++            assert.strictEqual(chalkStub.yellow.bold.callCount, 0);
++            assert.strictEqual(chalkStub.red.bold.callCount, 1);
++        });
++    });
++
++    describe("when passed one file with 1 message and fixes applied", () => {
++        const code = [{
++            filePath: "foo.js",
++            messages: [{
++                ruleId: "no-unused-vars",
++                severity: 2,
++                message: "'foo' is assigned a value but never used.",
++                line: 4,
++                column: 11,
++                source: "    const foo = 1;"
++            }],
++            errorCount: 1,
++            warningCount: 0,
++            output: "function foo() {\n\n    // a comment\n    const foo = 1;\n}\n\n"
++        }];
++
++        it("should return a string with code preview pointing to the correct location after fixes", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), [
++                "error: 'foo' is assigned a value but never used (no-unused-vars) at foo.js:4:11:",
++                "  2 | ",
++                "  3 |     // a comment",
++                "> 4 |     const foo = 1;",
++                "    |           ^",
++                "  5 | }",
++                "  6 | ",
++                "  7 | ",
++                "\n",
++                "1 error found."
++            ].join("\n"));
++        });
++    });
++
++    describe("when passed multiple files with 1 message each", () => {
++        const code = [{
++            filePath: "foo.js",
++            source: "const foo = 1\n",
++            messages: [{
++                message: "Missing semicolon.",
++                severity: 2,
++                line: 1,
++                column: 14,
++                ruleId: "semi"
++            }],
++            errorCount: 1,
++            warningCount: 0
++        }, {
++            filePath: "bar.js",
++            source: "const bar = 2\n",
++            messages: [{
++                message: "Missing semicolon.",
++                severity: 2,
++                line: 1,
++                column: 14,
++                ruleId: "semi"
++            }],
++            errorCount: 1,
++            warningCount: 0
++        }];
++
++        it("should return a string with multiple entries", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), [
++                "error: Missing semicolon (semi) at foo.js:1:14:",
++                "> 1 | const foo = 1",
++                "    |              ^",
++                "  2 | ",
++                "\n",
++                "error: Missing semicolon (semi) at bar.js:1:14:",
++                "> 1 | const bar = 2",
++                "    |              ^",
++                "  2 | ",
++                "\n",
++                "2 errors found."
++            ].join("\n"));
++        });
++    });
++
++    describe("when passed a fatal error message", () => {
++        const code = [{
++            filePath: "foo.js",
++            source: "e{}\n",
++            messages: [{
++                ruleId: null,
++                fatal: true,
++                severity: 2,
++                source: "e{}",
++                message: "Parsing error: Unexpected token {",
++                line: 1,
++                column: 2
++            }],
++            errorCount: 1,
++            warningCount: 0
++        }];
++
++        it("should return a string in the correct format", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), [
++                "error: Parsing error: Unexpected token { at foo.js:1:2:",
++                "> 1 | e{}",
++                "    |  ^",
++                "  2 | ",
++                "\n",
++                "1 error found."
++            ].join("\n"));
++        });
++    });
++
++    describe("when passed one file not found message", () => {
++        const code = [{
++            filePath: "foo.js",
++            messages: [{
++                fatal: true,
++                message: "Couldn't find foo.js."
++            }],
++            errorCount: 1,
++            warningCount: 0
++        }];
++
++        it("should return a string without code preview (codeframe)", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), "error: Couldn't find foo.js at foo.js\n\n\n1 error found.");
++        });
++    });
++
++    describe("when passed a single message with no line or column", () => {
++        const code = [{
++            filePath: "foo.js",
++            messages: [{
++                ruleId: "foo",
++                message: "Unexpected foo.",
++                severity: 2,
++                source: "foo"
++            }],
++            errorCount: 1,
++            warningCount: 0
++        }];
++
++        it("should return a string without code preview (codeframe)", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), "error: Unexpected foo (foo) at foo.js\n\n\n1 error found.");
++        });
++
++        it("should output filepath but without 'line:column' appended", () => {
++            const result = formatter(code);
++
++            assert.strictEqual(stripAnsi(result), "error: Unexpected foo (foo) at foo.js\n\n\n1 error found.");
++        });
++    });
++
++
++    describe("fixable problems", () => {
++        it("should not output fixable problems message when no errors or warnings are fixable", () => {
++            const code = [{
++                filePath: "foo.js",
++                errorCount: 1,
++                warningCount: 0,
++                fixableErrorCount: 0,
++                fixableWarningCount: 0,
++                messages: [{
++                    message: "Unexpected foo.",
++                    severity: 2,
++                    line: 5,
++                    column: 10,
++                    ruleId: "foo"
++                }]
++            }];
++
++            const result = formatter(code);
++
++            assert.notInclude(result, "potentially fixable");
++        });
++
++        it("should output the fixable problems message when errors are fixable", () => {
++            const code = [{
++                filePath: "foo.js",
++                errorCount: 1,
++                warningCount: 0,
++                fixableErrorCount: 1,
++                fixableWarningCount: 0,
++                messages: [{
++                    message: "Unexpected foo.",
++                    severity: 2,
++                    line: 5,
++                    column: 10,
++                    ruleId: "foo"
++                }]
++            }];
++
++            const result = formatter(code);
++
++            assert.include(result, "1 error potentially fixable with the `--fix` option.");
++        });
++
++        it("should output fixable problems message when warnings are fixable", () => {
++            const code = [{
++                filePath: "foo.js",
++                errorCount: 0,
++                warningCount: 3,
++                fixableErrorCount: 0,
++                fixableWarningCount: 2,
++                messages: [{
++                    message: "Unexpected foo."
++                }]
++            }];
++
++            const result = formatter(code);
++
++            assert.include(result, "2 warnings potentially fixable with the `--fix` option.");
++        });
++
++        it("should output the total number of fixable errors and warnings", () => {
++            const code = [{
++                filePath: "foo.js",
++                errorCount: 5,
++                warningCount: 3,
++                fixableErrorCount: 5,
++                fixableWarningCount: 2,
++                messages: [{
++                    message: "Unexpected foo."
++                }]
++            }, {
++                filePath: "bar.js",
++                errorCount: 4,
++                warningCount: 2,
++                fixableErrorCount: 4,
++                fixableWarningCount: 1,
++                messages: [{
++                    message: "Unexpected bar."
++                }]
++            }];
++
++            const result = formatter(code);
++
++            assert.include(result, "9 errors and 3 warnings potentially fixable with the `--fix` option.");
++        });
++    });
++
++});
+diff --git a/tests/lib/cli-engine/formatters/table.js b/tests/lib/cli-engine/formatters/table.js
+new file mode 100644
+index 000000000..3e29caf2e
+--- /dev/null
++++ b/tests/lib/cli-engine/formatters/table.js
+@@ -0,0 +1,324 @@
++/**
++ * @fileoverview Tests for "table" reporter.
++ * @author Gajus Kuizinas <gajus@gajus.com>
++ */
++"use strict";
++
++//------------------------------------------------------------------------------
++// Requirements
++//------------------------------------------------------------------------------
++
++const assert = require("chai").assert;
++const chalk = require("chalk");
++const formatter = require("../../../../lib/cli-engine/formatters/table");
++
++//------------------------------------------------------------------------------
++// Tests
++//------------------------------------------------------------------------------
++
++describe("formatter:table", () => {
++    const originalColorLevel = chalk.level;
++
++    before(() => {
++        chalk.level = 0;
++    });
++
++    after(() => {
++        chalk.level = originalColorLevel;
++    });
++
++    describe("when passed no messages", () => {
++        const code = [
++            {
++                filePath: "foo.js",
++                messages: [],
++                errorCount: 0,
++                warningCount: 0
++            }
++        ];
++
++        it("should return a table of error and warning count with no messages", () => {
++            const expectedOutput = [
++                "",
++                "╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗",
++                "║ 0 Errors                                                                                                       ║",
++                "╟────────────────────────────────────────────────────────────────────────────────────────────────────────────────╢",
++                "║ 0 Warnings                                                                                                     ║",
++                "╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝",
++                ""
++            ].join("\n");
++
++            const result = formatter(code);
++
++            assert.strictEqual(result, expectedOutput);
++        });
++    });
++
++    describe("when passed a single message", () => {
++        it("should return a string in the correct format for errors", () => {
++            const code = [
++                {
++                    filePath: "foo.js",
++                    messages: [
++                        {
++                            message: "Unexpected foo.",
++                            severity: 2,
++                            line: 5,
++                            column: 10,
++                            ruleId: "foo"
++                        }
++                    ],
++                    errorCount: 1,
++                    warningCount: 0
++                }
++            ];
++
++            const expectedOutput = [
++                "",
++                "foo.js",
++                "",
++                "║ Line     │ Column   │ Type     │ Message                                                │ Rule ID              ║",
++                "╟──────────┼──────────┼──────────┼────────────────────────────────────────────────────────┼──────────────────────╢",
++                "║ 5        │ 10       │ error    │ Unexpected foo.                                        │ foo                  ║",
++                "",
++                "╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗",
++                "║ 1 Error                                                                                                        ║",
++                "╟────────────────────────────────────────────────────────────────────────────────────────────────────────────────╢",
++                "║ 0 Warnings                                                                                                     ║",
++                "╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝",
++                ""
++            ].join("\n");
++
++            const result = formatter(code);
++
++            assert.strictEqual(result, expectedOutput);
++        });
++
++        it("should return a string in the correct format for warnings", () => {
++            const code = [
++                {
++                    filePath: "foo.js",
++                    messages: [
++                        {
++                            message: "Unexpected foo.",
++                            severity: 1,
++                            line: 5,
++                            column: 10,
++                            ruleId: "foo"
++                        }
++                    ],
++                    errorCount: 0,
++                    warningCount: 1
++                }
++            ];
++
++            const expectedOutput = [
++                "",
++                "foo.js",
++                "",
++                "║ Line     │ Column   │ Type     │ Message                                                │ Rule ID              ║",
++                "╟──────────┼──────────┼──────────┼────────────────────────────────────────────────────────┼──────────────────────╢",
++                "║ 5        │ 10       │ warning  │ Unexpected foo.                                        │ foo                  ║",
++                "",
++                "╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗",
++                "║ 0 Errors                                                                                                       ║",
++                "╟────────────────────────────────────────────────────────────────────────────────────────────────────────────────╢",
++                "║ 1 Warning                                                                                                      ║",
++                "╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝",
++                ""
++            ].join("\n");
++
++            const result = formatter(code);
++
++            assert.strictEqual(result, expectedOutput);
++        });
++    });
++
++    describe("when passed a fatal error message", () => {
++        it("should return a string in the correct format", () => {
++            const code = [
++                {
++                    filePath: "foo.js",
++                    messages: [
++                        {
++                            fatal: true,
++                            message: "Unexpected foo.",
++                            line: 5,
++                            column: 10,
++                            ruleId: "foo"
++                        }
++                    ],
++                    errorCount: 1,
++                    warningCount: 0
++                }
++            ];
++
++            const expectedOutput = [
++                "",
++                "foo.js",
++                "",
++                "║ Line     │ Column   │ Type     │ Message                                                │ Rule ID              ║",
++                "╟──────────┼──────────┼──────────┼────────────────────────────────────────────────────────┼──────────────────────╢",
++                "║ 5        │ 10       │ error    │ Unexpected foo.                                        │ foo                  ║",
++                "",
++                "╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗",
++                "║ 1 Error                                                                                                        ║",
++                "╟────────────────────────────────────────────────────────────────────────────────────────────────────────────────╢",
++                "║ 0 Warnings                                                                                                     ║",
++                "╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝",
++                ""
++            ].join("\n");
++
++            const result = formatter(code);
++
++            assert.strictEqual(result, expectedOutput);
++        });
++    });
++
++    describe("when passed multiple messages", () => {
++        it("should return a string with multiple entries", () => {
++            const code = [
++                {
++                    filePath: "foo.js",
++                    messages: [
++                        {
++                            message: "Unexpected foo.",
++                            severity: 2,
++                            line: 5,
++                            column: 10,
++                            ruleId: "foo"
++                        },
++                        {
++                            message: "Unexpected bar.",
++                            severity: 1,
++                            line: 6,
++                            column: 11,
++                            ruleId: "bar"
++                        }
++                    ],
++                    errorCount: 1,
++                    warningCount: 1
++                }
++            ];
++
++            const expectedOutput = [
++                "",
++                "foo.js",
++                "",
++                "║ Line     │ Column   │ Type     │ Message                                                │ Rule ID              ║",
++                "╟──────────┼──────────┼──────────┼────────────────────────────────────────────────────────┼──────────────────────╢",
++                "║ 5        │ 10       │ error    │ Unexpected foo.                                        │ foo                  ║",
++                "║ 6        │ 11       │ warning  │ Unexpected bar.                                        │ bar                  ║",
++                "",
++                "╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗",
++                "║ 1 Error                                                                                                        ║",
++                "╟────────────────────────────────────────────────────────────────────────────────────────────────────────────────╢",
++                "║ 1 Warning                                                                                                      ║",
++                "╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝",
++                ""
++            ].join("\n");
++
++            const result = formatter(code);
++
++            assert.strictEqual(result, expectedOutput);
++        });
++    });
++
++    describe("when passed multiple files with 1 message each", () => {
++        it("should return a string with multiple entries", () => {
++            const code = [
++                {
++                    filePath: "foo.js",
++                    messages: [
++                        {
++                            message: "Unexpected foo.",
++                            severity: 2,
++                            line: 5,
++                            column: 10,
++                            ruleId: "foo"
++                        }
++                    ],
++                    errorCount: 1,
++                    warningCount: 0
++                }, {
++                    filePath: "bar.js",
++                    messages: [
++                        {
++                            message: "Unexpected bar.",
++                            severity: 1,
++                            line: 6,
++                            column: 11,
++                            ruleId: "bar"
++                        }
++                    ],
++                    errorCount: 0,
++                    warningCount: 1
++                }
++            ];
++
++            const expectedOutput = [
++                "",
++                "foo.js",
++                "",
++                "║ Line     │ Column   │ Type     │ Message                                                │ Rule ID              ║",
++                "╟──────────┼──────────┼──────────┼────────────────────────────────────────────────────────┼──────────────────────╢",
++                "║ 5        │ 10       │ error    │ Unexpected foo.                                        │ foo                  ║",
++                "",
++                "bar.js",
++                "",
++                "║ Line     │ Column   │ Type     │ Message                                                │ Rule ID              ║",
++                "╟──────────┼──────────┼──────────┼────────────────────────────────────────────────────────┼──────────────────────╢",
++                "║ 6        │ 11       │ warning  │ Unexpected bar.                                        │ bar                  ║",
++                "",
++                "╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗",
++                "║ 1 Error                                                                                                        ║",
++                "╟────────────────────────────────────────────────────────────────────────────────────────────────────────────────╢",
++                "║ 1 Warning                                                                                                      ║",
++                "╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝",
++                ""
++            ].join("\n");
++
++            const result = formatter(code);
++
++            assert.strictEqual(result, expectedOutput);
++        });
++    });
++
++    describe("when passed one file not found message", () => {
++        it("should return a string without line and column (0, 0)", () => {
++            const code = [
++                {
++                    filePath: "foo.js",
++                    messages: [
++                        {
++                            fatal: true,
++                            message: "Couldn't find foo.js."
++                        }
++                    ],
++                    errorCount: 1,
++                    warningCount: 0
++                }
++            ];
++
++            const expectedOutput = [
++                "",
++                "foo.js",
++                "",
++                "║ Line     │ Column   │ Type     │ Message                                                │ Rule ID              ║",
++                "╟──────────┼──────────┼──────────┼────────────────────────────────────────────────────────┼──────────────────────╢",
++                "║ 0        │ 0        │ error    │ Couldn't find foo.js.                                  │                      ║",
++                "",
++                "╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗",
++                "║ 1 Error                                                                                                        ║",
++                "╟────────────────────────────────────────────────────────────────────────────────────────────────────────────────╢",
++                "║ 0 Warnings                                                                                                     ║",
++                "╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝",
++                ""
++            ].join("\n");
++
++            const result = formatter(code);
++
++            assert.strictEqual(result, expectedOutput);
++        });
++    });
++});
+diff --git a/tests/lib/eslint/eslint.js b/tests/lib/eslint/eslint.js
+index 817e79a7d..c5a1b7360 100644
+--- a/tests/lib/eslint/eslint.js
++++ b/tests/lib/eslint/eslint.js
+@@ -4653,7 +4653,7 @@ describe("ESLint", () => {
+             assert.strictEqual(typeof formatter.format, "function");
+         });
+ 
+-        it("should throw if a custom formatter doesn't exist", async () => {
++        it("should throw if a customer formatter doesn't exist", async () => {
+             const engine = new ESLint();
+             const formatterPath = getFixturePath("formatters", "doesntexist.js");
+             const fullFormatterPath = path.resolve(formatterPath);

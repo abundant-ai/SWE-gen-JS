@@ -1,0 +1,297 @@
+diff --git a/ohm-js/src/Builder.js b/ohm-js/src/Builder.js
+index 5ba6135b..6607ed0a 100644
+--- a/ohm-js/src/Builder.js
++++ b/ohm-js/src/Builder.js
+@@ -15,6 +15,7 @@ function Builder() {}
+ 
+ Builder.prototype = {
+   currentDecl: null,
++  currentRuleName: null,
+ 
+   newGrammar(name) {
+     return new GrammarDecl(name);
+@@ -32,16 +33,16 @@ Builder.prototype = {
+       gDecl.withSource(metaInfo.source);
+     }
+ 
+-    const self = this;
+     this.currentDecl = gDecl;
+     Object.keys(rules).forEach(ruleName => {
++      this.currentRuleName = ruleName;
+       const ruleRecipe = rules[ruleName];
+ 
+       const action = ruleRecipe[0]; // define/extend/override
+       const metaInfo = ruleRecipe[1];
+       const description = ruleRecipe[2];
+       const formals = ruleRecipe[3];
+-      const body = self.fromRecipe(ruleRecipe[4]);
++      const body = this.fromRecipe(ruleRecipe[4]);
+ 
+       let source;
+       if (gDecl.source && metaInfo && metaInfo.sourceInterval) {
+@@ -51,7 +52,7 @@ Builder.prototype = {
+       }
+       gDecl[action](ruleName, formals, body, description, source);
+     });
+-    this.currentDecl = null;
++    this.currentRuleName = this.currentDecl = null;
+     return gDecl.build();
+   },
+ 
+@@ -67,7 +68,7 @@ Builder.prototype = {
+     return new pexprs.Param(index);
+   },
+ 
+-  alt(/* term1, term1, ... */) {
++  alt(/* term1, term2, ... */) {
+     let terms = [];
+     for (let idx = 0; idx < arguments.length; idx++) {
+       let arg = arguments[idx];
+@@ -156,8 +157,19 @@ Builder.prototype = {
+     return new pexprs.Apply(ruleName, optParams);
+   },
+ 
++  // Note that unlike other methods in this class, this method cannot be used as a
++  // convenience constructor. It only works with recipes, because it relies on
++  // `this.currentDecl` and `this.currentRuleName` being set.
++  splice(beforeTerms, afterTerms) {
++    return new pexprs.Splice(
++        this.currentDecl.superGrammar,
++        this.currentRuleName,
++        beforeTerms.map(term => this.fromRecipe(term)),
++        afterTerms.map(term => this.fromRecipe(term)));
++  },
++
+   fromRecipe(recipe) {
+-    // the meta-info of 'grammar' is proccessed in Builder.grammar
++    // the meta-info of 'grammar' is processed in Builder.grammar
+     const result = this[recipe[0]].apply(this,
+       recipe[0] === 'grammar' ? recipe.slice(1) : recipe.slice(2));
+ 
+diff --git a/ohm-js/src/GrammarDecl.js b/ohm-js/src/GrammarDecl.js
+index 4915ff43..05fbca6a 100644
+--- a/ohm-js/src/GrammarDecl.js
++++ b/ohm-js/src/GrammarDecl.js
+@@ -39,6 +39,14 @@ GrammarDecl.prototype.ensureSuperGrammar = function() {
+   return this.superGrammar;
+ };
+ 
++GrammarDecl.prototype.ensureSuperGrammarRuleForOverriding = function(name, source) {
++  const ruleInfo = this.ensureSuperGrammar().rules[name];
++  if (!ruleInfo) {
++    throw errors.cannotOverrideUndeclaredRule(name, this.superGrammar.name, source);
++  }
++  return ruleInfo;
++};
++
+ GrammarDecl.prototype.installOverriddenOrExtendedRule = function(name, formals, body, source) {
+   const duplicateParameterNames = common.getDuplicates(formals);
+   if (duplicateParameterNames.length > 0) {
+@@ -156,10 +164,7 @@ GrammarDecl.prototype.define = function(name, formals, body, description, source
+ };
+ 
+ GrammarDecl.prototype.override = function(name, formals, body, descIgnored, source) {
+-  const ruleInfo = this.ensureSuperGrammar().rules[name];
+-  if (!ruleInfo) {
+-    throw errors.cannotOverrideUndeclaredRule(name, this.superGrammar.name, source);
+-  }
++  this.ensureSuperGrammarRuleForOverriding(name, source);
+   this.installOverriddenOrExtendedRule(name, formals, body, source);
+   return this;
+ };
+diff --git a/ohm-js/src/errors.js b/ohm-js/src/errors.js
+index 624f3512..bba729ea 100644
+--- a/ohm-js/src/errors.js
++++ b/ohm-js/src/errors.js
+@@ -153,6 +153,12 @@ function incorrectArgumentType(expectedType, expr) {
+   return createError('Incorrect argument type: expected ' + expectedType, expr.source);
+ }
+ 
++// Multiple instances of the super-splice operator (`...`) in the rule body.
++
++function multipleSuperSplices(expr) {
++  return createError("'...' can appear at most once in a rule body", expr.source);
++}
++
+ // ----------------- Kleene operators -----------------
+ 
+ function kleeneExprHasNullableOperand(kleeneExpr, applicationStack) {
+@@ -243,6 +249,7 @@ module.exports = {
+   grammarSyntaxError,
+   kleeneExprHasNullableOperand,
+   missingSemanticAction,
++  multipleSuperSplices,
+   undeclaredGrammar,
+   undeclaredRule,
+   wrongNumberOfArguments,
+diff --git a/ohm-js/src/main.js b/ohm-js/src/main.js
+index 101695a0..3ee307b1 100644
+--- a/ohm-js/src/main.js
++++ b/ohm-js/src/main.js
+@@ -31,6 +31,8 @@ let documentInterface = {
+   querySelectorAll(sel) { return document.querySelectorAll(sel); }
+ };
+ 
++const superSplicePlaceholder = Object.create(pexprs.PExpr.prototype);
++
+ // Check if `obj` is a DOM element.
+ function isElement(obj) {
+   return !!(obj && obj.nodeType === 1);
+@@ -119,26 +121,46 @@ function buildGrammar(match, namespace, optOhmGrammarForTesting) {
+     Rule_override(n, fs, _, b) {
+       currentRuleName = n.visit();
+       currentRuleFormals = fs.visit()[0] || [];
++
++      const source = this.source.trimmed();
++      decl.ensureSuperGrammarRuleForOverriding(currentRuleName, source);
++
+       overriding = true;
+       const body = b.visit();
+-      const source = this.source.trimmed();
+-      const ans = decl.override(currentRuleName, currentRuleFormals, body, null, source);
+       overriding = false;
+-      return ans;
++      return decl.override(currentRuleName, currentRuleFormals, body, null, source);
+     },
+     Rule_extend(n, fs, _, b) {
+       currentRuleName = n.visit();
+       currentRuleFormals = fs.visit()[0] || [];
+       const body = b.visit();
+       const source = this.source.trimmed();
+-      const ans = decl.extend(currentRuleName, currentRuleFormals, body, null, source);
+-      return ans;
++      return decl.extend(currentRuleName, currentRuleFormals, body, null, source);
+     },
+     RuleBody(_, terms) {
+       const args = terms.visit();
+       return builder.alt.apply(builder, args).withSource(this.source);
+     },
++    OverrideRuleBody(_, terms) {
++      const args = terms.visit();
+ 
++      // Check if the super-splice operator (`...`) appears in the terms.
++      const expansionPos = args.indexOf(superSplicePlaceholder);
++      if (expansionPos >= 0) {
++        const beforeTerms = args.slice(0, expansionPos);
++        const afterTerms = args.slice(expansionPos + 1);
++
++        // Ensure it appears no more than once.
++        afterTerms.forEach(t => {
++          if (t === superSplicePlaceholder) throw errors.multipleSuperSplices(t);
++        });
++
++        return new pexprs.Splice(
++            decl.superGrammar, currentRuleName, beforeTerms, afterTerms).withSource(this.source);
++      } else {
++        return builder.alt.apply(builder, args).withSource(this.source);
++      }
++    },
+     Formals(opointy, fs, cpointy) {
+       return fs.visit();
+     },
+@@ -166,6 +188,9 @@ function buildGrammar(match, namespace, optOhmGrammarForTesting) {
+       const params = currentRuleFormals.map(formal => builder.app(formal));
+       return builder.app(inlineRuleName, params).withSource(body.source);
+     },
++    OverrideTopLevelTerm_superSplice(_) {
++      return superSplicePlaceholder;
++    },
+ 
+     Seq(expr) {
+       return builder.seq.apply(builder, expr.visit()).withSource(this.source);
+diff --git a/ohm-js/src/ohm-cmd.js b/ohm-js/src/ohm-cmd.js
+index 6b873768..5642800a 100755
+--- a/ohm-js/src/ohm-cmd.js
++++ b/ohm-js/src/ohm-cmd.js
+@@ -32,5 +32,5 @@ if (filename === '--builtin') {
+   grammar = ohm.grammar(source);
+ }
+ 
+-console.log("const ohm = require('..');");
++console.log("var ohm = require('..');");
+ console.log('module.exports = ohm.makeRecipe(' + grammar.toRecipe() + ');');
+diff --git a/ohm-js/src/ohm-grammar.ohm b/ohm-js/src/ohm-grammar.ohm
+index 47f369fb..c6ff3315 100644
+--- a/ohm-js/src/ohm-grammar.ohm
++++ b/ohm-js/src/ohm-grammar.ohm
+@@ -11,7 +11,7 @@ Ohm {
+ 
+   Rule
+     = ident Formals? ruleDescr? "="  RuleBody  -- define
+-    | ident Formals?            ":=" RuleBody  -- override
++    | ident Formals?            ":=" OverrideRuleBody  -- override
+     | ident Formals?            "+=" RuleBody  -- extend
+ 
+   RuleBody
+@@ -21,6 +21,13 @@ Ohm {
+     = Seq caseName  -- inline
+     | Seq
+ 
++  OverrideRuleBody
++    = "|"? NonemptyListOf<OverrideTopLevelTerm, "|">
++
++  OverrideTopLevelTerm
++    = "..."  -- superSplice
++    | TopLevelTerm
++
+   Formals
+     = "<" ListOf<ident, ","> ">"
+ 
+diff --git a/ohm-js/src/pexprs-outputRecipe.js b/ohm-js/src/pexprs-outputRecipe.js
+index 6cc60c0a..22bb5c2f 100644
+--- a/ohm-js/src/pexprs-outputRecipe.js
++++ b/ohm-js/src/pexprs-outputRecipe.js
+@@ -67,10 +67,21 @@ pexprs.Alt.prototype.outputRecipe = function(formals, grammarInterval) {
+ };
+ 
+ pexprs.Extend.prototype.outputRecipe = function(formals, grammarInterval) {
+-  const extension = this.terms[0]; // [extension, orginal]
++  const extension = this.terms[0]; // [extension, original]
+   return extension.outputRecipe(formals, grammarInterval);
+ };
+ 
++pexprs.Splice.prototype.outputRecipe = function(formals, grammarInterval) {
++  const beforeTerms = this.terms.slice(0, this.expansionPos);
++  const afterTerms = this.terms.slice(this.expansionPos + 1);
++  return [
++    'splice',
++    getMetaInfo(this, grammarInterval),
++    beforeTerms.map(term => term.outputRecipe(formals, grammarInterval)),
++    afterTerms.map(term => term.outputRecipe(formals, grammarInterval))
++  ];
++};
++
+ pexprs.Seq.prototype.outputRecipe = function(formals, grammarInterval) {
+   return [
+     'seq',
+diff --git a/ohm-js/src/pexprs.js b/ohm-js/src/pexprs.js
+index 7a7de240..2e425426 100644
+--- a/ohm-js/src/pexprs.js
++++ b/ohm-js/src/pexprs.js
+@@ -87,6 +87,18 @@ class Extend extends Alt {
+   }
+ }
+ 
++// Splice is an implementation detail of rule overriding with the `...` operator.
++class Splice extends Alt {
++  constructor(superGrammar, ruleName, beforeTerms, afterTerms) {
++    const origBody = superGrammar.rules[ruleName].body;
++    super([...beforeTerms, origBody, ...afterTerms]);
++
++    this.superGrammar = superGrammar;
++    this.ruleName = ruleName;
++    this.expansionPos = beforeTerms.length;
++  }
++}
++
+ // Sequences
+ 
+ class Seq extends PExpr {
+@@ -190,6 +202,7 @@ exports.Range = Range;
+ exports.Param = Param;
+ exports.Alt = Alt;
+ exports.Extend = Extend;
++exports.Splice = Splice;
+ exports.Seq = Seq;
+ exports.Iter = Iter;
+ exports.Star = Star;

@@ -1,0 +1,206 @@
+diff --git a/changelog_unreleased/api/17331.md b/changelog_unreleased/api/17331.md
+new file mode 100644
+index 000000000..1c222e246
+--- /dev/null
++++ b/changelog_unreleased/api/17331.md
+@@ -0,0 +1,17 @@
++#### Add `isSupported` function support for `languages` API (#17331 by @JounQin)
++
++Previously, `languages` API for custom plugin only supported to infer parser based on the file basename or extension.
++
++Prettier main added `isSupported: (file: string) => boolean` function to allow plugin check if file is supported based on the full path (eg: files in a specific directory), the `file` parameter could be a normal path or a url string like `file:///C:/test.txt`.
++
++If no `isSupported` provided, it just behaviors the same way as before.
++
++```js
++export const languages = [
++  {
++    name: "foo",
++    parsers: ["foo"],
++    isSupported: (file) => file.includes(".foo"),
++  },
++];
++```
+diff --git a/docs/api.md b/docs/api.md
+index ec7efc10b..fe7d29b9a 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -124,6 +124,7 @@ The support information looks like this:
+     filenames?: string[];
+     linguistLanguageId?: number;
+     vscodeLanguageIds?: string[];
++    isSupported?(file: string): boolean;
+   }>;
+ }
+ ```
+diff --git a/docs/plugins.md b/docs/plugins.md
+index 10b059b03..7597a6e23 100644
+--- a/docs/plugins.md
++++ b/docs/plugins.md
+@@ -70,7 +70,7 @@ Strings provided to `plugins` are ultimately passed to [`import()` expression](h
+ - [`prettier-plugin-sql-cst`](https://github.com/nene/prettier-plugin-sql-cst) by [**@nene**](https://github.com/nene)
+ - [`prettier-plugin-solidity`](https://github.com/prettier-solidity/prettier-plugin-solidity) by [**@mattiaerre**](https://github.com/mattiaerre)
+ - [`prettier-plugin-svelte`](https://github.com/sveltejs/prettier-plugin-svelte) by [**@sveltejs**](https://github.com/sveltejs)
+-- [`prettier-plugin-toml`](https://github.com/bd82/toml-tools/tree/master/packages/prettier-plugin-toml) by [**@bd82**](https://github.com/bd82)
++- [`prettier-plugin-toml`](https://github.com/un-ts/prettier/tree/master/packages/toml) by [**@JounQin**](https://github.com/JounQin) and [**@so1ve**](https://github.com/so1ve)
+ 
+ ## Developing Plugins
+ 
+diff --git a/src/cli/file-info.js b/src/cli/file-info.js
+index a84bf7ea0..377445757 100644
+--- a/src/cli/file-info.js
++++ b/src/cli/file-info.js
+@@ -1,3 +1,4 @@
++import path from "node:path";
+ import stringify from "fast-json-stable-stringify";
+ import { format, getFileInfo } from "../index.js";
+ import { printToScreen } from "./utils.js";
+@@ -11,7 +12,7 @@ async function logFileInfoOrDie(context) {
+     config,
+   } = context.argv;
+ 
+-  const fileInfo = await getFileInfo(file, {
++  const fileInfo = await getFileInfo(path.resolve(file), {
+     ignorePath,
+     withNodeModules,
+     plugins,
+diff --git a/src/cli/format.js b/src/cli/format.js
+index 9385eeff8..5f3e04b51 100644
+--- a/src/cli/format.js
++++ b/src/cli/format.js
+@@ -239,10 +239,12 @@ async function formatStdin(context) {
+     // TODO[@fisker]: Exit if no input.
+     // `prettier --config-precedence cli-override`
+ 
++    const absoluteFilepath = filepath ? path.resolve(filepath) : undefined;
++
+     let isFileIgnored = false;
+-    if (filepath) {
++    if (absoluteFilepath) {
+       const isIgnored = await createIsIgnoredFromContextOrDie(context);
+-      isFileIgnored = isIgnored(filepath);
++      isFileIgnored = isIgnored(absoluteFilepath);
+     }
+ 
+     if (isFileIgnored) {
+@@ -250,10 +252,11 @@ async function formatStdin(context) {
+       return;
+     }
+ 
+-    const options = await getOptionsForFile(
+-      context,
+-      filepath ? path.resolve(filepath) : undefined,
+-    );
++    const options = {
++      ...(await getOptionsForFile(context, absoluteFilepath)),
++      // `getOptionsForFile` forwards `--stdin-filepath` directly, which can be a relative path
++      filepath: absoluteFilepath,
++    };
+ 
+     if (await listDifferent(context, input, options, "(stdin)")) {
+       return;
+diff --git a/src/index.d.ts b/src/index.d.ts
+index 7a7841ec8..84cf02a8d 100644
+--- a/src/index.d.ts
++++ b/src/index.d.ts
+@@ -673,6 +673,7 @@ export interface SupportLanguage {
+   linguistLanguageId?: number | undefined;
+   vscodeLanguageIds?: string[] | undefined;
+   interpreters?: string[] | undefined;
++  isSupported?: ((file: string) => boolean) | undefined;
+ }
+ 
+ export interface SupportOptionRange {
+diff --git a/src/utils/infer-parser.js b/src/utils/infer-parser.js
+index 0b1b4a013..7f23a7b24 100644
+--- a/src/utils/infer-parser.js
++++ b/src/utils/infer-parser.js
+@@ -1,11 +1,19 @@
+ import getInterpreter from "./get-interpreter.js";
+ 
+-/** @import {Options} from "../index.js" */
++/** @import {Options, SupportLanguage} from "../index.js" */
+ 
+-// Didn't use `path.basename` since this module need work in browsers too
+-// And `file` can be a `URL`
++/**
++ * Didn't use `path.basename` since this module should work in browsers too
++ * And `file` can be a `URL`
++ * @param {string | URL} file
++ */
+ const getFileBasename = (file) => String(file).split(/[/\\]/u).pop();
+ 
++/**
++ * @param {SupportLanguage[]} languages
++ * @param {string | URL | undefined} [file]
++ * @returns {SupportLanguage | undefined}
++ */
+ function getLanguageByFileName(languages, file) {
+   if (!file) {
+     return;
+@@ -23,6 +31,11 @@ function getLanguageByFileName(languages, file) {
+   );
+ }
+ 
++/**
++ * @param {SupportLanguage[]} languages
++ * @param {string | undefined} [languageName]
++ * @returns {SupportLanguage | undefined}
++ */
+ function getLanguageByLanguageName(languages, languageName) {
+   if (!languageName) {
+     return;
+@@ -35,6 +48,11 @@ function getLanguageByLanguageName(languages, languageName) {
+   );
+ }
+ 
++/**
++ * @param {SupportLanguage[]} languages
++ * @param {string | URL | undefined} [file]
++ * @returns {SupportLanguage | undefined}
++ */
+ function getLanguageByInterpreter(languages, file) {
+   if (
+     process.env.PRETTIER_TARGET === "universal" ||
+@@ -55,10 +73,30 @@ function getLanguageByInterpreter(languages, file) {
+   );
+ }
+ 
++/**
++ * @param {SupportLanguage[]} languages
++ * @param {string | URL | undefined} [file]
++ * @returns {SupportLanguage | undefined}
++ */
++function getLanguageByIsSupported(languages, file) {
++  if (!file) {
++    return;
++  }
++
++  /*
++  We can't use `url.fileURLToPath` here since this module should work in browsers too
++  `URL#pathname` won't work either since `new URL('file:///C:/path/to/file').pathname`
++  equals to `/C:/path/to/file`, try to improve this part in future
++  */
++  file = String(file);
++
++  return languages.find(({ isSupported }) => isSupported?.(file));
++}
++
+ /**
+  * @param {Options} options
+- * @param {{physicalFile?: string | URL, file?: string | URL, language?: string}} fileInfo
+- * @returns {string | void} matched parser name if found
++ * @param {{physicalFile?: string | URL | undefined, file?: string | URL | undefined, language?: string | undefined}} fileInfo
++ * @returns {string | undefined} matched parser name if found
+  */
+ function inferParser(options, fileInfo) {
+   const languages = options.plugins.flatMap(
+@@ -74,6 +112,8 @@ function inferParser(options, fileInfo) {
+     getLanguageByLanguageName(languages, fileInfo.language) ??
+     getLanguageByFileName(languages, fileInfo.physicalFile) ??
+     getLanguageByFileName(languages, fileInfo.file) ??
++    getLanguageByIsSupported(languages, fileInfo.physicalFile) ??
++    getLanguageByIsSupported(languages, fileInfo.file) ??
+     getLanguageByInterpreter(languages, fileInfo.physicalFile);
+ 
+   return language?.parsers[0];

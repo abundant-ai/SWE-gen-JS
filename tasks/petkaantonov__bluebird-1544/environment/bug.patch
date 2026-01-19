@@ -1,0 +1,228 @@
+diff --git a/.travis.yml b/.travis.yml
+index 612ff32e..50c2cec7 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -14,7 +14,7 @@ matrix:
+ git:
+   depth: 5
+ env:
+-  - "NODE_FLAGS='--expose-gc' SCRIPT_FLAGS=''"
++  - "NODE_FLAGS='' SCRIPT_FLAGS=''"
+ before_script:
+ - git submodule update --init --recursive
+ script: "node $NODE_FLAGS tools/test.js $SCRIPT_FLAGS"
+diff --git a/package.json b/package.json
+index d0e23931..8e4d073f 100644
+--- a/package.json
++++ b/package.json
+@@ -19,7 +19,7 @@
+   ],
+   "scripts": {
+     "lint": "node scripts/jshint.js",
+-    "test": "node --expose-gc tools/test.js",
++    "test": "node tools/test.js",
+     "istanbul": "istanbul",
+     "prepublish": "npm run generate-browser-core && npm run generate-browser-full",
+     "generate-browser-full": "node tools/build.js --no-clean --no-debug --release --browser --minify",
+diff --git a/src/async.js b/src/async.js
+index e6ea1f66..eec02b58 100644
+--- a/src/async.js
++++ b/src/async.js
+@@ -132,31 +132,25 @@ if (!util.hasDevTools) {
+     };
+ }
+ 
+-function _drainQueue(queue) {
++Async.prototype._drainQueue = function(queue) {
+     while (queue.length() > 0) {
+-        _drainQueueStep(queue);
+-    }
+-}
+-
+-// Shift the queue in a separate function to allow
+-// garbage collection after each step
+-function _drainQueueStep(queue) {
+-    var fn = queue.shift();
+-    if (typeof fn !== "function") {
+-        fn._settlePromises();
+-    } else {
++        var fn = queue.shift();
++        if (typeof fn !== "function") {
++            fn._settlePromises();
++            continue;
++        }
+         var receiver = queue.shift();
+         var arg = queue.shift();
+         fn.call(receiver, arg);
+     }
+-}
++};
+ 
+ Async.prototype._drainQueues = function () {
+     ASSERT(this._isTickUsed);
+-    _drainQueue(this._normalQueue);
++    this._drainQueue(this._normalQueue);
+     this._reset();
+     this._haveDrainedQueues = true;
+-    _drainQueue(this._lateQueue);
++    this._drainQueue(this._lateQueue);
+ };
+ 
+ Async.prototype._queueTick = function () {
+diff --git a/src/debuggability.js b/src/debuggability.js
+index c716f4ef..024892f0 100644
+--- a/src/debuggability.js
++++ b/src/debuggability.js
+@@ -127,7 +127,6 @@ Promise.longStackTraces = function () {
+     if (!config.longStackTraces && longStackTracesIsSupported()) {
+         var Promise_captureStackTrace = Promise.prototype._captureStackTrace;
+         var Promise_attachExtraTrace = Promise.prototype._attachExtraTrace;
+-        var Promise_dereferenceTrace = Promise.prototype._dereferenceTrace;
+         config.longStackTraces = true;
+         disableLongStackTraces = function() {
+             if (async.haveItemsQueued() && !config.longStackTraces) {
+@@ -135,14 +134,12 @@ Promise.longStackTraces = function () {
+             }
+             Promise.prototype._captureStackTrace = Promise_captureStackTrace;
+             Promise.prototype._attachExtraTrace = Promise_attachExtraTrace;
+-            Promise.prototype._dereferenceTrace = Promise_dereferenceTrace;
+             Context.deactivateLongStackTraces();
+             async.enableTrampoline();
+             config.longStackTraces = false;
+         };
+         Promise.prototype._captureStackTrace = longStackTracesCaptureStackTrace;
+         Promise.prototype._attachExtraTrace = longStackTracesAttachExtraTrace;
+-        Promise.prototype._dereferenceTrace = longStackTracesDereferenceTrace;
+         Context.activateLongStackTraces();
+         async.disableTrampolineIfNecessary();
+     }
+@@ -328,7 +325,6 @@ Promise.prototype._attachCancellationCallback = function(onCancel) {
+ };
+ Promise.prototype._captureStackTrace = function () {};
+ Promise.prototype._attachExtraTrace = function () {};
+-Promise.prototype._dereferenceTrace = function () {};
+ Promise.prototype._clearCancellationData = function() {};
+ Promise.prototype._propagateFrom = function (parent, flags) {
+     USE(parent);
+@@ -439,10 +435,6 @@ function longStackTracesAttachExtraTrace(error, ignoreSelf) {
+     }
+ }
+ 
+-function longStackTracesDereferenceTrace() {
+-    this._trace = undefined;
+-}
+-
+ function checkForgottenReturns(returnValue, promiseCreated, name, promise,
+                                parent) {
+     if (returnValue === undefined && promiseCreated !== null &&
+diff --git a/src/promise.js b/src/promise.js
+index 10dc52a4..b1cd220e 100644
+--- a/src/promise.js
++++ b/src/promise.js
+@@ -681,7 +681,6 @@ Promise.prototype._fulfill = function (value) {
+         } else {
+             async.settlePromises(this);
+         }
+-        this._dereferenceTrace();
+     }
+ };
+ 
+diff --git a/test/mocha/async.js b/test/mocha/async.js
+index c487ddd6..6eb9ea7e 100644
+--- a/test/mocha/async.js
++++ b/test/mocha/async.js
+@@ -152,94 +152,4 @@ describe("Async requirement", function() {
+             });
+         });
+     }
+-
+-    if (testUtils.isRecentNode) {
+-        describe("Frees memory of old values in promise chains", function () {
+-            function getHeapUsed() {
+-                global.gc();
+-                return process.memoryUsage().heapUsed;
+-            }
+-
+-            var initialHeapUsed;
+-
+-            before(function () {
+-                if (typeof global.gc !== "function") {
+-                    throw new Error("These tests require the --expose-gc flag");
+-                }
+-                initialHeapUsed = getHeapUsed();
+-            });
+-
+-            specify(".then", function () {
+-                return Promise.resolve()
+-                    .then(function () {
+-                        assert.ok(
+-                            getHeapUsed() < initialHeapUsed * 1.1,
+-                            "Promise.resolve uses minimal memory"
+-                        );
+-                        var rows = [];
+-                        for (var i = 0; i < 1e6; i++) {
+-                            rows.push(["Example " + i, i, i * 2]);
+-                        }
+-                        return rows;
+-                    })
+-                    .then(function (rows) {
+-                        assert.ok(
+-                            getHeapUsed() > initialHeapUsed * 12,
+-                            "large array uses a large amount of memory"
+-                        );
+-                        return { len: rows.length };
+-                    })
+-                    .then(function (x) {
+-                        // work around cancellation retaining previous result
+-                        return x;
+-                    })
+-                    .then(function (summaryResult) {
+-                        assert.ok(
+-                            getHeapUsed() < initialHeapUsed * 1.1,
+-                            "memory used by large array is freed"
+-                        );
+-                        assert.strictEqual(summaryResult.len, 1e6, "result");
+-                    });
+-            });
+-
+-            specify(".catch", function () {
+-                return Promise.reject(new Error("error 1"))
+-                    .catch(function () {
+-                        assert.ok(
+-                            getHeapUsed() < initialHeapUsed * 1.1,
+-                            "Promise.reject uses minimal memory"
+-                        );
+-                        var rows = [];
+-                        for (var i = 0; i < 1e6; i++) {
+-                            rows.push(["Example " + i, i, i * 2]);
+-                        }
+-                        var error = new Error("error 2");
+-                        error.result = rows;
+-                        throw error;
+-                    })
+-                    .catch(function (err) {
+-                        assert.ok(
+-                            getHeapUsed() > initialHeapUsed * 12,
+-                            "large array uses a large amount of memory"
+-                        );
+-                        var rows = err.result;
+-                        var error = new Error("error 3");
+-                        error.result = { len: rows.length };
+-                        throw error;
+-                    })
+-                    .catch(function (err) {
+-                        // work around cancellation retaining previous result
+-                        throw err;
+-                    })
+-                    .catch(function (err) {
+-                        assert.ok(
+-                            getHeapUsed() < initialHeapUsed * 1.1,
+-                            "memory used by large array is freed"
+-                        );
+-                        var summaryResult = err.result;
+-                        assert.strictEqual(summaryResult.len, 1e6, "result");
+-                    });
+-            });
+-        });
+-    }
+ });

@@ -1,0 +1,289 @@
+diff --git a/.changeset/silly-walls-build.md b/.changeset/silly-walls-build.md
+new file mode 100644
+index 0000000000..651a85dcf2
+--- /dev/null
++++ b/.changeset/silly-walls-build.md
+@@ -0,0 +1,35 @@
++---
++"@biomejs/biome": patch
++---
++
++Improved the rules `useConst`, `noUnusedImports`, `useImportTypes` and `noUnusedVariables` inside
++Vue, Svelte and Astro files when `experimentalFullSupportEnabled` is set to `true`.
++
++Now variables and components that are imported or defined inside the files won't trigger false positives.
++
++Until now, we suggested disabling these rules with an override. _Now the rules are more stable_; however, you might still experience
++a few false positives. Those are probably issues caused by our parser.
++
++**If you use `experimentalFullSupportEnabled`, you can remove the following override:**
++
++```diff
++{
++-  "overrides": [
++-    {
++-      "includes": ["**/*.svelte", "**/*.astro", "**/*.vue"],
++-      "linter": {
++-        "rules": {
++-          "style": {
++-            "useConst": "off",
++-            "useImportType": "off"
++-          },
++-          "correctness": {
++-            "noUnusedVariables": "off",
++-            "noUnusedImports": "off"
++-          }
++-        }
++-      }
++-    }
++-  ]
++}
++```
+diff --git a/crates/biome_js_analyze/src/lint/correctness/no_unused_imports.rs b/crates/biome_js_analyze/src/lint/correctness/no_unused_imports.rs
+index b21300bf70..e3f149c2bd 100644
+--- a/crates/biome_js_analyze/src/lint/correctness/no_unused_imports.rs
++++ b/crates/biome_js_analyze/src/lint/correctness/no_unused_imports.rs
+@@ -5,6 +5,7 @@ use crate::{
+ };
+ use biome_rule_options::no_unused_imports::NoUnusedImportsOptions;
+ 
++use crate::services::embedded_bindings::EmbeddedBindings;
+ use biome_analyze::{
+     AddVisitor, FixKind, FromServices, Phase, Phases, QueryKey, Queryable, Rule, RuleDiagnostic,
+     RuleKey, RuleMetadata, RuleSource, ServiceBag, ServicesDiagnostic, SyntaxVisitor, Visitor,
+@@ -270,6 +271,10 @@ impl Rule for NoUnusedImports {
+     type Options = NoUnusedImportsOptions;
+ 
+     fn run(ctx: &RuleContext<Self>) -> Self::Signals {
++        let embedded_bindings = ctx
++            .get_service::<EmbeddedBindings>()
++            .expect("embedded bindings service");
++
+         match ctx.query() {
+             AnyJsImportClause::JsImportBareClause(_) => {
+                 // ignore bare imports (aka side-effect imports) such as `import "mod"`.
+@@ -277,10 +282,12 @@ impl Rule for NoUnusedImports {
+             }
+             AnyJsImportClause::JsImportCombinedClause(clause) => {
+                 let default_local_name = clause.default_specifier().ok()?.local_name().ok()?;
+-                let is_default_import_unused = is_unused(ctx, &default_local_name);
++
++                let is_default_import_unused =
++                    is_unused(ctx, embedded_bindings, &default_local_name);
+                 let (is_combined_unused, named_import_range) = match clause.specifier().ok()? {
+                     AnyJsCombinedSpecifier::JsNamedImportSpecifiers(specifiers) => {
+-                        match unused_named_specifiers(ctx, &specifiers) {
++                        match unused_named_specifiers(ctx, embedded_bindings, &specifiers) {
+                             Some(Unused::AllImports(range) | Unused::EmptyStatement(range)) => {
+                                 (true, range)
+                             }
+@@ -299,7 +306,10 @@ impl Rule for NoUnusedImports {
+                     }
+                     AnyJsCombinedSpecifier::JsNamespaceImportSpecifier(specifier) => {
+                         let local_name = specifier.local_name().ok()?;
+-                        (is_unused(ctx, &local_name), local_name.range())
++                        (
++                            is_unused(ctx, embedded_bindings, &local_name),
++                            local_name.range(),
++                        )
+                     }
+                 };
+                 match (is_default_import_unused, is_combined_unused) {
+@@ -314,7 +324,8 @@ impl Rule for NoUnusedImports {
+             }
+             AnyJsImportClause::JsImportDefaultClause(clause) => {
+                 let local_name = clause.default_specifier().ok()?.local_name().ok()?;
+-                is_unused(ctx, &local_name).then_some(Unused::AllImports(local_name.range()))
++                is_unused(ctx, embedded_bindings, &local_name)
++                    .then_some(Unused::AllImports(local_name.range()))
+             }
+             AnyJsImportClause::JsImportNamedClause(clause) => {
+                 // exception: allow type augmentation imports
+@@ -326,11 +337,12 @@ impl Rule for NoUnusedImports {
+                     return None;
+                 }
+ 
+-                unused_named_specifiers(ctx, &clause.named_specifiers().ok()?)
++                unused_named_specifiers(ctx, embedded_bindings, &clause.named_specifiers().ok()?)
+             }
+             AnyJsImportClause::JsImportNamespaceClause(clause) => {
+                 let local_name = clause.namespace_specifier().ok()?.local_name().ok()?;
+-                is_unused(ctx, &local_name).then_some(Unused::AllImports(local_name.range()))
++                is_unused(ctx, embedded_bindings, &local_name)
++                    .then_some(Unused::AllImports(local_name.range()))
+             }
+         }
+     }
+@@ -591,6 +603,7 @@ pub enum Unused {
+ 
+ fn unused_named_specifiers(
+     ctx: &RuleContext<NoUnusedImports>,
++    embedded_bindings: &EmbeddedBindings,
+     named_specifiers: &JsNamedImportSpecifiers,
+ ) -> Option<Unused> {
+     let specifiers = named_specifiers.specifiers();
+@@ -604,7 +617,7 @@ fn unused_named_specifiers(
+             let Some(local_name) = specifier.local_name() else {
+                 continue;
+             };
+-            if is_unused(ctx, &local_name) {
++            if is_unused(ctx, embedded_bindings, &local_name) {
+                 unused_imports.push(specifier);
+             }
+         }
+@@ -620,10 +633,23 @@ fn unused_named_specifiers(
+     }
+ }
+ 
+-fn is_unused(ctx: &RuleContext<NoUnusedImports>, local_name: &AnyJsBinding) -> bool {
++fn is_unused(
++    ctx: &RuleContext<NoUnusedImports>,
++    embedded_bindings: &EmbeddedBindings,
++    local_name: &AnyJsBinding,
++) -> bool {
+     let AnyJsBinding::JsIdentifierBinding(binding) = &local_name else {
+         return false;
+     };
++
++    let is_defined_in_embed = binding
++        .name_token()
++        .ok()
++        .is_some_and(|token| embedded_bindings.contains_binding(token.text_trimmed()));
++    if is_defined_in_embed {
++        return false;
++    }
++
+     if ctx.jsx_runtime() == JsxRuntime::ReactClassic {
+         // Check for standard React import
+         if is_global_react_import(binding, ReactLibrary::React) {
+diff --git a/crates/biome_js_analyze/src/lint/style/use_const.rs b/crates/biome_js_analyze/src/lint/style/use_const.rs
+index 6a94a9ec69..08e3380c22 100644
+--- a/crates/biome_js_analyze/src/lint/style/use_const.rs
++++ b/crates/biome_js_analyze/src/lint/style/use_const.rs
+@@ -4,7 +4,6 @@ use biome_analyze::{
+ };
+ use biome_console::markup;
+ use biome_diagnostics::Severity;
+-
+ use biome_js_factory::make;
+ use biome_js_semantic::{ReferencesExtensions, Scope, SemanticModel, SemanticScopeExtensions};
+ use biome_js_syntax::*;
+@@ -105,6 +104,12 @@ impl Rule for UseConst {
+         let declaration = ctx.query();
+         let model = ctx.model();
+ 
++        // `let` declarations inside snippets are allowed
++        let file_source = ctx.source_type::<JsFileSource>();
++        if file_source.is_embedded_source() && declaration.is_let() {
++            return None;
++        }
++
+         // Not a let declaration or inside a for-loop init
+         if !declaration.is_let() || declaration.parent::<JsForStatement>().is_some() {
+             return None;
+diff --git a/crates/biome_lsp/src/server.tests.rs b/crates/biome_lsp/src/server.tests.rs
+index 5fe8078b28..42762ab439 100644
+--- a/crates/biome_lsp/src/server.tests.rs
++++ b/crates/biome_lsp/src/server.tests.rs
+@@ -4088,7 +4088,9 @@ async fn should_correctly_fix_all_astro_files() -> Result<()> {
+     server
+         .open_named_document(
+             r#"---
+-let useConst = "Astro Test";
++loop: for (let i = 0; i < 5; i++) {
++  continue loop;
++}
+ ---
+ <!doctype html>"#,
+             uri!("document.astro"),
+@@ -4141,13 +4143,13 @@ let useConst = "Astro Test";
+                     character: 0,
+                 },
+                 end: Position {
+-                    line: 4,
++                    line: 6,
+                     character: 0,
+                 },
+             },
+             new_text: String::from(
+                 r#"---
+-const useConst = "Astro Test";
++for (let i = 0; i < 5; i++) {}
+ ---
+ <!doctype html>"#,
+             ),
+diff --git a/crates/biome_service/src/file_handlers/html.rs b/crates/biome_service/src/file_handlers/html.rs
+index 6d3247bce2..5e8138f497 100644
+--- a/crates/biome_service/src/file_handlers/html.rs
++++ b/crates/biome_service/src/file_handlers/html.rs
+@@ -435,13 +435,21 @@ fn parse_embedded_nodes(
+         }
+ 
+         if file_source.is_vue()
+-            && let Some(_text_expression) = HtmlDoubleTextExpression::cast_ref(&element)
++            && let Some(text_expression) = HtmlDoubleTextExpression::cast_ref(&element)
+         {
+-            // TODO: uncomment this once we have better parsing of Vue syntax where we have expressions VS names
+-            // let result = parse_vue_text_expression(text_expression, cache, biome_path, settings);
+-            // if let Some((content, file_source)) = result {
+-            //     nodes.push((content.into(), file_source));
+-            // }
++            let result = parse_vue_text_expression(text_expression, cache, biome_path, settings);
++            if let Some((content, file_source)) = result {
++                nodes.push((content.into(), file_source));
++            }
++        }
++
++        if file_source.is_astro()
++            && let Some(text_expression) = HtmlSingleTextExpression::cast_ref(&element)
++        {
++            let result = parse_astro_text_expression(text_expression, cache, biome_path, settings);
++            if let Some((content, file_source)) = result {
++                nodes.push((content.into(), file_source));
++            }
+         }
+ 
+         if let Some(element) = HtmlElement::cast_ref(&element) {
+@@ -718,8 +726,41 @@ pub(crate) fn parse_svelte_text_expression(
+     Some((snippet, document_file_source))
+ }
+ 
++/// Parses Astro single text expressions `{ expression }`
++pub(crate) fn parse_astro_text_expression(
++    element: HtmlSingleTextExpression,
++    cache: &mut NodeCache,
++    biome_path: &BiomePath,
++    settings: &SettingsWithEditor,
++) -> Option<(EmbeddedSnippet<JsLanguage>, DocumentFileSource)> {
++    let expression = element.expression().ok()?;
++    let content = expression.html_literal_token().ok()?;
++    // Astro is kinda weird in its JSX-like expressions. They are JS, but they contain HTML, not JSX.
++    // That's because Astro doesn't parse what's inside the expressions, actually. In fact, their arrow function callbacks
++    // don't have curly brackets.
++    //
++    // As for now, we use the TSX parser, hoping it won't bite us back in the future.
++    let file_source =
++        JsFileSource::tsx().with_embedding_kind(EmbeddingKind::Astro { frontmatter: false });
++    let document_file_source = DocumentFileSource::Js(file_source);
++    let options = settings.parse_options::<JsLanguage>(biome_path, &document_file_source);
++    let parse = parse_js_with_offset_and_cache(
++        content.text(),
++        content.text_range().start(),
++        file_source,
++        options,
++        cache,
++    );
++    let snippet = EmbeddedSnippet::new(
++        parse.into(),
++        expression.range(),
++        content.text_range(),
++        content.text_range().start(),
++    );
++    Some((snippet, document_file_source))
++}
++
+ /// Parses Vue double text expressions `{{ expression }}`
+-#[expect(unused)]
+ pub(crate) fn parse_vue_text_expression(
+     element: HtmlDoubleTextExpression,
+     cache: &mut NodeCache,

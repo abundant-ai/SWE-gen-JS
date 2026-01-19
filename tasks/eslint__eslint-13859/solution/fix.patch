@@ -1,0 +1,394 @@
+diff --git a/docs/rules/no-unsafe-optional-chaining.md b/docs/rules/no-unsafe-optional-chaining.md
+new file mode 100644
+index 000000000..48296aac2
+--- /dev/null
++++ b/docs/rules/no-unsafe-optional-chaining.md
+@@ -0,0 +1,153 @@
++# disallow use of optional chaining in contexts where the `undefined` value is not allowed (no-unsafe-optional-chaining)
++
++The optional chaining (`?.`) expression can short-circuit with a return value of `undefined`. Therefore, treating an evaluated optional chaining expression as a function, object, number, etc., can cause TypeError or unexpected results. For example:
++
++```js
++var obj = undefined;
++
++1 in obj?.foo;  // TypeError
++with (obj?.foo);  // TypeError
++for (bar of obj?.foo);  // TypeError
++bar instanceof obj?.foo;  // TypeError
++const { bar } = obj?.foo;  // TypeError
++```
++
++Also, parentheses limit the scope of short-circuiting in chains. For example:
++
++```js
++var obj = undefined;
++
++(obj?.foo)(); // TypeError
++(obj?.foo).bar; // TypeError
++```
++
++## Rule Details
++
++This rule aims to detect some cases where the use of optional chaining doesn't prevent runtime errors. In particular, it flags optional chaining expressions in positions where short-circuiting to `undefined` causes throwing a TypeError afterward.
++
++Examples of **incorrect** code for this rule:
++
++```js
++/*eslint no-unsafe-optional-chaining: "error"*/
++
++(obj?.foo)();
++
++(obj?.foo).bar;
++
++(foo?.()).bar;
++
++(foo?.()).bar();
++
++(obj?.foo ?? obj?.bar)();
++
++(foo || obj?.foo)();
++
++(obj?.foo && foo)();
++
++(foo ? obj?.foo : bar)();
++
++(foo, obj?.bar).baz;
++
++(obj?.foo)`template`;
++
++new (obj?.foo)();
++
++[...obj?.foo];
++
++bar(...obj?.foo);
++
++1 in obj?.foo;
++
++bar instanceof obj?.foo;
++
++for (bar of obj?.foo);
++
++const { bar } = obj?.foo;
++
++[{ bar } = obj?.foo] = [];
++
++with (obj?.foo);
++
++class A extends obj?.foo {}
++
++var a = class A extends obj?.foo {};
++
++async function foo () {
++    const { bar } = await obj?.foo;
++   (await obj?.foo)();
++   (await obj?.foo).bar;
++}
++```
++
++Examples of **correct** code for this rule:
++
++```js
++/*eslint no-unsafe-optional-chaining: "error"*/
++
++(obj?.foo)?.();
++
++obj?.foo();
++
++(obj?.foo ?? bar)();
++
++obj?.foo.bar;
++
++foo?.()?.bar;
++
++(obj?.foo ?? bar)`template`;
++
++new (obj?.foo ?? bar)();
++
++var baz = {...obj?.foo};
++
++const { bar } = obj?.foo || baz;
++
++async function foo () {
++  const { bar } = await obj?.foo || baz;
++   (await obj?.foo)?.();
++   (await obj?.foo)?.bar;
++}
++```
++
++## Options
++
++This rule has an object option:
++
++- `disallowArithmeticOperators`: Disallow arithmetic operations on optional chaining expressions (Default `false`). If this is `true`, this rule warns arithmetic operations on optional chaining expressions, which possibly result in `NaN`.
++
++### disallowArithmeticOperators
++
++With this option set to `true` the rule is enforced for:
++
++- Unary operators: `-`, `+`
++- Arithmetic operators: `+`, `-`, `/`, `*`, `%`, `**`
++- Assignment operators: `+=`, `-=`, `/=`, `*=`, `%=`, `**=`
++
++Examples of additional **incorrect** code for this rule with the `{ "disallowArithmeticOperators": true }` option:
++
++```js
++/*eslint no-unsafe-optional-chaining: ["error", { "disallowArithmeticOperators": true }]*/
++
+++obj?.foo;
++-obj?.foo;
++
++obj?.foo + bar;
++obj?.foo - bar;
++obj?.foo / bar;
++obj?.foo * bar;
++obj?.foo % bar;
++obj?.foo ** bar;
++
++baz += obj?.foo;
++baz -= obj?.foo;
++baz /= obj?.foo;
++baz *= obj?.foo;
++baz %= obj?.foo;
++baz **= obj?.foo;
++
++async function foo () {
++  +await obj?.foo;
++  await obj?.foo + bar;
++  baz += await obj?.foo;
++}
++```
+diff --git a/lib/rules/index.js b/lib/rules/index.js
+index 3cf26e51b..bace65583 100644
+--- a/lib/rules/index.js
++++ b/lib/rules/index.js
+@@ -217,6 +217,7 @@ module.exports = new LazyLoadingRuleMap(Object.entries({
+     "no-unreachable-loop": () => require("./no-unreachable-loop"),
+     "no-unsafe-finally": () => require("./no-unsafe-finally"),
+     "no-unsafe-negation": () => require("./no-unsafe-negation"),
++    "no-unsafe-optional-chaining": () => require("./no-unsafe-optional-chaining"),
+     "no-unused-expressions": () => require("./no-unused-expressions"),
+     "no-unused-labels": () => require("./no-unused-labels"),
+     "no-unused-vars": () => require("./no-unused-vars"),
+diff --git a/lib/rules/no-unsafe-optional-chaining.js b/lib/rules/no-unsafe-optional-chaining.js
+new file mode 100644
+index 000000000..2eafc1ad8
+--- /dev/null
++++ b/lib/rules/no-unsafe-optional-chaining.js
+@@ -0,0 +1,205 @@
++/**
++ * @fileoverview Rule to disallow unsafe optional chaining
++ * @author Yeon JuAn
++ */
++
++"use strict";
++
++const UNSAFE_ARITHMETIC_OPERATORS = new Set(["+", "-", "/", "*", "%", "**"]);
++const UNSAFE_ASSIGNMENT_OPERATORS = new Set(["+=", "-=", "/=", "*=", "%=", "**="]);
++const UNSAFE_RELATIONAL_OPERATORS = new Set(["in", "instanceof"]);
++
++/**
++ * Checks whether a node is a destructuring pattern or not
++ * @param {ASTNode} node node to check
++ * @returns {boolean} `true` if a node is a destructuring pattern, otherwise `false`
++ */
++function isDestructuringPattern(node) {
++    return node.type === "ObjectPattern" || node.type === "ArrayPattern";
++}
++
++module.exports = {
++    meta: {
++        type: "problem",
++
++        docs: {
++            description: "disallow use of optional chaining in contexts where the `undefined` value is not allowed",
++            category: "Possible Errors",
++            recommended: false,
++            url: "https://eslint.org/docs/rules/no-unsafe-optional-chaining"
++        },
++        schema: [{
++            type: "object",
++            properties: {
++                disallowArithmeticOperators: {
++                    type: "boolean",
++                    default: false
++                }
++            },
++            additionalProperties: false
++        }],
++        fixable: null,
++        messages: {
++            unsafeOptionalChain: "Unsafe usage of optional chaining. If it short-circuits with 'undefined' the evaluation will throw TypeError.",
++            unsafeArithmetic: "Unsafe arithmetic operation on optional chaining. It can result in NaN."
++        }
++    },
++
++    create(context) {
++        const options = context.options[0] || {};
++        const disallowArithmeticOperators = (options.disallowArithmeticOperators) || false;
++
++        /**
++         * Reports unsafe usage of optional chaining
++         * @param {ASTNode} node node to report
++         * @returns {void}
++         */
++        function reportUnsafeUsage(node) {
++            context.report({
++                messageId: "unsafeOptionalChain",
++                node
++            });
++        }
++
++        /**
++         * Reports unsafe arithmetic operation on optional chaining
++         * @param {ASTNode} node node to report
++         * @returns {void}
++         */
++        function reportUnsafeArithmetic(node) {
++            context.report({
++                messageId: "unsafeArithmetic",
++                node
++            });
++        }
++
++        /**
++         * Checks and reports if a node can short-circuit with `undefined` by optional chaining.
++         * @param {ASTNode} [node] node to check
++         * @param {Function} reportFunc report function
++         * @returns {void}
++         */
++        function checkUndefinedShortCircuit(node, reportFunc) {
++            if (!node) {
++                return;
++            }
++            switch (node.type) {
++                case "LogicalExpression":
++                    if (node.operator === "||" || node.operator === "??") {
++                        checkUndefinedShortCircuit(node.right, reportFunc);
++                    } else if (node.operator === "&&") {
++                        checkUndefinedShortCircuit(node.left, reportFunc);
++                        checkUndefinedShortCircuit(node.right, reportFunc);
++                    }
++                    break;
++                case "SequenceExpression":
++                    checkUndefinedShortCircuit(
++                        node.expressions[node.expressions.length - 1],
++                        reportFunc
++                    );
++                    break;
++                case "ConditionalExpression":
++                    checkUndefinedShortCircuit(node.consequent, reportFunc);
++                    checkUndefinedShortCircuit(node.alternate, reportFunc);
++                    break;
++                case "AwaitExpression":
++                    checkUndefinedShortCircuit(node.argument, reportFunc);
++                    break;
++                case "ChainExpression":
++                    reportFunc(node);
++                    break;
++                default:
++                    break;
++            }
++        }
++
++        /**
++         * Checks unsafe usage of optional chaining
++         * @param {ASTNode} node node to check
++         * @returns {void}
++         */
++        function checkUnsafeUsage(node) {
++            checkUndefinedShortCircuit(node, reportUnsafeUsage);
++        }
++
++        /**
++         * Checks unsafe arithmetic operations on optional chaining
++         * @param {ASTNode} node node to check
++         * @returns {void}
++         */
++        function checkUnsafeArithmetic(node) {
++            checkUndefinedShortCircuit(node, reportUnsafeArithmetic);
++        }
++
++        return {
++            "AssignmentExpression, AssignmentPattern"(node) {
++                if (isDestructuringPattern(node.left)) {
++                    checkUnsafeUsage(node.right);
++                }
++            },
++            "ClassDeclaration, ClassExpression"(node) {
++                checkUnsafeUsage(node.superClass);
++            },
++            CallExpression(node) {
++                if (!node.optional) {
++                    checkUnsafeUsage(node.callee);
++                }
++            },
++            NewExpression(node) {
++                checkUnsafeUsage(node.callee);
++            },
++            VariableDeclarator(node) {
++                if (isDestructuringPattern(node.id)) {
++                    checkUnsafeUsage(node.init);
++                }
++            },
++            MemberExpression(node) {
++                if (!node.optional) {
++                    checkUnsafeUsage(node.object);
++                }
++            },
++            TaggedTemplateExpression(node) {
++                checkUnsafeUsage(node.tag);
++            },
++            ForOfStatement(node) {
++                checkUnsafeUsage(node.right);
++            },
++            SpreadElement(node) {
++                if (node.parent && node.parent.type !== "ObjectExpression") {
++                    checkUnsafeUsage(node.argument);
++                }
++            },
++            BinaryExpression(node) {
++                if (UNSAFE_RELATIONAL_OPERATORS.has(node.operator)) {
++                    checkUnsafeUsage(node.right);
++                }
++                if (
++                    disallowArithmeticOperators &&
++                    UNSAFE_ARITHMETIC_OPERATORS.has(node.operator)
++                ) {
++                    checkUnsafeArithmetic(node.right);
++                    checkUnsafeArithmetic(node.left);
++                }
++            },
++            WithStatement(node) {
++                checkUnsafeUsage(node.object);
++            },
++            UnaryExpression(node) {
++                if (
++                    disallowArithmeticOperators &&
++                    UNSAFE_ARITHMETIC_OPERATORS.has(node.operator)
++                ) {
++                    checkUnsafeArithmetic(node.argument);
++                }
++            },
++            AssignmentExpression(node) {
++                if (
++                    disallowArithmeticOperators &&
++                    UNSAFE_ASSIGNMENT_OPERATORS.has(node.operator)
++                ) {
++                    checkUnsafeArithmetic(node.right);
++                }
++            }
++        };
++    }
++};
+diff --git a/tools/rule-types.json b/tools/rule-types.json
+index 84700de70..158e09a7d 100644
+--- a/tools/rule-types.json
++++ b/tools/rule-types.json
+@@ -204,6 +204,7 @@
+     "no-unreachable-loop": "problem",
+     "no-unsafe-finally": "problem",
+     "no-unsafe-negation": "problem",
++    "no-unsafe-optional-chaining": "problem",
+     "no-unused-expressions": "suggestion",
+     "no-unused-labels": "suggestion",
+     "no-unused-vars": "problem",

@@ -1,0 +1,268 @@
+diff --git a/.changeset/tricky-comics-know.md b/.changeset/tricky-comics-know.md
+new file mode 100644
+index 0000000000..75dd2b1a38
+--- /dev/null
++++ b/.changeset/tricky-comics-know.md
+@@ -0,0 +1,49 @@
++---
++'@xstate/store': minor
++---
++
++Added `createAtom()` for creating reactive atoms that can be combined with other atoms and stores:
++
++- Create simple atoms with initial values:
++
++  ```ts
++  import { createAtom } from '@xstate/store';
++
++  const countAtom = createAtom(0);
++  countAtom.get(); // 0
++  countAtom.set(1); // or use setter function: (prev) => prev + 1
++  ```
++
++- Subscribe to atom changes:
++
++  ```ts
++  countAtom.subscribe((value) => console.log(value));
++  ```
++
++- Combine multiple atoms:
++
++  ```ts
++  const nameAtom = createAtom('hello');
++  const countAtom = createAtom(3);
++  const combinedAtom = createAtom((read) =>
++    read(nameAtom).repeat(read(countAtom))
++  );
++  combinedAtom.get(); // "hellohellohello"
++  ```
++
++- Seamlessly combine atoms with stores:
++
++  ```ts
++  const countAtom = createAtom(0);
++  const nameStore = createStore({
++    context: { name: 'David' }
++    // ... store config
++  });
++
++  const combinedAtom = createAtom(
++    (read) => read(nameStore).context.name + ` ${read(countAtom)}`
++  );
++  combinedAtom.get(); // "David 0"
++  ```
++
++Atoms automatically update when their dependencies change, making it easy to create derived state from both atoms and stores.
+diff --git a/packages/xstate-store/src/atom.ts b/packages/xstate-store/src/atom.ts
+new file mode 100644
+index 0000000000..2b108a9fb4
+--- /dev/null
++++ b/packages/xstate-store/src/atom.ts
+@@ -0,0 +1,65 @@
++import { toObserver } from './toObserver';
++import { Atom, Observer, Readable, ReadonlyAtom, Subscription } from './types';
++
++export function createAtom<T>(
++  getValue: (read: <U>(atom: Readable<U>) => U) => T
++): ReadonlyAtom<T>;
++export function createAtom<T>(initialValue: T): Atom<T>;
++export function createAtom<T>(
++  valueOrFn: T | ((read: <U>(atom: Readable<U>) => U) => T)
++): Atom<T> | ReadonlyAtom<T> {
++  const current = { value: undefined as T };
++  let observers: Set<Observer<T>> | undefined;
++  const subs = new Map<Atom<any>, Subscription>();
++
++  // Handle computed case
++  if (typeof valueOrFn === 'function') {
++    const getValue = valueOrFn as (read: <U>(atom: Atom<U>) => U) => T;
++    const read = (atom: Atom<any>) => {
++      const val = atom.get();
++      if (subs.get(atom)) {
++        return val;
++      }
++      const sub = atom.subscribe(recompute);
++      subs.set(atom, sub);
++      return val;
++    };
++
++    function recompute() {
++      const newValue = getValue(read);
++      current.value = newValue;
++      observers?.forEach((o) => o.next?.(newValue));
++    }
++
++    // Initialize computed value
++    current.value = getValue(read);
++  } else {
++    // Handle static value case
++    current.value = valueOrFn;
++  }
++
++  return {
++    get: () => current.value,
++    set:
++      typeof valueOrFn === 'function'
++        ? undefined
++        : (newValueOrFn) => {
++            let newValue = newValueOrFn;
++            if (typeof newValueOrFn === 'function') {
++              newValue = (newValueOrFn as (prev: T) => T)(current.value);
++            }
++            current.value = newValue as T;
++            observers?.forEach((o) => o.next?.(newValue as T));
++          },
++    subscribe: (observerOrFn: Observer<T> | ((value: T) => void)) => {
++      const obs = toObserver(observerOrFn);
++      observers ??= new Set();
++      observers.add(obs);
++      return {
++        unsubscribe() {
++          observers?.delete(obs);
++        }
++      };
++    }
++  };
++}
+diff --git a/packages/xstate-store/src/index.ts b/packages/xstate-store/src/index.ts
+index 41ea096303..e883345e37 100644
+--- a/packages/xstate-store/src/index.ts
++++ b/packages/xstate-store/src/index.ts
+@@ -5,4 +5,5 @@ export {
+   createStoreWithProducer,
+   createStoreConfig
+ } from './store';
++export { createAtom } from './atom';
+ export * from './types';
+diff --git a/packages/xstate-store/src/react.ts b/packages/xstate-store/src/react.ts
+index b0b6e4e089..b74002963a 100644
+--- a/packages/xstate-store/src/react.ts
++++ b/packages/xstate-store/src/react.ts
+@@ -1,12 +1,12 @@
+ import { useCallback, useRef, useSyncExternalStore } from 'react';
+ import {
+-  SnapshotFromStore,
+   AnyStore,
+   StoreContext,
+   EventPayloadMap,
+   StoreConfig,
+   Store,
+-  ExtractEvents
++  ExtractEvents,
++  Readable
+ } from './types';
+ import { createStore } from './store';
+ 
+@@ -14,16 +14,16 @@ function defaultCompare<T>(a: T | undefined, b: T) {
+   return a === b;
+ }
+ 
+-function useSelectorWithCompare<TStore extends AnyStore, T>(
+-  selector: (snapshot: SnapshotFromStore<TStore>) => T,
++function useSelectorWithCompare<TStore extends Readable<any>, T>(
++  selector: (snapshot: TStore extends Readable<infer T> ? T : never) => T,
+   compare: (a: T | undefined, b: T) => boolean
+-): (snapshot: SnapshotFromStore<TStore>) => T {
++): (snapshot: TStore extends Readable<infer TValue> ? TValue : never) => T {
+   const previous = useRef<T | undefined>(undefined);
+ 
+-  return (state) => {
+-    const next = selector(state);
+-    return compare(previous.current, next)
+-      ? (previous.current as T)
++  return (snapshot) => {
++    const next = selector(snapshot);
++    return previous.current && compare(previous.current, next)
++      ? previous.current
+       : (previous.current = next);
+   };
+ }
+@@ -49,9 +49,9 @@ function useSelectorWithCompare<TStore extends AnyStore, T>(
+  *   previous value
+  * @returns The selected value
+  */
+-export function useSelector<TStore extends AnyStore, T>(
++export function useSelector<TStore extends Readable<any>, T>(
+   store: TStore,
+-  selector: (snapshot: SnapshotFromStore<TStore>) => T,
++  selector: (snapshot: TStore extends Readable<infer T> ? T : never) => T,
+   compare: (a: T | undefined, b: T) => boolean = defaultCompare
+ ): T {
+   const selectorWithCompare = useSelectorWithCompare(selector, compare);
+@@ -61,11 +61,8 @@ export function useSelector<TStore extends AnyStore, T>(
+       (handleStoreChange) => store.subscribe(handleStoreChange).unsubscribe,
+       [store]
+     ),
+-    () => selectorWithCompare(store.getSnapshot() as SnapshotFromStore<TStore>),
+-    () =>
+-      selectorWithCompare(
+-        store.getInitialSnapshot() as SnapshotFromStore<TStore>
+-      )
++    () => selectorWithCompare(store.get()),
++    () => selectorWithCompare(store.get())
+   );
+ }
+ 
+diff --git a/packages/xstate-store/src/store.ts b/packages/xstate-store/src/store.ts
+index d7a861861c..2a82b1b4b9 100644
+--- a/packages/xstate-store/src/store.ts
++++ b/packages/xstate-store/src/store.ts
+@@ -147,6 +147,9 @@ function createStoreCore<
+     getSnapshot() {
+       return currentSnapshot;
+     },
++    get() {
++      return currentSnapshot;
++    },
+     getInitialSnapshot() {
+       return initialSnapshot;
+     },
+diff --git a/packages/xstate-store/src/types.ts b/packages/xstate-store/src/types.ts
+index 53eb4202da..edf8663c51 100644
+--- a/packages/xstate-store/src/types.ts
++++ b/packages/xstate-store/src/types.ts
+@@ -69,9 +69,12 @@ export interface Store<
+   TEvent extends EventObject,
+   TEmitted extends EventObject
+ > extends Subscribable<StoreSnapshot<TContext>>,
+-    InteropObservable<StoreSnapshot<TContext>> {
++    InteropObservable<StoreSnapshot<TContext>>,
++    Readable<StoreSnapshot<TContext>> {
+   send: (event: TEvent) => void;
+   getSnapshot: () => StoreSnapshot<TContext>;
++  /** @alias getSnapshot */
++  get: () => StoreSnapshot<TContext>;
+   getInitialSnapshot: () => StoreSnapshot<TContext>;
+   /**
+    * Subscribes to [inspection events](https://stately.ai/docs/inspection) from
+@@ -337,6 +340,28 @@ export type EventMap<TEvent extends EventObject> = {
+ 
+ export type Selector<TContext, TSelected> = (context: TContext) => TSelected;
+ 
+-export interface Selection<TSelected> extends Subscribable<TSelected> {
+-  get: () => TSelected;
++export type Selection<TSelected> = Readable<TSelected>;
++
++export interface Readable<T> extends Subscribable<T> {
++  get: () => T;
++}
++
++export interface Atom<T> extends Subscribable<T>, Readable<T> {
++  /** Sets the value of the atom using a function. */
++  set(fn: (prevVal: T) => T): void;
++  /** Sets the value of the atom. */
++  set(value: T): void;
+ }
++
++/**
++ * An atom that is read-only and cannot be set.
++ *
++ * @example
++ *
++ * ```ts
++ * const atom = createAtom(() => 42);
++ * // @ts-expect-error - Cannot set a readonly atom
++ * atom.set(43);
++ * ```
++ */
++export interface ReadonlyAtom<T> extends Readable<T> {}

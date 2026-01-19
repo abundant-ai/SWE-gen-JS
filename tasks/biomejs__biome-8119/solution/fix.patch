@@ -1,0 +1,228 @@
+diff --git a/.changeset/lovely-sloths-chew.md b/.changeset/lovely-sloths-chew.md
+new file mode 100644
+index 0000000000..3475eab21d
+--- /dev/null
++++ b/.changeset/lovely-sloths-chew.md
+@@ -0,0 +1,20 @@
++---
++"@biomejs/biome": patch
++---
++
++Improved the detection of the rule `noUnnecessaryConditions`. Now the rule isn't triggered for variables that are mutated inside a module.
++
++This logic deviates from the original rule, hence `noUnnecessaryConditions` is now marked as "inspired".
++
++In the following example, `hey` starts as `false`, but then it's assigned to a string. The rule isn't triggered inside the `if` check.
++
++```js
++let hey = false;
++
++function test() {
++    hey = "string";
++}
++
++if (hey) {}
++
++```
+diff --git a/.changeset/upset-cameras-walk.md b/.changeset/upset-cameras-walk.md
+new file mode 100644
+index 0000000000..4927e92413
+--- /dev/null
++++ b/.changeset/upset-cameras-walk.md
+@@ -0,0 +1,5 @@
++---
++"@biomejs/biome": patch
++---
++
++Improved the type inference engine, by resolving types for variables that are assigned to multiple values.
+diff --git a/crates/biome_cli/src/execute/migrate/eslint_any_rule_to_biome.rs b/crates/biome_cli/src/execute/migrate/eslint_any_rule_to_biome.rs
+index e8f996268e..6b01459b21 100644
+--- a/crates/biome_cli/src/execute/migrate/eslint_any_rule_to_biome.rs
++++ b/crates/biome_cli/src/execute/migrate/eslint_any_rule_to_biome.rs
+@@ -502,6 +502,10 @@ pub(crate) fn migrate_eslint_any_rule(
+             rule.set_level(rule.level().max(rule_severity.into()));
+         }
+         "@typescript-eslint/no-unnecessary-condition" => {
++            if !options.include_inspired {
++                results.add(eslint_name, eslint_to_biome::RuleMigrationResult::Inspired);
++                return false;
++            }
+             if !options.include_nursery {
+                 results.add(eslint_name, eslint_to_biome::RuleMigrationResult::Nursery);
+                 return false;
+diff --git a/crates/biome_js_analyze/src/lint/nursery/no_unnecessary_conditions.rs b/crates/biome_js_analyze/src/lint/nursery/no_unnecessary_conditions.rs
+index f10287a65a..b4f3aefa4e 100644
+--- a/crates/biome_js_analyze/src/lint/nursery/no_unnecessary_conditions.rs
++++ b/crates/biome_js_analyze/src/lint/nursery/no_unnecessary_conditions.rs
+@@ -44,6 +44,22 @@ declare_lint_rule! {
+     /// }
+     /// ```
+     ///
++    /// Contrary to the source rule, this rule doesn't trigger bindings that are assigned to multiple
++    /// values. In the following example, the variable `greeting` is assigned to multiple values; hence
++    /// it can't be inferred to a truthy or falsy value.
++    ///
++    /// ```ts
++    /// let greeting = false;
++    ///
++    /// function changeGreeting() {
++    ///     greeting = "Hello World!"
++    /// }
++    ///
++    /// if (greeting) {} // rule not triggered here
++    ///
++    /// ```
++    ///
++    ///
+     /// ### Valid
+     ///
+     /// ```ts
+@@ -71,7 +87,7 @@ declare_lint_rule! {
+         version: "2.1.4",
+         name: "noUnnecessaryConditions",
+         language: "js",
+-        sources: &[RuleSource::EslintTypeScript("no-unnecessary-condition").same()],
++        sources: &[RuleSource::EslintTypeScript("no-unnecessary-condition").inspired()],
+         recommended: false,
+         severity: Severity::Warning,
+         domains: &[RuleDomain::Project],
+diff --git a/crates/biome_js_type_info/src/resolver.rs b/crates/biome_js_type_info/src/resolver.rs
+index 0c39dcafd6..161bb9f29f 100644
+--- a/crates/biome_js_type_info/src/resolver.rs
++++ b/crates/biome_js_type_info/src/resolver.rs
+@@ -722,6 +722,14 @@ pub trait TypeResolver {
+         ]))))))
+     }
+ 
++    /// Register a new type that is a union between `current_type` and `ty`
++    fn union_with(&mut self, current_type: TypeReference, ty: TypeReference) -> TypeId {
++        self.register_type(Cow::Owned(TypeData::Union(Box::new(Union(Box::new([
++            current_type,
++            ty,
++        ]))))))
++    }
++
+     // #endregion
+ }
+ 
+diff --git a/crates/biome_module_graph/src/js_module_info/collector.rs b/crates/biome_module_graph/src/js_module_info/collector.rs
+index d4c2d627ee..d86fde17d8 100644
+--- a/crates/biome_module_graph/src/js_module_info/collector.rs
++++ b/crates/biome_module_graph/src/js_module_info/collector.rs
+@@ -3,9 +3,10 @@ use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
+ use biome_js_semantic::{SemanticEvent, SemanticEventExtractor};
+ use biome_js_syntax::{
+     AnyJsCombinedSpecifier, AnyJsDeclaration, AnyJsExportDefaultDeclaration, AnyJsExpression,
+-    AnyJsImportClause, JsForVariableDeclaration, JsFormalParameter, JsIdentifierBinding,
+-    JsRestParameter, JsSyntaxKind, JsSyntaxNode, JsSyntaxToken, JsVariableDeclaration,
+-    TsIdentifierBinding, TsTypeParameter, TsTypeParameterName, inner_string_text,
++    AnyJsImportClause, JsAssignmentExpression, JsForVariableDeclaration, JsFormalParameter,
++    JsIdentifierBinding, JsRestParameter, JsSyntaxKind, JsSyntaxNode, JsSyntaxToken,
++    JsVariableDeclaration, TsIdentifierBinding, TsTypeParameter, TsTypeParameterName,
++    inner_string_text,
+ };
+ use biome_js_type_info::{
+     BindingId, FunctionParameter, GLOBAL_RESOLVER, GLOBAL_UNKNOWN_ID, GenericTypeParameter,
+@@ -573,34 +574,58 @@ impl JsModuleInfoCollector {
+         for index in 0..self.bindings.len() {
+             let binding = &self.bindings[index];
+             if let Some(node) = self.binding_node_by_start.get(&binding.range.start()) {
+-                let name = binding.name.clone();
+                 let scope_id = scope_id_for_range(scope_by_range, binding.range);
+-                let ty = self.infer_type(&node.clone(), &name, scope_id);
++                let ty = self.infer_type(&node.clone(), binding.clone(), scope_id);
+                 self.bindings[index].ty = ty;
+             }
+         }
+     }
+ 
++    fn has_writable_reference(&self, binding: &JsBindingData) -> bool {
++        binding
++            .references
++            .iter()
++            .any(|reference| reference.is_write())
++    }
++
++    fn get_writable_references(&self, binding: &JsBindingData) -> Vec<JsBindingReference> {
++        binding
++            .references
++            .iter()
++            .filter(|reference| reference.is_write())
++            .cloned()
++            .collect()
++    }
++
+     fn infer_type(
+         &mut self,
+         node: &JsSyntaxNode,
+-        binding_name: &Text,
++        binding: JsBindingData,
+         scope_id: ScopeId,
+     ) -> TypeReference {
++        let binding_name = &binding.name.clone();
+         for ancestor in node.ancestors() {
+             if let Some(decl) = AnyJsDeclaration::cast_ref(&ancestor) {
+-                return if let Some(typed_bindings) = decl
++                let ty = if let Some(typed_bindings) = decl
+                     .as_js_variable_declaration()
+                     .and_then(|decl| self.variable_declarations.get(decl.syntax()))
+                 {
+-                    typed_bindings
++                    let ty = typed_bindings
+                         .iter()
+                         .find_map(|(name, ty)| (name == binding_name).then(|| ty.clone()))
+-                        .unwrap_or_default()
++                        .unwrap_or_default();
++
++                    if self.has_writable_reference(&binding) {
++                        self.widen_binding_from_writable_references(scope_id, &binding, &ty)
++                    } else {
++                        ty
++                    }
+                 } else {
+                     let data = TypeData::from_any_js_declaration(self, scope_id, &decl);
+                     self.reference_to_owned_data(data)
+                 };
++
++                return ty;
+             } else if let Some(declaration) = AnyJsExportDefaultDeclaration::cast_ref(&ancestor) {
+                 let data =
+                     TypeData::from_any_js_export_default_declaration(self, scope_id, &declaration);
+@@ -640,6 +665,37 @@ impl JsModuleInfoCollector {
+         TypeReference::unknown()
+     }
+ 
++    /// Widen the type of binding from its writable references.
++    fn widen_binding_from_writable_references(
++        &mut self,
++        scope_id: ScopeId,
++        binding: &JsBindingData,
++        ty: &TypeReference,
++    ) -> TypeReference {
++        let references = self.get_writable_references(binding);
++        let mut ty = ty.clone();
++        for reference in references {
++            let Some(node) = self.binding_node_by_start.get(&reference.range_start) else {
++                continue;
++            };
++            for ancestor in node.ancestors().skip(1) {
++                if let Some(assignment) = JsAssignmentExpression::cast_ref(&ancestor)
++                    && let Ok(right) = assignment.right()
++                {
++                    let data = TypeData::from_any_js_expression(self, scope_id, &right);
++                    let assigned_type = self.reference_to_owned_data(data);
++                    ty = ResolvedTypeId::new(
++                        self.level(),
++                        self.union_with(ty.clone(), assigned_type),
++                    )
++                    .into();
++                }
++            }
++        }
++
++        ty
++    }
++
+     /// After the first pass of the collector, import references have been
+     /// resolved to an import binding. But we can't store the information of the
+     /// import target inside the `ResolvedTypeId`, because it resides in the

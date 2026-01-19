@@ -1,0 +1,200 @@
+diff --git a/packages/vue-query/src/__tests__/useQuery.test.ts b/packages/vue-query/src/__tests__/useQuery.test.ts
+index 90e77c2e0..0f92de41f 100644
+--- a/packages/vue-query/src/__tests__/useQuery.test.ts
++++ b/packages/vue-query/src/__tests__/useQuery.test.ts
+@@ -146,8 +146,6 @@ describe('useQuery', () => {
+     })
+ 
+     secondKeyRef.value = 'key8'
+-    await flushPromises()
+-
+     expect(query).toMatchObject({
+       status: { value: 'loading' },
+       data: { value: undefined },
+@@ -172,9 +170,6 @@ describe('useQuery', () => {
+     })
+ 
+     enabled.value = true
+-
+-    await flushPromises()
+-
+     expect(query).toMatchObject({
+       fetchStatus: { value: 'fetching' },
+       data: { value: undefined },
+diff --git a/packages/vue-query/src/useBaseQuery.ts b/packages/vue-query/src/useBaseQuery.ts
+index 9244411b6..3d52f4e33 100644
+--- a/packages/vue-query/src/useBaseQuery.ts
++++ b/packages/vue-query/src/useBaseQuery.ts
+@@ -15,7 +15,7 @@ import {
+   shouldThrowError,
+   updateState,
+ } from './utils'
+-import type { ToRef } from 'vue-demi'
++import type { ToRefs } from 'vue-demi'
+ import type {
+   QueryFunction,
+   QueryKey,
+@@ -31,11 +31,7 @@ export type UseQueryReturnType<
+   TData,
+   TError,
+   Result = QueryObserverResult<TData, TError>,
+-> = {
+-  [K in keyof Result]: Result[K] extends (...args: any[]) => any
+-    ? Result[K]
+-    : ToRef<Result[K]>
+-} & {
++> = ToRefs<Readonly<Result>> & {
+   suspense: () => Promise<Result>
+ }
+ 
+@@ -110,23 +106,19 @@ export function useBaseQuery<
+     { immediate: true },
+   )
+ 
+-  const updater = () => {
+-    observer.setOptions(defaultedOptions.value)
+-    updateState(state, observer.getCurrentResult())
+-  }
+-
+-  watch(defaultedOptions, updater)
++  watch(
++    defaultedOptions,
++    () => {
++      observer.setOptions(defaultedOptions.value)
++      updateState(state, observer.getCurrentResult())
++    },
++    { flush: 'sync' },
++  )
+ 
+   onScopeDispose(() => {
+     unsubscribe()
+   })
+ 
+-  // fix #5910
+-  const refetch = (...args: Parameters<typeof state['refetch']>) => {
+-    updater()
+-    return state.refetch(...args)
+-  }
+-
+   const suspense = () => {
+     return new Promise<QueryObserverResult<TData, TError>>(
+       (resolve, reject) => {
+@@ -174,17 +166,10 @@ export function useBaseQuery<
+     },
+   )
+ 
+-  const object: any = toRefs(readonly(state))
+-  for (const key in state) {
+-    if (typeof state[key as keyof typeof state] === 'function') {
+-      object[key] = state[key as keyof typeof state]
+-    }
++  return {
++    ...(toRefs(readonly(state)) as UseQueryReturnType<TData, TError>),
++    suspense,
+   }
+-
+-  object.suspense = suspense
+-  object.refetch = refetch
+-
+-  return object as UseQueryReturnType<TData, TError>
+ }
+ 
+ export function parseQueryArgs<
+diff --git a/packages/vue-query/src/useInfiniteQuery.ts b/packages/vue-query/src/useInfiniteQuery.ts
+index 021f90299..63cd709f5 100644
+--- a/packages/vue-query/src/useInfiniteQuery.ts
++++ b/packages/vue-query/src/useInfiniteQuery.ts
+@@ -105,6 +105,11 @@ export function useInfiniteQuery<
+     arg2,
+     arg3,
+   ) as InfiniteQueryReturnType<TData, TError>
+-
+-  return result
++  return {
++    ...result,
++    fetchNextPage: result.fetchNextPage.value,
++    fetchPreviousPage: result.fetchPreviousPage.value,
++    refetch: result.refetch.value,
++    remove: result.remove.value,
++  }
+ }
+diff --git a/packages/vue-query/src/useIsFetching.ts b/packages/vue-query/src/useIsFetching.ts
+index cb1237b0f..bbeb10e07 100644
+--- a/packages/vue-query/src/useIsFetching.ts
++++ b/packages/vue-query/src/useIsFetching.ts
+@@ -4,7 +4,7 @@ import {
+   onScopeDispose,
+   ref,
+   unref,
+-  watchEffect,
++  watchSyncEffect,
+ } from 'vue-demi'
+ import { useQueryClient } from './useQueryClient'
+ import { cloneDeepUnref, isQueryKey } from './utils'
+@@ -44,7 +44,7 @@ export function useIsFetching(
+ 
+   const unsubscribe = queryClient.getQueryCache().subscribe(listener)
+ 
+-  watchEffect(listener)
++  watchSyncEffect(listener)
+ 
+   onScopeDispose(() => {
+     unsubscribe()
+diff --git a/packages/vue-query/src/useIsMutating.ts b/packages/vue-query/src/useIsMutating.ts
+index c9d6b67df..695d03a98 100644
+--- a/packages/vue-query/src/useIsMutating.ts
++++ b/packages/vue-query/src/useIsMutating.ts
+@@ -4,7 +4,7 @@ import {
+   onScopeDispose,
+   ref,
+   unref,
+-  watchEffect,
++  watchSyncEffect,
+ } from 'vue-demi'
+ import { useQueryClient } from './useQueryClient'
+ import { cloneDeepUnref, isQueryKey } from './utils'
+@@ -44,7 +44,7 @@ export function useIsMutating(
+ 
+   const unsubscribe = queryClient.getMutationCache().subscribe(listener)
+ 
+-  watchEffect(listener)
++  watchSyncEffect(listener)
+ 
+   onScopeDispose(() => {
+     unsubscribe()
+diff --git a/packages/vue-query/src/useMutation.ts b/packages/vue-query/src/useMutation.ts
+index 5e75dc1d0..a7d696cac 100644
+--- a/packages/vue-query/src/useMutation.ts
++++ b/packages/vue-query/src/useMutation.ts
+@@ -181,9 +181,13 @@ export function useMutation<
+     })
+   }
+ 
+-  watch(options, () => {
+-    observer.setOptions(queryClient.defaultMutationOptions(options.value))
+-  })
++  watch(
++    options,
++    () => {
++      observer.setOptions(queryClient.defaultMutationOptions(options.value))
++    },
++    { flush: 'sync' },
++  )
+ 
+   onScopeDispose(() => {
+     unsubscribe()
+diff --git a/packages/vue-query/src/useQuery.ts b/packages/vue-query/src/useQuery.ts
+index dc574c309..0d9bbd86b 100644
+--- a/packages/vue-query/src/useQuery.ts
++++ b/packages/vue-query/src/useQuery.ts
+@@ -187,5 +187,9 @@ export function useQuery<
+   | UseQueryDefinedReturnType<TData, TError> {
+   const result = useBaseQuery(QueryObserver, arg1, arg2, arg3)
+ 
+-  return result
++  return {
++    ...result,
++    refetch: result.refetch.value,
++    remove: result.remove.value,
++  }
+ }

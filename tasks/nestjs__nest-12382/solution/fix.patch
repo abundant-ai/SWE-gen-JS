@@ -1,0 +1,108 @@
+diff --git a/integration/websockets/src/app.gateway.ts b/integration/websockets/src/app.gateway.ts
+index d473280f4..30ea2ee22 100644
+--- a/integration/websockets/src/app.gateway.ts
++++ b/integration/websockets/src/app.gateway.ts
+@@ -1,10 +1,13 @@
+-import { UseInterceptors } from '@nestjs/common';
++import { UseFilters, UseInterceptors } from '@nestjs/common';
+ import {
+   MessageBody,
+   SubscribeMessage,
+   WebSocketGateway,
++  WsException,
+ } from '@nestjs/websockets';
+ import { RequestInterceptor } from './request.interceptor';
++import { throwError } from 'rxjs';
++import { RequestFilter } from './request.filter';
+ 
+ @WebSocketGateway(8080)
+ export class ApplicationGateway {
+@@ -24,4 +27,10 @@ export class ApplicationGateway {
+       data: { ...data, path: client.pattern },
+     };
+   }
++
++  @UseFilters(RequestFilter)
++  @SubscribeMessage('getClientWithError')
++  getPathCalledWithError() {
++    return throwError(() => new WsException('This is an error'));
++  }
+ }
+diff --git a/integration/websockets/src/request.filter.ts b/integration/websockets/src/request.filter.ts
+new file mode 100644
+index 000000000..4fe099df3
+--- /dev/null
++++ b/integration/websockets/src/request.filter.ts
+@@ -0,0 +1,12 @@
++import { ArgumentsHost, Catch, ExceptionFilter } from '@nestjs/common';
++import { WsException } from '@nestjs/websockets';
++
++@Catch(WsException)
++export class RequestFilter implements ExceptionFilter {
++  catch(exception: WsException, host: ArgumentsHost) {
++    const wsCtx = host.switchToWs();
++    const pattern = wsCtx.getPattern();
++    const client = wsCtx.getClient();
++    client.emit('exception', { pattern, message: exception.message });
++  }
++}
+diff --git a/packages/websockets/context/ws-context-creator.ts b/packages/websockets/context/ws-context-creator.ts
+index 0ccec159c..c699612b6 100644
+--- a/packages/websockets/context/ws-context-creator.ts
++++ b/packages/websockets/context/ws-context-creator.ts
+@@ -107,22 +107,26 @@ export class WsContextCreator {
+       }
+       return callback.apply(instance, args);
+     };
++    const targetPattern = this.reflectCallbackPattern(callback);
++    return this.wsProxy.create(
++      async (...args: unknown[]) => {
++        args.push(targetPattern);
+ 
+-    return this.wsProxy.create(async (...args: unknown[]) => {
+-      args.push(this.reflectCallbackPattern(callback));
++        const initialArgs = this.contextUtils.createNullArray(argsLength);
++        fnCanActivate && (await fnCanActivate(args));
+ 
+-      const initialArgs = this.contextUtils.createNullArray(argsLength);
+-      fnCanActivate && (await fnCanActivate(args));
+-
+-      return this.interceptorsConsumer.intercept(
+-        interceptors,
+-        args,
+-        instance,
+-        callback,
+-        handler(initialArgs, args),
+-        contextType,
+-      );
+-    }, exceptionHandler);
++        return this.interceptorsConsumer.intercept(
++          interceptors,
++          args,
++          instance,
++          callback,
++          handler(initialArgs, args),
++          contextType,
++        );
++      },
++      exceptionHandler,
++      targetPattern,
++    );
+   }
+ 
+   public reflectCallbackParamtypes(
+diff --git a/packages/websockets/context/ws-proxy.ts b/packages/websockets/context/ws-proxy.ts
+index dee999afc..51f362fbe 100644
+--- a/packages/websockets/context/ws-proxy.ts
++++ b/packages/websockets/context/ws-proxy.ts
+@@ -7,8 +7,10 @@ export class WsProxy {
+   public create(
+     targetCallback: (...args: unknown[]) => Promise<any>,
+     exceptionsHandler: WsExceptionsHandler,
++    targetPattern?: string,
+   ): (...args: unknown[]) => Promise<any> {
+     return async (...args: unknown[]) => {
++      args = [...args, targetPattern ?? 'unknown'];
+       try {
+         const result = await targetCallback(...args);
+         return !isObservable(result)

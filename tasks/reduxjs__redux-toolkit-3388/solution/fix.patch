@@ -1,0 +1,778 @@
+diff --git a/docs/api/createSlice.mdx b/docs/api/createSlice.mdx
+index 39f10f8b..2c3d0c0c 100644
+--- a/docs/api/createSlice.mdx
++++ b/docs/api/createSlice.mdx
+@@ -130,6 +130,192 @@ const todosSlice = createSlice({
+ })
+ ```
+ 
++### The `reducers` "creator callback" notation
++
++Alternatively, the `reducers` field can be a callback which receives a "create" object.
++
++The main benefit of this is that you can create [async thunks](./createAsyncThunk) as part of your slice. Types are also slightly simplified for prepared reducers.
++
++```ts title="Creator callback for reducers"
++import { createSlice, nanoid } from '@reduxjs/toolkit'
++import type { PayloadAction } from '@reduxjs/toolkit'
++
++interface Item {
++  id: string
++  text: string
++}
++
++interface TodoState {
++  loading: boolean
++  todos: Item[]
++}
++
++const todosSlice = createSlice({
++  name: 'todos',
++  initialState: {
++    loading: false,
++    todos: [],
++  } as TodoState,
++  reducers: (create) => ({
++    deleteTodo: create.reducer((state, action: PayloadAction<number>) => {
++      state.todos.splice(action.payload, 1)
++    }),
++    addTodo: create.preparedReducer(
++      (text: string) => {
++        const id = nanoid()
++        return { payload: { id, text } }
++      },
++      // action type is inferred from prepare callback
++      (state, action) => {
++        state.todos.push(action.payload)
++      }
++    ),
++    fetchTodo: create.asyncThunk(
++      async (id: string, thunkApi) => {
++        const res = await fetch(`myApi/todos?id=${id}`)
++        return (await res.json()) as Item
++      },
++      {
++        pending: (state) => {
++          state.loading = true
++        },
++        rejected: (state, action) => {
++          state.loading = false
++        },
++        fulfilled: (state, action) => {
++          state.loading = false
++          state.todos.push(action.payload)
++        },
++      }
++    ),
++  }),
++})
++
++export const { addTodo, deleteTodo, fetchTodo } = todosSlice.actions
++```
++
++#### Create Methods
++
++#### `create.reducer`
++
++A standard slice case reducer.
++
++**Parameters**
++
++- **reducer** The slice case reducer to use.
++
++```ts no-transpile
++create.reducer((state, action: PayloadAction<Todo>) => {
++  state.todos.push(action.payload)
++})
++```
++
++#### `create.preparedReducer`
++
++A [prepared](#customizing-generated-action-creators) reducer, to customize the action creator.
++
++**Parameters**
++
++- **prepareAction** The [`prepare callback`](./createAction#using-prepare-callbacks-to-customize-action-contents).
++- **reducer** The slice case reducer to use.
++
++The action passed to the case reducer will be inferred from the prepare callback's return.
++
++```ts no-transpile
++create.preparedReducer(
++  (text: string) => {
++    const id = nanoid()
++    return { payload: { id, text } }
++  },
++  (state, action) => {
++    state.todos.push(action.payload)
++  }
++)
++```
++
++#### `create.asyncThunk`
++
++Creates an async thunk instead of an action creator.
++
++**Parameters**
++
++- **payloadCreator** The thunk [payload creator](./createAsyncThunk#payloadcreator).
++- **config** The configuration object. (optional)
++
++The configuration object can contain case reducers for each of the [lifecycle actions](./createAsyncThunk#promise-lifecycle-actions) (`pending`, `fulfilled`, and `rejected`).
++
++Each case reducer will be attached to the slice's `caseReducers` object, e.g. `slice.caseReducers.fetchTodo.fulfilled`.
++
++The configuration object can also contain [`options`](./createAsyncThunk#options).
++
++```ts no-transpile
++create.asyncThunk(
++  async (id: string, thunkApi) => {
++    const res = await fetch(`myApi/todos?id=${id}`)
++    return (await res.json()) as Item
++  },
++  {
++    pending: (state) => {
++      state.loading = true
++    },
++    rejected: (state, action) => {
++      state.loading = false
++    },
++    fulfilled: (state, action) => {
++      state.loading = false
++      state.todos.push(action.payload)
++    },
++    options: {
++      idGenerator: uuid,
++    },
++  }
++)
++```
++
++:::note
++
++Typing for the `create.asyncThunk` works in the same way as [`createAsyncThunk`](usage/usage-with-typescript#createasyncthunk), with one key difference.
++
++A type for `state` and/or `dispatch` _cannot_ be provided as part of the `ThunkApiConfig`, as this would cause circular types.
++
++Instead, it is necessary to assert the type when needed.
++
++```ts no-transpile
++create.asyncThunk<Todo, string, { rejectValue: { error: string } }>(
++  async (id, thunkApi) => {
++    const state = thunkApi.getState() as RootState
++    const dispatch = thunkApi.dispatch as AppDispatch
++    throw thunkApi.rejectWithValue({
++      error: 'Oh no!',
++    })
++  }
++)
++```
++
++For common thunk API configuration options, a [`withTypes` helper](usage/usage-with-typescript#defining-a-pre-typed-createasyncthunk) is provided:
++
++```ts no-transpile
++reducers: (create) => {
++  const createAThunk =
++    create.asyncThunk.withTypes<{ rejectValue: { error: string } }>()
++
++  return {
++    fetchTodo: createAThunk<Todo, string>(async (id, thunkApi) => {
++      throw thunkApi.rejectWithValue({
++        error: 'Oh no!',
++      })
++    }),
++    fetchTodos: createAThunk<Todo[], string>(async (id, thunkApi) => {
++      throw thunkApi.rejectWithValue({
++        error: 'Oh no, not again!',
++      })
++    }),
++  }
++}
++```
++
++:::
++
+ ### `extraReducers`
+ 
+ One of the key concepts of Redux is that each slice reducer "owns" its slice of state, and that many slice reducers
+diff --git a/docs/api/getDefaultMiddleware.mdx b/docs/api/getDefaultMiddleware.mdx
+index a574d445..2b6948ba 100644
+--- a/docs/api/getDefaultMiddleware.mdx
++++ b/docs/api/getDefaultMiddleware.mdx
+@@ -40,14 +40,7 @@ to the store. `configureStore` will not add any extra middleware beyond what you
+ `getDefaultMiddleware` is useful if you want to add some custom middleware, but also still want to have the default
+ middleware added as well:
+ 
+-```ts
+-// file: reducer.ts noEmit
+-
+-export default function rootReducer(state = {}, action: any) {
+-  return state
+-}
+-
+-// file: store.ts
++```ts no-transpile
+ import { configureStore } from '@reduxjs/toolkit'
+ 
+ import logger from 'redux-logger'
+diff --git a/docs/rtk-query/usage/error-handling.mdx b/docs/rtk-query/usage/error-handling.mdx
+index 40ad27b2..bfecee97 100644
+--- a/docs/rtk-query/usage/error-handling.mdx
++++ b/docs/rtk-query/usage/error-handling.mdx
+@@ -80,7 +80,7 @@ Redux Toolkit has [action matching utilities](../../api/matching-utilities.mdx#m
+ 
+ :::
+ 
+-```ts title="Error catching middleware example"
++```ts no-transpile title="Error catching middleware example"
+ import { isRejectedWithValue } from '@reduxjs/toolkit'
+ import type { MiddlewareAPI, Middleware } from '@reduxjs/toolkit'
+ import { toast } from 'your-cool-library'
+diff --git a/packages/toolkit/src/createAsyncThunk.ts b/packages/toolkit/src/createAsyncThunk.ts
+index 5a805ebc..7a8cac4e 100644
+--- a/packages/toolkit/src/createAsyncThunk.ts
++++ b/packages/toolkit/src/createAsyncThunk.ts
+@@ -105,7 +105,7 @@ export const miniSerializeError = (value: any): SerializedError => {
+   return { message: String(value) }
+ }
+ 
+-type AsyncThunkConfig = {
++export type AsyncThunkConfig = {
+   state?: unknown
+   dispatch?: Dispatch
+   extra?: unknown
+@@ -414,7 +414,7 @@ export type AsyncThunk<
+   typePrefix: string
+ }
+ 
+-type OverrideThunkApiConfigs<OldConfig, NewConfig> = Id<
++export type OverrideThunkApiConfigs<OldConfig, NewConfig> = Id<
+   NewConfig & Omit<OldConfig, keyof NewConfig>
+ >
+ 
+diff --git a/packages/toolkit/src/createSlice.ts b/packages/toolkit/src/createSlice.ts
+index 07cca7b6..cb69c3b0 100644
+--- a/packages/toolkit/src/createSlice.ts
++++ b/packages/toolkit/src/createSlice.ts
+@@ -1,4 +1,4 @@
+-import type { AnyAction, Reducer } from 'redux'
++import type { Action, AnyAction, Reducer } from 'redux'
+ import type {
+   ActionCreatorWithoutPayload,
+   PayloadAction,
+@@ -18,6 +18,14 @@ import { executeReducerBuilderCallback } from './mapBuilders'
+ import type { Id, NoInfer, Tail } from './tsHelpers'
+ import { freezeDraftable } from './utils'
+ import type { CombinedSliceReducer, InjectConfig } from './combineSlices'
++import type {
++  AsyncThunk,
++  AsyncThunkConfig,
++  AsyncThunkOptions,
++  AsyncThunkPayloadCreator,
++  OverrideThunkApiConfigs,
++} from './createAsyncThunk'
++import { createAsyncThunk } from './createAsyncThunk'
+ 
+ /**
+  * The return value of `createSlice`
+@@ -167,7 +175,9 @@ export interface CreateSliceOptions<
+    * functions. For every action type, a matching action creator will be
+    * generated using `createAction()`.
+    */
+-  reducers: ValidateSliceCaseReducers<State, CR>
++  reducers:
++    | ValidateSliceCaseReducers<State, CR>
++    | ((creators: ReducerCreators<State>) => CR)
+ 
+   /**
+    * A callback that receives a *builder* object to define
+@@ -211,7 +221,7 @@ createSlice({
+ })
+ ```
+    */
+-  extraReducers?: (builder: ActionReducerMapBuilder<NoInfer<State>>) => void
++  extraReducers?: (builder: ActionReducerMapBuilder<State>) => void
+ 
+   /**
+    * A map of selectors that receive the slice's state and any additional arguments, and return a result.
+@@ -219,6 +229,21 @@ createSlice({
+   selectors?: Selectors
+ }
+ 
++const reducerDefinitionType: unique symbol = Symbol.for('rtk-reducer-type')
++enum ReducerType {
++  reducer = 'reducer',
++  reducerWithPrepare = 'reducerWithPrepare',
++  asyncThunk = 'asyncThunk',
++}
++
++interface ReducerDefinition<T extends ReducerType = ReducerType> {
++  [reducerDefinitionType]: T
++}
++
++export interface CaseReducerDefinition<S = any, A extends Action = AnyAction>
++  extends CaseReducer<S, A>,
++    ReducerDefinition<ReducerType.reducer> {}
++
+ /**
+  * A CaseReducer with a `prepare` method.
+  *
+@@ -229,16 +254,147 @@ export type CaseReducerWithPrepare<State, Action extends PayloadAction> = {
+   prepare: PrepareAction<Action['payload']>
+ }
+ 
++export interface CaseReducerWithPrepareDefinition<
++  State,
++  Action extends PayloadAction
++> extends CaseReducerWithPrepare<State, Action>,
++    ReducerDefinition<ReducerType.reducerWithPrepare> {}
++
++export interface AsyncThunkSliceReducerConfig<
++  State,
++  ThunkArg extends any,
++  Returned = unknown,
++  ThunkApiConfig extends AsyncThunkConfig = {}
++> {
++  pending?: CaseReducer<
++    State,
++    ReturnType<AsyncThunk<Returned, ThunkArg, ThunkApiConfig>['pending']>
++  >
++  rejected?: CaseReducer<
++    State,
++    ReturnType<AsyncThunk<Returned, ThunkArg, ThunkApiConfig>['rejected']>
++  >
++  fulfilled?: CaseReducer<
++    State,
++    ReturnType<AsyncThunk<Returned, ThunkArg, ThunkApiConfig>['fulfilled']>
++  >
++  options?: AsyncThunkOptions<ThunkArg, ThunkApiConfig>
++}
++
++export interface AsyncThunkSliceReducerDefinition<
++  State,
++  ThunkArg extends any,
++  Returned = unknown,
++  ThunkApiConfig extends AsyncThunkConfig = {}
++> extends AsyncThunkSliceReducerConfig<
++      State,
++      ThunkArg,
++      Returned,
++      ThunkApiConfig
++    >,
++    ReducerDefinition<ReducerType.asyncThunk> {
++  payloadCreator: AsyncThunkPayloadCreator<Returned, ThunkArg, ThunkApiConfig>
++}
++
++/**
++ * Providing these as part of the config would cause circular types, so we disallow passing them
++ */
++type PreventCircular<ThunkApiConfig> = {
++  [K in keyof ThunkApiConfig]: K extends 'state' | 'dispatch'
++    ? never
++    : ThunkApiConfig[K]
++}
++
++interface AsyncThunkCreator<
++  State,
++  CurriedThunkApiConfig extends PreventCircular<AsyncThunkConfig> = PreventCircular<AsyncThunkConfig>
++> {
++  <ThunkArg extends any, Returned = unknown>(
++    payloadCreator: AsyncThunkPayloadCreator<
++      Returned,
++      ThunkArg,
++      CurriedThunkApiConfig
++    >,
++    config?: AsyncThunkSliceReducerConfig<
++      State,
++      ThunkArg,
++      Returned,
++      CurriedThunkApiConfig
++    >
++  ): AsyncThunkSliceReducerDefinition<
++    State,
++    ThunkArg,
++    Returned,
++    CurriedThunkApiConfig
++  >
++  <
++    ThunkArg extends any,
++    Returned = unknown,
++    ThunkApiConfig extends PreventCircular<AsyncThunkConfig> = {}
++  >(
++    payloadCreator: AsyncThunkPayloadCreator<
++      Returned,
++      ThunkArg,
++      ThunkApiConfig
++    >,
++    config?: AsyncThunkSliceReducerConfig<
++      State,
++      ThunkArg,
++      Returned,
++      ThunkApiConfig
++    >
++  ): AsyncThunkSliceReducerDefinition<State, ThunkArg, Returned, ThunkApiConfig>
++  withTypes<
++    ThunkApiConfig extends PreventCircular<AsyncThunkConfig>
++  >(): AsyncThunkCreator<
++    State,
++    OverrideThunkApiConfigs<CurriedThunkApiConfig, ThunkApiConfig>
++  >
++}
++
++export interface ReducerCreators<State> {
++  reducer<Payload>(
++    caseReducer: CaseReducer<State, PayloadAction<Payload>>
++  ): CaseReducerDefinition<State, PayloadAction<Payload>>
++
++  asyncThunk: AsyncThunkCreator<State>
++
++  preparedReducer<Prepare extends PrepareAction<any>>(
++    prepare: Prepare,
++    reducer: CaseReducer<
++      State,
++      ReturnType<_ActionCreatorWithPreparedPayload<Prepare>>
++    >
++  ): {
++    [reducerDefinitionType]: ReducerType.reducerWithPrepare
++    prepare: Prepare
++    reducer: CaseReducer<
++      State,
++      ReturnType<_ActionCreatorWithPreparedPayload<Prepare>>
++    >
++  }
++}
++
+ /**
+  * The type describing a slice's `reducers` option.
+  *
+  * @public
+  */
+-export type SliceCaseReducers<State> = {
+-  [K: string]:
+-    | CaseReducer<State, PayloadAction<any>>
+-    | CaseReducerWithPrepare<State, PayloadAction<any, string, any, any>>
+-}
++export type SliceCaseReducers<State> =
++  | Record<
++      string,
++      | CaseReducerDefinition<State, PayloadAction<any>>
++      | CaseReducerWithPrepareDefinition<
++          State,
++          PayloadAction<any, string, any, any>
++        >
++      | AsyncThunkSliceReducerDefinition<State, any, any, any>
++    >
++  | Record<
++      string,
++      | CaseReducer<State, PayloadAction<any>>
++      | CaseReducerWithPrepare<State, PayloadAction<any, string, any, any>>
++    >
+ 
+ /**
+  * The type describing a slice's `selectors` option.
+@@ -261,15 +417,29 @@ export type CaseReducerActions<
+   CaseReducers extends SliceCaseReducers<any>,
+   SliceName extends string
+ > = {
+-  [Type in keyof CaseReducers]: CaseReducers[Type] extends { prepare: any }
+-    ? ActionCreatorForCaseReducerWithPrepare<
+-        CaseReducers[Type],
+-        SliceActionType<SliceName, Type>
+-      >
+-    : ActionCreatorForCaseReducer<
+-        CaseReducers[Type],
+-        SliceActionType<SliceName, Type>
+-      >
++  [Type in keyof CaseReducers]: CaseReducers[Type] extends infer Definition
++    ? Definition extends { prepare: any }
++      ? ActionCreatorForCaseReducerWithPrepare<
++          Definition,
++          SliceActionType<SliceName, Type>
++        >
++      : Definition extends AsyncThunkSliceReducerDefinition<
++          any,
++          infer ThunkArg,
++          infer Returned,
++          infer ThunkApiConfig
++        >
++      ? AsyncThunk<Returned, ThunkArg, ThunkApiConfig>
++      : Definition extends { reducer: any }
++      ? ActionCreatorForCaseReducer<
++          Definition['reducer'],
++          SliceActionType<SliceName, Type>
++        >
++      : ActionCreatorForCaseReducer<
++          Definition,
++          SliceActionType<SliceName, Type>
++        >
++    : never
+ }
+ 
+ /**
+@@ -303,11 +473,15 @@ type ActionCreatorForCaseReducer<CR, Type extends string> = CR extends (
+  * @internal
+  */
+ type SliceDefinedCaseReducers<CaseReducers extends SliceCaseReducers<any>> = {
+-  [Type in keyof CaseReducers]: CaseReducers[Type] extends {
+-    reducer: infer Reducer
+-  }
+-    ? Reducer
+-    : CaseReducers[Type]
++  [Type in keyof CaseReducers]: CaseReducers[Type] extends infer Definition
++    ? Definition extends AsyncThunkSliceReducerDefinition<any, any, any, any>
++      ? Id<Pick<Required<Definition>, 'fulfilled' | 'rejected' | 'pending'>>
++      : Definition extends {
++          reducer: infer Reducer
++        }
++      ? Reducer
++      : Definition
++    : never
+ }
+ 
+ /**
+@@ -362,8 +536,6 @@ function getType(slice: string, actionKey: string): string {
+  * action creators and action types that correspond to the
+  * reducers and state.
+  *
+- * The `reducer` argument is passed to `createReducer()`.
+- *
+  * @public
+  */
+ export function createSlice<
+@@ -391,38 +563,39 @@ export function createSlice<
+     }
+   }
+ 
+-  const initialState =
+-    typeof options.initialState == 'function'
+-      ? options.initialState
+-      : freezeDraftable(options.initialState)
+-
+-  const reducers = options.reducers || {}
++  const reducers =
++    (typeof options.reducers === 'function'
++      ? options.reducers(buildReducerCreators<State>())
++      : options.reducers) || {}
+ 
+   const reducerNames = Object.keys(reducers)
+ 
+-  const sliceCaseReducersByName: Record<string, CaseReducer> = {}
+-  const sliceCaseReducersByType: Record<string, CaseReducer> = {}
+-  const actionCreators: Record<string, Function> = {}
++  const context: ReducerHandlingContext<State> = {
++    sliceCaseReducersByName: {},
++    sliceCaseReducersByType: {},
++    actionCreators: {},
++  }
+ 
+   reducerNames.forEach((reducerName) => {
+-    const maybeReducerWithPrepare = reducers[reducerName]
+-    const type = getType(name, reducerName)
+-
+-    let caseReducer: CaseReducer<State, any>
+-    let prepareCallback: PrepareAction<any> | undefined
+-
+-    if ('reducer' in maybeReducerWithPrepare) {
+-      caseReducer = maybeReducerWithPrepare.reducer
+-      prepareCallback = maybeReducerWithPrepare.prepare
++    const reducerDefinition = reducers[reducerName]
++    const reducerDetails: ReducerDetails = {
++      reducerName,
++      type: getType(name, reducerName),
++      createNotation: typeof options.reducers === 'function',
++    }
++    if (isAsyncThunkSliceReducerDefinition<State>(reducerDefinition)) {
++      handleThunkCaseReducerDefinition(
++        reducerDetails,
++        reducerDefinition,
++        context
++      )
+     } else {
+-      caseReducer = maybeReducerWithPrepare
++      handleNormalReducerDefinition<State>(
++        reducerDetails,
++        reducerDefinition,
++        context
++      )
+     }
+-
+-    sliceCaseReducersByName[reducerName] = caseReducer
+-    sliceCaseReducersByType[type] = caseReducer
+-    actionCreators[reducerName] = prepareCallback
+-      ? createAction(type, prepareCallback)
+-      : createAction(type)
+   })
+ 
+   function buildReducer() {
+@@ -442,9 +615,12 @@ export function createSlice<
+         ? executeReducerBuilderCallback(options.extraReducers)
+         : [options.extraReducers]
+ 
+-    const finalCaseReducers = { ...extraReducers, ...sliceCaseReducersByType }
++    const finalCaseReducers = {
++      ...extraReducers,
++      ...context.sliceCaseReducersByType,
++    }
+ 
+-    return createReducer(initialState, (builder) => {
++    return createReducer(options.initialState, (builder) => {
+       for (let key in finalCaseReducers) {
+         builder.addCase(key, finalCaseReducers[key] as CaseReducer<any>)
+       }
+@@ -481,8 +657,8 @@ export function createSlice<
+ 
+       return _reducer(state, action)
+     },
+-    actions: actionCreators as any,
+-    caseReducers: sliceCaseReducersByName as any,
++    actions: context.actionCreators as any,
++    caseReducers: context.sliceCaseReducersByName as any,
+     getInitialState() {
+       if (!_reducer) _reducer = buildReducer()
+ 
+@@ -537,3 +713,133 @@ export function createSlice<
+   }
+   return slice
+ }
++
++interface ReducerHandlingContext<State> {
++  sliceCaseReducersByName: Record<
++    string,
++    | CaseReducer<State, any>
++    | Pick<
++        AsyncThunkSliceReducerDefinition<State, any, any, any>,
++        'fulfilled' | 'rejected' | 'pending'
++      >
++  >
++  sliceCaseReducersByType: Record<string, CaseReducer<State, any>>
++  actionCreators: Record<string, Function>
++}
++
++interface ReducerDetails {
++  reducerName: string
++  type: string
++  createNotation: boolean
++}
++
++function buildReducerCreators<State>(): ReducerCreators<State> {
++  function asyncThunk(
++    payloadCreator: AsyncThunkPayloadCreator<any, any>,
++    config: AsyncThunkSliceReducerConfig<State, any>
++  ): AsyncThunkSliceReducerDefinition<State, any> {
++    return {
++      [reducerDefinitionType]: ReducerType.asyncThunk,
++      payloadCreator,
++      ...config,
++    }
++  }
++  asyncThunk.withTypes = () => asyncThunk
++  return {
++    reducer(caseReducer) {
++      return Object.assign(
++        {
++          // hack so the wrapping function has the same name as the original
++          // we need to create a wrapper so the `reducerDefinitionType` is not assigned to the original
++          [caseReducer.name](...args: Parameters<typeof caseReducer>) {
++            return caseReducer(...args)
++          },
++        }[caseReducer.name],
++        {
++          [reducerDefinitionType]: ReducerType.reducer,
++        } as const
++      )
++    },
++    preparedReducer(prepare, reducer) {
++      return {
++        [reducerDefinitionType]: ReducerType.reducerWithPrepare,
++        prepare,
++        reducer,
++      }
++    },
++    asyncThunk: asyncThunk as any,
++  }
++}
++
++function handleNormalReducerDefinition<State>(
++  { type, reducerName, createNotation }: ReducerDetails,
++  maybeReducerWithPrepare:
++    | CaseReducer<State, { payload: any; type: string }>
++    | CaseReducerWithPrepare<State, PayloadAction<any, string, any, any>>,
++  context: ReducerHandlingContext<State>
++) {
++  let caseReducer: CaseReducer<State, any>
++  let prepareCallback: PrepareAction<any> | undefined
++  if ('reducer' in maybeReducerWithPrepare) {
++    if (
++      createNotation &&
++      !isCaseReducerWithPrepareDefinition(maybeReducerWithPrepare)
++    ) {
++      throw new Error(
++        'Please use the `create.preparedReducer` notation for prepared action creators with the `create` notation.'
++      )
++    }
++    caseReducer = maybeReducerWithPrepare.reducer
++    prepareCallback = maybeReducerWithPrepare.prepare
++  } else {
++    caseReducer = maybeReducerWithPrepare
++  }
++  context.sliceCaseReducersByName[reducerName] = caseReducer
++  context.sliceCaseReducersByType[type] = caseReducer
++  context.actionCreators[reducerName] = prepareCallback
++    ? createAction(type, prepareCallback)
++    : createAction(type)
++}
++
++function isAsyncThunkSliceReducerDefinition<State>(
++  reducerDefinition: any
++): reducerDefinition is AsyncThunkSliceReducerDefinition<State, any, any, any> {
++  return reducerDefinition[reducerDefinitionType] === ReducerType.asyncThunk
++}
++
++function isCaseReducerWithPrepareDefinition<State>(
++  reducerDefinition: any
++): reducerDefinition is CaseReducerWithPrepareDefinition<State, any> {
++  return (
++    reducerDefinition[reducerDefinitionType] === ReducerType.reducerWithPrepare
++  )
++}
++
++function handleThunkCaseReducerDefinition<State>(
++  { type, reducerName }: ReducerDetails,
++  reducerDefinition: AsyncThunkSliceReducerDefinition<State, any, any, any>,
++  context: ReducerHandlingContext<State>
++) {
++  const { payloadCreator, fulfilled, pending, rejected, options } =
++    reducerDefinition
++  const thunk = createAsyncThunk(type, payloadCreator, options as any)
++  context.actionCreators[reducerName] = thunk
++
++  if (fulfilled) {
++    context.sliceCaseReducersByType[thunk.fulfilled.type] = fulfilled
++  }
++  if (pending) {
++    context.sliceCaseReducersByType[thunk.pending.type] = pending
++  }
++  if (rejected) {
++    context.sliceCaseReducersByType[thunk.rejected.type] = rejected
++  }
++
++  context.sliceCaseReducersByName[reducerName] = {
++    fulfilled: fulfilled || noop,
++    pending: pending || noop,
++    rejected: rejected || noop,
++  }
++}
++
++function noop() {}
+diff --git a/packages/toolkit/src/index.ts b/packages/toolkit/src/index.ts
+index 5210b247..977cc4cc 100644
+--- a/packages/toolkit/src/index.ts
++++ b/packages/toolkit/src/index.ts
+@@ -69,6 +69,7 @@ export type {
+   SliceCaseReducers,
+   ValidateSliceCaseReducers,
+   CaseReducerWithPrepare,
++  ReducerCreators,
+ } from './createSlice'
+ export {
+   // js

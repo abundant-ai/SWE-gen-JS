@@ -1,0 +1,774 @@
+diff --git a/.changeset/cool-berries-build.md b/.changeset/cool-berries-build.md
+deleted file mode 100644
+index 142017c51b..0000000000
+--- a/.changeset/cool-berries-build.md
++++ /dev/null
+@@ -1,25 +0,0 @@
+----
+-'xstate': major
+----
+-
+-Removed the ability to configure `input` within the implementations object. You no longer can do this:
+-
+-```ts
+-createMachine(
+-  {
+-    invoke: {
+-      src: 'child'
+-    }
+-  },
+-  {
+-    actors: {
+-      child: {
+-        src: childMachine,
+-        input: 'foo'
+-      }
+-    }
+-  }
+-);
+-```
+-
+-The `input` can only be provided within the config of the machine.
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 6850f5e18c..c1560c3573 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -548,7 +548,7 @@ export class StateMachine<
+       const src = actorData.src;
+ 
+       const logic =
+-        typeof src === 'string' ? resolveReferencedActor(this, src) : src;
++        typeof src === 'string' ? resolveReferencedActor(this, src)?.src : src;
+ 
+       if (!logic) {
+         return;
+diff --git a/packages/core/src/actions/spawn.ts b/packages/core/src/actions/spawn.ts
+index dd411ff904..0a7fee88eb 100644
+--- a/packages/core/src/actions/spawn.ts
++++ b/packages/core/src/actions/spawn.ts
+@@ -16,8 +16,7 @@ import {
+   ProvidedActor,
+   IsLiteralString,
+   InputFrom,
+-  UnifiedArg,
+-  Mapper
++  UnifiedArg
+ } from '../types.ts';
+ import { resolveReferencedActor } from '../utils.ts';
+ 
+@@ -47,26 +46,30 @@ function resolveSpawn(
+     syncSnapshot: boolean;
+   }
+ ) {
+-  const logic =
+-    typeof src === 'string' ? resolveReferencedActor(state.machine, src) : src;
++  const referenced =
++    typeof src === 'string'
++      ? resolveReferencedActor(state.machine, src)
++      : { src, input: undefined };
+   const resolvedId = typeof id === 'function' ? id(actionArgs) : id;
+ 
+   let actorRef: AnyActorRef | undefined;
+ 
+-  if (logic) {
+-    actorRef = createActor(logic, {
++  if (referenced) {
++    // TODO: inline `input: undefined` should win over the referenced one
++    const configuredInput = input || referenced.input;
++    actorRef = createActor(referenced.src, {
+       id: resolvedId,
+       src,
+       parent: actorScope?.self,
+       systemId,
+       input:
+-        typeof input === 'function'
+-          ? input({
++        typeof configuredInput === 'function'
++          ? configuredInput({
+               context: state.context,
+               event: actionArgs.event,
+               self: actorScope?.self
+             })
+-          : input
++          : configuredInput
+     });
+ 
+     if (syncSnapshot) {
+@@ -152,9 +155,7 @@ type DistributeActors<
+             TActor['id']
+           >;
+           systemId?: string;
+-          input?:
+-            | Mapper<TContext, TEvent, InputFrom<TActor['logic']>, TEvent>
+-            | InputFrom<TActor['logic']>;
++          input?: InputFrom<TActor['logic']>;
+           syncSnapshot?: boolean;
+         }
+       ]
+@@ -163,9 +164,7 @@ type DistributeActors<
+         options?: {
+           id?: ResolvableActorId<TContext, TExpressionEvent, TEvent, string>;
+           systemId?: string;
+-          input?:
+-            | Mapper<TContext, TEvent, InputFrom<TActor['logic']>, TEvent>
+-            | InputFrom<TActor['logic']>;
++          input?: InputFrom<TActor['logic']>;
+           syncSnapshot?: boolean;
+         }
+       ]
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index d28004703b..a0a92bd49a 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -65,17 +65,20 @@ export function createSpawner(
+   spawnedChildren: Record<string, AnyActorRef>
+ ): Spawner<any> {
+   const spawn: Spawner<any> = (src, options = {}) => {
+-    const { systemId, input } = options;
++    const { systemId } = options;
+     if (typeof src === 'string') {
+-      const logic = resolveReferencedActor(machine, src);
++      const referenced = resolveReferencedActor(machine, src);
+ 
+-      if (!logic) {
++      if (!referenced) {
+         throw new Error(
+           `Actor logic '${src}' not implemented in machine '${machine.id}'`
+         );
+       }
+ 
+-      const actorRef = createActor(logic, {
++      const input = 'input' in options ? options.input : referenced.input;
++
++      // TODO: this should also receive `src`
++      const actorRef = createActor(referenced.src, {
+         id: options.id,
+         parent: actorScope.self,
+         input:
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 233d338213..bc920d99c5 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -1087,18 +1087,33 @@ type MachineImplementationsActions<
+ };
+ 
+ type MachineImplementationsActors<
+-  _TContext extends MachineContext,
++  TContext extends MachineContext,
+   TResolvedTypesMeta,
++  TEventsCausingActors = Prop<
++    Prop<TResolvedTypesMeta, 'resolved'>,
++    'eventsCausingActors'
++  >,
+   TIndexedActors = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedActors'>,
++  TIndexedEvents = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedEvents'>,
+   _TInvokeSrcNameMap = Prop<
+     Prop<TResolvedTypesMeta, 'resolved'>,
+     'invokeSrcNameMap'
+   >
+ > = {
+-  [K in keyof TIndexedActors]?: Cast<
+-    Prop<TIndexedActors[K], 'logic'>,
+-    AnyActorLogic
+-  >;
++  // TODO: this should require `{ src, input }` for required inputs
++  [K in keyof TIndexedActors]?:
++    | Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>
++    | {
++        src: Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>;
++        input:
++          | Mapper<
++              TContext,
++              MaybeNarrowedEvent<TIndexedEvents, TEventsCausingActors, K>,
++              InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>,
++              Cast<Prop<TIndexedEvents, keyof TIndexedEvents>, EventObject>
++            >
++          | InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>;
++      };
+ };
+ 
+ type MachineImplementationsDelays<
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index 6cee5a9432..ff6e7c6ae5 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -407,11 +407,18 @@ export function resolveReferencedActor(machine: AnyStateMachine, src: string) {
+     const [, indexStr] = src.match(/\[(\d+)\]$/)!;
+     const node = machine.getStateNodeById(src.slice(7, -(indexStr.length + 2)));
+     const invokeConfig = node.config.invoke!;
+-    return (
+-      Array.isArray(invokeConfig)
++    return {
++      src: (Array.isArray(invokeConfig)
+         ? invokeConfig[indexStr as any]
+         : (invokeConfig as InvokeConfig<any, any, any, any, any, any>)
+-    ).src;
++      ).src,
++      input: undefined
++    };
+   }
+-  return machine.implementations.actors[src];
++  const referenced = machine.implementations.actors[src];
++  return referenced
++    ? 'transition' in referenced
++      ? { src: referenced, input: undefined }
++      : referenced
++    : undefined;
+ }
+diff --git a/packages/core/test/input.test.ts b/packages/core/test/input.test.ts
+index 5533414edc..51e6d50b3e 100644
+--- a/packages/core/test/input.test.ts
++++ b/packages/core/test/input.test.ts
+@@ -1,5 +1,5 @@
+ import { of } from 'rxjs';
+-import { assign, createActor, spawn } from '../src';
++import { AnyActorLogic, AnyActorRef, assign, createActor } from '../src';
+ import { createMachine } from '../src/Machine';
+ import {
+   fromCallback,
+@@ -265,6 +265,175 @@ describe('input', () => {
+     expect(spy).toHaveBeenCalledWith(142);
+   });
+ 
++  it('should provide input to the referenced actor defined together with static input', () => {
++    const spy = jest.fn();
++
++    const machine = createMachine(
++      {
++        invoke: {
++          src: 'child'
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: createMachine({
++              context: ({ input }) => {
++                spy(input);
++                return {};
++              }
++            }),
++            input: 42
++          }
++        }
++      }
++    );
++
++    createActor(machine).start();
++
++    expect(spy).toHaveBeenCalledWith(42);
++  });
++
++  it('should provide input to the referenced actor defined together with dynamic input when invoking', () => {
++    const spy = jest.fn();
++
++    const machine = createMachine(
++      {
++        types: {} as {
++          context: {
++            count: number;
++          };
++          input: number;
++        },
++        context: ({ input }) => ({
++          count: input
++        }),
++        invoke: {
++          src: 'child'
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: createMachine({
++              context: ({ input }) => {
++                spy(input);
++                return {};
++              }
++            }),
++            input: ({ context }) => context.count + 100
++          }
++        }
++      }
++    );
++
++    createActor(machine, { input: 42 }).start();
++
++    expect(spy).toHaveBeenCalledWith(142);
++  });
++
++  it('should provide input to the referenced actor defined together with dynamic input when spawning', () => {
++    const spy = jest.fn();
++
++    const machine = createMachine(
++      {
++        types: {} as {
++          context: {
++            count: number;
++            childRef?: AnyActorRef;
++          };
++          input: number;
++          actors: {
++            src: 'child';
++            logic: AnyActorLogic;
++          };
++        },
++        context: ({ input }) => ({
++          count: input
++        }),
++        entry: assign(({ spawn }) => ({
++          childRef: spawn('child')
++        }))
++      },
++      {
++        actors: {
++          child: {
++            src: createMachine({
++              context: ({ input }) => {
++                spy(input);
++                return {};
++              }
++            }),
++            input: ({ context }) => context.count + 100
++          }
++        }
++      }
++    );
++
++    createActor(machine, { input: 42 }).start();
++
++    expect(spy).toHaveBeenCalledWith(142);
++  });
++
++  it('should prioritize inline input over the one defined with referenced actor when invoking', () => {
++    const spy = jest.fn();
++
++    const machine = createMachine(
++      {
++        invoke: {
++          src: 'child',
++          input: 100
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: createMachine({
++              context: ({ input }) => {
++                spy(input);
++                return {};
++              }
++            }),
++            input: 42
++          }
++        }
++      }
++    );
++
++    createActor(machine).start();
++
++    expect(spy).toHaveBeenCalledWith(100);
++  });
++
++  it('should prioritize inline input over the one defined with referenced actor when spawning', () => {
++    const spy = jest.fn();
++
++    const machine = createMachine(
++      {
++        entry: assign(({ spawn }) => ({
++          childRef: spawn('child', { input: 100 })
++        }))
++      },
++      {
++        actors: {
++          child: {
++            src: createMachine({
++              context: ({ input }) => {
++                spy(input);
++                return {};
++              }
++            }),
++            input: 42
++          }
++        }
++      }
++    );
++
++    createActor(machine).start();
++
++    expect(spy).toHaveBeenCalledWith(100);
++  });
++
+   it('should call the input factory with self when invoking', () => {
+     const spy = jest.fn();
+ 
+@@ -285,13 +454,16 @@ describe('input', () => {
+ 
+     const machine = createMachine(
+       {
+-        entry: spawn('child', {
+-          input: ({ self }: any) => spy(self)
+-        })
++        entry: assign(({ spawn }) => ({
++          childRef: spawn('child')
++        }))
+       },
+       {
+         actors: {
+-          child: createMachine({})
++          child: {
++            src: createMachine({}),
++            input: ({ self }: any) => spy(self)
++          }
+         }
+       }
+     );
+diff --git a/packages/core/test/typegenTypes.test.ts b/packages/core/test/typegenTypes.test.ts
+index 3a079707c2..1a9fa039a9 100644
+--- a/packages/core/test/typegenTypes.test.ts
++++ b/packages/core/test/typegenTypes.test.ts
+@@ -132,6 +132,44 @@ describe('typegen types', () => {
+     );
+   });
+ 
++  it(`should limit event type provided to the actor's input factory`, () => {
++    interface TypesMeta extends TypegenMeta {
++      missingImplementations: {
++        actions: never;
++        delays: never;
++        guards: never;
++        actors: never;
++      };
++      eventsCausingActors: {
++        myActor: 'FOO' | 'BAR';
++      };
++    }
++
++    createMachine(
++      {
++        context: { foo: 100 },
++        types: {
++          typegen: {} as TypesMeta,
++          events: {} as { type: 'FOO' } | { type: 'BAR' } | { type: 'BAZ' }
++        }
++      },
++      {
++        actors: {
++          myActor: {
++            src: fromPromise(() => Promise.resolve(42)),
++            input: ({ event }) => {
++              event.type === 'FOO';
++              event.type === 'BAR';
++              // @ts-expect-error
++              event.type === 'BAZ';
++              return null;
++            }
++          }
++        }
++      }
++    );
++  });
++
+   it('should not allow an unknown action', () => {
+     interface TypesMeta extends TypegenMeta {
+       missingImplementations: {
+diff --git a/packages/core/test/types.test.ts b/packages/core/test/types.test.ts
+index 50c7b65630..e9ba322fd1 100644
+--- a/packages/core/test/types.test.ts
++++ b/packages/core/test/types.test.ts
+@@ -955,7 +955,7 @@ describe('spawn action', () => {
+     });
+   });
+ 
+-  it(`should reject dynamic wrong input`, () => {
++  it(`should reject an attempt to provide dynamic input`, () => {
+     const child = fromPromise(({}: { input: number }) =>
+       Promise.resolve('foo')
+     );
+@@ -969,66 +969,11 @@ describe('spawn action', () => {
+       },
+       entry: spawn('child', {
+         // @ts-expect-error
+-        input: () => 'hello'
+-      })
+-    });
+-  });
+-
+-  it(`should allow dynamic correct input`, () => {
+-    const child = fromPromise(({}: { input: number }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+         input: () => 42
+       })
+     });
+   });
+ 
+-  it(`should reject dynamic input that is a supertype of the expected one`, () => {
+-    const child = fromPromise(({}: { input: number }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+-        // @ts-expect-error
+-        input: () => (Math.random() > 0.5 ? 42 : 'hello')
+-      })
+-    });
+-  });
+-
+-  it(`should allow dynamic input that is a subtype of the expected one`, () => {
+-    const child = fromPromise(({}: { input: number | string }) =>
+-      Promise.resolve('foo')
+-    );
+-
+-    createMachine({
+-      types: {} as {
+-        actors: {
+-          src: 'child';
+-          logic: typeof child;
+-        };
+-      },
+-      entry: spawn('child', {
+-        input: () => 'hello'
+-      })
+-    });
+-  });
+-
+   it(`should reject a valid input of a different provided actor`, () => {
+     const child1 = fromPromise(({}: { input: number }) => Promise.resolve(100));
+ 
+@@ -1649,7 +1594,7 @@ describe('invoke', () => {
+     });
+   });
+ 
+-  it(`should allow dynamic correct input`, () => {
++  it(`should allow dynamic correct input in the provided implementations`, () => {
+     const child = fromPromise(({}: { input: number }) =>
+       Promise.resolve('foo')
+     );
+@@ -1866,6 +1811,210 @@ describe('actor implementations', () => {
+     );
+   });
+ 
++  it(`should reject static wrong input in the provided implementations`, () => {
++    const child = fromPromise(({}: { input: number }) =>
++      Promise.resolve('foo')
++    );
++
++    createMachine(
++      {
++        types: {} as {
++          actors: {
++            src: 'child';
++            logic: typeof child;
++          };
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: child,
++            // @ts-expect-error
++            input: 'hello'
++          }
++        }
++      }
++    );
++  });
++
++  it(`should allow static correct input in the provided implementations`, () => {
++    const child = fromPromise(({}: { input: number }) =>
++      Promise.resolve('foo')
++    );
++
++    createMachine(
++      {
++        types: {} as {
++          actors: {
++            src: 'child';
++            logic: typeof child;
++          };
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: child,
++            input: 42
++          }
++        }
++      }
++    );
++  });
++
++  it(`should allow static input that is a subtype of the expected one`, () => {
++    const child = fromPromise(({}: { input: number | string }) =>
++      Promise.resolve('foo')
++    );
++
++    createMachine(
++      {
++        types: {} as {
++          actors: {
++            src: 'child';
++            logic: typeof child;
++          };
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: child,
++            input: 42
++          }
++        }
++      }
++    );
++  });
++
++  it(`should reject static input that is a supertype of the expected one`, () => {
++    const child = fromPromise(({}: { input: number }) =>
++      Promise.resolve('foo')
++    );
++
++    createMachine(
++      {
++        types: {} as {
++          actors: {
++            src: 'child';
++            logic: typeof child;
++          };
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: child,
++            // @ts-expect-error
++            input: Math.random() > 0.5 ? 'string' : 42
++          }
++        }
++      }
++    );
++  });
++
++  it(`should reject dynamic wrong input in the provided implementations`, () => {
++    const child = fromPromise(({}: { input: number }) =>
++      Promise.resolve('foo')
++    );
++
++    createMachine(
++      {
++        types: {} as {
++          actors: {
++            src: 'child';
++            logic: typeof child;
++          };
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: child,
++            // @ts-expect-error
++            input: () => 'hello'
++          }
++        }
++      }
++    );
++  });
++
++  it(`should allow dynamic correct input in the provided implementations`, () => {
++    const child = fromPromise(({}: { input: number }) =>
++      Promise.resolve('foo')
++    );
++
++    createMachine(
++      {
++        types: {} as {
++          actors: {
++            src: 'child';
++            logic: typeof child;
++          };
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: child,
++            input: () => 42
++          }
++        }
++      }
++    );
++  });
++
++  it(`should reject dynamic input that is a supertype of the expected one`, () => {
++    const child = fromPromise(({}: { input: number }) =>
++      Promise.resolve('foo')
++    );
++
++    createMachine(
++      {
++        types: {} as {
++          actors: {
++            src: 'child';
++            logic: typeof child;
++          };
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: child,
++            // @ts-expect-error
++            input: () => (Math.random() > 0.5 ? 42 : 'hello')
++          }
++        }
++      }
++    );
++  });
++
++  it(`should allow dynamic input that is a subtype of the expected one`, () => {
++    const child = fromPromise(({}: { input: number | string }) =>
++      Promise.resolve('foo')
++    );
++
++    createMachine(
++      {
++        types: {} as {
++          actors: {
++            src: 'child';
++            logic: typeof child;
++          };
++        }
++      },
++      {
++        actors: {
++          child: {
++            src: child,
++            input: () => 'hello'
++          }
++        }
++      }
++    );
++  });
++
+   it('should allow an actor with the expected snapshot type', () => {
+     const child = createMachine({
+       types: {} as {

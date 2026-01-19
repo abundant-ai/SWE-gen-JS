@@ -1,0 +1,526 @@
+diff --git a/.changeset/gold-icons-protect.md b/.changeset/gold-icons-protect.md
+new file mode 100644
+index 0000000000..f014ef30d8
+--- /dev/null
++++ b/.changeset/gold-icons-protect.md
+@@ -0,0 +1,5 @@
++---
++'xstate': patch
++---
++
++Fixed an issue that caused `invoke`d actors to be created before resolving `assign` actions from `entry` of the same state when using `predictableActionArguments` flag.
+diff --git a/docs/updates/2021-10-15.md b/docs/updates/2021-10-15.md
+index b18431e586..90eeab585c 100644
+--- a/docs/updates/2021-10-15.md
++++ b/docs/updates/2021-10-15.md
+@@ -10,7 +10,7 @@ updateType: docs
+ <h1>{{ $frontmatter.title }}</h1>
+ <p class="date">{{ new Date($frontmatter.date).toLocaleString('en-US',{ month:'long', day:'numeric', year:'numeric' }) }}</p>
+ 
+-Want to know what the Visualizer is and how it works? Now you can read about it in the [What is XState?](/visualizer/) section.
++Want to know what the Visualizer is and how it works? Now you can read about it in the [What is XState?](/docs/visualizer/) section.
+ 
+ We’ll keep the introductory documentation updated, and add introductions to further Stately products in the future.
+ 
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index 0245a6c17f..33b80d7b31 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -1001,8 +1001,9 @@ class StateNode<
+     transition: StateTransition<TContext, TEvent>,
+     currentContext: TContext,
+     _event: SCXML.Event<TEvent>,
+-    prevState?: State<TContext, any, any, any, any>
+-  ): Array<ActionObject<TContext, TEvent>> {
++    prevState?: State<TContext, any, any, any, any>,
++    predictableExec?: PredictableActionArgumentsExec
++  ): Array<Array<ActionObject<TContext, TEvent>>> {
+     const prevConfig = getConfiguration(
+       [],
+       prevState ? this.getStateNodes(prevState.value) : [this]
+@@ -1065,27 +1066,36 @@ class StateNode<
+     const entryStates = new Set(transition.entrySet);
+     const exitStates = new Set(transition.exitSet);
+ 
+-    const [entryActions, exitActions] = [
+-      flatten(
+-        Array.from(entryStates).map((stateNode) => {
+-          return [
+-            ...stateNode.activities.map((activity) => start(activity)),
+-            ...stateNode.onEntry
+-          ];
+-        })
+-      ).concat(doneEvents.map(raise) as Array<ActionObject<TContext, TEvent>>),
+-      flatten(
+-        Array.from(exitStates).map((stateNode) => [
++    const entryActions = Array.from(entryStates)
++      .map((stateNode) => {
++        const entryActions = stateNode.onEntry;
++        const invokeActions = stateNode.activities.map((activity) =>
++          start(activity)
++        );
++        return toActionObjects(
++          predictableExec
++            ? [...entryActions, ...invokeActions]
++            : [...invokeActions, ...entryActions],
++          this.machine.options.actions as any
++        );
++      })
++      .concat([doneEvents.map(raise) as Array<ActionObject<TContext, TEvent>>]);
++
++    const exitActions = Array.from(exitStates).map((stateNode) =>
++      toActionObjects(
++        [
+           ...stateNode.onExit,
+           ...stateNode.activities.map((activity) => stop(activity))
+-        ])
++        ],
++        this.machine.options.actions as any
+       )
+-    ];
++    );
+ 
+-    const actions = toActionObjects(
+-      exitActions.concat(transition.actions).concat(entryActions),
+-      this.machine.options.actions as any
+-    ) as Array<ActionObject<TContext, TEvent>>;
++    const actions = exitActions
++      .concat([
++        toActionObjects(transition.actions, this.machine.options.actions as any)
++      ])
++      .concat(entryActions);
+ 
+     if (isDone) {
+       const stopActions = toActionObjects(
+@@ -1101,7 +1111,7 @@ class StateNode<
+           (action.type !== actionTypes.send ||
+             (!!action.to && action.to !== SpecialTargets.Internal))
+       );
+-      return actions.concat(stopActions);
++      return actions.concat([stopActions]);
+     }
+ 
+     return actions;
+@@ -1255,22 +1265,25 @@ class StateNode<
+         ? (this.machine.historyValue(currentState.value) as HistoryValue)
+         : undefined
+       : undefined;
+-    const actions = this.getActions(
++    const actionBlocks = this.getActions(
+       new Set(resolvedConfiguration),
+       isDone,
+       stateTransition,
+       context,
+       _event,
+-      currentState
++      currentState,
++      predictableExec
+     );
+     const activities = currentState ? { ...currentState.activities } : {};
+-    for (const action of actions) {
+-      if (action.type === actionTypes.start) {
+-        activities[
+-          action.activity!.id || action.activity!.type
+-        ] = action as ActivityDefinition<TContext, TEvent>;
+-      } else if (action.type === actionTypes.stop) {
+-        activities[action.activity!.id || action.activity!.type] = false;
++    for (const block of actionBlocks) {
++      for (const action of block) {
++        if (action.type === actionTypes.start) {
++          activities[
++            action.activity!.id || action.activity!.type
++          ] = action as ActivityDefinition<TContext, TEvent>;
++        } else if (action.type === actionTypes.stop) {
++          activities[action.activity!.id || action.activity!.type] = false;
++        }
+       }
+     }
+ 
+@@ -1279,7 +1292,7 @@ class StateNode<
+       currentState,
+       context,
+       _event,
+-      actions,
++      actionBlocks,
+       predictableExec,
+       this.machine.config.predictableActionArguments ||
+         this.machine.config.preserveActionOrder
+diff --git a/packages/core/src/actions.ts b/packages/core/src/actions.ts
+index 5fe0040721..a1a789c979 100644
+--- a/packages/core/src/actions.ts
++++ b/packages/core/src/actions.ts
+@@ -49,7 +49,6 @@ import {
+   isString,
+   toEventObject,
+   toSCXMLEvent,
+-  partition,
+   flatten,
+   updateContext,
+   warn,
+@@ -623,22 +622,36 @@ export function choose<TContext, TEvent extends EventObject>(
+   };
+ }
+ 
++const pluckAssigns = <TContext, TEvent extends EventObject>(
++  actionBlocks: Array<Array<ActionObject<TContext, TEvent>>>
++): AssignAction<TContext, TEvent>[] => {
++  const assignActions: AssignAction<TContext, TEvent>[] = [];
++
++  for (const block of actionBlocks) {
++    let i = 0;
++    while (i < block.length) {
++      if (block[i].type === actionTypes.assign) {
++        assignActions.push(block[i] as AssignAction<TContext, TEvent>);
++        block.splice(i, 1);
++        continue;
++      }
++      i++;
++    }
++  }
++
++  return assignActions;
++};
++
+ export function resolveActions<TContext, TEvent extends EventObject>(
+   machine: StateNode<TContext, any, TEvent, any, any, any>,
+   currentState: State<TContext, TEvent, any, any, any> | undefined,
+   currentContext: TContext,
+   _event: SCXML.Event<TEvent>,
+-  actions: Array<ActionObject<TContext, TEvent>>,
++  actionBlocks: Array<Array<ActionObject<TContext, TEvent>>>,
+   predictableExec?: PredictableActionArgumentsExec,
+   preserveActionOrder: boolean = false
+ ): [Array<ActionObject<TContext, TEvent>>, TContext] {
+-  const [assignActions, otherActions] = preserveActionOrder
+-    ? [[], actions]
+-    : partition(
+-        actions,
+-        (action): action is AssignAction<TContext, TEvent> =>
+-          action.type === actionTypes.assign
+-      );
++  const assignActions = preserveActionOrder ? [] : pluckAssigns(actionBlocks);
+ 
+   let updatedContext = assignActions.length
+     ? updateContext(currentContext, _event, assignActions, currentState)
+@@ -648,151 +661,171 @@ export function resolveActions<TContext, TEvent extends EventObject>(
+     ? [currentContext]
+     : undefined;
+ 
+-  const resolvedActions = flatten(
+-    otherActions
+-      .map((actionObject) => {
+-        switch (actionObject.type) {
+-          case actionTypes.raise: {
+-            return resolveRaise(actionObject as RaiseAction<TEvent>);
+-          }
+-          case actionTypes.send:
+-            const sendAction = resolveSend(
+-              actionObject as SendAction<TContext, TEvent, AnyEventObject>,
+-              updatedContext,
+-              _event,
+-              machine.options.delays as any
+-            ) as SendActionObject<TContext, TEvent>; // TODO: fix ActionTypes.Init
+-
+-            if (!IS_PRODUCTION) {
+-              // warn after resolving as we can create better contextual message here
+-              warn(
+-                !isString(actionObject.delay) ||
+-                  typeof sendAction.delay === 'number',
+-                // tslint:disable-next-line:max-line-length
+-                `No delay reference for delay expression '${actionObject.delay}' was found on machine '${machine.id}'`
+-              );
+-            }
++  const deferredToBlockEnd: Array<ActionObject<TContext, TEvent>> = [];
+ 
+-            if (sendAction.to !== SpecialTargets.Internal) {
+-              predictableExec?.(sendAction, updatedContext, _event);
+-            }
++  function handleAction(actionObject: ActionObject<TContext, TEvent>) {
++    switch (actionObject.type) {
++      case actionTypes.raise: {
++        return resolveRaise(actionObject as RaiseAction<TEvent>);
++      }
++      case actionTypes.send:
++        const sendAction = resolveSend(
++          actionObject as SendAction<TContext, TEvent, AnyEventObject>,
++          updatedContext,
++          _event,
++          machine.options.delays as any
++        ) as SendActionObject<TContext, TEvent>; // TODO: fix ActionTypes.Init
++
++        if (!IS_PRODUCTION) {
++          // warn after resolving as we can create better contextual message here
++          warn(
++            !isString(actionObject.delay) ||
++              typeof sendAction.delay === 'number',
++            // tslint:disable-next-line:max-line-length
++            `No delay reference for delay expression '${actionObject.delay}' was found on machine '${machine.id}'`
++          );
++        }
+ 
+-            return sendAction;
+-          case actionTypes.log: {
+-            const resolved = resolveLog(
+-              actionObject as LogAction<TContext, TEvent>,
+-              updatedContext,
+-              _event
+-            );
+-            predictableExec?.(resolved, updatedContext, _event);
+-            return resolved;
+-          }
+-          case actionTypes.choose: {
+-            const chooseAction = actionObject as ChooseAction<TContext, TEvent>;
+-            const matchedActions = chooseAction.conds.find((condition) => {
+-              const guard = toGuard(
+-                condition.cond,
+-                machine.options.guards as any
+-              );
+-              return (
+-                !guard ||
+-                evaluateGuard(
+-                  machine,
+-                  guard,
+-                  updatedContext,
+-                  _event,
+-                  (!predictableExec ? currentState : undefined) as any
+-                )
+-              );
+-            })?.actions;
+-
+-            if (!matchedActions) {
+-              return [];
+-            }
++        if (predictableExec && sendAction.to !== SpecialTargets.Internal) {
++          deferredToBlockEnd.push(sendAction);
++        }
+ 
+-            const [
+-              resolvedActionsFromChoose,
+-              resolvedContextFromChoose
+-            ] = resolveActions(
+-              machine,
+-              currentState,
+-              updatedContext,
+-              _event,
+-              toActionObjects(
+-                toArray(matchedActions),
+-                machine.options.actions as any
+-              ),
+-              predictableExec,
+-              preserveActionOrder
+-            );
+-            updatedContext = resolvedContextFromChoose;
+-            preservedContexts?.push(updatedContext);
+-            return resolvedActionsFromChoose;
+-          }
+-          case actionTypes.pure: {
+-            const matchedActions = (actionObject as PureAction<
+-              TContext,
+-              TEvent
+-            >).get(updatedContext, _event.data);
+-            if (!matchedActions) {
+-              return [];
+-            }
+-            const [resolvedActionsFromPure, resolvedContext] = resolveActions(
++        return sendAction;
++      case actionTypes.log: {
++        const resolved = resolveLog(
++          actionObject as LogAction<TContext, TEvent>,
++          updatedContext,
++          _event
++        );
++        predictableExec?.(resolved, updatedContext, _event);
++        return resolved;
++      }
++      case actionTypes.choose: {
++        const chooseAction = actionObject as ChooseAction<TContext, TEvent>;
++        const matchedActions = chooseAction.conds.find((condition) => {
++          const guard = toGuard(condition.cond, machine.options.guards as any);
++          return (
++            !guard ||
++            evaluateGuard(
+               machine,
+-              currentState,
+-              updatedContext,
+-              _event,
+-              toActionObjects(
+-                toArray(matchedActions),
+-                machine.options.actions as any
+-              ),
+-              predictableExec,
+-              preserveActionOrder
+-            );
+-            updatedContext = resolvedContext;
+-            preservedContexts?.push(updatedContext);
+-            return resolvedActionsFromPure;
+-          }
+-          case actionTypes.stop: {
+-            const resolved = resolveStop(
+-              actionObject as StopAction<TContext, TEvent>,
+-              updatedContext,
+-              _event
+-            );
+-            predictableExec?.(resolved, updatedContext, _event);
+-            return resolved;
+-          }
+-          case actionTypes.assign: {
+-            updatedContext = updateContext(
++              guard,
+               updatedContext,
+               _event,
+-              [actionObject as AssignAction<TContext, TEvent>],
+-              !predictableExec ? currentState : undefined
+-            );
+-            preservedContexts?.push(updatedContext);
+-            break;
+-          }
+-          default:
+-            let resolvedActionObject = toActionObject(
+-              actionObject,
++              (!predictableExec ? currentState : undefined) as any
++            )
++          );
++        })?.actions;
++
++        if (!matchedActions) {
++          return [];
++        }
++
++        const [
++          resolvedActionsFromChoose,
++          resolvedContextFromChoose
++        ] = resolveActions(
++          machine,
++          currentState,
++          updatedContext,
++          _event,
++          [
++            toActionObjects(
++              toArray(matchedActions),
+               machine.options.actions as any
+-            );
+-            const { exec } = resolvedActionObject;
+-            if (predictableExec) {
+-              predictableExec(resolvedActionObject, updatedContext, _event);
+-            } else if (exec && preservedContexts) {
+-              const contextIndex = preservedContexts.length - 1;
+-              resolvedActionObject = {
+-                ...resolvedActionObject,
+-                exec: (_ctx, ...args) => {
+-                  exec(preservedContexts[contextIndex], ...args);
+-                }
+-              };
++            )
++          ],
++          predictableExec,
++          preserveActionOrder
++        );
++        updatedContext = resolvedContextFromChoose;
++        preservedContexts?.push(updatedContext);
++        return resolvedActionsFromChoose;
++      }
++      case actionTypes.pure: {
++        const matchedActions = (actionObject as PureAction<
++          TContext,
++          TEvent
++        >).get(updatedContext, _event.data);
++        if (!matchedActions) {
++          return [];
++        }
++        const [resolvedActionsFromPure, resolvedContext] = resolveActions(
++          machine,
++          currentState,
++          updatedContext,
++          _event,
++          [
++            toActionObjects(
++              toArray(matchedActions),
++              machine.options.actions as any
++            )
++          ],
++          predictableExec,
++          preserveActionOrder
++        );
++        updatedContext = resolvedContext;
++        preservedContexts?.push(updatedContext);
++        return resolvedActionsFromPure;
++      }
++      case actionTypes.stop: {
++        const resolved = resolveStop(
++          actionObject as StopAction<TContext, TEvent>,
++          updatedContext,
++          _event
++        );
++
++        predictableExec?.(resolved, currentContext, _event);
++        return resolved;
++      }
++      case actionTypes.assign: {
++        updatedContext = updateContext(
++          updatedContext,
++          _event,
++          [actionObject as AssignAction<TContext, TEvent>],
++          !predictableExec ? currentState : undefined
++        );
++        preservedContexts?.push(updatedContext);
++        break;
++      }
++      default:
++        let resolvedActionObject = toActionObject(
++          actionObject,
++          machine.options.actions as any
++        );
++        const { exec } = resolvedActionObject;
++        if (predictableExec) {
++          predictableExec(resolvedActionObject, updatedContext, _event);
++        } else if (exec && preservedContexts) {
++          const contextIndex = preservedContexts.length - 1;
++          resolvedActionObject = {
++            ...resolvedActionObject,
++            exec: (_ctx, ...args) => {
++              exec(preservedContexts[contextIndex], ...args);
+             }
+-            return resolvedActionObject;
++          };
+         }
+-      })
+-      .filter((a): a is ActionObject<TContext, TEvent> => !!a)
+-  );
++        return resolvedActionObject;
++    }
++  }
++
++  function processBlock(block: ActionObject<TContext, TEvent>[]) {
++    let resolvedActions: Array<ActionObject<TContext, TEvent>> = [];
++
++    for (const action of block) {
++      const resolved = handleAction(action);
++      if (resolved) {
++        resolvedActions = resolvedActions.concat(resolved);
++      }
++    }
++
++    deferredToBlockEnd.forEach((action) => {
++      predictableExec!(action, updatedContext, _event);
++    });
++    deferredToBlockEnd.length = 0;
++
++    return resolvedActions;
++  }
++
++  const resolvedActions = flatten(actionBlocks.map(processBlock));
+   return [resolvedActions, updatedContext];
+ }
+diff --git a/packages/core/src/interpreter.ts b/packages/core/src/interpreter.ts
+index 0e600c2da6..0775e37b1b 100644
+--- a/packages/core/src/interpreter.ts
++++ b/packages/core/src/interpreter.ts
+@@ -633,7 +633,7 @@ export class Interpreter<
+           this.state,
+           this.state.context,
+           _event,
+-          exitActions,
++          [exitActions],
+           this.machine.config.predictableActionArguments
+             ? this._exec
+             : undefined,

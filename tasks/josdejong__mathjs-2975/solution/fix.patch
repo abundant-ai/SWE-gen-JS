@@ -1,0 +1,260 @@
+diff --git a/HISTORY.md b/HISTORY.md
+index 22caa1ab7..0ca196270 100644
+--- a/HISTORY.md
++++ b/HISTORY.md
+@@ -2,6 +2,10 @@
+ 
+ # unpublished changes since 11.9.1
+ 
++- Extend function `quantileSeq` with support for a `dimension` (#3002).
++  Thanks @dvd101x.
++- Implement #2735: Support indexing with an array of booleans (#2994),
++  for example `a[[true, false, true]]` and `a[a > 2]`. Thanks @dvd101x.
+ - Fix #2990: `DenseMatrix` can mutate input arrays (#2991).
+ 
+ 
+diff --git a/src/expression/embeddedDocs/embeddedDocs.js b/src/expression/embeddedDocs/embeddedDocs.js
+index 1e9c82ec4..e2adde8a9 100644
+--- a/src/expression/embeddedDocs/embeddedDocs.js
++++ b/src/expression/embeddedDocs/embeddedDocs.js
+@@ -184,6 +184,7 @@ import { setUnionDocs } from './function/set/setUnion.js'
+ import { zpk2tfDocs } from './function/signal/zpk2tf.js'
+ import { freqzDocs } from './function/signal/freqz.js'
+ import { erfDocs } from './function/special/erf.js'
++import { zetaDocs } from './function/special/zeta.js'
+ import { madDocs } from './function/statistics/mad.js'
+ import { maxDocs } from './function/statistics/max.js'
+ import { meanDocs } from './function/statistics/mean.js'
+@@ -527,6 +528,7 @@ export const embeddedDocs = {
+ 
+   // functions - special
+   erf: erfDocs,
++  zeta: zetaDocs,
+ 
+   // functions - statistics
+   cumsum: cumSumDocs,
+diff --git a/src/expression/embeddedDocs/function/special/zeta.js b/src/expression/embeddedDocs/function/special/zeta.js
+new file mode 100644
+index 000000000..1871dab9e
+--- /dev/null
++++ b/src/expression/embeddedDocs/function/special/zeta.js
+@@ -0,0 +1,14 @@
++export const zetaDocs = {
++  name: 'zeta',
++  category: 'Special',
++  syntax: [
++    'zeta(s)'
++  ],
++  description: 'Compute the Riemann Zeta Function using an infinite series and Riemanns Functional Equation for the entire complex plane',
++  examples: [
++    'zeta(0.2)',
++    'zeta(-0.5)',
++    'zeta(4)'
++  ],
++  seealso: []
++}
+diff --git a/src/factoriesAny.js b/src/factoriesAny.js
+index 00b5fe195..8d79c6755 100644
+--- a/src/factoriesAny.js
++++ b/src/factoriesAny.js
+@@ -96,6 +96,7 @@ export { createFft } from './function/matrix/fft.js'
+ export { createIfft } from './function/matrix/ifft.js'
+ export { createSolveODE } from './function/numeric/solveODE.js'
+ export { createErf } from './function/special/erf.js'
++export { createZeta } from './function/special/zeta.js'
+ export { createMode } from './function/statistics/mode.js'
+ export { createProd } from './function/statistics/prod.js'
+ export { createFormat } from './function/string/format.js'
+diff --git a/src/factoriesNumber.js b/src/factoriesNumber.js
+index 9ae85a9b4..47f9a37e1 100644
+--- a/src/factoriesNumber.js
++++ b/src/factoriesNumber.js
+@@ -249,7 +249,7 @@ export { createUnequalNumber as createUnequal } from './function/relational/uneq
+ 
+ // special
+ export { createErf } from './function/special/erf.js'
+-
++export { createZeta } from './function/special/zeta.js'
+ // statistics
+ export { createMode } from './function/statistics/mode.js'
+ export { createProd } from './function/statistics/prod.js'
+diff --git a/src/function/special/zeta.js b/src/function/special/zeta.js
+new file mode 100644
+index 000000000..49f9c6179
+--- /dev/null
++++ b/src/function/special/zeta.js
+@@ -0,0 +1,140 @@
++import { factory } from '../../utils/factory.js'
++
++const name = 'zeta'
++const dependencies = ['typed', 'config', 'multiply', 'pow', 'divide', 'factorial', 'equal', 'smallerEq', 'isNegative', 'gamma', 'sin', 'subtract', 'add', '?Complex', '?BigNumber', 'pi']
++
++export const createZeta = /* #__PURE__ */ factory(name, dependencies, ({ typed, config, multiply, pow, divide, factorial, equal, smallerEq, isNegative, gamma, sin, subtract, add, Complex, BigNumber, pi }) => {
++  /**
++   * Compute the Riemann Zeta function of a value using an infinite series for
++   * all of the complex plane using Riemann's Functional equation.
++   *
++   * Based off the paper by Xavier Gourdon and Pascal Sebah
++   * ( http://numbers.computation.free.fr/Constants/Miscellaneous/zetaevaluations.pdf )
++   *
++   * Implementation and slight modification by Anik Patel
++   *
++   * Note: the implementation is accurate up to about 6 digits.
++   *
++   * Syntax:
++   *
++   *    math.zeta(n)
++   *
++   * Examples:
++   *
++   *    math.zeta(5)       // returns 1.0369277551433895
++   *    math.zeta(-0.5)    // returns -0.2078862249773449
++   *    math.zeta(math.i)  // returns 0.0033002236853253153 - 0.4181554491413212i
++   *
++   *
++   * @param {number | Complex | BigNumber} s   A Real, Complex or BigNumber parameter to the Riemann Zeta Function
++   * @return {number | Complex | BigNumber}    The Riemann Zeta of `s`
++   */
++  return typed(name, {
++    number: (s) => zetaNumeric(s, value => value, () => 20),
++    BigNumber: (s) => zetaNumeric(
++      s,
++      value => new BigNumber(value),
++      () => {
++        // epsilon is for example 1e-12. Extract the positive exponent 12 from that
++        return Math.abs(Math.log10(config.epsilon))
++      }
++    ),
++    Complex: zetaComplex
++  })
++
++  /**
++   * @param {number | BigNumber} s
++   * @param {(value: number) => number | BigNumber} createValue
++   * @param {(value: number | BigNumber | Complex) => number} determineDigits
++   * @returns {number | BigNumber}
++   */
++  function zetaNumeric (s, createValue, determineDigits) {
++    if (equal(s, 0)) {
++      return createValue(-0.5)
++    }
++    if (equal(s, 1)) {
++      return createValue(NaN)
++    }
++    if (!isFinite(s)) {
++      return isNegative(s) ? createValue(NaN) : createValue(1)
++    }
++
++    return zeta(s, createValue, determineDigits, s => s)
++  }
++
++  /**
++   * @param {Complex} s
++   * @returns {Complex}
++   */
++  function zetaComplex (s) {
++    if (s.re === 0 && s.im === 0) {
++      return new Complex(-0.5)
++    }
++    if (s.re === 1) {
++      return new Complex(NaN, NaN)
++    }
++    if (s.re === Infinity && s.im === 0) {
++      return new Complex(1)
++    }
++    if (s.im === Infinity || s.re === -Infinity) {
++      return new Complex(NaN, NaN)
++    }
++
++    return zeta(s, value => value, s => Math.round(1.3 * 15 + 0.9 * Math.abs(s.im)), s => s.re)
++  }
++
++  /**
++   * @param {number | BigNumber | Complex} s
++   * @param {(value: number) => number | BigNumber | Complex} createValue
++   * @param {(value: number | BigNumber | Complex) => number} determineDigits
++   * @param {(value: number | BigNumber | Complex) => number} getRe
++   * @returns {*|number}
++   */
++  function zeta (s, createValue, determineDigits, getRe) {
++    const n = determineDigits(s)
++    if (getRe(s) > -(n - 1) / 2) {
++      return f(s, createValue(n), createValue)
++    } else {
++      // Function Equation for reflection to x < 1
++      let c = multiply(pow(2, s), pow(createValue(pi), subtract(s, 1)))
++      c = multiply(c, (sin(multiply(divide(createValue(pi), 2), s))))
++      c = multiply(c, gamma(subtract(1, s)))
++      return multiply(c, zeta(subtract(1, s), createValue, determineDigits, getRe))
++    }
++  }
++
++  /**
++   * Calculate a portion of the sum
++   * @param {number | BigNumber} k   a positive integer
++   * @param {number | BigNumber} n   a positive integer
++   * @return {number}    the portion of the sum
++   **/
++  function d (k, n) {
++    let S = k
++    for (let j = k; smallerEq(j, n); j = add(j, 1)) {
++      const factor = divide(
++        multiply(factorial(add(n, subtract(j, 1))), pow(4, j)),
++        multiply(factorial(subtract(n, j)), factorial(multiply(2, j)))
++      )
++      S = add(S, factor)
++    }
++
++    return multiply(n, S)
++  }
++
++  /**
++   * Calculate the positive Riemann Zeta function
++   * @param {number} s   a real or complex number with s.re > 1
++   * @param {number} n   a positive integer
++   * @param {(number) => number | BigNumber | Complex} createValue
++   * @return {number}    Riemann Zeta of s
++   **/
++  function f (s, n, createValue) {
++    const c = divide(1, multiply(d(createValue(0), n), subtract(1, pow(2, subtract(1, s)))))
++    let S = createValue(0)
++    for (let k = createValue(1); smallerEq(k, n); k = add(k, 1)) {
++      S = add(S, divide(multiply((-1) ** (k - 1), d(k, n)), pow(k, s)))
++    }
++    return multiply(c, S)
++  }
++})
+diff --git a/types/index.d.ts b/types/index.d.ts
+index 2293d23d8..000122295 100644
+--- a/types/index.d.ts
++++ b/types/index.d.ts
+@@ -2600,6 +2600,14 @@ declare namespace math {
+      */
+     erf<T extends number | MathCollection>(x: T): NoLiteralType<T>
+ 
++    /**
++     * Compute the Riemann Zeta function of a value using an infinite series
++     * and Riemann's Functional equation.
++     * @param s A real, complex or BigNumber
++     * @returns The Riemann Zeta of s
++     */
++    zeta<T extends number | Complex | BigNumber>(s: T): T
++
+     /*************************************************************************
+      * Statistics functions
+      ************************************************************************/
+@@ -5977,6 +5985,14 @@ declare namespace math {
+       this: MathJsChain<T>
+     ): MathJsChain<NoLiteralType<T>>
+ 
++    /**
++     * Compute the Riemann Zeta function of a value using an infinite series
++     * and Riemann's Functional equation.
++     */
++    zeta<T extends number | Complex | BigNumber>(
++      this: MathJsChain<T>
++    ): MathJsChain<T>
++
+     /*************************************************************************
+      * Statistics functions
+      ************************************************************************/

@@ -1,0 +1,197 @@
+diff --git a/advanced-creation.md b/advanced-creation.md
+index 0cae26a..59b14c9 100644
+--- a/advanced-creation.md
++++ b/advanced-creation.md
+@@ -31,9 +31,9 @@ Function making additional changes to the request.
+ To inherit from parent, set it as `got.defaults.handler`.<br>
+ To use the default handler, just omit specifying this.
+ 
+-###### [options](readme.md#options)
++###### [url](readme.md#url)
+ 
+-**Note:** These options are [normalized](source/normalize-arguments.js).
++###### [options](readme.md#options)
+ 
+ ###### next()
+ 
+@@ -41,16 +41,16 @@ Normalizes arguments and returns a `Promise` or a `Stream` depending on [`option
+ 
+ ```js
+ const settings = {
+-	handler: (options, next) => {
++	handler: (url, options, next) => {
+ 		if (options.stream) {
+ 			// It's a Stream
+ 			// We can perform stream-specific actions on it
+-			return next(options)
++			return next(url, options)
+ 				.on('request', request => setTimeout(() => request.abort(), 50));
+ 		}
+ 
+ 		// It's a Promise
+-		return next(options);
++		return next(url, options);
+ 	},
+ 	methods: got.defaults.methods,
+ 	options: {
+@@ -64,7 +64,9 @@ const jsonGot = got.create(settings);
+ 
+ ```js
+ const defaults = {
+-	handler: (options, next) => next(options),
++	handler: (url, options, next) => {
++		return next(url, options);
++	},
+ 	methods: [
+ 		'get',
+ 		'post',
+diff --git a/source/create.js b/source/create.js
+index 41bb8de..55e173a 100644
+--- a/source/create.js
++++ b/source/create.js
+@@ -1,4 +1,5 @@
+ 'use strict';
++const URLGlobal = typeof URL === 'undefined' ? require('url').URL : URL; // TODO: Use the `URL` global when targeting Node.js 10
+ const errors = require('./errors');
+ const assignOptions = require('./assign-options');
+ const asStream = require('./as-stream');
+@@ -6,7 +7,15 @@ const asPromise = require('./as-promise');
+ const normalizeArguments = require('./normalize-arguments');
+ const deepFreeze = require('./deep-freeze');
+ 
+-const next = options => {
++const makeNext = defaults => (path, options) => {
++	let url = path;
++
++	if (options.baseUrl) {
++		url = new URLGlobal(path, options.baseUrl);
++	}
++
++	options = normalizeArguments(url, options, defaults);
++
+ 	if (options.stream) {
+ 		return asStream(options);
+ 	}
+@@ -15,14 +24,15 @@ const next = options => {
+ };
+ 
+ const create = defaults => {
++	const next = makeNext(defaults);
+ 	if (!defaults.handler) {
+-		defaults.handler = (options, next) => next(options);
++		defaults.handler = next;
+ 	}
+ 
+ 	function got(url, options) {
+ 		try {
+ 			options = assignOptions(defaults.options, options);
+-			return defaults.handler(normalizeArguments(url, options, defaults), next);
++			return defaults.handler(url, options, next);
+ 		} catch (error) {
+ 			return Promise.reject(error);
+ 		}
+@@ -38,7 +48,7 @@ const create = defaults => {
+ 	got.stream = (url, options) => {
+ 		options = assignOptions(defaults.options, options);
+ 		options.stream = true;
+-		return defaults.handler(normalizeArguments(url, options, defaults), next);
++		return defaults.handler(url, options, next);
+ 	};
+ 
+ 	for (const method of defaults.methods) {
+diff --git a/source/normalize-arguments.js b/source/normalize-arguments.js
+index d427da9..e09e97d 100644
+--- a/source/normalize-arguments.js
++++ b/source/normalize-arguments.js
+@@ -1,6 +1,5 @@
+ 'use strict';
+-const URLGlobal = typeof URL === 'undefined' ? require('url').URL : URL; // TODO: Use the `URL` global when targeting Node.js 10
+-const URLSearchParamsGlobal = typeof URLSearchParams === 'undefined' ? require('url').URLSearchParams : URLSearchParams;
++const URLSearchParamsGlobal = typeof URLSearchParams === 'undefined' ? require('url').URLSearchParams : URLSearchParams; // TODO: Use the `URL` global when targeting Node.js 10
+ const is = require('@sindresorhus/is');
+ const toReadableStream = require('to-readable-stream');
+ const urlParseLax = require('url-parse-lax');
+@@ -18,24 +17,18 @@ module.exports = (url, options, defaults) => {
+ 
+ 	if (!is.string(url) && !is.object(url)) {
+ 		throw new TypeError(`Parameter \`url\` must be a string or object, not ${is(url)}`);
+-	}
+-
+-	if (is.string(url)) {
+-		if (options.baseUrl) {
+-			url = urlToOptions(new URLGlobal(url, options.baseUrl));
+-		} else {
+-			url = url.replace(/^unix:/, 'http://$&');
++	} else if (is.string(url)) {
++		url = url.replace(/^unix:/, 'http://$&');
+ 
+-			try {
+-				decodeURI(url);
+-			} catch (_) {
+-				throw new Error('Parameter `url` must contain valid UTF-8 character sequences');
+-			}
++		try {
++			decodeURI(url);
++		} catch (_) {
++			throw new Error('Parameter `url` must contain valid UTF-8 character sequences');
++		}
+ 
+-			url = urlParseLax(url);
+-			if (url.auth) {
+-				throw new Error('Basic authentication must be done with the `auth` option');
+-			}
++		url = urlParseLax(url);
++		if (url.auth) {
++			throw new Error('Basic authentication must be done with the `auth` option');
+ 		}
+ 	} else if (is(url) === 'URL') {
+ 		url = urlToOptions(url);
+@@ -43,7 +36,6 @@ module.exports = (url, options, defaults) => {
+ 
+ 	options = {
+ 		path: '',
+-		headers: {},
+ 		...url,
+ 		protocol: url.protocol || 'http:', // Override both null/undefined with default protocol
+ 		...options
+diff --git a/test/create.js b/test/create.js
+index c225dff..c5ad429 100644
+--- a/test/create.js
++++ b/test/create.js
+@@ -76,16 +76,17 @@ test('custom headers (extend)', async t => {
+ 	t.is(headers.unicorn, 'rainbow');
+ });
+ 
+-test('create', async t => {
+-	const instance = got.create({
+-		options: {},
+-		methods: ['get'],
+-		handler: (options, next) => {
+-			options.headers.unicorn = 'rainbow';
+-			return next(options);
+-		}
+-	});
+-	const headers = (await instance(s.url, {
++test('custom endpoint with custom headers (create)', async t => {
++	const options = {headers: {unicorn: 'rainbow'}};
++	const handler = (url, options, next) => {
++		url = `${s.url}` + url;
++
++		return next(url, options);
++	};
++	const methods = ['get'];
++
++	const instance = got.create({options, methods, handler});
++	const headers = (await instance('/', {
+ 		json: true
+ 	})).body;
+ 	t.is(headers.unicorn, 'rainbow');
+@@ -98,7 +99,7 @@ test('custom endpoint with custom headers (extend)', async t => {
+ 		json: true
+ 	})).body;
+ 	t.is(headers.unicorn, 'rainbow');
+-	t.not(headers['user-agent'], undefined);
++	t.is(headers['user-agent'] === undefined, false);
+ });
+ 
+ test('no tampering with defaults', t => {

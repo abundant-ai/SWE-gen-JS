@@ -1,0 +1,236 @@
+diff --git a/package.json b/package.json
+index 02a6bbaa..6f35c2a8 100644
+--- a/package.json
++++ b/package.json
+@@ -45,7 +45,7 @@
+   "scripts": {
+     "build": "yarn build:packages",
+     "test": "yarn test:packages",
+-    "build:examples": "yarn workspaces foreach --include '@reduxjs/*' --include '@examples-query-react/*' --include '@examples-action-listener/*' -vtp run build",
++    "build:examples": "yarn workspaces foreach --include '@reduxjs/*' --include '@examples-query-react/*' -vtp run build",
+     "build:docs": "yarn workspace website run build",
+     "build:packages": "yarn workspaces foreach --include '@reduxjs/*' --include '@rtk-query/*' --include '@rtk-incubator/*' --topological-dev run build",
+     "test:packages": "yarn workspaces foreach --include '@reduxjs/*' --include '@rtk-query/*'  --include '@rtk-incubator/*' run test",
+diff --git a/packages/action-listener-middleware/README.md b/packages/action-listener-middleware/README.md
+index 17ae5516..adc988c2 100644
+--- a/packages/action-listener-middleware/README.md
++++ b/packages/action-listener-middleware/README.md
+@@ -285,7 +285,7 @@ Both these methods are cancelation-aware, and will throw a `TaskAbortError` if t
+ 
+ - `fork: (executor: (forkApi: ForkApi) => T | Promise<T>) => ForkedTask<T>`: Launches a "child task" that may be used to accomplish additional work. Accepts any sync or async function as its argument, and returns a `{result, cancel}` object that can be used to check the final status and return value of the child task, or cancel it while in-progress.
+ 
+-Child tasks can be launched, and waited on to collect their return values. The provided `executor` function will be called asynchronously with a `forkApi` object containing `{pause, delay, signal}`, allowing it to pause or check cancelation status. It can also make use of the `listenerApi` from the listener's scope.
++Child tasks can be launched, and waited on to collect their return values. The provided `executor` function will be called with a `forkApi` object containing `{pause, delay, signal}`, allowing it to pause or check cancelation status. It can also make use of the `listenerApi` from the listener's scope.
+ 
+ An example of this might be a listener that forks a child task containing an infinite loop that listens for events from a server. The parent then uses `listenerApi.condition()` to wait for a "stop" action, and cancels the child task.
+ 
+diff --git a/packages/action-listener-middleware/src/index.ts b/packages/action-listener-middleware/src/index.ts
+index 65541989..090cfe61 100644
+--- a/packages/action-listener-middleware/src/index.ts
++++ b/packages/action-listener-middleware/src/index.ts
+@@ -28,7 +28,6 @@ import type {
+   ForkedTask,
+   TypedRemoveListener,
+   TypedStopListening,
+-  TaskResult,
+ } from './types'
+ import {
+   abortControllerWithReason,
+@@ -86,6 +85,9 @@ const createFork = (parentAbortSignal: AbortSignal) => {
+   return <T>(taskExecutor: ForkedTaskExecutor<T>): ForkedTask<T> => {
+     assertFunction(taskExecutor, 'taskExecutor')
+     const childAbortController = new AbortController()
++    const cancel = () => {
++      abortControllerWithReason(childAbortController, taskCancelled)
++    }
+ 
+     const result = runTask<T>(
+       async (): Promise<T> => {
+@@ -96,6 +98,7 @@ const createFork = (parentAbortSignal: AbortSignal) => {
+           delay: createDelay(childAbortController.signal),
+           signal: childAbortController.signal,
+         })) as T
++        validateActive(parentAbortSignal)
+         validateActive(childAbortController.signal)
+         return result
+       },
+@@ -103,10 +106,8 @@ const createFork = (parentAbortSignal: AbortSignal) => {
+     )
+ 
+     return {
+-      result: createPause<TaskResult<T>>(parentAbortSignal)(result),
+-      cancel() {
+-        abortControllerWithReason(childAbortController, taskCancelled)
+-      },
++      result,
++      cancel,
+     }
+   }
+ }
+diff --git a/packages/action-listener-middleware/src/task.ts b/packages/action-listener-middleware/src/task.ts
+index 21839aba..8644223b 100644
+--- a/packages/action-listener-middleware/src/task.ts
++++ b/packages/action-listener-middleware/src/task.ts
+@@ -37,9 +37,8 @@ export const promisifyAbortSignal = (
+ 
+ /**
+  * Runs a task and returns promise that resolves to {@link TaskResult}.
+- * Second argument is an optional `cleanUp` function that always runs after task.
+  *
+- * **Note:** `runTask` runs the executor in the next microtask.
++ * Second argument is an optional `cleanUp` function that always runs after task.
+  * @returns
+  */
+ export const runTask = async <T>(
+diff --git a/packages/action-listener-middleware/src/tests/fork.test.ts b/packages/action-listener-middleware/src/tests/fork.test.ts
+index c54285d1..813d4e78 100644
+--- a/packages/action-listener-middleware/src/tests/fork.test.ts
++++ b/packages/action-listener-middleware/src/tests/fork.test.ts
+@@ -1,5 +1,5 @@
+ import type { EnhancedStore } from '@reduxjs/toolkit'
+-import { configureStore, createSlice, createAction } from '@reduxjs/toolkit'
++import { configureStore, createSlice } from '@reduxjs/toolkit'
+ 
+ import type { PayloadAction } from '@reduxjs/toolkit'
+ import type { ForkedTaskExecutor, TaskResult } from '../types'
+@@ -99,23 +99,24 @@ describe('fork', () => {
+     expect(hasRunAsyncExecutor).toBe(true)
+   })
+ 
+-  test('forkedTask.result rejects TaskAbortError if listener is cancelled', async () => {
++  it('runs forked tasks that are cancelled if parent listener is cancelled', async () => {
+     const deferredForkedTaskError = deferred()
+ 
+     startListening({
+       actionCreator: increment,
+-      async effect(_, listenerApi) {
++      effect: async (_, listenerApi) => {
+         listenerApi.cancelActiveListeners()
+-        listenerApi
+-          .fork(async () => {
+-            await delay(10)
++        const result = await listenerApi.fork(async () => {
++          await delay(20)
+ 
+-            throw new Error('unreachable code')
+-          })
+-          .result.then(
+-            deferredForkedTaskError.resolve,
+-            deferredForkedTaskError.resolve
+-          )
++          throw new Error('unreachable code')
++        }).result
++
++        if (result.status !== 'ok') {
++          deferredForkedTaskError.resolve(result.error)
++        } else {
++          deferredForkedTaskError.reject(new Error('unreachable code'))
++        }
+       },
+     })
+ 
+@@ -385,25 +386,26 @@ describe('fork', () => {
+   })
+ 
+   test('forkApi.pause rejects if listener is cancelled', async () => {
+-    const incrementByInListener = createAction<number>('incrementByInListener')
+-
++    let deferredResult = deferred()
+     startListening({
+-      actionCreator: incrementByInListener,
+-      async effect({ payload: amountToIncrement }, listenerApi) {
++      actionCreator: increment,
++      effect: async (_, listenerApi) => {
+         listenerApi.cancelActiveListeners()
+-        await listenerApi.fork(async (forkApi) => {
+-          await forkApi.pause(delay(10))
+-          listenerApi.dispatch(incrementByAmount(amountToIncrement))
+-        }).result
+-        listenerApi.dispatch(incrementByAmount(2 * amountToIncrement))
++        const forkedTask = listenerApi.fork(async (forkApi) => {
++          await forkApi.pause(delay(30))
++
++          return 4
++        })
++        deferredResult.resolve(await forkedTask.result)
+       },
+     })
+ 
+-    store.dispatch(incrementByInListener(10))
+-    store.dispatch(incrementByInListener(100))
+-
+-    await delay(50)
++    store.dispatch(increment())
++    store.dispatch(increment())
+ 
+-    expect(store.getState().value).toEqual(300)
++    expect(await deferredResult).toEqual({
++      status: 'cancelled',
++      error: new TaskAbortError(listenerCancelled),
++    })
+   })
+ })
+diff --git a/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts b/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
+index 5b600f5e..97d545b0 100644
+--- a/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
++++ b/packages/action-listener-middleware/src/tests/listenerMiddleware.test.ts
+@@ -709,27 +709,24 @@ describe('createListenerMiddleware', () => {
+     })
+ 
+     test('clear() cancels all running forked tasks', async () => {
+-      const store = configureStore({
+-        reducer: counterSlice.reducer,
+-        middleware: (gDM) => gDM().prepend(middleware),
+-      })
++      const fork1Test = deferred()
+ 
+       startListening({
+         actionCreator: testAction1,
+-        async effect(_, { fork, dispatch }) {
+-          await fork(() => dispatch(incrementByAmount(3))).result
+-          dispatch(incrementByAmount(4))
++        async effect(_, { fork }) {
++          const taskResult = await fork(() => {
++            return 3
++          }).result
++          fork1Test.resolve(taskResult)
+         },
+       })
+ 
+-      expect(store.getState().value).toBe(0)
+       store.dispatch(testAction1('a'))
+ 
+       clearListeners()
++      store.dispatch(testAction1('b'))
+ 
+-      await Promise.resolve() // Forked tasks run on the next microtask.
+-
+-      expect(store.getState().value).toBe(0)
++      expect(await fork1Test).toHaveProperty('status', 'cancelled')
+     })
+   })
+ 
+diff --git a/packages/action-listener-middleware/src/types.ts b/packages/action-listener-middleware/src/types.ts
+index d2d97e66..312bfe19 100644
+--- a/packages/action-listener-middleware/src/types.ts
++++ b/packages/action-listener-middleware/src/types.ts
+@@ -105,19 +105,6 @@ export type TaskResult<Value> =
+   | TaskCancelled
+ 
+ export interface ForkedTask<T> {
+-  /**
+-   * A promise that resolves when the task is either completed or cancelled or rejects
+-   * if parent listener execution is cancelled or completed.
+-   *
+-   * ### Example
+-   * ```ts
+-   * const result = await fork(async (forkApi) => Promise.resolve(4)).result
+-   *
+-   * if(result.status === 'ok') {
+-   *   console.log(result.value) // logs 4
+-   * }}
+-   * ```
+-   */
+   result: Promise<TaskResult<T>>
+   /**
+    * Cancel task if it is in progress or not yet started,

@@ -1,0 +1,129 @@
+diff --git a/changelog_unreleased/cli/17505-2.md b/changelog_unreleased/cli/17505-2.md
+new file mode 100644
+index 000000000..6c0df4b52
+--- /dev/null
++++ b/changelog_unreleased/cli/17505-2.md
+@@ -0,0 +1,18 @@
++#### Fix result message for files can not be formatted (#17505 by @fisker)
++
++```console
++touch unknown
++prettier --check unknown
++
++# Prettier stable
++Checking formatting...
++unknown
++[error] No parser could be inferred for file "</path/to/unknown>".
++All matched files use Prettier code style!
++
++# Prettier main
++Checking formatting...
++unknown
++[error] No parser could be inferred for file "</path/to/unknown>".
++Error occurred when checking code style in the above file.
++```
+diff --git a/changelog_unreleased/cli/17505.md b/changelog_unreleased/cli/17505.md
+new file mode 100644
+index 000000000..4f24ba70d
+--- /dev/null
++++ b/changelog_unreleased/cli/17505.md
+@@ -0,0 +1,14 @@
++#### Fix exitCode when parser can not infer (#17505 by @fisker)
++
++```console
++touch unknown
++prettier --check unknown > /dev/null;echo $?
++
++# Prettier stable
++[error] No parser could be inferred for file "</path/to/unknown>".
++0
++
++# Prettier main
++[error] No parser could be inferred for file "</path/to/unknown>".
++2
++```
+diff --git a/src/cli/format.js b/src/cli/format.js
+index eedeb4c9b..c0a50e3fb 100644
+--- a/src/cli/format.js
++++ b/src/cli/format.js
+@@ -29,25 +29,21 @@ function handleError(context, filename, error, printedFilename, ignoreUnknown) {
+   const errorIsUndefinedParseError =
+     error instanceof errors.UndefinedParserError;
+ 
+-  if (printedFilename) {
++  if (errorIsUndefinedParseError && ignoreUnknown) {
+     // Can't test on CI, `isTTY` is always false, see comments in `formatFiles`
+-    /* c8 ignore next 3 */
+-    if ((context.argv.write || ignoreUnknown) && errorIsUndefinedParseError) {
+-      printedFilename.clear();
+-    } else {
+-      // Add newline to split errors from filename line.
+-      process.stdout.write("\n");
+-    }
++    printedFilename?.clear();
++
++    return true;
++  }
++
++  if (printedFilename) {
++    // Add newline to split errors from filename line.
++    process.stdout.write("\n");
+   }
+ 
+   if (errorIsUndefinedParseError) {
+-    if (ignoreUnknown) {
+-      return;
+-    }
+-    if (!context.argv.check && !context.argv.listDifferent) {
+-      process.exitCode = 2;
+-    }
+     context.logger.error(error.message);
++    process.exitCode = 2;
+     return;
+   }
+ 
+@@ -280,6 +276,7 @@ async function formatFiles(context) {
+   const cwd = process.cwd();
+ 
+   let numberOfUnformattedFilesFound = 0;
++  let numberOfFilesWithError = 0;
+   const { performanceTestFlag } = context;
+ 
+   if (context.argv.check && !performanceTestFlag) {
+@@ -383,13 +380,18 @@ async function formatFiles(context) {
+       }
+       output = result.formatted;
+     } catch (error) {
+-      handleError(
++      const errorIsIgnored = handleError(
+         context,
+         fileNameToDisplay,
+         error,
+         printedFilename,
+         ignoreUnknown,
+       );
++
++      if (!errorIsIgnored) {
++        numberOfFilesWithError += 1;
++      }
++
+       continue;
+     }
+ 
+@@ -467,7 +469,15 @@ async function formatFiles(context) {
+ 
+   // Print check summary based on expected exit code
+   if (context.argv.check) {
+-    if (numberOfUnformattedFilesFound === 0) {
++    if (numberOfFilesWithError > 0) {
++      const files =
++        numberOfFilesWithError === 1
++          ? "the above file"
++          : `${numberOfFilesWithError} files`;
++      context.logger.log(
++        `Error occurred when checking code style in ${files}.`,
++      );
++    } else if (numberOfUnformattedFilesFound === 0) {
+       context.logger.log("All matched files use Prettier code style!");
+     } else {
+       const files =

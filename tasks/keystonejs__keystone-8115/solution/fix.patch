@@ -1,0 +1,411 @@
+diff --git a/.changeset/fix-busted-init.md b/.changeset/fix-busted-init.md
+new file mode 100644
+index 000000000..30e148fb3
+--- /dev/null
++++ b/.changeset/fix-busted-init.md
+@@ -0,0 +1,5 @@
++---
++'@keystone-6/auth': patch
++---
++
++Fixes `initFirstItem` bypass when `ui.isAccessAllowed` is defined
+diff --git a/examples/auth/keystone.ts b/examples/auth/keystone.ts
+index 21079075c..707e9b6ec 100644
+--- a/examples/auth/keystone.ts
++++ b/examples/auth/keystone.ts
+@@ -64,7 +64,6 @@ export default withAuth(
+       url: process.env.DATABASE_URL || 'file:./keystone-example.db',
+     },
+     lists,
+-    ui: {},
+     session:
+       // Stateless sessions will store the listKey and itemId of the signed-in user in a cookie
+       statelessSessions({
+diff --git a/packages/auth/src/gql/getInitFirstItemSchema.ts b/packages/auth/src/gql/getInitFirstItemSchema.ts
+index 23fe1028b..2bbf71aa2 100644
+--- a/packages/auth/src/gql/getInitFirstItemSchema.ts
++++ b/packages/auth/src/gql/getInitFirstItemSchema.ts
+@@ -35,6 +35,7 @@ export function getInitFirstItemSchema({
+       name: gqlNames.CreateInitialInput,
+     })
+   );
++
+   return {
+     mutation: {
+       [gqlNames.createInitialItem]: graphql.field({
+@@ -46,6 +47,8 @@ export function getInitFirstItemSchema({
+           }
+ 
+           const dbItemAPI = context.sudo().db[listKey];
++
++          // should approximate hasInitFirstItemConditions
+           const count = await dbItemAPI.count({});
+           if (count !== 0) {
+             throw new Error('Initial items can only be created when no items exist in that list');
+diff --git a/packages/auth/src/index.ts b/packages/auth/src/index.ts
+index f277b3036..dde847556 100644
+--- a/packages/auth/src/index.ts
++++ b/packages/auth/src/index.ts
+@@ -1,10 +1,8 @@
+-import url from 'url';
+ import {
+   AdminFileToWrite,
+   BaseListTypeInfo,
+   KeystoneConfig,
+   KeystoneContext,
+-  AdminUIConfig,
+   SessionStrategy,
+   BaseKeystoneTypeInfo,
+ } from '@keystone-6/core/types';
+@@ -79,46 +77,6 @@ export function createAuth<ListTypeInfo extends BaseListTypeInfo>({
+     ...(magicAuthLink && tokenFields('magicAuth')),
+   };
+ 
+-  /**
+-   * pageMiddleware
+-   *
+-   * Should be added to the ui.pageMiddleware stack.
+-   *
+-   * Redirects:
+-   *  - from the signin or init pages to the index when a valid session is present
+-   *  - to the init page when initFirstItem is configured, and there are no user in the database
+-   *  - to the signin page when no valid session is present
+-   */
+-  const pageMiddleware: AdminUIConfig<BaseKeystoneTypeInfo>['pageMiddleware'] = async ({
+-    context,
+-    isValidSession,
+-  }) => {
+-    const { req, session } = context;
+-    const pathname = url.parse(req!.url!).pathname!;
+-
+-    if (isValidSession) {
+-      if (pathname === '/signin' || (initFirstItem && pathname === '/init')) {
+-        return { kind: 'redirect', to: '/' };
+-      }
+-      return;
+-    }
+-
+-    if (!session && initFirstItem) {
+-      const count = await context.sudo().query[listKey].count({});
+-      if (count === 0) {
+-        if (pathname !== '/init') {
+-          return { kind: 'redirect', to: '/init' };
+-        }
+-        return;
+-      }
+-    }
+-
+-    if (!session && pathname !== '/signin') {
+-      let to = pathname === '/' ? '/signin' : `/signin?from=${encodeURIComponent(req!.url!)}`;
+-      return { kind: 'redirect', to };
+-    }
+-  };
+-
+   /**
+    * getAdditionalFiles
+    *
+@@ -127,8 +85,8 @@ export function createAuth<ListTypeInfo extends BaseListTypeInfo>({
+    *
+    * The signin page is always included, and the init page is included when initFirstItem is set
+    */
+-  const getAdditionalFiles = () => {
+-    let filesToWrite: AdminFileToWrite[] = [
++  const authGetAdditionalFiles = () => {
++    const filesToWrite: AdminFileToWrite[] = [
+       {
+         mode: 'write',
+         src: signinTemplate({ gqlNames, identityField, secretField }),
+@@ -150,10 +108,7 @@ export function createAuth<ListTypeInfo extends BaseListTypeInfo>({
+    *
+    * Must be added to the ui.publicPages config
+    */
+-  const publicPages = ['/signin'];
+-  if (initFirstItem) {
+-    publicPages.push('/init');
+-  }
++  const authPublicPages = ['/signin'];
+ 
+   /**
+    * extendGraphqlSchema
+@@ -216,9 +171,6 @@ export function createAuth<ListTypeInfo extends BaseListTypeInfo>({
+    *
+    * Automatically injects a session.data value with the authenticated item
+    */
+-  /* TODO:
+-    - [ ] We could support additional where input to validate item sessions (e.g an isEnabled boolean)
+-  */
+   const withItemData = (
+     _sessionStrategy: SessionStrategy<Record<string, any>>
+   ): SessionStrategy<{ listKey: string; itemId: string; data: any }> => {
+@@ -255,44 +207,88 @@ export function createAuth<ListTypeInfo extends BaseListTypeInfo>({
+     };
+   };
+ 
++  async function hasInitFirstItemConditions(context: KeystoneContext) {
++    if (!initFirstItem) return false;
++
++    const count = await context.sudo().db[listKey].count({});
++    return count === 0;
++  }
++
++  async function attemptRedirects({
++    context,
++    isValidSession,
++    publicPages,
++  }: {
++    context: KeystoneContext;
++    isValidSession: boolean; // TODO: rename "isValidSession" to "wasAccessAllowed"?
++    publicPages: string[];
++  }): Promise<{ kind: 'redirect'; to: string } | void> {
++    const { req } = context;
++    const { pathname } = new URL(req!.url!, 'http://_');
++
++    // redirect to init if initFirstItem conditions are met
++    if (pathname !== '/init' && (await hasInitFirstItemConditions(context))) {
++      return { kind: 'redirect', to: '/init' };
++    }
++
++    // redirect to / if attempting to /init and initFirstItem conditions are not met
++    if (pathname === '/init' && !(await hasInitFirstItemConditions(context))) {
++      return { kind: 'redirect', to: '/' };
++    }
++
++    // don't redirect if we are on a public page
++    if (publicPages.includes(pathname)) return;
++
++    // don't redirect if we have access
++    if (isValidSession) return;
++
++    // otherwise, redirect to signin
++    if (pathname === '/') return { kind: 'redirect', to: '/signin' };
++    return {
++      kind: 'redirect',
++      to: `/signin?from=${encodeURIComponent(req!.url!)}`,
++    };
++  }
++
++  function defaultIsAccessAllowed({ session, sessionStrategy }: KeystoneContext) {
++    return session !== undefined;
++  }
++
+   /**
+    * withAuth
+    *
+-   * Automatically extends config with the correct auth functionality. This is the easiest way to
+-   * configure auth for keystone; you should probably use it unless you want to extend or replace
+-   * the way auth is set up with custom functionality.
+-   *
+-   * It validates the auth config against the provided keystone config, and preserves existing
+-   * config by composing existing extendGraphqlSchema functions and ui config.
++   * Automatically extends your configuration with a prescriptive implementation.
+    */
+   const withAuth = <TypeInfo extends BaseKeystoneTypeInfo>(
+     keystoneConfig: KeystoneConfig<TypeInfo>
+   ): KeystoneConfig<TypeInfo> => {
+     validateConfig(keystoneConfig);
+-    let ui = keystoneConfig.ui;
+-    if (!keystoneConfig.ui?.isDisabled) {
++
++    let { ui } = keystoneConfig;
++    if (!ui?.isDisabled) {
++      const {
++        getAdditionalFiles = [],
++        isAccessAllowed = defaultIsAccessAllowed,
++        pageMiddleware,
++        publicPages = [],
++      } = ui || {};
+       ui = {
+-        ...keystoneConfig.ui,
+-        publicPages: [...(keystoneConfig.ui?.publicPages || []), ...publicPages],
+-        getAdditionalFiles: [...(keystoneConfig.ui?.getAdditionalFiles || []), getAdditionalFiles],
+-        pageMiddleware: async args =>
+-          (await pageMiddleware(args)) ?? keystoneConfig?.ui?.pageMiddleware?.(args),
++        ...ui,
++        publicPages: [...publicPages, ...authPublicPages],
++        getAdditionalFiles: [...getAdditionalFiles, authGetAdditionalFiles],
++
+         isAccessAllowed: async (context: KeystoneContext) => {
+-          // Allow access to the adminMeta data from the /init path to correctly render that page
+-          // even if the user isn't logged in (which should always be the case if they're seeing /init)
+-          const headers = context.req?.headers;
+-          const host = headers ? headers['x-forwarded-host'] || headers['host'] : null;
+-          const url = headers?.referer ? new URL(headers.referer) : undefined;
+-          const accessingInitPage =
+-            url?.pathname === '/init' &&
+-            url?.host === host &&
+-            (await context.sudo().query[listKey].count({})) === 0;
+-          return (
+-            accessingInitPage ||
+-            (keystoneConfig.ui?.isAccessAllowed
+-              ? keystoneConfig.ui.isAccessAllowed(context)
+-              : context.session !== undefined)
+-          );
++          if (await hasInitFirstItemConditions(context)) return true;
++          return isAccessAllowed(context);
++        },
++
++        pageMiddleware: async args => {
++          const shouldRedirect = await attemptRedirects({
++            ...args,
++            publicPages: [...publicPages, ...authPublicPages],
++          });
++          if (shouldRedirect) return shouldRedirect;
++          return pageMiddleware?.(args);
+         },
+       };
+     }
+@@ -306,10 +302,6 @@ export function createAuth<ListTypeInfo extends BaseListTypeInfo>({
+       ...keystoneConfig,
+       ui,
+       session,
+-      // Add the additional fields to the references lists fields object
+-      // TODO: The fields we're adding here shouldn't naively replace existing fields with the same key
+-      // Leaving existing fields in place would allow solution devs to customise these field defs (eg. access control,
+-      // work factor for the tokens, etc.) without abandoning the withAuth() interface
+       lists: {
+         ...keystoneConfig.lists,
+         [listKey]: { ...listConfig, fields: { ...listConfig.fields, ...fields } },
+@@ -322,12 +314,5 @@ export function createAuth<ListTypeInfo extends BaseListTypeInfo>({
+ 
+   return {
+     withAuth,
+-    // In the future we may want to return the following so that developers can
+-    // roll their own. This is pending a review of the use cases this might be
+-    // appropriate for, along with documentation and testing.
+-    // ui: { pageMiddleware, getAdditionalFiles, publicPages },
+-    // fields,
+-    // extendGraphqlSchema,
+-    // validateConfig,
+   };
+ }
+diff --git a/packages/auth/src/schema.ts b/packages/auth/src/schema.ts
+index f85db9571..2476d2698 100644
+--- a/packages/auth/src/schema.ts
++++ b/packages/auth/src/schema.ts
+@@ -87,14 +87,15 @@ export const getSchemaExtension = ({
+     // technically this will incorrectly error if someone has a schema extension that adds a field to the list output type
+     // and then wants to fetch that field with `sessionData` but it's extremely unlikely someone will do that since if
+     // they want to add a GraphQL field, they'll probably use a virtual field
+-    let ast;
+-    let query = `query($id: ID!) { ${
++    const query = `query($id: ID!) { ${
+       getGqlNames({
+         listKey,
+         // this isn't used to get the itemQueryName and we don't know it here
+         pluralGraphQLName: '',
+       }).itemQueryName
+     }(where: { id: $id }) { ${sessionData} } }`;
++
++    let ast;
+     try {
+       ast = parse(query);
+     } catch (err) {
+diff --git a/packages/core/src/admin-ui/context.tsx b/packages/core/src/admin-ui/context.tsx
+index 35468e8da..218c0b5a5 100644
+--- a/packages/core/src/admin-ui/context.tsx
++++ b/packages/core/src/admin-ui/context.tsx
+@@ -113,13 +113,6 @@ export const useKeystone = (): {
+     throw new Error('useKeystone must be called inside a KeystoneProvider component');
+   }
+   if (value.adminMeta.state === 'error') {
+-    // If we get an "Access denied" error, it probably means the user doesn't have access to the
+-    // adminMeta but has navigated (probably client-side) to a page that requires it. We reload
+-    // the page so the server-side access control can run which should bounce them to the right
+-    // place (or display the no-access page)
+-    if (value.adminMeta.error.message === 'Access denied') {
+-      window.location.reload();
+-    }
+     throw new Error('An error occurred when loading Admin Metadata');
+   }
+   return {
+diff --git a/packages/core/src/lib/server/createAdminUIMiddleware.ts b/packages/core/src/lib/server/createAdminUIMiddleware.ts
+index 0ee2564e3..b4aca1b8e 100644
+--- a/packages/core/src/lib/server/createAdminUIMiddleware.ts
++++ b/packages/core/src/lib/server/createAdminUIMiddleware.ts
+@@ -24,6 +24,11 @@ export async function getNextApp(dev: boolean, projectAdminPath: string): Promis
+   return app;
+ }
+ 
++function defaultIsAccessAllowed({ session, sessionStrategy }: KeystoneContext) {
++  if (!sessionStrategy) return true;
++  return session !== undefined;
++}
++
+ export function createAdminUIMiddlewareWithNextApp(
+   config: KeystoneConfig,
+   context: KeystoneContext,
+@@ -31,22 +36,26 @@ export function createAdminUIMiddlewareWithNextApp(
+ ) {
+   const handle = nextApp.getRequestHandler();
+ 
+-  const { ui, session } = config;
+-  const publicPages = ui?.publicPages ?? [];
++  const {
++    ui: { isAccessAllowed = defaultIsAccessAllowed, pageMiddleware, publicPages = [] } = {},
++  } = config;
++
+   return async (req: express.Request, res: express.Response) => {
+     const { pathname } = url.parse(req.url);
+-    if (pathname?.startsWith('/_next')) {
++
++    if (pathname?.startsWith('/_next') || pathname?.startsWith('/__next')) {
+       handle(req, res);
+       return;
+     }
++
+     try {
+       const userContext = await context.withRequest(req, res);
+-      const isValidSession = ui?.isAccessAllowed
+-        ? await ui.isAccessAllowed(userContext)
+-        : session
+-        ? context.session !== undefined
+-        : true;
+-      const shouldRedirect = await ui?.pageMiddleware?.({ context, isValidSession });
++      const isValidSession = await isAccessAllowed(userContext); // TODO: rename "isValidSession" to "wasAccessAllowed"?
++      const shouldRedirect = await pageMiddleware?.({
++        context,
++        isValidSession,
++      });
++
+       if (shouldRedirect) {
+         res.header('Cache-Control', 'no-cache, max-age=0');
+         res.header('Location', shouldRedirect.to);
+@@ -54,7 +63,8 @@ export function createAdminUIMiddlewareWithNextApp(
+         res.send();
+         return;
+       }
+-      if (!isValidSession && !publicPages.includes(url.parse(req.url).pathname!)) {
++
++      if (!isValidSession && !publicPages.includes(pathname!)) {
+         nextApp.render(req, res, '/no-access');
+       } else {
+         handle(req, res);
+diff --git a/packages/core/src/types/config/index.ts b/packages/core/src/types/config/index.ts
+index 6dcf6b5ff..ee8986585 100644
+--- a/packages/core/src/types/config/index.ts
++++ b/packages/core/src/types/config/index.ts
+@@ -129,19 +129,20 @@ export type DatabaseConfig<TypeInfo extends BaseKeystoneTypeInfo> = {
+ export type AdminUIConfig<TypeInfo extends BaseKeystoneTypeInfo> = {
+   /** Completely disables the Admin UI */
+   isDisabled?: boolean;
++
+   /** A function that can be run to validate that the current session should have access to the Admin UI */
+   isAccessAllowed?: (context: KeystoneContext<TypeInfo>) => MaybePromise<boolean>;
++
+   /** An array of page routes that can be accessed without passing the isAccessAllowed check */
+   publicPages?: readonly string[];
+-  /** The basePath for the Admin UI App */
+-  // FIXME: currently unused
+-  // path?: string;
++
+   getAdditionalFiles?: readonly ((
+     config: KeystoneConfig<TypeInfo>
+   ) => MaybePromise<readonly AdminFileToWrite[]>)[];
++
+   pageMiddleware?: (args: {
+     context: KeystoneContext<TypeInfo>;
+-    isValidSession: boolean;
++    isValidSession: boolean; // TODO: rename "isValidSession" to "wasAccessAllowed"?
+   }) => MaybePromise<{ kind: 'redirect'; to: string } | void>;
+ };
+ 

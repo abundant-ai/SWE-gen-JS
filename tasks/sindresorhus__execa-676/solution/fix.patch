@@ -1,0 +1,487 @@
+diff --git a/index.d.ts b/index.d.ts
+index dd0e0ee..853c4f7 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -241,7 +241,7 @@ export type Options<IsSync extends boolean = boolean, EncodingType extends Encod
+ 	readonly shell?: boolean | string | URL;
+ 
+ 	/**
+-	Specify the character encoding used to decode the `stdout` and `stderr` output. If set to `'buffer'`, then `stdout` and `stderr` will be a `Uint8Array` instead of a string.
++	Specify the character encoding used to decode the `stdout`, `stderr` and `stdio` output. If set to `'buffer'`, then `stdout`, `stderr` and `stdio` will be `Uint8Array`s instead of strings.
+ 
+ 	@default 'utf8'
+ 	*/
+@@ -255,7 +255,7 @@ export type Options<IsSync extends boolean = boolean, EncodingType extends Encod
+ 	readonly timeout?: number;
+ 
+ 	/**
+-	Largest amount of data in bytes allowed on `stdout` or `stderr`. Default: 100 MB.
++	Largest amount of data in bytes allowed on `stdout`, `stderr` and `stdio`. Default: 100 MB.
+ 
+ 	@default 100_000_000
+ 	*/
+@@ -428,6 +428,13 @@ export type ExecaReturnValue<IsSync extends boolean, StdoutStderrType extends St
+ 	*/
+ 	stderr: StdoutStderrType;
+ 
++	/**
++	The output of the process on `stdin`, `stdout`, `stderr` and other file descriptors.
++
++	Items are `undefined` when their corresponding `stdio` option is set to [`'inherit'`, `'ipc'`, `'ignore'`, `Stream` or `integer`](https://nodejs.org/api/child_process.html#child_process_options_stdio).
++	*/
++	stdio: [undefined, StdoutStderrType, StdoutStderrType, ...Array<StdoutStderrType | undefined>];
++
+ 	/**
+ 	Whether the process failed to run.
+ 	*/
+@@ -489,17 +496,17 @@ export type ExecaError<IsSync extends boolean = boolean, StdoutStderrType extend
+ 	/**
+ 	Error message when the child process failed to run. In addition to the underlying error message, it also contains some information related to why the child process errored.
+ 
+-	The child process `stderr` then `stdout` are appended to the end, separated with newlines and not interleaved.
++	The child process `stderr`, `stdout` and other file descriptors' output are appended to the end, separated with newlines and not interleaved.
+ 	*/
+ 	message: string;
+ 
+ 	/**
+-	This is the same as the `message` property except it does not include the child process `stdout`/`stderr`.
++	This is the same as the `message` property except it does not include the child process `stdout`/`stderr`/`stdio`.
+ 	*/
+ 	shortMessage: string;
+ 
+ 	/**
+-	Original error message. This is the same as the `message` property excluding the child process `stdout`/`stderr` and some additional information added by Execa.
++	Original error message. This is the same as the `message` property excluding the child process `stdout`/`stderr`/`stdio` and some additional information added by Execa.
+ 
+ 	This is `undefined` unless the child process exited due to an `error` event or a timeout.
+ 	*/
+diff --git a/index.js b/index.js
+index b702988..1b934b6 100644
+--- a/index.js
++++ b/index.js
+@@ -80,32 +80,23 @@ const handleArguments = (rawFile, rawArgs, rawOptions = {}) => {
+ 	return {file, args, command, escapedCommand, options};
+ };
+ 
+-const handleOutputSync = (options, value, error) => {
+-	if (Buffer.isBuffer(value)) {
+-		value = bufferToUint8Array(value);
+-	}
+-
+-	return handleOutput(options, value, error);
+-};
+-
+-const handleOutput = (options, value, error) => {
++const handleOutput = (options, value) => {
+ 	if (typeof value !== 'string' && !ArrayBuffer.isView(value)) {
+-		// When `execaSync()` errors, we normalize it to '' to mimic `execa()`
+-		return error === undefined ? undefined : '';
++		return;
+ 	}
+ 
+-	if (options.stripFinalNewline) {
+-		return stripFinalNewline(value);
++	if (Buffer.isBuffer(value)) {
++		value = bufferToUint8Array(value);
+ 	}
+ 
+-	return value;
++	return options.stripFinalNewline ? stripFinalNewline(value) : value;
+ };
+ 
+ export function execa(rawFile, rawArgs, rawOptions) {
+ 	const {file, args, command, escapedCommand, options} = handleArguments(rawFile, rawArgs, rawOptions);
+ 	validateTimeout(options);
+ 
+-	const stdioStreams = handleInputAsync(options);
++	const {stdioStreams, stdioLength} = handleInputAsync(options);
+ 
+ 	let spawned;
+ 	try {
+@@ -115,9 +106,8 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 		const dummySpawned = new childProcess.ChildProcess();
+ 		const errorPromise = Promise.reject(makeError({
+ 			error,
+-			stdout: '',
+-			stderr: '',
+-			all: '',
++			stdio: Array.from({length: stdioLength}),
++			all: options.all ? '' : undefined,
+ 			command,
+ 			escapedCommand,
+ 			options,
+@@ -147,12 +137,10 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ const handlePromise = async ({spawned, options, context, stdioStreams, command, escapedCommand}) => {
+ 	const [
+ 		[exitCode, signal, error],
+-		stdoutResult,
+-		stderrResult,
++		stdioResults,
+ 		allResult,
+ 	] = await getSpawnedResult(spawned, options, context, stdioStreams);
+-	const stdout = handleOutput(options, stdoutResult);
+-	const stderr = handleOutput(options, stderrResult);
++	const stdio = stdioResults.map(stdioResult => handleOutput(options, stdioResult));
+ 	const all = handleOutput(options, allResult);
+ 
+ 	if (error || exitCode !== 0 || signal !== null) {
+@@ -161,8 +149,7 @@ const handlePromise = async ({spawned, options, context, stdioStreams, command,
+ 			error,
+ 			exitCode,
+ 			signal,
+-			stdout,
+-			stderr,
++			stdio,
+ 			all,
+ 			command,
+ 			escapedCommand,
+@@ -182,8 +169,9 @@ const handlePromise = async ({spawned, options, context, stdioStreams, command,
+ 		command,
+ 		escapedCommand,
+ 		exitCode: 0,
+-		stdout,
+-		stderr,
++		stdio,
++		stdout: stdio[1],
++		stderr: stdio[2],
+ 		all,
+ 		failed: false,
+ 		timedOut: false,
+@@ -195,7 +183,7 @@ const handlePromise = async ({spawned, options, context, stdioStreams, command,
+ export function execaSync(rawFile, rawArgs, rawOptions) {
+ 	const {file, args, command, escapedCommand, options} = handleArguments(rawFile, rawArgs, rawOptions);
+ 
+-	const stdioStreams = handleInputSync(options);
++	const {stdioStreams, stdioLength} = handleInputSync(options);
+ 
+ 	let result;
+ 	try {
+@@ -203,9 +191,7 @@ export function execaSync(rawFile, rawArgs, rawOptions) {
+ 	} catch (error) {
+ 		throw makeError({
+ 			error,
+-			stdout: '',
+-			stderr: '',
+-			all: '',
++			stdio: Array.from({length: stdioLength}),
+ 			command,
+ 			escapedCommand,
+ 			options,
+@@ -215,13 +201,13 @@ export function execaSync(rawFile, rawArgs, rawOptions) {
+ 	}
+ 
+ 	pipeOutputSync(stdioStreams, result);
+-	const stdout = handleOutputSync(options, result.stdout, result.error);
+-	const stderr = handleOutputSync(options, result.stderr, result.error);
++
++	const output = result.output || [undefined, undefined, undefined];
++	const stdio = output.map(stdioOutput => handleOutput(options, stdioOutput));
+ 
+ 	if (result.error || result.status !== 0 || result.signal !== null) {
+ 		const error = makeError({
+-			stdout,
+-			stderr,
++			stdio,
+ 			error: result.error,
+ 			signal: result.signal,
+ 			exitCode: result.status,
+@@ -243,8 +229,9 @@ export function execaSync(rawFile, rawArgs, rawOptions) {
+ 		command,
+ 		escapedCommand,
+ 		exitCode: 0,
+-		stdout,
+-		stderr,
++		stdio,
++		stdout: stdio[1],
++		stderr: stdio[2],
+ 		failed: false,
+ 		timedOut: false,
+ 		isCanceled: false,
+diff --git a/index.test-d.ts b/index.test-d.ts
+index 22001e7..7f18dc2 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -63,8 +63,12 @@ try {
+ 	expectType<string>(unicornsResult.command);
+ 	expectType<string>(unicornsResult.escapedCommand);
+ 	expectType<number | undefined>(unicornsResult.exitCode);
++	expectType<undefined>(unicornsResult.stdio[0]);
+ 	expectType<string>(unicornsResult.stdout);
++	expectType<string>(unicornsResult.stdio[1]);
+ 	expectType<string>(unicornsResult.stderr);
++	expectType<string>(unicornsResult.stdio[2]);
++	expectType<string | undefined>(unicornsResult.stdio[3]);
+ 	expectType<string | undefined>(unicornsResult.all);
+ 	expectType<boolean>(unicornsResult.failed);
+ 	expectType<boolean>(unicornsResult.timedOut);
+@@ -78,8 +82,12 @@ try {
+ 
+ 	expectType<string>(execaError.message);
+ 	expectType<number | undefined>(execaError.exitCode);
++	expectType<undefined>(execaError.stdio[0]);
+ 	expectType<string>(execaError.stdout);
++	expectType<string>(execaError.stdio[1]);
+ 	expectType<string>(execaError.stderr);
++	expectType<string>(execaError.stdio[2]);
++	expectType<string | undefined>(execaError.stdio[3]);
+ 	expectType<string | undefined>(execaError.all);
+ 	expectType<boolean>(execaError.failed);
+ 	expectType<boolean>(execaError.timedOut);
+@@ -98,8 +106,12 @@ try {
+ 	expectType<string>(unicornsResult.command);
+ 	expectType<string>(unicornsResult.escapedCommand);
+ 	expectType<number | undefined>(unicornsResult.exitCode);
++	expectType<undefined>(unicornsResult.stdio[0]);
+ 	expectType<string>(unicornsResult.stdout);
++	expectType<string>(unicornsResult.stdio[1]);
+ 	expectType<string>(unicornsResult.stderr);
++	expectType<string>(unicornsResult.stdio[2]);
++	expectType<string | undefined>(unicornsResult.stdio[3]);
+ 	expectError(unicornsResult.all);
+ 	expectError(unicornsResult.pipeStdout);
+ 	expectError(unicornsResult.pipeStderr);
+@@ -117,8 +129,12 @@ try {
+ 	expectType<ExecaSyncError>(execaError);
+ 	expectType<string>(execaError.message);
+ 	expectType<number | undefined>(execaError.exitCode);
++	expectType<undefined>(execaError.stdio[0]);
+ 	expectType<string>(execaError.stdout);
++	expectType<string>(execaError.stdio[1]);
+ 	expectType<string>(execaError.stderr);
++	expectType<string>(execaError.stdio[2]);
++	expectType<string | undefined>(execaError.stdio[3]);
+ 	expectError(execaError.all);
+ 	expectType<boolean>(execaError.failed);
+ 	expectType<boolean>(execaError.timedOut);
+diff --git a/lib/error.js b/lib/error.js
+index 907e21b..d554bc3 100644
+--- a/lib/error.js
++++ b/lib/error.js
+@@ -26,8 +26,7 @@ const getErrorPrefix = ({timedOut, timeout, errorCode, signal, signalDescription
+ };
+ 
+ export const makeError = ({
+-	stdout,
+-	stderr,
++	stdio,
+ 	all,
+ 	error,
+ 	signal,
+@@ -38,6 +37,8 @@ export const makeError = ({
+ 	isCanceled,
+ 	options: {timeout, cwd = process.cwd()},
+ }) => {
++	stdio = stdio.map(stdioOutput => stdioOutput ?? '');
++
+ 	// `signal` and `exitCode` emitted on `spawned.on('exit')` event can be `null`.
+ 	// We normalize them to `undefined`
+ 	exitCode = exitCode === null ? undefined : exitCode;
+@@ -50,7 +51,7 @@ export const makeError = ({
+ 	const execaMessage = `Command ${prefix}: ${command}`;
+ 	const isError = Object.prototype.toString.call(error) === '[object Error]';
+ 	const shortMessage = isError ? `${execaMessage}\n${error.message}` : execaMessage;
+-	const message = [shortMessage, stderr, stdout].filter(Boolean).join('\n');
++	const message = [shortMessage, stdio[2], stdio[1], ...stdio.slice(3)].filter(Boolean).join('\n');
+ 
+ 	if (isError) {
+ 		error.originalMessage = error.message;
+@@ -65,8 +66,9 @@ export const makeError = ({
+ 	error.exitCode = exitCode;
+ 	error.signal = signal;
+ 	error.signalDescription = signalDescription;
+-	error.stdout = stdout;
+-	error.stderr = stderr;
++	error.stdio = stdio;
++	error.stdout = stdio[1];
++	error.stderr = stdio[2];
+ 	error.cwd = cwd;
+ 
+ 	if (all !== undefined) {
+diff --git a/lib/stdio/handle.js b/lib/stdio/handle.js
+index 56be992..ccacfef 100644
+--- a/lib/stdio/handle.js
++++ b/lib/stdio/handle.js
+@@ -13,7 +13,7 @@ export const handleInput = (addProperties, options) => {
+ 		.map(stdioStreams => addStreamDirection(stdioStreams))
+ 		.map(stdioStreams => addStreamsProperties(stdioStreams, addProperties));
+ 	options.stdio = transformStdio(stdioStreamsGroups);
+-	return stdioStreamsGroups.flat();
++	return {stdioStreams: stdioStreamsGroups.flat(), stdioLength: stdioStreamsGroups.length};
+ };
+ 
+ // We make sure passing an array with a single item behaves the same as passing that item without an array.
+diff --git a/lib/stdio/sync.js b/lib/stdio/sync.js
+index d50ea3f..d93ab0a 100644
+--- a/lib/stdio/sync.js
++++ b/lib/stdio/sync.js
+@@ -6,9 +6,9 @@ import {bufferToUint8Array} from './utils.js';
+ 
+ // Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in sync mode
+ export const handleInputSync = options => {
+-	const stdioStreams = handleInput(addPropertiesSync, options);
++	const {stdioStreams, stdioLength} = handleInput(addPropertiesSync, options);
+ 	addInputOptionSync(stdioStreams, options);
+-	return stdioStreams;
++	return {stdioStreams, stdioLength};
+ };
+ 
+ const forbiddenIfStreamSync = ({value, optionName}) => {
+diff --git a/lib/stream.js b/lib/stream.js
+index a0b9128..fa7967e 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -35,6 +35,11 @@ const getBufferedData = async (streamPromise, encoding) => {
+ 	}
+ };
+ 
++const getStdioPromise = ({stream, index, stdioStreams, encoding, buffer, maxBuffer}) => {
++	const stdioStream = stdioStreams.find(stdioStream => stdioStream.index === index);
++	return stdioStream?.direction === 'output' ? getStreamPromise(stream, {encoding, buffer, maxBuffer}) : undefined;
++};
++
+ const getStreamPromise = async (stream, {encoding, buffer, maxBuffer}) => {
+ 	if (!stream || !buffer) {
+ 		return;
+@@ -112,16 +117,14 @@ export const getSpawnedResult = async (
+ 	cleanupOnExit(spawned, cleanup, detached, finalizers);
+ 	const customStreams = getCustomStreams(stdioStreams);
+ 
+-	const stdoutPromise = getStreamPromise(spawned.stdout, {encoding, buffer, maxBuffer});
+-	const stderrPromise = getStreamPromise(spawned.stderr, {encoding, buffer, maxBuffer});
++	const stdioPromises = spawned.stdio.map((stream, index) => getStdioPromise({stream, index, stdioStreams, encoding, buffer, maxBuffer}));
+ 	const allPromise = getStreamPromise(spawned.all, {encoding, buffer, maxBuffer: maxBuffer * 2});
+ 
+ 	try {
+ 		return await Promise.race([
+ 			Promise.all([
+ 				once(spawned, 'exit'),
+-				stdoutPromise,
+-				stderrPromise,
++				Promise.all(stdioPromises),
+ 				allPromise,
+ 				...waitForCustomStreamsEnd(customStreams),
+ 			]),
+@@ -133,8 +136,7 @@ export const getSpawnedResult = async (
+ 		spawned.kill();
+ 		const results = await Promise.all([
+ 			[undefined, context.signal, error],
+-			getBufferedData(stdoutPromise, encoding),
+-			getBufferedData(stderrPromise, encoding),
++			Promise.all(stdioPromises.map(stdioPromise => getBufferedData(stdioPromise, encoding))),
+ 			getBufferedData(allPromise, encoding),
+ 		]);
+ 		cleanupStdioStreams(customStreams, error);
+diff --git a/readme.md b/readme.md
+index 1743ba1..2398507 100644
+--- a/readme.md
++++ b/readme.md
+@@ -255,7 +255,7 @@ This is the preferred method when executing Node.js files.
+ Like [`child_process#fork()`](https://nodejs.org/api/child_process.html#child_process_child_process_fork_modulepath_args_options):
+ - the current Node version and options are used. This can be overridden using the [`nodePath`](#nodepath-for-node-only) and [`nodeOptions`](#nodeoptions-for-node-only) options.
+ - the [`shell`](#shell) option cannot be used
+-- an extra channel [`ipc`](https://nodejs.org/api/child_process.html#child_process_options_stdio) is passed to [`stdio`](#stdio)
++- an extra channel [`ipc`](https://nodejs.org/api/child_process.html#child_process_options_stdio) is passed to [`stdio`](#stdio-1)
+ 
+ #### $\`command\`
+ 
+@@ -289,7 +289,7 @@ This is the preferred method when executing a user-supplied `command` string, su
+ 
+ Same as [`execa()`](#execacommandcommand-options) but synchronous.
+ 
+-Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio) and [`input`](#input) options cannot be a stream nor an iterable.
++Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio-1) and [`input`](#input) options cannot be a stream nor an iterable.
+ 
+ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+@@ -298,7 +298,7 @@ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+ Same as [$\`command\`](#command) but synchronous.
+ 
+-Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio) and [`input`](#input) options cannot be a stream nor an iterable.
++Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio-1) and [`input`](#input) options cannot be a stream nor an iterable.
+ 
+ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+@@ -306,7 +306,7 @@ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+ Same as [`execaCommand()`](#execacommand-command-options) but synchronous.
+ 
+-Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio) and [`input`](#input) options cannot be a stream nor an iterable.
++Cannot use the following options: [`all`](#all-2), [`cleanup`](#cleanup), [`buffer`](#buffer), [`detached`](#detached), [`serialization`](#serialization) and [`signal`](#signal). Also, the [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1), [`stdio`](#stdio-1) and [`input`](#input) options cannot be a stream nor an iterable.
+ 
+ Returns or throws a [`childProcessResult`](#childProcessResult).
+ 
+@@ -432,6 +432,14 @@ This is `undefined` if either:
+ - the [`all` option](#all-2) is `false` (the default value)
+ - both [`stdout`](#stdout-1) and [`stderr`](#stderr-1) options are set to [`'inherit'`, `'ipc'`, `'ignore'`, `Stream` or `integer`](https://nodejs.org/api/child_process.html#child_process_options_stdio)
+ 
++#### stdio
++
++Type: `Array<string | Uint8Array | undefined>`
++
++The output of the process on [`stdin`](#stdin), [`stdout`](#stdout-1), [`stderr`](#stderr-1) and [other file descriptors](#stdio-1).
++
++Items are `undefined` when their corresponding [`stdio`](#stdio-1) option is set to [`'inherit'`, `'ipc'`, `'ignore'`, `Stream` or `integer`](https://nodejs.org/api/child_process.html#child_process_options_stdio).
++
+ #### failed
+ 
+ Type: `boolean`
+@@ -490,19 +498,19 @@ Type: `string`
+ 
+ Error message when the child process failed to run. In addition to the [underlying error message](#originalMessage), it also contains some information related to why the child process errored.
+ 
+-The child process [`stderr`](#stderr) then [`stdout`](#stdout) are appended to the end, separated with newlines and not interleaved.
++The child process [`stderr`](#stderr), [`stdout`](#stdout) and other [file descriptors' output](#stdio) are appended to the end, separated with newlines and not interleaved.
+ 
+ #### shortMessage
+ 
+ Type: `string`
+ 
+-This is the same as the [`message` property](#message) except it does not include the child process `stdout`/`stderr`.
++This is the same as the [`message` property](#message) except it does not include the child process [`stdout`](#stdout)/[`stderr`](#stderr)/[`stdio`](#stdio).
+ 
+ #### originalMessage
+ 
+ Type: `string | undefined`
+ 
+-Original error message. This is the same as the `message` property excluding the child process `stdout`/`stderr` and some additional information added by Execa.
++Original error message. This is the same as the `message` property excluding the child process [`stdout`](#stdout)/[`stderr`](#stderr)/[`stdio`](#stdio) and some additional information added by Execa.
+ 
+ This is `undefined` unless the child process exited due to an `error` event or a timeout.
+ 
+@@ -554,7 +562,7 @@ Default: `true`
+ 
+ Buffer the output from the spawned process. When set to `false`, you must read the output of [`stdout`](#stdout-1) and [`stderr`](#stderr-1) (or [`all`](#all) if the [`all`](#all-2) option is `true`). Otherwise the returned promise will not be resolved/rejected.
+ 
+-If the spawned process fails, [`error.stdout`](#stdout), [`error.stderr`](#stderr), and [`error.all`](#all) will contain the buffered data.
++If the spawned process fails, [`error.stdout`](#stdout), [`error.stderr`](#stderr), [`error.all`](#all) and [`error.stdio`](#stdio) will contain the buffered data.
+ 
+ #### input
+ 
+@@ -699,7 +707,7 @@ Explicitly set the value of `argv[0]` sent to the child process. This will be se
+ Type: `string`\
+ Default: `'json'`
+ 
+-Specify the kind of serialization used for sending messages between processes when using the [`stdio: 'ipc'`](#stdio) option or [`execaNode()`](#execanodescriptpath-arguments-options):
++Specify the kind of serialization used for sending messages between processes when using the [`stdio: 'ipc'`](#stdio-1) option or [`execaNode()`](#execanodescriptpath-arguments-options):
+ 	- `json`: Uses `JSON.stringify()` and `JSON.parse()`.
+ 	- `advanced`: Uses [`v8.serialize()`](https://nodejs.org/api/v8.html#v8_v8_serialize_value)
+ 
+@@ -740,7 +748,7 @@ We recommend against using this option since it is:
+ Type: `string`\
+ Default: `utf8`
+ 
+-Specify the character encoding used to decode the `stdout` and `stderr` output. If set to `'buffer'`, then `stdout` and `stderr` will be a `Uint8Array` instead of a string.
++Specify the character encoding used to decode the [`stdout`](#stdout), [`stderr`](#stderr) and [`stdio`](#stdio) output. If set to `'buffer'`, then `stdout`, `stderr` and `stdio` will be `Uint8Array`s instead of strings.
+ 
+ #### timeout
+ 
+@@ -754,7 +762,7 @@ If timeout is greater than `0`, the parent will send the signal identified by th
+ Type: `number`\
+ Default: `100_000_000` (100 MB)
+ 
+-Largest amount of data in bytes allowed on `stdout` or `stderr`.
++Largest amount of data in bytes allowed on [`stdout`](#stdout), [`stderr`](#stderr) and [`stdio`](#stdio).
+ 
+ #### killSignal
+ 

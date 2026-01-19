@@ -1,0 +1,217 @@
+diff --git a/docs/API.md b/docs/API.md
+index 0dd8c6a..61adae1 100644
+--- a/docs/API.md
++++ b/docs/API.md
+@@ -53,6 +53,7 @@
+     Default: 'info'.
+   * `levelVal` (integer): when defining a custom log level via `level`, set to an
+     integer value to define the new level. Default: `undefined`.
++  * `messageKey` (string): the string key for the 'message' in the JSON object. Default `msg`.
+   * `prettyPrint` (boolean|object): enables [pino.pretty](#pretty). This is intended for non-production
+     configurations. This may be set to a configuration object as outlined in [pino.pretty](#pretty). Default: `false`.
+   * `onTerminated` (function): this function will be invoked during process shutdown when `extreme` is set to `true`.
+@@ -93,6 +94,8 @@ Returns a new [logger](#logger) instance.
+   JSON object as an argument and should return a string value.
+   * `levelFirst` (boolean): if set to `true`, it will print the name of the log
+   level as the first field in the log line. Default: `false`.
++  * `messageKey` (string): the key in the JSON object to use as the highlighted
++  message. Default: `msg`.
+ 
+ ### Example:
+ ```js
+diff --git a/docs/cli.md b/docs/cli.md
+index 9925d01..e3598fd 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -9,6 +9,22 @@ To use the command line tool, we can install `pino` globally:
+ npm install -g pino
+ ```
+ 
++The pretty-printed output will highlight the message value of the input JSON. By
++default, Pino provides this message value at the `msg` key. A custom key can be
++specified with `-m <key>`.
++
++`pino -m fooMessage` will transform this:
++
++```js
++{"pid":14139,"hostname":"MacBook-Pro-3.home","level":30,"fooMessage":"hello world","time":1457537229339,"v":1}
++```
++
++Into this:
++
++```sh
++[2016-03-09T15:27:09.339Z] INFO (14139 on MacBook-Pro-3.home): hello world
++```
++
+ There are also two transformer flags:
+ 
+ + `-t` that converts Epoch timestamps to ISO timestamps.
+@@ -25,13 +41,13 @@ There are also two transformer flags:
+ `pino -t` will transform this:
+ 
+ ```js
+-{"pid":14139,"hostname":"MacBook-Pro-3.home","level":30,"msg":"hello world","time":1457537229339,"v":0}
++{"pid":14139,"hostname":"MacBook-Pro-3.home","level":30,"msg":"hello world","time":1457537229339,"v":1}
+ ```
+ 
+ Into this:
+ 
+ ```js
+-{"pid":14139,"hostname":"MacBook-Pro-3.home","level":30,"msg":"hello world","time":"2016-03-09T15:27:09.339Z","v":0}
++{"pid":14139,"hostname":"MacBook-Pro-3.home","level":30,"msg":"hello world","time":"2016-03-09T15:27:09.339Z","v":1}
+ ```
+ 
+ 
+@@ -45,4 +61,4 @@ Into this:
+ 
+ ```sh
+ INFO [2016-03-09T15:27:09.339Z] (14139 on MacBook-Pro-3.home): hello world
+-```
+\ No newline at end of file
++```
+diff --git a/lib/tools.js b/lib/tools.js
+index 55b866d..77f8d2d 100644
+--- a/lib/tools.js
++++ b/lib/tools.js
+@@ -31,6 +31,8 @@ function applyOptions (opts) {
+   this.cache = opts.cache
+   this.formatOpts = opts.formatOpts
+   this.onTerminated = opts.onTerminated
++  this.messageKey = opts.messageKey
++  this.messageKeyString = opts.messageKeyString
+ 
+   if (opts.level && opts.levelVal) {
+     var levelIsStandard = levels.isStandardLevel(opts.level)
+diff --git a/pino.js b/pino.js
+index ac98c2e..2915b71 100644
+--- a/pino.js
++++ b/pino.js
+@@ -27,7 +27,8 @@ var defaultOptions = {
+     if (err) return process.exit(1)
+     process.exit(0)
+   },
+-  enabled: true
++  enabled: true,
++  messageKey: 'msg'
+ }
+ 
+ var pinoPrototype = Object.create(EventEmitter.prototype, {
+@@ -121,7 +122,7 @@ function asJson (obj, msg, num) {
+   // to catch both null and undefined
+   /* eslint-disable eqeqeq */
+   if (msg != undefined) {
+-    data += ',"msg":' + JSON.stringify('' + msg)
++    data += this.messageKeyString + JSON.stringify('' + msg)
+   }
+   // we need the child bindings added to the output first so that logged
+   // objects can take precedence when JSON.parse-ing the resulting log line
+@@ -176,7 +177,9 @@ function child (bindings) {
+     slowtime: this.slowtime,
+     chindings: data,
+     cache: this.cache,
+-    formatOpts: this.formatOpts
++    formatOpts: this.formatOpts,
++    messageKey: this.messageKey,
++    messageKeyString: this.messageKeyString
+   }
+ 
+   var _child = Object.create(this)
+@@ -244,7 +247,8 @@ function pino (opts, stream) {
+   if (iopts.extreme && iopts.prettyPrint) throw Error('cannot enable pretty print in extreme mode')
+   istream = istream || process.stdout
+   if (iopts.prettyPrint) {
+-    var pstream = pretty(iopts.prettyPrint)
++    var prettyOpts = Object.assign({ messageKey: iopts.messageKey }, iopts.prettyPrint)
++    var pstream = pretty(prettyOpts)
+     var origStream = istream
+     pump(pstream, origStream, function (err) {
+       if (err) instance.emit('error', err)
+@@ -255,6 +259,7 @@ function pino (opts, stream) {
+   // internal options
+   iopts.stringify = iopts.safe ? stringifySafe : JSON.stringify
+   iopts.formatOpts = {lowres: true}
++  iopts.messageKeyString = `,"${iopts.messageKey}":`
+   iopts.end = ',"v":' + LOG_VERSION + '}\n'
+   iopts.cache = !iopts.extreme ? null : {
+     size: 4096,
+diff --git a/pretty.js b/pretty.js
+index 3b8de1a..5c7808c 100755
+--- a/pretty.js
++++ b/pretty.js
+@@ -19,7 +19,6 @@ var standardKeys = [
+   'hostname',
+   'name',
+   'level',
+-  'msg',
+   'time',
+   'v'
+ ]
+@@ -32,12 +31,13 @@ function withSpaces (value) {
+   return lines.join('\n')
+ }
+ 
+-function filter (value) {
++function filter (value, messageKey) {
+   var keys = Object.keys(value)
++  var filteredKeys = standardKeys.concat([messageKey])
+   var result = ''
+ 
+   for (var i = 0; i < keys.length; i++) {
+-    if (standardKeys.indexOf(keys[i]) < 0) {
++    if (filteredKeys.indexOf(keys[i]) < 0) {
+       result += '    ' + keys[i] + ': ' + withSpaces(JSON.stringify(value[keys[i]], null, 2)) + '\n'
+     }
+   }
+@@ -56,6 +56,8 @@ function pretty (opts) {
+   var timeTransOnly = opts && opts.timeTransOnly
+   var formatter = opts && opts.formatter
+   var levelFirst = opts && opts.levelFirst
++  var messageKey = opts && opts.messageKey
++  messageKey = messageKey || 'msg'
+ 
+   var stream = split(mapLine)
+   var ctx
+@@ -111,14 +113,14 @@ function pretty (opts) {
+     }
+     line += value.pid + ' on ' + value.hostname + ')'
+     line += ': '
+-    if (value.msg) {
+-      line += ctx.cyan(value.msg)
++    if (value[messageKey]) {
++      line += ctx.cyan(value[messageKey])
+     }
+     line += '\n'
+     if (value.type === 'Error') {
+       line += '    ' + withSpaces(value.stack) + '\n'
+     } else {
+-      line += filter(value)
++      line += filter(value, messageKey)
+     }
+     return line
+   }
+diff --git a/usage.txt b/usage.txt
+index d37ece3..bb2efaf 100644
+--- a/usage.txt
++++ b/usage.txt
+@@ -5,7 +5,11 @@
+ 
+      [33mcat log | pino[39m
+ 
+-  [0mTo converts Epoch timestamps to ISO timestamps use the [33m-t[39m flag[0m
++  [0mTo highlight a string at a key other than 'msg', use [33m-m <key>[39m:[0m
++
++     [33mcat log | pino -m fooMessage[39m
++
++  [0mTo convert Epoch timestamps to ISO timestamps use the [33m-t[39m flag[0m
+ 
+      [33mcat log | pino -t[39m
+ 
+@@ -16,6 +20,7 @@
+   [36m[1mFlags[22m[39m
+   [0m-h | --help      Display Help
+   -v | --version   Display Version
+-  -t               Convert Epoch timestamps to ISO[0m
++  -m <key>         Highlight the message at the <key> property
++  -t               Convert Epoch timestamps to ISO
+   -l               Flip level and date
+ 

@@ -1,0 +1,408 @@
+diff --git a/__tests__/base.js b/__tests__/base.js
+index a2dcd17..1fd171b 100644
+--- a/__tests__/base.js
++++ b/__tests__/base.js
+@@ -1,4 +1,3 @@
+-"use strict"
+ import immer from ".."
+ 
+ describe("base", () => {
+@@ -138,6 +137,7 @@ describe("base", () => {
+ 
+     it("reusing object should work", () => {
+         const nextState = immer(baseState, s => {
++            debugger
+             const obj = s.anObject
+             delete s.anObject
+             s.messy = obj
+@@ -204,13 +204,14 @@ describe("base", () => {
+         }).toThrowError(/^Cannot perform.*on a proxy that has been revoked/)
+         expect(() => {
+             const aProp = proxy.aProp
+-        }).toThrowError(/^Cannot perform.*on a proxy that has been revoked/)
++        }).toThrowError(/^Cannot perform.*on a proxy that has been revoked/)          
+ 
+         expect(nextState).not.toBe(baseState)
+         expect(baseState.aProp).toBe("hi")
+         expect(nextState.aProp).toBe("hello")
+-    })
+ 
++    })
++    
+     afterEach(() => {
+         expect(baseState).toBe(origBaseState)
+         expect(baseState).toEqual(createBaseState())
+@@ -229,3 +230,37 @@ describe("base", () => {
+         }
+     }
+ })
++
++describe("readme example", () => {
++    it("works", () => {
++        const baseState = [
++            {
++                todo: "Learn typescript",
++                done: true,
++            },
++            {
++                todo: "Try immer",
++                done: false,
++            },
++        ]
++
++        const nextState = immer(baseState, state => {
++            state.push({todo: "Tweet about it"})
++            state[1].done = true
++        })
++
++        // the new item is only added to the next state,
++        // base state is unmodified
++        expect(baseState.length).toBe(2)
++        expect(nextState.length).toBe(3)
++
++        // same for the changed 'done' prop
++        expect(baseState[1].done).toBe(false)
++        expect(nextState[1].done).toBe(true)
++
++        // unchanged data is structurally shared
++        expect(nextState[0]).toBe(baseState[0])
++        // changed data not (dûh)
++        expect(nextState[1]).not.toBe(baseState[1])
++    })
++})
+diff --git a/__tests__/frozen.js b/__tests__/frozen.js
+deleted file mode 100644
+index 63e0cb2..0000000
+--- a/__tests__/frozen.js
++++ /dev/null
+@@ -1,49 +0,0 @@
+-"use strict"
+-import immer from ".."
+-
+-describe("auto freeze", () => {
+-    const baseState = {
+-        object: {a: 1},
+-        array: [1, 2],
+-    }
+-
+-    it("should freeze objects after modifications", () => {
+-        expect(Object.isFrozen(baseState.object)).toBe(false) // initially not frozen
+-        const next = immer(baseState, draft => {
+-            draft.object.c = 2
+-        })
+-        expect(Object.isFrozen(next.object)).toBe(true)
+-        expect(Object.isFrozen(next)).toBe(true)
+-        expect(Object.isFrozen(next.array)).toBe(false)
+-
+-        expect(() => {
+-            next.object.a = 2
+-        }).toThrow(/Cannot assign to read only property/)
+-    })
+-
+-    it("should freeze arrays after modifications", () => {
+-        expect(Object.isFrozen(baseState.object)).toBe(false) // initially not frozen
+-        const next = immer(baseState, draft => {
+-            draft.array.push(3)
+-        })
+-        expect(Object.isFrozen(next.object)).toBe(false) // not touched
+-        expect(Object.isFrozen(next)).toBe(true)
+-        expect(Object.isFrozen(next.array)).toBe(true)
+-
+-        expect(() => {
+-            next.array.shift()
+-        }).toThrow(/Cannot add\/remove sealed array elements/)
+-    })
+-
+-    it("can handle already frozen trees", () => {
+-        const a = []
+-        const b = {a: a}
+-        Object.freeze(a)
+-        Object.freeze(b)
+-        const n = immer(b, draft => {
+-            draft.c = true
+-            draft.a.push(3)
+-        })
+-        expect(n).toEqual({c: true, a: [3]})
+-    })
+-})
+diff --git a/__tests__/readme.js b/__tests__/readme.js
+deleted file mode 100644
+index d07857c..0000000
+--- a/__tests__/readme.js
++++ /dev/null
+@@ -1,36 +0,0 @@
+-"use strict"
+-import immer from ".."
+-
+-describe("readme example", () => {
+-    it("works", () => {
+-        const baseState = [
+-            {
+-                todo: "Learn typescript",
+-                done: true,
+-            },
+-            {
+-                todo: "Try immer",
+-                done: false,
+-            },
+-        ]
+-
+-        const nextState = immer(baseState, draft => {
+-            draft.push({todo: "Tweet about it"})
+-            draft[1].done = true
+-        })
+-
+-        // the new item is only added to the next state,
+-        // base state is unmodified
+-        expect(baseState.length).toBe(2)
+-        expect(nextState.length).toBe(3)
+-
+-        // same for the changed 'done' prop
+-        expect(baseState[1].done).toBe(false)
+-        expect(nextState[1].done).toBe(true)
+-
+-        // unchanged data is structurally shared
+-        expect(nextState[0]).toBe(baseState[0])
+-        // changed data not (dûh)
+-        expect(nextState[1]).not.toBe(baseState[1])
+-    })
+-})
+diff --git a/immer.js b/immer.js
+index f54bc85..58c22ff 100644
+--- a/immer.js
++++ b/immer.js
+@@ -1,19 +1,12 @@
+-"use strict"
+-// @ts-check
+-
+ /**
+  * @typedef {Object} RevocableProxy
+  * @property {any} proxy
+  * @property {Function} revoke
+  */
+ 
+-const IMMER_PROXY = Symbol("immer-proxy") // TODO: create per closure, to avoid sharing proxies between multiple immer version
+-
+-// This property indicates that the current object is cloned for another object,
+-// to make sure the proxy of a frozen object is writeable
+-const CLONE_TARGET = Symbol("immer-clone-target")
++// @ts-check
+ 
+-let autoFreeze = true
++const isProxySymbol = Symbol("immer-proxy")
+ 
+ /**
+  * Immer takes a state, and runs a function against it.
+@@ -26,6 +19,7 @@ let autoFreeze = true
+  * @returns {any} a new state, or the base state if nothing was modified
+  */
+ function immer(baseState, thunk) {
++
+     /**
+      * Maps baseState objects to revocable proxies
+      * @type {Map<Object,RevocableProxy>}
+@@ -37,7 +31,7 @@ function immer(baseState, thunk) {
+ 
+     const objectTraps = {
+         get(target, prop) {
+-            if (prop === IMMER_PROXY) return target
++            if (prop === isProxySymbol) return target
+             return createProxy(getCurrentSource(target)[prop])
+         },
+         has(target, prop) {
+@@ -52,7 +46,7 @@ function immer(baseState, thunk) {
+             if (current !== newValue) {
+                 const copy = getOrCreateCopy(target)
+                 copy[prop] = isProxy(newValue)
+-                    ? newValue[IMMER_PROXY]
++                    ? newValue[isProxySymbol]
+                     : newValue
+             }
+             return true
+@@ -67,16 +61,10 @@ function immer(baseState, thunk) {
+     // creates a copy for a base object if there ain't one
+     function getOrCreateCopy(base) {
+         let copy = copies.get(base)
+-        if (copy) return copy
+-        const cloneTarget = base[CLONE_TARGET]
+-        if (cloneTarget) {
+-            // base is a clone already (source was frozen), no need to create addtional copy
+-            copies.set(cloneTarget, base)
+-            return base
++        if (!copy) {
++            copy = Array.isArray(base) ? base.slice() : Object.assign({}, base)
++            copies.set(base, copy)
+         }
+-        // create a fresh copy
+-        copy = Array.isArray(base) ? base.slice() : Object.assign({}, base)
+-        copies.set(base, copy)
+         return copy
+     }
+ 
+@@ -85,29 +73,14 @@ function immer(baseState, thunk) {
+         const copy = copies.get(base)
+         return copy || base
+     }
+-
++    
+     // creates a proxy for plain objects / arrays
+     function createProxy(base) {
+         if (isPlainObject(base) || Array.isArray(base)) {
+             if (isProxy(base)) return base // avoid double wrapping
+-            if (revocableProxies.has(base))
+-                return revocableProxies.get(base).proxy
+-            let proxyTarget
+-            // special case, if the base tree is frozen, we cannot modify it's proxy it in strict mode, clone first.
+-            if (Object.isFrozen(base)) {
+-                proxyTarget = Array.isArray(base)
+-                    ? base.slice()
+-                    : Object.assign({}, base)
+-                Object.defineProperty(proxyTarget, CLONE_TARGET, {
+-                    enumerable: false,
+-                    value: base,
+-                    configurable: true,
+-                })
+-            } else {
+-                proxyTarget = base
+-            }
+-            // create the proxy
+-            const revocableProxy = Proxy.revocable(proxyTarget, objectTraps)
++            if (revocableProxies.has(base)) return revocableProxies.get(base).proxy
++            //const proxy = new Proxy(base, objectTraps)
++            const revocableProxy = Proxy.revocable(base, objectTraps)
+             revocableProxies.set(base, revocableProxy)
+             return revocableProxy.proxy
+         }
+@@ -142,22 +115,20 @@ function immer(baseState, thunk) {
+ 
+     function finalizeObject(thing) {
+         if (!hasChanges(thing)) return thing
+-        const copy = getOrCreateCopy(thing) // TODO: getOrCreate is weird here..
++        const copy = getOrCreateCopy(thing)
+         Object.keys(copy).forEach(prop => {
+             copy[prop] = finalize(copy[prop])
+         })
+-        delete copy[CLONE_TARGET]
+-        return freeze(copy)
++        return copy
+     }
+ 
+     function finalizeArray(thing) {
+         if (!hasChanges(thing)) return thing
+-        const copy = getOrCreateCopy(thing) // TODO: getOrCreate is weird here..
++        const copy = getOrCreateCopy(thing)
+         copy.forEach((value, index) => {
+             copy[index] = finalize(copy[index])
+         })
+-        delete copy[CLONE_TARGET]
+-        return freeze(copy)
++        return copy
+     }
+ 
+     // create proxy for root
+@@ -177,10 +148,10 @@ function immer(baseState, thunk) {
+ 
+ /**
+  * Revoke all the proxies stored in the revocableProxies map
+- *
++ * 
+  * @param {Map<Object,RevocableProxy>} revocableProxies
+  */
+-function revoke(revocableProxies) {
++function revoke (revocableProxies){
+     for (var revocableProxy of revocableProxies.values()) {
+         revocableProxy.revoke()
+     }
+@@ -193,30 +164,7 @@ function isPlainObject(value) {
+ }
+ 
+ function isProxy(value) {
+-    return !!value && !!value[IMMER_PROXY]
+-}
+-
+-function freeze(value) {
+-    if (autoFreeze) {
+-        Object.freeze(value)
+-    }
+-    return value
+-}
+-
+-/**
+- * Automatically freezes any state trees generated by immer.
+- * This protects against accidental modifications of the state tree outside of an immer function.
+- * This comes with a performance impact, so it is recommended to disable this option in production.
+- * It is by default enabled.
+- *
+- * @returns {void}
+- */
+-function setAutoFreeze(enableAutoFreeze) {
+-    autoFreeze = enableAutoFreeze
++    return !!value && !!value[isProxySymbol]
+ }
+ 
+-Object.defineProperty(exports, "__esModule", {
+-    value: true,
+-})
+-module.exports.default = immer
+-module.exports.setAutoFreeze = setAutoFreeze
++module.exports = immer
+diff --git a/index.d.ts b/index.d.ts
+index 2f4a2e7..e88cad8 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -2,20 +2,9 @@
+  * Immer takes a state, and runs a function against it.
+  * That function can freely mutate the state, as it will create copies-on-write.
+  * This means that the original state will stay unchanged, and once the function finishes, the modified state is returned
+- *
++ * 
+  * @param currentState - the state to start with
+  * @param thunk - function that receives a proxy of the current state as first argument and which can be freely modified
+  * @returns The next state: a new state, or the current state if nothing was modified
+  */
+-export default function<S = any>(
+-    currentState: S,
+-    thunk: (draftState: S) => void,
+-): S
+-
+-/**
+- * Automatically freezes any state trees generated by immer.
+- * This protects against accidental modifications of the state tree outside of an immer function.
+- * This comes with a performance impact, so it is recommended to disable this option in production.
+- * It is by default enabled.
+- */
+-export function setAutoFreeze(autoFreeze: boolean)
++export function immer<S = any>(currentState: S, thunk: (draftState: S) => void): S;
+diff --git a/readme.md b/readme.md
+index 6442d76..16b91fa 100644
+--- a/readme.md
++++ b/readme.md
+@@ -68,15 +68,6 @@ expect(nextState[1]).not.toBe(baseState[1])
+ * Small, dependency free library with minimal api surface
+ * No accidental mutations of current state, but intentional mutations of a draft state
+ 
+-## Auto freezing
+-
+- Immer automatically freezes any state trees that are modified using `immer.
+- This protects against accidental modifications of the state tree outside of an immer function.
+- This comes with a performance impact, so it is recommended to disable this option in production.
+- It is by default enabled.
+-
+- Use `setAutoFreeze(true / false)` to turn this feature on or off.
+-
+ ## Reducer Example
+ 
+ A lot of words; here is a simple example of the difference that this approach could make in practice.
+@@ -163,12 +154,6 @@ Creating middleware or a reducer wrapper that applies `immer` automatically is l
+ 
+ ## Changelog
+ 
+-### 0.0.5
+-
+-* Fixed `immer` function export, it is now properly exposed as `default`
+-* Immer now automatically freezes any state modifications made. Turn this is using `setAutoFreeze(false)`
+-* Added support for frozen state trees in strict mode.
+-
+ ### 0.0.4 (31-12-2017)
+ 
+ * Added typescript typings [#11](https://github.com/mweststrate/immer/pull/11) by [@benbraou](https://github.com/benbraou)

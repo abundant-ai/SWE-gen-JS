@@ -1,0 +1,233 @@
+diff --git a/src/commands/includes/removeJob.lua b/src/commands/includes/removeJob.lua
+index 114ecc55d4..6f4c3b4c38 100644
+--- a/src/commands/includes/removeJob.lua
++++ b/src/commands/includes/removeJob.lua
+@@ -7,7 +7,7 @@
+ 
+ local function removeJob(key, hard, baseKey)
+   local jobKey = baseKey .. key
+-  removeParentDependencyKey(jobKey, hard, nil, baseKey)
++  removeParentDependencyKey(jobKey, hard, baseKey)
+   rcall("DEL", jobKey, jobKey .. ':logs',
+     jobKey .. ':dependencies', jobKey .. ':processed')
+ end
+diff --git a/src/commands/includes/removeParentDependencyKey.lua b/src/commands/includes/removeParentDependencyKey.lua
+index c1b240d948..39800bd006 100644
+--- a/src/commands/includes/removeParentDependencyKey.lua
++++ b/src/commands/includes/removeParentDependencyKey.lua
+@@ -19,10 +19,9 @@ local function moveParentToWait(parentPrefix, parentId, emitEvent)
+   end
+ end
+ 
+-local function removeParentDependencyKey(jobKey, hard, parentKey, baseKey)
+-  if parentKey then
+-    local parentProcessedKey = parentKey .. ":processed"
+-    rcall("HDEL", parentProcessedKey, jobKey)
++local function removeParentDependencyKey(jobKey, hard, baseKey)
++  local parentKey = rcall("HGET", jobKey, "parentKey")
++  if( (type(parentKey) == "string") and parentKey ~= "" and (rcall("EXISTS", parentKey) == 1)) then
+     local parentDependenciesKey = parentKey .. ":dependencies"
+     local result = rcall("SREM", parentDependenciesKey, jobKey)
+     if result > 0 then
+@@ -35,7 +34,7 @@ local function removeParentDependencyKey(jobKey, hard, parentKey, baseKey)
+ 
+         if hard then  
+           if parentPrefix == baseKey then
+-            removeParentDependencyKey(parentKey, hard, nil, baseKey)
++            removeParentDependencyKey(parentKey, hard, baseKey)
+             rcall("DEL", parentKey, parentKey .. ':logs',
+               parentKey .. ':dependencies', parentKey .. ':processed')
+           else
+@@ -46,34 +45,6 @@ local function removeParentDependencyKey(jobKey, hard, parentKey, baseKey)
+         end
+       end
+     end
+-  else
+-    local missedParentKey = rcall("HGET", jobKey, "parentKey")
+-    if( (type(missedParentKey) == "string") and missedParentKey ~= "" and (rcall("EXISTS", missedParentKey) == 1)) then
+-      local parentProcessedKey = missedParentKey .. ":processed"
+-      rcall("HDEL", parentProcessedKey, jobKey)
+-      local parentDependenciesKey = missedParentKey .. ":dependencies"
+-      local result = rcall("SREM", parentDependenciesKey, jobKey)
+-      if result > 0 then
+-        local pendingDependencies = rcall("SCARD", parentDependenciesKey)
+-        if pendingDependencies == 0 then
+-          local parentId = getJobIdFromKey(missedParentKey)
+-          local parentPrefix = getJobKeyPrefix(missedParentKey, parentId)
+-
+-          rcall("ZREM", parentPrefix .. "waiting-children", parentId)
+-
+-          if hard then  
+-            if parentPrefix == baseKey then
+-              removeParentDependencyKey(missedParentKey, hard, nil, baseKey)
+-              rcall("DEL", missedParentKey, missedParentKey .. ':logs',
+-                missedParentKey .. ':dependencies', missedParentKey .. ':processed')
+-            else
+-              moveParentToWait(parentPrefix, parentId)
+-            end
+-          else
+-            moveParentToWait(parentPrefix, parentId, true)
+-          end
+-        end
+-      end
+-    end  
+   end
+ end
++
+diff --git a/src/commands/removeJob-1.lua b/src/commands/removeJob-1.lua
+index df64400be7..2dfc16a4bf 100644
+--- a/src/commands/removeJob-1.lua
++++ b/src/commands/removeJob-1.lua
+@@ -42,44 +42,35 @@ local function isLocked( prefix, jobId)
+     return true
+ end
+ 
+-local function removeJob( prefix, jobId, parentKey)
++local function removeJob( prefix, jobId)
+     local jobKey = prefix .. jobId;
+ 
+-    removeParentDependencyKey(jobKey, false, parentKey)
++    removeParentDependencyKey(jobKey)
++
++    rcall("LREM", prefix .. "active", 0, jobId)
++    rcall("LREM", prefix .. "wait", 0, jobId)
++    rcall("ZREM", prefix .. "delayed", jobId)
++    rcall("LREM", prefix .. "paused", 0, jobId)
++    rcall("ZREM", prefix .. "completed", jobId)
++    rcall("ZREM", prefix .. "failed", jobId)
++    rcall("ZREM", prefix .. "priority", jobId)
++    rcall("ZREM", prefix .. "waiting-children", jobId)
++    rcall("DEL", jobKey, jobKey .. ":logs", jobKey .. ":processed")
+ 
+     -- Check if this job has children
+     -- If so, we are going to try to remove the children recursively in deep first way because
+     -- if some job is locked we must exit with and error.
+-    --local countProcessed = rcall("HLEN", jobKey .. ":processed")
+-    local processed = rcall("HGETALL", jobKey .. ":processed")
+-
+-    if (#processed > 0) then
+-        for i = 1, #processed, 2 do
+-            local childJobId = getJobIdFromKey(processed[i])
+-            local childJobPrefix = getJobKeyPrefix(processed[i], childJobId)
+-            removeJob( childJobPrefix, childJobId, jobKey )
+-        end
+-    end
+-
+     local dependencies = rcall("SMEMBERS", jobKey .. ":dependencies")
+     if (#dependencies > 0) then
+         for i, childJobKey in ipairs(dependencies) do
+             -- We need to get the jobId for this job.
+             local childJobId = getJobIdFromKey(childJobKey)
+             local childJobPrefix = getJobKeyPrefix(childJobKey, childJobId)
+-            removeJob( childJobPrefix, childJobId, jobKey )
++            removeJob( childJobPrefix, childJobId )
+         end
+     end
+ 
+-    rcall("LREM", prefix .. "active", 0, jobId)
+-    rcall("LREM", prefix .. "wait", 0, jobId)
+-    rcall("ZREM", prefix .. "delayed", jobId)
+-    rcall("LREM", prefix .. "paused", 0, jobId)
+-    rcall("ZREM", prefix .. "completed", jobId)
+-    rcall("ZREM", prefix .. "failed", jobId)
+-    rcall("ZREM", prefix .. "priority", jobId)
+-    rcall("ZREM", prefix .. "waiting-children", jobId)
+-    rcall("DEL", jobKey, jobKey .. ":logs", jobKey .. ":dependencies", jobKey .. ":processed")
++    rcall("DEL", jobKey .. ":dependencies")
+ 
+     -- -- delete keys related to rate limiter
+         -- local limiterIndexTable = KEYS[10] .. ":index"
+diff --git a/tests/test_flow.ts b/tests/test_flow.ts
+index be60d04e52..1457d9e754 100644
+--- a/tests/test_flow.ts
++++ b/tests/test_flow.ts
+@@ -1764,89 +1764,6 @@ describe('flows', () => {
+       await removeAllQueueData(new IORedis(), parentQueueName);
+     });
+ 
+-    describe('when there are processed children', () => {
+-      it('removes all children when removing a parent', async () => {
+-        const parentQueueName = `parent-queue-${v4()}`;
+-        const name = 'child-job';
+-
+-        const flow = new FlowProducer({ connection });
+-        const tree = await flow.add({
+-          name: 'parent-job',
+-          queueName: parentQueueName,
+-          data: {},
+-          children: [
+-            { name, data: { idx: 0, foo: 'bar' }, queueName },
+-            {
+-              name,
+-              data: { idx: 0, foo: 'baz' },
+-              queueName,
+-              children: [{ name, data: { idx: 0, foo: 'qux' }, queueName }],
+-            },
+-          ],
+-        });
+-
+-        expect(await tree.job.getState()).to.be.equal('waiting-children');
+-
+-        expect(await tree.children[0].job.getState()).to.be.equal('waiting');
+-        expect(await tree.children[1].job.getState()).to.be.equal(
+-          'waiting-children',
+-        );
+-
+-        expect(await tree.children[1].children[0].job.getState()).to.be.equal(
+-          'waiting',
+-        );
+-
+-        for (let i = 0; i < tree.children.length; i++) {
+-          const child = tree.children[i];
+-          const childJob = await Job.fromId(queue, child.job.id);
+-          expect(childJob.parent).to.deep.equal({
+-            id: tree.job.id,
+-            queueKey: `bull:${parentQueueName}`,
+-          });
+-        }
+-
+-        const parentWorker = new Worker(parentQueueName, async () => {}, {
+-          connection,
+-        });
+-        const childrenWorker = new Worker(
+-          queueName,
+-          async () => {
+-            await delay(10);
+-          },
+-          {
+-            connection,
+-          },
+-        );
+-        await parentWorker.waitUntilReady();
+-        await childrenWorker.waitUntilReady();
+-
+-        const completing = new Promise(resolve => {
+-          parentWorker.on('completed', resolve);
+-        });
+-
+-        await completing;
+-        await tree.job.remove();
+-
+-        const parentQueue = new Queue(parentQueueName, { connection });
+-        const parentJob = await Job.fromId(parentQueue, tree.job.id);
+-        expect(parentJob).to.be.undefined;
+-
+-        for (let i = 0; i < tree.children.length; i++) {
+-          const child = tree.children[i];
+-          const childJob = await Job.fromId(queue, child.job.id);
+-          expect(childJob).to.be.undefined;
+-        }
+-
+-        expect(await tree.children[0].job.getState()).to.be.equal('unknown');
+-        expect(await tree.children[1].job.getState()).to.be.equal('unknown');
+-        expect(await tree.job.getState()).to.be.equal('unknown');
+-
+-        await flow.close();
+-        await parentQueue.close();
+-        await removeAllQueueData(new IORedis(), parentQueueName);
+-      });
+-    });
+-
+     it('should not remove anything if there is a locked job in the tree', async () => {
+       const parentQueueName = `parent-queue-${v4()}`;
+       const name = 'child-job';

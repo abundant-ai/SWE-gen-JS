@@ -1,0 +1,264 @@
+diff --git a/package.json b/package.json
+index 508228d..bf45655 100644
+--- a/package.json
++++ b/package.json
+@@ -44,6 +44,7 @@
+ 		"mimic-response": "^1.0.0",
+ 		"p-cancelable": "^0.5.0",
+ 		"p-timeout": "^2.0.1",
++		"timed-out": "^4.0.1",
+ 		"to-readable-stream": "^1.0.0",
+ 		"url-parse-lax": "^3.0.0"
+ 	},
+diff --git a/source/as-promise.js b/source/as-promise.js
+index 8473edd..ebd66a7 100644
+--- a/source/as-promise.js
++++ b/source/as-promise.js
+@@ -3,10 +3,15 @@ const EventEmitter = require('events');
+ const getStream = require('get-stream');
+ const is = require('@sindresorhus/is');
+ const PCancelable = require('p-cancelable');
++const pTimeout = require('p-timeout');
+ const requestAsEventEmitter = require('./request-as-event-emitter');
+-const {HTTPError, ParseError, ReadError} = require('./errors');
++const {HTTPError, ParseError, ReadError, RequestError} = require('./errors');
+ 
+ module.exports = options => {
++	const timeoutFn = requestPromise => options.gotTimeout && options.gotTimeout.request ?
++		pTimeout(requestPromise, options.gotTimeout.request, new RequestError({message: 'Request timed out', code: 'ETIMEDOUT'}, options)) :
++		requestPromise;
++
+ 	const proxy = new EventEmitter();
+ 
+ 	const cancelable = new PCancelable((resolve, reject, onCancel) => {
+@@ -78,7 +83,7 @@ module.exports = options => {
+ 		emitter.on('downloadProgress', proxy.emit.bind(proxy, 'downloadProgress'));
+ 	});
+ 
+-	const promise = cancelable;
++	const promise = timeoutFn(cancelable);
+ 
+ 	promise.cancel = cancelable.cancel.bind(cancelable);
+ 
+diff --git a/source/as-stream.js b/source/as-stream.js
+index a77cdbe..d4d3d92 100644
+--- a/source/as-stream.js
++++ b/source/as-stream.js
+@@ -3,7 +3,7 @@ const {PassThrough} = require('stream');
+ const duplexer3 = require('duplexer3');
+ const is = require('@sindresorhus/is');
+ const requestAsEventEmitter = require('./request-as-event-emitter');
+-const {HTTPError, ReadError} = require('./errors');
++const {HTTPError, ReadError, RequestError} = require('./errors');
+ 
+ module.exports = options => {
+ 	options.stream = true;
+@@ -11,6 +11,13 @@ module.exports = options => {
+ 	const input = new PassThrough();
+ 	const output = new PassThrough();
+ 	const proxy = duplexer3(input, output);
++	let timeout;
++
++	if (options.gotTimeout && options.gotTimeout.request) {
++		timeout = setTimeout(() => {
++			proxy.emit('error', new RequestError({message: 'Request timed out', code: 'ETIMEDOUT'}, options));
++		}, options.gotTimeout.request);
++	}
+ 
+ 	if (options.json) {
+ 		throw new Error('Got can not be used as a stream when the `json` option is used');
+@@ -46,6 +53,8 @@ module.exports = options => {
+ 	});
+ 
+ 	emitter.on('response', response => {
++		clearTimeout(timeout);
++
+ 		const {statusCode} = response;
+ 
+ 		response.on('error', error => {
+diff --git a/source/request-as-event-emitter.js b/source/request-as-event-emitter.js
+index fd2f39c..0458f5a 100644
+--- a/source/request-as-event-emitter.js
++++ b/source/request-as-event-emitter.js
+@@ -6,7 +6,7 @@ const URLGlobal = typeof URL === 'undefined' ? require('url').URL : URL; // TODO
+ const urlLib = require('url');
+ const CacheableRequest = require('cacheable-request');
+ const is = require('@sindresorhus/is');
+-const timedOut = require('./timed-out');
++const timedOut = require('timed-out');
+ const getBodySize = require('./get-body-size');
+ const getResponse = require('./get-response');
+ const {CacheError, UnsupportedProtocolError, MaxRedirectsError, RequestError} = require('./errors');
+diff --git a/source/timed-out.js b/source/timed-out.js
+deleted file mode 100644
+index 2fdfd83..0000000
+--- a/source/timed-out.js
++++ /dev/null
+@@ -1,78 +0,0 @@
+-'use strict';
+-
+-// Forked from https://github.com/floatdrop/timed-out
+-
+-module.exports = function (req, time) {
+-	if (req.timeoutTimer) {
+-		return req;
+-	}
+-
+-	const delays = isNaN(time) ? time : {socket: time, connect: time};
+-	const host = req._headers ? (' to ' + req._headers.host) : '';
+-
+-	function throwESOCKETTIMEDOUT() {
+-		req.abort();
+-		const e = new Error('Socket timed out on request' + host);
+-		e.code = 'ESOCKETTIMEDOUT';
+-		req.emit('error', e);
+-	}
+-
+-	function throwETIMEDOUT() {
+-		req.abort();
+-		const e = new Error('Connection timed out on request' + host);
+-		e.code = 'ETIMEDOUT';
+-		req.emit('error', e);
+-	}
+-
+-	if (delays.connect !== undefined) {
+-		req.timeoutTimer = setTimeout(throwETIMEDOUT, delays.connect);
+-	}
+-
+-	if (delays.request !== undefined) {
+-		req.requestTimeoutTimer = setTimeout(() => {
+-			clear();
+-
+-			if (req.connection.connecting) {
+-				throwESOCKETTIMEDOUT();
+-			} else {
+-				throwETIMEDOUT();
+-			}
+-		}, delays.request);
+-	}
+-
+-	// Clear the connection timeout timer once a socket is assigned to the
+-	// request and is connected.
+-	req.on('socket', socket => {
+-		// Socket may come from Agent pool and may be already connected.
+-		if (!(socket.connecting || socket._connecting)) {
+-			connect();
+-			return;
+-		}
+-
+-		socket.once('connect', connect);
+-	});
+-
+-	function clear() {
+-		if (req.timeoutTimer) {
+-			clearTimeout(req.timeoutTimer);
+-			req.timeoutTimer = null;
+-		}
+-	}
+-
+-	function connect() {
+-		clear();
+-
+-		if (delays.socket !== undefined) {
+-			// Abort the request if there is no activity on the socket for more
+-			// than `delays.socket` milliseconds.
+-			req.setTimeout(delays.socket, throwESOCKETTIMEDOUT);
+-		}
+-
+-		req.on('end', () => {
+-			// The request is finished, cancel request timeout.
+-			clearTimeout(req.requestTimeoutTimer);
+-		});
+-	}
+-
+-	return req.on('error', clear);
+-};
+diff --git a/test/timeout.js b/test/timeout.js
+index 7780e37..4cd2e39 100644
+--- a/test/timeout.js
++++ b/test/timeout.js
+@@ -3,14 +3,12 @@ import pEvent from 'p-event';
+ import got from '../source';
+ import {createServer} from './helpers/server';
+ 
+-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+ let s;
+ 
+ test.before('setup', async () => {
+ 	s = await createServer();
+ 
+-	s.on('/', async (req, res) => {
+-		await sleep(20);
++	s.on('/', (req, res) => {
+ 		res.statusCode = 200;
+ 		res.end('OK');
+ 	});
+@@ -24,7 +22,7 @@ test('timeout option', async t => {
+ 		retries: 0
+ 	}));
+ 
+-	t.is(err.code, 'ESOCKETTIMEDOUT');
++	t.is(err.code, 'ETIMEDOUT');
+ });
+ 
+ test('timeout option as object', async t => {
+@@ -33,7 +31,7 @@ test('timeout option as object', async t => {
+ 		retries: 0
+ 	}));
+ 
+-	t.is(err.code, 'ESOCKETTIMEDOUT');
++	t.is(err.code, 'ETIMEDOUT');
+ });
+ 
+ test('socket timeout', async t => {
+@@ -51,49 +49,11 @@ test('connection, request timeout', async t => {
+ 		retries: 0
+ 	}));
+ 
+-	t.is(err.code, 'ESOCKETTIMEDOUT');
+-});
+-
+-test('retries on timeout, ESOCKETTIMEDOUT', async t => {
+-	let tried = false;
+-
+-	const err = await t.throws(got(`${s.url}/404`, {
+-		timeout: 1,
+-		retries: () => {
+-			if (tried) {
+-				return 0;
+-			}
+-
+-			tried = true;
+-			return 1;
+-		}
+-	}));
+-
+-	t.true(tried);
+-	t.is(err.code, 'ESOCKETTIMEDOUT');
+-});
+-
+-test('retries on timeout, ETIMEDOUT', async t => {
+-	let tried = false;
+-
+-	const err = await t.throws(got(`${s.url}/404`, {
+-		timeout: 15,
+-		retries: () => {
+-			if (tried) {
+-				return 0;
+-			}
+-
+-			tried = true;
+-			return 1;
+-		}
+-	}));
+-
+-	t.true(tried);
+ 	t.is(err.code, 'ETIMEDOUT');
+ });
+ 
+ test('timeout with streams', async t => {
+ 	const stream = got.stream(s.url, {timeout: 1, retries: 0});
+ 	const err = await t.throws(pEvent(stream, 'response'));
+-	t.is(err.code, 'ESOCKETTIMEDOUT');
++	t.is(err.code, 'ETIMEDOUT');
+ });

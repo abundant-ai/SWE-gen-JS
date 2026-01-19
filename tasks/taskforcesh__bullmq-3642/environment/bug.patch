@@ -1,0 +1,493 @@
+diff --git a/docs/gitbook/guide/queues/removing-jobs.md b/docs/gitbook/guide/queues/removing-jobs.md
+index e02fb216e4..a8159fa636 100644
+--- a/docs/gitbook/guide/queues/removing-jobs.md
++++ b/docs/gitbook/guide/queues/removing-jobs.md
+@@ -41,8 +41,6 @@ const deletedJobIds = await queue.clean(
+ 
+ Completely obliterates a queue and all of its contents.
+ 
+-{% tabs %}
+-{% tab title="TypeScript" %}
+ ```typescript
+ import { Queue } from 'bullmq';
+ 
+@@ -50,83 +48,6 @@ const queue = new Queue('paint');
+ 
+ await queue.obliterate();
+ ```
+-{% endtab %}
+-
+-{% tab title="Python" %}
+-```python
+-import asyncio
+-from bullmq import Queue
+-
+-async def main():
+-    queue = Queue('paint')
+-    
+-    await queue.obliterate()
+-    await queue.close()
+-
+-asyncio.run(main())
+-```
+-{% endtab %}
+-
+-{% tab title="PHP" %}
+-```php
+-<?php
+-use BullMQ\Queue;
+-
+-$queue = new Queue('paint');
+-
+-$queue->obliterate();
+-
+-$queue->close();
+-?>
+-```
+-{% endtab %}
+-{% endtabs %}
+-
+-For more advanced scenarios where you need to force obliteration even with active jobs:
+-
+-{% tabs %}
+-{% tab title="TypeScript" %}
+-```typescript
+-import { Queue } from 'bullmq';
+-
+-const queue = new Queue('paint');
+-
+-// Force obliteration even with active jobs
+-await queue.obliterate({ force: true });
+-```
+-{% endtab %}
+-
+-{% tab title="Python" %}
+-```python
+-import asyncio
+-from bullmq import Queue
+-
+-async def main():
+-    queue = Queue('paint')
+-    
+-    # Force obliteration even with active jobs
+-    await queue.obliterate(force=True)
+-    await queue.close()
+-
+-asyncio.run(main())
+-```
+-{% endtab %}
+-
+-{% tab title="PHP" %}
+-```php
+-<?php
+-use BullMQ\Queue;
+-
+-$queue = new Queue('paint');
+-
+-// Force obliteration even with active jobs
+-$queue->obliterate(['force' => true]);
+-
+-$queue->close();
+-?>
+-```
+-{% endtab %}
+-{% endtabs %}
+ 
+ {% hint style="warning" %}
+ Parent jobs in queues different from the one being obliterated will either stay in **waiting-children** if they
+diff --git a/elixir/test/bullmq/worker_cancellation_test.exs b/elixir/test/bullmq/worker_cancellation_test.exs
+index 3c5b8f3af0..87d4f5cf5c 100644
+--- a/elixir/test/bullmq/worker_cancellation_test.exs
++++ b/elixir/test/bullmq/worker_cancellation_test.exs
+@@ -366,8 +366,6 @@ defmodule BullMQ.WorkerCancellationTest do
+             {:ok, "task completed"}
+           end)
+ 
+-        task_ref = task.ref
+-
+         # Wait for either completion or cancellation
+         receive do
+           {:cancel, ^cancel_token, reason} ->
+@@ -375,9 +373,7 @@ defmodule BullMQ.WorkerCancellationTest do
+             Task.shutdown(task, :brutal_kill)
+             {:error, {:cancelled, reason}}
+ 
+-          {^task_ref, result} ->
+-            # Task.async sends {ref, result}
+-            Process.demonitor(task_ref, [:flush])
++          {^task, result} ->
+             send(test_pid, {:task_completed, job.id})
+             result
+         end
+diff --git a/python/bullmq/scripts.py b/python/bullmq/scripts.py
+index a03931d574..0941fb2940 100644
+--- a/python/bullmq/scripts.py
++++ b/python/bullmq/scripts.py
+@@ -528,7 +528,7 @@ class Scripts:
+         Remove a queue completely
+         """
+         keys = self.getKeys(['meta', ''])
+-        result = await self.commands["obliterate"](keys, args=[count, "force" if force else ""])
++        result = await self.commands["obliterate"](keys, args=[count, force or ""])
+         if (result < 0):
+             if (result == -1):
+                 raise Exception("Cannot obliterate non-paused queue")
+diff --git a/python/bullmq/types/deduplication_options.py b/python/bullmq/types/deduplication_options.py
+index b297b04162..3cc17b00c9 100644
+--- a/python/bullmq/types/deduplication_options.py
++++ b/python/bullmq/types/deduplication_options.py
+@@ -1,4 +1,4 @@
+-from typing import TypedDict
++from typing import TypedDict, Required
+ 
+ 
+ class DeduplicationOptions(TypedDict, total=False):
+@@ -6,7 +6,7 @@ class DeduplicationOptions(TypedDict, total=False):
+     Deduplication options.
+     """
+ 
+-    id: str
++    id: Required[str]
+     """
+     Identifier for deduplication.
+     
+diff --git a/python/bullmq/worker.py b/python/bullmq/worker.py
+index 46c5e76a75..625d905d5f 100644
+--- a/python/bullmq/worker.py
++++ b/python/bullmq/worker.py
+@@ -204,8 +204,6 @@ class Worker(EventEmitter):
+ 
+     async def processJob(self, job: Job, token: str):
+         try:
+-            self.emit("active", job, "waiting")
+-
+             self.jobs.add((job, token))
+             
+             if job.deferredFailure:
+diff --git a/python/tests/bulk_test.py b/python/tests/bulk_test.py
+index 9abbd27ae6..fe565b22b4 100644
+--- a/python/tests/bulk_test.py
++++ b/python/tests/bulk_test.py
+@@ -6,24 +6,23 @@ https://bbc.github.io/cloudfit-public-docs/asyncio/testing.html
+ 
+ import unittest
+ import os
+-import redis.asyncio as redis
+ 
+ from asyncio import Future
+ from bullmq import Queue, Job, Worker
+ from uuid import uuid4
+ 
+-queueName = ""
++queueName = f"__test_queue__{uuid4().hex}"
+ prefix = os.environ.get('BULLMQ_TEST_PREFIX') or "bull"
+ 
+ class TestJob(unittest.IsolatedAsyncioTestCase):
+ 
+-    def setUp(self):
++    async def asyncSetUp(self):
+         print("Setting up test queue")
+-        queueName = f"__test_queue__{uuid4().hex}"
+-
+-    async def asyncTearDown(self):
+-        connection = redis.Redis(host='localhost')
+-        await connection.flushdb()
++        # Delete test queue
++        queue = Queue(queueName, {"prefix": prefix})
++        await queue.pause()
++        await queue.obliterate()
++        await queue.close()
+ 
+     async def test_process_jobs(self):
+         name = "test"
+diff --git a/python/tests/deduplication_test.py b/python/tests/deduplication_test.py
+index ae4ed36ee2..46f61e88ae 100644
+--- a/python/tests/deduplication_test.py
++++ b/python/tests/deduplication_test.py
+@@ -8,22 +8,21 @@ from bullmq import Queue
+ from uuid import uuid4
+ 
+ import asyncio
+-import redis.asyncio as redis
+ import unittest
+ import os
+ 
+-queueName = ""
++queueName = f"__test_dedup__{uuid4().hex}"
+ prefix = os.environ.get('BULLMQ_TEST_PREFIX') or "bull"
+ 
+ class TestDeduplication(unittest.IsolatedAsyncioTestCase):
+ 
+-    def setUp(self):
+-        print("Setting up test queue")
+-        queueName = f"__test_queue__{uuid4().hex}"
+-
+-    async def asyncTearDown(self):
+-        connection = redis.Redis(host='localhost')
+-        await connection.flushdb()
++    async def asyncSetUp(self):
++        print("Setting up deduplication test queue")
++        # Delete test queue
++        queue = Queue(queueName, {"prefix": prefix})
++        await queue.pause()
++        await queue.obliterate()
++        await queue.close()
+ 
+     async def test_simple_mode_deduplication(self):
+         """Test simple mode where deduplication lasts until job is completed"""
+diff --git a/python/tests/delay_test.py b/python/tests/delay_test.py
+index df67f7eaf0..f5d54b53c5 100644
+--- a/python/tests/delay_test.py
++++ b/python/tests/delay_test.py
+@@ -7,24 +7,23 @@ https://bbc.github.io/cloudfit-public-docs/asyncio/testing.html
+ import unittest
+ import time
+ import os
+-import redis.asyncio as redis
+ 
+ from asyncio import Future
+ from bullmq import Queue, Job, Worker
+ from uuid import uuid4
+ 
+-queueName = ""
++queueName = f"__test_queue__{uuid4().hex}"
+ prefix = os.environ.get('BULLMQ_TEST_PREFIX') or "bull"
+ 
+ class TestJob(unittest.IsolatedAsyncioTestCase):
+ 
+-    def setUp(self):
++    async def asyncSetUp(self):
+         print("Setting up test queue")
+-        queueName = f"__test_queue__{uuid4().hex}"
+-
+-    async def asyncTearDown(self):
+-        connection = redis.Redis(host='localhost')
+-        await connection.flushdb()
++        # Delete test queue
++        queue = Queue(queueName, {"prefix": prefix})
++        await queue.pause()
++        await queue.obliterate()
++        await queue.close()
+ 
+     async def test_progress_delayed_job_only_after_delayed_time(self):
+         delay = 1000
+diff --git a/python/tests/flow_test.py b/python/tests/flow_test.py
+index 470b76dc31..07639c9a99 100644
+--- a/python/tests/flow_test.py
++++ b/python/tests/flow_test.py
+@@ -6,26 +6,25 @@ https://bbc.github.io/cloudfit-public-docs/asyncio/testing.html
+ 
+ import asyncio
+ import os
+-import redis.asyncio as redis
+-
+ from asyncio import Future
++
+ from bullmq import Queue, Job, FlowProducer, Worker
+ from uuid import uuid4
+ 
+ import unittest
+ 
+-queue_name = ""
++queue_name = f"__test_queue__{uuid4().hex}"
+ prefix = os.environ.get('BULLMQ_TEST_PREFIX') or "bull"
+ 
+ class TestJob(unittest.IsolatedAsyncioTestCase):
+ 
+-    def setUp(self):
++    async def asyncSetUp(self):
+         print("Setting up test queue")
+-        queueName = f"__test_queue__{uuid4().hex}"
+-
+-    async def asyncTearDown(self):
+-        connection = redis.Redis(host='localhost')
+-        await connection.flushdb()
++        # Delete test queue
++        queue = Queue(queue_name, {"prefix": prefix})
++        await queue.pause()
++        await queue.obliterate()
++        await queue.close()
+ 
+     async def test_should_process_children_before_parent(self):
+         child_job_name = 'child-job'
+diff --git a/python/tests/job_test.py b/python/tests/job_test.py
+index ec7ec94c85..49ccd254ce 100644
+--- a/python/tests/job_test.py
++++ b/python/tests/job_test.py
+@@ -6,23 +6,22 @@ https://bbc.github.io/cloudfit-public-docs/asyncio/testing.html
+ 
+ import unittest
+ import os
+-import redis.asyncio as redis
+ 
+ from bullmq import Queue, Job
+ from uuid import uuid4
+ 
+-queueName = ""
++queueName = f"__test_queue__{uuid4().hex}"
+ prefix = os.environ.get('BULLMQ_TEST_PREFIX') or "bull"
+ 
+ class TestJob(unittest.IsolatedAsyncioTestCase):
+ 
+-    def setUp(self):
++    async def asyncSetUp(self):
+         print("Setting up test queue")
+-        queueName = f"__test_queue__{uuid4().hex}"
+-
+-    async def asyncTearDown(self):
+-        connection = redis.Redis(host='localhost')
+-        await connection.flushdb()
++        # Delete test queue
++        queue = Queue(queueName, {"prefix": prefix})
++        await queue.pause()
++        await queue.obliterate()
++        await queue.close()
+ 
+     async def test_set_and_get_progress_as_number(self):
+         queue = Queue(queueName, {"prefix": prefix})
+diff --git a/python/tests/queue_test.py b/python/tests/queue_test.py
+index a1fc6364bb..deb94abe3e 100644
+--- a/python/tests/queue_test.py
++++ b/python/tests/queue_test.py
+@@ -14,18 +14,18 @@ import unittest
+ import os
+ import time
+ 
+-queueName = ""
++queueName = f"__test_queue__{uuid4().hex}"
+ prefix = os.environ.get('BULLMQ_TEST_PREFIX') or "bull"
+ 
+ class TestQueue(unittest.IsolatedAsyncioTestCase):
+ 
+-    def setUp(self):
++    async def asyncSetUp(self):
+         print("Setting up test queue")
+-        queueName = f"__test_queue__{uuid4().hex}"
+-
+-    async def asyncTearDown(self):
+-        connection = redis.Redis(host='localhost')
+-        await connection.flushdb()
++        # Delete test queue
++        queue = Queue(queueName, {"prefix": prefix})
++        await queue.pause()
++        await queue.obliterate()
++        await queue.close()
+ 
+     async def test_connection_str(self):
+         queue = Queue(queueName, {"connection": "redis://localhost:6379", "prefix": prefix})
+@@ -475,85 +475,5 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(job.id, "1")
+         await queue.close()
+ 
+-    async def test_obliterate_with_force_false_should_fail_with_active_jobs(self):
+-        """Test that obliterate without force fails when there are active jobs"""
+-        queue = Queue(queueName, {"prefix": prefix})
+-        
+-        # Add jobs
+-        await queue.add("test-job", {"foo": "bar"}, {})
+-        await queue.add("test-job", {"qux": "baz"}, {})
+-        
+-        # Create a worker that processes jobs slowly
+-        async def process(job: Job, token: str):
+-            await asyncio.sleep(1)
+-            return "done"
+-        
+-        worker = Worker(queueName, process, {"prefix": prefix, "autorun": False})
+-
+-        active_event = Future()
+-        worker.on("active", lambda job, result: active_event.set_result(None))
+-
+-        asyncio.ensure_future(worker.run())
+-
+-        await active_event
+-        
+-        # Try to obliterate without force - should fail
+-        with self.assertRaises(Exception) as context:
+-            await queue.obliterate(force=False)
+-        
+-        self.assertIn("Cannot obliterate queue with active jobs", str(context.exception))
+-        
+-        await worker.close()
+-        await queue.close()
+-
+-    async def test_obliterate_with_force_true_should_succeed_with_active_jobs(self):
+-        """Test that obliterate with force=True succeeds even with active jobs"""
+-        queue = Queue(queueName, {"prefix": prefix})
+-        
+-        # Add jobs
+-        await queue.add("test-job", {"foo": "bar"}, {})
+-        await queue.add("test-job", {"qux": "baz"}, {})
+-        await queue.add("test-job", {"foo": "bar2"}, {})
+-        
+-        # Create a worker that processes jobs slowly
+-        async def process(job: Job, token: str):
+-            await asyncio.sleep(2)
+-            return "done"
+-        
+-        worker = Worker(queueName, process, {"prefix": prefix, "autorun": False})
+-
+-        active_event = Future()
+-        worker.on("active", lambda job, result: active_event.set_result(None))
+-
+-        asyncio.ensure_future(worker.run())
+-
+-        await active_event
+-        
+-        # Verify there are active jobs
+-        job_counts = await queue.getJobCounts('active')
+-        self.assertGreater(job_counts.get('active', 0), 0)
+-        
+-        # Obliterate with force=True - should succeed
+-        await queue.obliterate(force=True)
+-        
+-        # Verify all keys are deleted
+-        keys = await queue.client.keys(f"{prefix}:{queueName}:*")
+-        self.assertEqual(len(keys), 0)
+-        
+-        await worker.close()
+-        await queue.close()
+-
+-    async def test_obliterate_with_force_true_parameter_conversion(self):
+-        """Test that force=True is properly converted to string for Redis"""
+-        queue = Queue(queueName, {"prefix": prefix})
+-        
+-        # Add a few jobs
+-        await queue.add("test-job", {"foo": "bar"}, {})
+-        await queue.add("test-job", {"foo": "baz"}, {})
+-        
+-        await queue.obliterate(force=True)
+-        
+-        await queue.close()
+-
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/python/tests/worker_test.py b/python/tests/worker_test.py
+index e9d993a08b..07b11cdec4 100644
+--- a/python/tests/worker_test.py
++++ b/python/tests/worker_test.py
+@@ -15,18 +15,18 @@ import unittest
+ import time
+ import os
+ 
+-queueName = ""
++queueName = f"__test_queue__{uuid4().hex}"
+ prefix = os.environ.get('BULLMQ_TEST_PREFIX') or "bull"
+ 
+ class TestWorker(unittest.IsolatedAsyncioTestCase):
+ 
+-    def setUp(self):
++    async def asyncSetUp(self):
+         print("Setting up test queue")
+-        queueName = f"__test_queue__{uuid4().hex}"
+-
+-    async def asyncTearDown(self):
+-        connection = redis.Redis(host='localhost')
+-        await connection.flushdb()
++        # Delete test queue
++        queue = Queue(queueName, {"prefix": prefix})
++        await queue.pause()
++        await queue.obliterate()
++        await queue.close()
+ 
+     async def test_process_jobs(self):
+         queue = Queue(queueName, {"prefix": prefix})

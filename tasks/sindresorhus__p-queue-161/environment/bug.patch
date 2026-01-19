@@ -1,0 +1,744 @@
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 441975c..41fe626 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -10,10 +10,11 @@ jobs:
+       fail-fast: false
+       matrix:
+         node-version:
+-          - 16
++          - 14
++          - 12
+     steps:
+       - uses: actions/checkout@v2
+-      - uses: actions/setup-node@v2
++      - uses: actions/setup-node@v1
+         with:
+           node-version: ${{ matrix.node-version }}
+       - run: npm install
+diff --git a/readme.md b/readme.md
+index cd92ce8..dc32de4 100644
+--- a/readme.md
++++ b/readme.md
+@@ -118,7 +118,7 @@ Note: If your items can potentially throw an exception, you must handle those er
+ 
+ Type: `Function`
+ 
+-Promise-returning/async function. When executed, it will receive `{signal}` as the first argument.
++Promise-returning/async function.
+ 
+ #### options
+ 
+@@ -131,41 +131,6 @@ Default: `0`
+ 
+ Priority of operation. Operations with greater priority will be scheduled first.
+ 
+-##### signal
+-
+-[`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal) for cancellation of the operation. When aborted, it will be removed from the queue and the `queue.add()` call will reject with an `AbortError`. If the operation is already running, the signal will need to be handled by the operation itself.
+-
+-```js
+-import PQueue, {AbortError} from 'p-queue';
+-import got, {CancelError} from 'got';
+-
+-const queue = new PQueue();
+-
+-const controller = new AbortController();
+-
+-try {
+-	await queue.add(({signal}) => {
+-		const request = got('https://sindresorhus.com');
+-
+-		signal.addEventListener('abort', () => {
+-			request.cancel();
+-		});
+-
+-		try {
+-			return await request;
+-		} catch (error) {
+-			if (!(error instanceof CancelError)) {
+-				throw error;
+-			}
+-		}
+-	}, {signal: controller.signal});
+-} catch (error) {
+-	if (!(error instanceof AbortError)) {
+-		throw error;
+-	}
+-}
+-```
+-
+ #### .addAll(fns, options?)
+ 
+ Same as `.add()`, but accepts an array of sync or async functions and returns a promise that resolves when all functions are resolved.
+@@ -362,10 +327,6 @@ await queue.add(() => delay(600));
+ //=> 'Task is completed.  Size: 0  Pending: 0'
+ ```
+ 
+-### AbortError
+-
+-The error thrown by `queue.add()` when a job is aborted before it is run. See [`signal`](#signal).
+-
+ ## Advanced example
+ 
+ A more advanced example to help you understand the flow.
+diff --git a/source/index.ts b/source/index.ts
+index 2965430..38e8ae5 100644
+--- a/source/index.ts
++++ b/source/index.ts
+@@ -2,62 +2,57 @@ import EventEmitter from 'eventemitter3';
+ import pTimeout, {TimeoutError} from 'p-timeout';
+ import {Queue, RunFunction} from './queue.js';
+ import PriorityQueue from './priority-queue.js';
+-import {QueueAddOptions, Options, TaskOptions} from './options.js';
++import {QueueAddOptions, DefaultAddOptions, Options} from './options.js';
+ 
+ type ResolveFunction<T = void> = (value?: T | PromiseLike<T>) => void;
+ 
+ type Task<TaskResultType> =
+-	| ((options: TaskOptions) => PromiseLike<TaskResultType>)
+-	| ((options: TaskOptions) => TaskResultType);
++	| (() => PromiseLike<TaskResultType>)
++	| (() => TaskResultType);
+ 
+ // eslint-disable-next-line @typescript-eslint/no-empty-function
+ const empty = (): void => {};
+ 
+ const timeoutError = new TimeoutError();
+ 
+-/**
+-The error thrown by `queue.add()` when a job is aborted before it is run. See `signal`.
+-*/
+-export class AbortError extends Error {}
+-
+ /**
+ Promise queue with concurrency control.
+ */
+-export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsType> = PriorityQueue, EnqueueOptionsType extends QueueAddOptions = QueueAddOptions> extends EventEmitter<'active' | 'idle' | 'add' | 'next' | 'completed' | 'error'> {
+-	readonly #carryoverConcurrencyCount: boolean;
++export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsType> = PriorityQueue, EnqueueOptionsType extends QueueAddOptions = DefaultAddOptions> extends EventEmitter<'active' | 'idle' | 'add' | 'next' | 'completed' | 'error'> {
++	private readonly _carryoverConcurrencyCount: boolean;
+ 
+-	readonly #isIntervalIgnored: boolean;
++	private readonly _isIntervalIgnored: boolean;
+ 
+-	#intervalCount = 0;
++	private _intervalCount = 0;
+ 
+-	readonly #intervalCap: number;
++	private readonly _intervalCap: number;
+ 
+-	readonly #interval: number;
++	private readonly _interval: number;
+ 
+-	#intervalEnd = 0;
++	private _intervalEnd = 0;
+ 
+-	#intervalId?: NodeJS.Timeout;
++	private _intervalId?: NodeJS.Timeout;
+ 
+-	#timeoutId?: NodeJS.Timeout;
++	private _timeoutId?: NodeJS.Timeout;
+ 
+-	#queue: QueueType;
++	private _queue: QueueType;
+ 
+-	readonly #queueClass: new () => QueueType;
++	private readonly _queueClass: new () => QueueType;
+ 
+-	#pendingCount = 0;
++	private _pendingCount = 0;
+ 
+ 	// The `!` is needed because of https://github.com/microsoft/TypeScript/issues/32194
+-	#concurrency!: number;
++	private _concurrency!: number;
+ 
+-	#isPaused: boolean;
++	private _isPaused: boolean;
+ 
+-	#resolveEmpty: ResolveFunction = empty;
++	private _resolveEmpty: ResolveFunction = empty;
+ 
+-	#resolveIdle: ResolveFunction = empty;
++	private _resolveIdle: ResolveFunction = empty;
+ 
+-	#timeout?: number;
++	private _timeout?: number;
+ 
+-	readonly #throwOnTimeout: boolean;
++	private readonly _throwOnTimeout: boolean;
+ 
+ 	constructor(options?: Options<QueueType, EnqueueOptionsType>) {
+ 		super();
+@@ -81,64 +76,64 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 			throw new TypeError(`Expected \`interval\` to be a finite number >= 0, got \`${options.interval?.toString() ?? ''}\` (${typeof options.interval})`);
+ 		}
+ 
+-		this.#carryoverConcurrencyCount = options.carryoverConcurrencyCount!;
+-		this.#isIntervalIgnored = options.intervalCap === Number.POSITIVE_INFINITY || options.interval === 0;
+-		this.#intervalCap = options.intervalCap;
+-		this.#interval = options.interval;
+-		this.#queue = new options.queueClass!();
+-		this.#queueClass = options.queueClass!;
++		this._carryoverConcurrencyCount = options.carryoverConcurrencyCount!;
++		this._isIntervalIgnored = options.intervalCap === Number.POSITIVE_INFINITY || options.interval === 0;
++		this._intervalCap = options.intervalCap;
++		this._interval = options.interval;
++		this._queue = new options.queueClass!();
++		this._queueClass = options.queueClass!;
+ 		this.concurrency = options.concurrency!;
+-		this.#timeout = options.timeout;
+-		this.#throwOnTimeout = options.throwOnTimeout === true;
+-		this.#isPaused = options.autoStart === false;
++		this._timeout = options.timeout;
++		this._throwOnTimeout = options.throwOnTimeout === true;
++		this._isPaused = options.autoStart === false;
+ 	}
+ 
+-	get #doesIntervalAllowAnother(): boolean {
+-		return this.#isIntervalIgnored || this.#intervalCount < this.#intervalCap;
++	private get _doesIntervalAllowAnother(): boolean {
++		return this._isIntervalIgnored || this._intervalCount < this._intervalCap;
+ 	}
+ 
+-	get #doesConcurrentAllowAnother(): boolean {
+-		return this.#pendingCount < this.#concurrency;
++	private get _doesConcurrentAllowAnother(): boolean {
++		return this._pendingCount < this._concurrency;
+ 	}
+ 
+-	#next(): void {
+-		this.#pendingCount--;
+-		this.#tryToStartAnother();
++	private _next(): void {
++		this._pendingCount--;
++		this._tryToStartAnother();
+ 		this.emit('next');
+ 	}
+ 
+-	#resolvePromises(): void {
+-		this.#resolveEmpty();
+-		this.#resolveEmpty = empty;
++	private _resolvePromises(): void {
++		this._resolveEmpty();
++		this._resolveEmpty = empty;
+ 
+-		if (this.#pendingCount === 0) {
+-			this.#resolveIdle();
+-			this.#resolveIdle = empty;
++		if (this._pendingCount === 0) {
++			this._resolveIdle();
++			this._resolveIdle = empty;
+ 			this.emit('idle');
+ 		}
+ 	}
+ 
+-	#onResumeInterval(): void {
+-		this.#onInterval();
+-		this.#initializeIntervalIfNeeded();
+-		this.#timeoutId = undefined;
++	private _onResumeInterval(): void {
++		this._onInterval();
++		this._initializeIntervalIfNeeded();
++		this._timeoutId = undefined;
+ 	}
+ 
+-	#isIntervalPaused(): boolean {
++	private _isIntervalPaused(): boolean {
+ 		const now = Date.now();
+ 
+-		if (this.#intervalId === undefined) {
+-			const delay = this.#intervalEnd - now;
++		if (this._intervalId === undefined) {
++			const delay = this._intervalEnd - now;
+ 			if (delay < 0) {
+ 				// Act as the interval was done
+ 				// We don't need to resume it here because it will be resumed on line 160
+-				this.#intervalCount = (this.#carryoverConcurrencyCount) ? this.#pendingCount : 0;
++				this._intervalCount = (this._carryoverConcurrencyCount) ? this._pendingCount : 0;
+ 			} else {
+ 				// Act as the interval is pending
+-				if (this.#timeoutId === undefined) {
+-					this.#timeoutId = setTimeout(
++				if (this._timeoutId === undefined) {
++					this._timeoutId = setTimeout(
+ 						() => {
+-							this.#onResumeInterval();
++							this._onResumeInterval();
+ 						},
+ 						delay,
+ 					);
+@@ -151,25 +146,25 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 		return false;
+ 	}
+ 
+-	#tryToStartAnother(): boolean {
+-		if (this.#queue.size === 0) {
++	private _tryToStartAnother(): boolean {
++		if (this._queue.size === 0) {
+ 			// We can clear the interval ("pause")
+ 			// Because we can redo it later ("resume")
+-			if (this.#intervalId) {
+-				clearInterval(this.#intervalId);
++			if (this._intervalId) {
++				clearInterval(this._intervalId);
+ 			}
+ 
+-			this.#intervalId = undefined;
++			this._intervalId = undefined;
+ 
+-			this.#resolvePromises();
++			this._resolvePromises();
+ 
+ 			return false;
+ 		}
+ 
+-		if (!this.#isPaused) {
+-			const canInitializeInterval = !this.#isIntervalPaused();
+-			if (this.#doesIntervalAllowAnother && this.#doesConcurrentAllowAnother) {
+-				const job = this.#queue.dequeue();
++		if (!this._isPaused) {
++			const canInitializeInterval = !this._isIntervalPaused();
++			if (this._doesIntervalAllowAnother && this._doesConcurrentAllowAnother) {
++				const job = this._queue.dequeue();
+ 				if (!job) {
+ 					return false;
+ 				}
+@@ -178,7 +173,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 				job();
+ 
+ 				if (canInitializeInterval) {
+-					this.#initializeIntervalIfNeeded();
++					this._initializeIntervalIfNeeded();
+ 				}
+ 
+ 				return true;
+@@ -188,41 +183,41 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 		return false;
+ 	}
+ 
+-	#initializeIntervalIfNeeded(): void {
+-		if (this.#isIntervalIgnored || this.#intervalId !== undefined) {
++	private _initializeIntervalIfNeeded(): void {
++		if (this._isIntervalIgnored || this._intervalId !== undefined) {
+ 			return;
+ 		}
+ 
+-		this.#intervalId = setInterval(
++		this._intervalId = setInterval(
+ 			() => {
+-				this.#onInterval();
++				this._onInterval();
+ 			},
+-			this.#interval,
++			this._interval,
+ 		);
+ 
+-		this.#intervalEnd = Date.now() + this.#interval;
++		this._intervalEnd = Date.now() + this._interval;
+ 	}
+ 
+-	#onInterval(): void {
+-		if (this.#intervalCount === 0 && this.#pendingCount === 0 && this.#intervalId) {
+-			clearInterval(this.#intervalId);
+-			this.#intervalId = undefined;
++	private _onInterval(): void {
++		if (this._intervalCount === 0 && this._pendingCount === 0 && this._intervalId) {
++			clearInterval(this._intervalId);
++			this._intervalId = undefined;
+ 		}
+ 
+-		this.#intervalCount = this.#carryoverConcurrencyCount ? this.#pendingCount : 0;
+-		this.#processQueue();
++		this._intervalCount = this._carryoverConcurrencyCount ? this._pendingCount : 0;
++		this._processQueue();
+ 	}
+ 
+ 	/**
+ 	Executes all queued functions until it reaches the limit.
+ 	*/
+-	#processQueue(): void {
++	private _processQueue(): void {
+ 		// eslint-disable-next-line no-empty
+-		while (this.#tryToStartAnother()) {}
++		while (this._tryToStartAnother()) {}
+ 	}
+ 
+ 	get concurrency(): number {
+-		return this.#concurrency;
++		return this._concurrency;
+ 	}
+ 
+ 	set concurrency(newConcurrency: number) {
+@@ -230,9 +225,9 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 			throw new TypeError(`Expected \`concurrency\` to be a number from 1 and up, got \`${newConcurrency}\` (${typeof newConcurrency})`);
+ 		}
+ 
+-		this.#concurrency = newConcurrency;
++		this._concurrency = newConcurrency;
+ 
+-		this.#processQueue();
++		this._processQueue();
+ 	}
+ 
+ 	/**
+@@ -241,21 +236,15 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 	async add<TaskResultType>(fn: Task<TaskResultType>, options: Partial<EnqueueOptionsType> = {}): Promise<TaskResultType> {
+ 		return new Promise<TaskResultType>((resolve, reject) => {
+ 			const run = async (): Promise<void> => {
+-				this.#pendingCount++;
+-				this.#intervalCount++;
++				this._pendingCount++;
++				this._intervalCount++;
+ 
+ 				try {
+-					if (options.signal?.aborted) {
+-						// TODO: Use ABORT_ERR code when targeting Node.js 16 (https://nodejs.org/docs/latest-v16.x/api/errors.html#abort_err)
+-						reject(new AbortError('The task was aborted.'));
+-						return;
+-					}
+-
+-					const operation = (this.#timeout === undefined && options.timeout === undefined) ? fn({signal: options.signal}) : pTimeout(
+-						Promise.resolve(fn({signal: options.signal})),
+-						(options.timeout === undefined ? this.#timeout : options.timeout)!,
++					const operation = (this._timeout === undefined && options.timeout === undefined) ? fn() : pTimeout(
++						Promise.resolve(fn()),
++						(options.timeout === undefined ? this._timeout : options.timeout) as number,
+ 						() => {
+-							if (options.throwOnTimeout === undefined ? this.#throwOnTimeout : options.throwOnTimeout) {
++							if (options.throwOnTimeout === undefined ? this._throwOnTimeout : options.throwOnTimeout) {
+ 								reject(timeoutError);
+ 							}
+ 
+@@ -271,11 +260,11 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 					this.emit('error', error);
+ 				}
+ 
+-				this.#next();
++				this._next();
+ 			};
+ 
+-			this.#queue.enqueue(run, options);
+-			this.#tryToStartAnother();
++			this._queue.enqueue(run, options);
++			this._tryToStartAnother();
+ 			this.emit('add');
+ 		});
+ 	}
+@@ -296,13 +285,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 	Start (or resume) executing enqueued tasks within concurrency limit. No need to call this if queue is not paused (via `options.autoStart = false` or by `.pause()` method.)
+ 	*/
+ 	start(): this {
+-		if (!this.#isPaused) {
++		if (!this._isPaused) {
+ 			return this;
+ 		}
+ 
+-		this.#isPaused = false;
++		this._isPaused = false;
+ 
+-		this.#processQueue();
++		this._processQueue();
+ 		return this;
+ 	}
+ 
+@@ -310,14 +299,14 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 	Put queue execution on hold.
+ 	*/
+ 	pause(): void {
+-		this.#isPaused = true;
++		this._isPaused = true;
+ 	}
+ 
+ 	/**
+ 	Clear the queue.
+ 	*/
+ 	clear(): void {
+-		this.#queue = new this.#queueClass();
++		this._queue = new this._queueClass();
+ 	}
+ 
+ 	/**
+@@ -327,13 +316,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 	*/
+ 	async onEmpty(): Promise<void> {
+ 		// Instantly resolve if the queue is empty
+-		if (this.#queue.size === 0) {
++		if (this._queue.size === 0) {
+ 			return;
+ 		}
+ 
+ 		return new Promise<void>(resolve => {
+-			const existingResolve = this.#resolveEmpty;
+-			this.#resolveEmpty = () => {
++			const existingResolve = this._resolveEmpty;
++			this._resolveEmpty = () => {
+ 				existingResolve();
+ 				resolve();
+ 			};
+@@ -349,13 +338,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 	*/
+ 	async onSizeLessThan(limit: number): Promise<void> {
+ 		// Instantly resolve if the queue is empty.
+-		if (this.#queue.size < limit) {
++		if (this._queue.size < limit) {
+ 			return;
+ 		}
+ 
+ 		return new Promise<void>(resolve => {
+ 			const listener = () => {
+-				if (this.#queue.size < limit) {
++				if (this._queue.size < limit) {
+ 					this.removeListener('next', listener);
+ 					resolve();
+ 				}
+@@ -372,13 +361,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 	*/
+ 	async onIdle(): Promise<void> {
+ 		// Instantly resolve if none pending and if nothing else is queued
+-		if (this.#pendingCount === 0 && this.#queue.size === 0) {
++		if (this._pendingCount === 0 && this._queue.size === 0) {
+ 			return;
+ 		}
+ 
+ 		return new Promise<void>(resolve => {
+-			const existingResolve = this.#resolveIdle;
+-			this.#resolveIdle = () => {
++			const existingResolve = this._resolveIdle;
++			this._resolveIdle = () => {
+ 				existingResolve();
+ 				resolve();
+ 			};
+@@ -389,7 +378,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 	Size of the queue, the number of queued items waiting to run.
+ 	*/
+ 	get size(): number {
+-		return this.#queue.size;
++		return this._queue.size;
+ 	}
+ 
+ 	/**
+@@ -399,34 +388,33 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
+ 	*/
+ 	sizeBy(options: Readonly<Partial<EnqueueOptionsType>>): number {
+ 		// eslint-disable-next-line unicorn/no-array-callback-reference
+-		return this.#queue.filter(options).length;
++		return this._queue.filter(options).length;
+ 	}
+ 
+ 	/**
+ 	Number of running items (no longer in the queue).
+ 	*/
+ 	get pending(): number {
+-		return this.#pendingCount;
++		return this._pendingCount;
+ 	}
+ 
+ 	/**
+ 	Whether the queue is currently paused.
+ 	*/
+ 	get isPaused(): boolean {
+-		return this.#isPaused;
++		return this._isPaused;
+ 	}
+ 
+ 	get timeout(): number | undefined {
+-		return this.#timeout;
++		return this._timeout;
+ 	}
+ 
+ 	/**
+ 	Set the timeout for future operations.
+ 	*/
+ 	set timeout(milliseconds: number | undefined) {
+-		this.#timeout = milliseconds;
++		this._timeout = milliseconds;
+ 	}
+ }
+ 
+-// TODO: Rename `DefaultAddOptions` to `QueueAddOptions` in next major version
+-export {Queue, QueueAddOptions, QueueAddOptions as DefaultAddOptions, Options};
++export {Queue, QueueAddOptions, DefaultAddOptions, Options};
+diff --git a/source/options.ts b/source/options.ts
+index af5a196..82fd7b1 100644
+--- a/source/options.ts
++++ b/source/options.ts
+@@ -1,20 +1,8 @@
+ import {Queue, RunFunction} from './queue.js';
+ 
+-interface TimeoutOptions {
+-	/**
+-	Per-operation timeout in milliseconds. Operations fulfill once `timeout` elapses if they haven't already.
+-	*/
+-	timeout?: number;
+-
+-	/**
+-	Whether or not a timeout is considered an exception.
++export type QueueAddOptions = Readonly<Record<string, unknown>>;
+ 
+-	@default false
+-	*/
+-	throwOnTimeout?: boolean;
+-}
+-
+-export interface Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOptions extends QueueAddOptions> extends TimeoutOptions {
++export interface Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOptions extends QueueAddOptions> {
+ 	/**
+ 	Concurrency limit.
+ 
+@@ -60,52 +48,25 @@ export interface Options<QueueType extends Queue<RunFunction, QueueOptions>, Que
+ 	@default false
+ 	*/
+ 	readonly carryoverConcurrencyCount?: boolean;
+-}
+ 
+-export interface QueueAddOptions extends TaskOptions, TimeoutOptions {
+ 	/**
+-	Priority of operation. Operations with greater priority will be scheduled first.
++	Per-operation timeout in milliseconds. Operations fulfill once `timeout` elapses if they haven't already.
++	*/
++	timeout?: number;
+ 
+-	@default 0
++	/**
++	Whether or not a timeout is considered an exception.
++
++	@default false
+ 	*/
+-	readonly priority?: number;
++	throwOnTimeout?: boolean;
+ }
+ 
+-export interface TaskOptions {
++export interface DefaultAddOptions extends QueueAddOptions {
+ 	/**
+-	[`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal) for cancellation of the operation. When aborted, it will be removed from the queue and the `queue.add()` call will reject with an `AbortError`. If the operation is already running, the signal will need to be handled by the operation itself.
+-
+-	@example
+-	```
+-	import PQueue, {AbortError} from 'p-queue';
+-	import got, {CancelError} from 'got';
+-
+-	const queue = new PQueue();
+-
+-	const controller = new AbortController();
+-
+-	try {
+-		await queue.add(({signal}) => {
+-			const request = got('https://sindresorhus.com');
+-
+-			signal.addEventListener('abort', () => {
+-				request.cancel();
+-			});
+-
+-			try {
+-				return await request;
+-			} catch (error) {
+-				if (!(error instanceof CancelError)) {
+-					throw error;
+-				}
+-			}
+-		}, {signal: controller.signal});
+-	} catch (error) {
+-		if (!(error instanceof AbortError)) {
+-			throw error;
+-		}
+-	}
+-	```
++	Priority of operation. Operations with greater priority will be scheduled first.
++
++	@default 0
+ 	*/
+-	readonly signal?: AbortSignal;
++	readonly priority?: number;
+ }
+diff --git a/source/priority-queue.ts b/source/priority-queue.ts
+index 45993bc..acc3e73 100644
+--- a/source/priority-queue.ts
++++ b/source/priority-queue.ts
+@@ -7,7 +7,7 @@ export interface PriorityQueueOptions extends QueueAddOptions {
+ }
+ 
+ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOptions> {
+-	readonly #queue: Array<PriorityQueueOptions & {run: RunFunction}> = [];
++	private readonly _queue: Array<PriorityQueueOptions & {run: RunFunction}> = [];
+ 
+ 	enqueue(run: RunFunction, options?: Partial<PriorityQueueOptions>): void {
+ 		options = {
+@@ -20,30 +20,30 @@ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOp
+ 			run,
+ 		};
+ 
+-		if (this.size && this.#queue[this.size - 1]!.priority! >= options.priority!) {
+-			this.#queue.push(element);
++		if (this.size && this._queue[this.size - 1]!.priority! >= options.priority!) {
++			this._queue.push(element);
+ 			return;
+ 		}
+ 
+ 		const index = lowerBound(
+-			this.#queue, element,
++			this._queue, element,
+ 			(a: Readonly<PriorityQueueOptions>, b: Readonly<PriorityQueueOptions>) => b.priority! - a.priority!,
+ 		);
+-		this.#queue.splice(index, 0, element);
++		this._queue.splice(index, 0, element);
+ 	}
+ 
+ 	dequeue(): RunFunction | undefined {
+-		const item = this.#queue.shift();
++		const item = this._queue.shift();
+ 		return item?.run;
+ 	}
+ 
+ 	filter(options: Readonly<Partial<PriorityQueueOptions>>): RunFunction[] {
+-		return this.#queue.filter(
++		return this._queue.filter(
+ 			(element: Readonly<PriorityQueueOptions>) => element.priority === options.priority,
+ 		).map((element: Readonly<{run: RunFunction}>) => element.run);
+ 	}
+ 
+ 	get size(): number {
+-		return this.#queue.length;
++		return this._queue.length;
+ 	}
+ }
+diff --git a/test/test.ts b/test/test.ts
+index 878e000..3fb6359 100644
+--- a/test/test.ts
++++ b/test/test.ts
+@@ -5,7 +5,7 @@ import delay from 'delay';
+ import inRange from 'in-range';
+ import timeSpan from 'time-span';
+ import randomInt from 'random-int';
+-import PQueue, {AbortError} from '../source/index.js';
++import PQueue from '../source/index.js';
+ 
+ const fixture = Symbol('fixture');
+ 
+@@ -1062,25 +1062,3 @@ test('should verify timeout overrides passed to add', async t => {
+ 
+ 	await queue.onIdle();
+ });
+-
+-test('should skip an aborted job', async t => {
+-	const queue = new PQueue();
+-
+-	const controller = new AbortController();
+-
+-	controller.abort();
+-	// eslint-disable-next-line @typescript-eslint/no-empty-function
+-	await t.throwsAsync(queue.add(() => {}, {signal: controller.signal}), {
+-		instanceOf: AbortError,
+-	});
+-});
+-
+-test('should pass AbortSignal instance to job', async t => {
+-	const queue = new PQueue();
+-
+-	const controller = new AbortController();
+-
+-	await queue.add(async ({signal}) => {
+-		t.is(controller.signal, signal);
+-	}, {signal: controller.signal});
+-});

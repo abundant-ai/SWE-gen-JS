@@ -1,0 +1,135 @@
+diff --git a/README.md b/README.md
+index 518b8e8..86894f2 100644
+--- a/README.md
++++ b/README.md
+@@ -193,6 +193,7 @@ const num = number().cast('1'); // 1
+ const obj = object({
+   firstName: string().lowercase().trim(),
+ })
++  .json()
+   .camelCase()
+   .cast('{"first_name": "jAnE "}'); // { firstName: 'jane' }
+ ```
+@@ -206,14 +207,14 @@ const reversedString = string()
+ ```
+ 
+ Transforms form a "pipeline", where the value of a previous transform is piped into the next one.
+-If the end value is `undefined` yup will apply the schema default if it's configured.
++When an input value is `undefined` yup will apply the schema default if it's configured.
+ 
+ > Watch out! values are not guaranteed to be valid types in transform functions. Previous transforms
+ > may have failed. For example a number transform may be receive the input value, `NaN`, or a number.
+ 
+ ### Validation: Tests
+ 
+-Yup has robust support for assertions, or "tests", over input values. Tests assert that inputs conform to some
++Yup schema run "tests" over input values. Tests assert that inputs conform to some
+ criteria. Tests are distinct from transforms, in that they do not change or alter the input (or its type)
+ and are usually reserved for checks that are hard, if not impossible, to represent in static types.
+ 
+@@ -241,7 +242,7 @@ jamesSchema.validateSync('Jane'); // ValidationError "this is not James"
+ > Heads up: unlike transforms, `value` in a custom test is guaranteed to be the correct type
+ > (in this case an optional string). It still may be `undefined` or `null` depending on your schema
+ > in those cases, you may want to return `true` for absent values unless your transform makes presence
+-> related assertions
++> related assertions. The test option `skipAbsent` will do this for you if set.
+ 
+ #### Customizing errors
+ 
+diff --git a/src/date.ts b/src/date.ts
+index 1155869..ca1e367 100644
+--- a/src/date.ts
++++ b/src/date.ts
+@@ -47,7 +47,10 @@ export default class DateSchema<
+ 
+     this.withMutation(() => {
+       this.transform((value, _raw, ctx) => {
+-        if (!ctx.spec.coerce || ctx.isType(value)) return value;
++        // null -> InvalidDate isn't useful; treat all nulls as null and let it fail on
++        // nullability check vs TypeErrors
++        if (!ctx.spec.coerce || ctx.isType(value) || value === null)
++          return value;
+ 
+         value = isoParse(value);
+ 
+diff --git a/src/number.ts b/src/number.ts
+index 3662b0c..818ffac 100644
+--- a/src/number.ts
++++ b/src/number.ts
+@@ -54,7 +54,9 @@ export default class NumberSchema<
+           parsed = +parsed;
+         }
+ 
+-        if (ctx.isType(parsed)) return parsed;
++        // null -> NaN isn't useful; treat all nulls as null and let it fail on
++        // nullability check vs TypeErrors
++        if (ctx.isType(parsed) || parsed === null) return parsed;
+ 
+         return parseFloat(parsed);
+       });
+diff --git a/src/object.ts b/src/object.ts
+index 4b534e7..5b307b3 100644
+--- a/src/object.ts
++++ b/src/object.ts
+@@ -320,11 +320,9 @@ export default class ObjectSchema<
+     );
+   }
+ 
+-  protected _getDefault(
+-    options?: ResolveOptions<TContext>,
+-  ) {
++  protected _getDefault(options?: ResolveOptions<TContext>) {
+     if ('default' in this.spec) {
+-      return super._getDefault();
++      return super._getDefault(options);
+     }
+ 
+     // if there is no default set invent one
+@@ -335,8 +333,20 @@ export default class ObjectSchema<
+     let dft: any = {};
+     this._nodes.forEach((key) => {
+       const field = this.fields[key] as any;
++
++      let innerOptions = options;
++      if (innerOptions?.value) {
++        innerOptions = {
++          ...innerOptions,
++          parent: innerOptions.value,
++          value: innerOptions.value[key],
++        };
++      }
++
+       dft[key] =
+-        field && 'getDefault' in field ? field.getDefault(options) : undefined;
++        field && 'getDefault' in field
++          ? field.getDefault(innerOptions)
++          : undefined;
+     });
+ 
+     return dft;
+diff --git a/src/schema.ts b/src/schema.ts
+index 322edcb..6bfa84b 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -607,9 +607,7 @@ export default abstract class Schema<
+     }
+   }
+ 
+-  protected _getDefault(
+-    _options?: ResolveOptions<TContext>,
+-  ) {
++  protected _getDefault(_options?: ResolveOptions<TContext>) {
+     let defaultValue = this.spec.default;
+ 
+     if (defaultValue == null) {
+@@ -801,8 +799,9 @@ export default abstract class Schema<
+     next.internalTests.typeError = createValidation({
+       message,
+       name: 'typeError',
++      skipAbsent: true,
+       test(value) {
+-        if (!isAbsent(value) && !this.schema._typeCheck(value))
++        if (!this.schema._typeCheck(value))
+           return this.createError({
+             params: {
+               type: this.schema.type,

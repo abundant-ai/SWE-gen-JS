@@ -1,0 +1,845 @@
+diff --git a/.changeset/stupid-feet-flash.md b/.changeset/stupid-feet-flash.md
+deleted file mode 100644
+index c150d34d1c..0000000000
+--- a/.changeset/stupid-feet-flash.md
++++ /dev/null
+@@ -1,30 +0,0 @@
+----
+-'xstate': major
+----
+-
+-The final `output` of a state machine is now specified directly in the `output` property of the machine config:
+-
+-```ts
+-const machine = createMachine({
+-  initial: 'started',
+-  states: {
+-    started: {
+-      // ...
+-    },
+-    finished: {
+-      type: 'final'
+-      // moved to the top level
+-      //
+-      // output: {
+-      //   status: 200
+-      // }
+-    }
+-  },
+-  // This will be the final output of the machine
+-  // present on `snapshot.output` and in the done events received by the parent
+-  // when the machine reaches the top-level final state ("finished")
+-  output: {
+-    status: 200
+-  }
+-});
+-```
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 93f5e1076e..76ff47576b 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -49,7 +49,6 @@ import type {
+ } from './types.ts';
+ import { isErrorActorEvent, resolveReferencedActor } from './utils.ts';
+ import { createActor } from './interpreter.ts';
+-import isDevelopment from '#is-development';
+ 
+ export const STATE_IDENTIFIER = '#';
+ export const WILDCARD = '*';
+@@ -194,18 +193,6 @@ export class StateMachine<
+ 
+     this.states = this.root.states; // TODO: remove!
+     this.events = this.root.events;
+-
+-    if (
+-      isDevelopment &&
+-      !this.root.output &&
+-      Object.values(this.states).some(
+-        (state) => state.type === 'final' && !!state.output
+-      )
+-    ) {
+-      console.warn(
+-        'Missing `machine.output` declaration (top-level final state with output detected)'
+-      );
+-    }
+   }
+ 
+   /**
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index d2f6fd793b..9a37b76796 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -13,6 +13,7 @@ import {
+ import type {
+   DelayedTransitionDefinition,
+   EventObject,
++  FinalStateNodeConfig,
+   InitialTransitionDefinition,
+   InvokeDefinition,
+   MachineContext,
+@@ -28,8 +29,7 @@ import type {
+   ParameterizedObject,
+   AnyStateMachine,
+   AnyStateNodeConfig,
+-  ProvidedActor,
+-  NonReducibleUnknown
++  ProvidedActor
+ } from './types.ts';
+ import {
+   createInvokeId,
+@@ -134,9 +134,7 @@ export class StateNode<
+   /**
+    * The output data sent with the "xstate.done.state._id_" event if this is a final state node.
+    */
+-  public output?:
+-    | Mapper<MachineContext, EventObject, unknown, EventObject>
+-    | NonReducibleUnknown;
++  public output?: Mapper<TContext, TEvent, any>;
+ 
+   /**
+    * The order this state node appears. Corresponds to the implicit document order.
+@@ -218,7 +216,9 @@ export class StateNode<
+ 
+     this.meta = this.config.meta;
+     this.output =
+-      this.type === 'final' || !this.parent ? this.config.output : undefined;
++      this.type === 'final'
++        ? (this.config as FinalStateNodeConfig<TContext, TEvent>).output
++        : undefined;
+     this.tags = toArray(config.tags).slice();
+   }
+ 
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 70610b78be..3dfe23403d 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -45,7 +45,7 @@ import {
+ } from './types.ts';
+ import {
+   isArray,
+-  resolveOutput,
++  mapContext,
+   normalizeTarget,
+   toArray,
+   toStatePath,
+@@ -67,26 +67,15 @@ function getOutput<TContext extends MachineContext, TEvent extends EventObject>(
+   event: TEvent,
+   self: AnyActorRef
+ ) {
+-  const { machine } = configuration[0];
+-  const { root } = machine;
+-
+-  if (!root.output) {
+-    return undefined;
+-  }
+-
++  const machine = configuration[0].machine;
+   const finalChildStateNode = configuration.find(
+     (stateNode) =>
+       stateNode.type === 'final' && stateNode.parent === machine.root
+-  )!;
+-
+-  const doneStateEvent = createDoneStateEvent(
+-    finalChildStateNode.id,
+-    finalChildStateNode.output
+-      ? resolveOutput(finalChildStateNode.output, context, event, self)
+-      : undefined
+   );
+ 
+-  return resolveOutput(root.output, context, doneStateEvent, self);
++  return finalChildStateNode && finalChildStateNode.output
++    ? mapContext(finalChildStateNode.output, context, event, self)
++    : undefined;
+ }
+ 
+ export const isAtomicStateNode = (stateNode: StateNode<any, any>) =>
+@@ -1189,7 +1178,7 @@ function enterStates(
+         createDoneStateEvent(
+           parent!.id,
+           stateNodeToEnter.output
+-            ? resolveOutput(
++            ? mapContext(
+                 stateNodeToEnter.output,
+                 currentState.context,
+                 event,
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index da0353234e..a5fe64d115 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -361,9 +361,7 @@ export interface InvokeDefinition<
+    */
+   src: string;
+ 
+-  input?:
+-    | Mapper<TContext, TEvent, NonReducibleUnknown, TEvent>
+-    | NonReducibleUnknown;
++  input?: Mapper<TContext, TEvent, NonReducibleUnknown> | NonReducibleUnknown;
+   /**
+    * The transition to take upon the invoked child machine reaching its final top-level state.
+    */
+@@ -586,7 +584,7 @@ type DistributeActors<
+         // in a sense, we shouldn't - they could be provided within the `implementations` object
+         // how do we verify if the required input has been provided?
+         input?:
+-          | Mapper<TContext, TEvent, InputFrom<TSpecificActor['logic']>, TEvent>
++          | Mapper<TContext, TEvent, InputFrom<TSpecificActor['logic']>>
+           | InputFrom<TSpecificActor['logic']>;
+         /**
+          * The transition to take upon the invoked child machine reaching its final top-level state.
+@@ -675,7 +673,7 @@ export type InvokeConfig<
+       src: AnyActorLogic | string; // TODO: fix types
+ 
+       input?:
+-        | Mapper<TContext, TEvent, NonReducibleUnknown, TEvent>
++        | Mapper<TContext, TEvent, NonReducibleUnknown>
+         | NonReducibleUnknown;
+       /**
+        * The transition to take upon the invoked child machine reaching its final top-level state.
+@@ -862,7 +860,7 @@ export interface StateNodeConfig<
+    * The output data will be evaluated with the current `context` and placed on the `.data` property
+    * of the event.
+    */
+-  output?: Mapper<TContext, TEvent, unknown, TEvent> | NonReducibleUnknown;
++  output?: Mapper<TContext, TEvent, TOutput> | TOutput;
+   /**
+    * The unique ID of the state node, which can be referenced as a transition target via the
+    * `#id` syntax.
+@@ -917,16 +915,7 @@ export interface StateNodeDefinition<
+   exit: UnknownAction[];
+   meta: any;
+   order: number;
+-  output?: StateNodeConfig<
+-    TContext,
+-    TEvent,
+-    ProvidedActor,
+-    ParameterizedObject,
+-    ParameterizedObject,
+-    string,
+-    string,
+-    unknown
+-  >['output'];
++  output?: FinalStateNodeConfig<TContext, TEvent>['output'];
+   invoke: Array<InvokeDefinition<TContext, TEvent, TODO, TODO, TODO, TODO>>;
+   description?: string;
+   tags: string[];
+@@ -991,6 +980,18 @@ export interface HistoryStateNodeConfig<
+   target: string | undefined;
+ }
+ 
++export interface FinalStateNodeConfig<
++  TContext extends MachineContext,
++  TEvent extends EventObject
++> extends AtomicStateNodeConfig<TContext, TEvent> {
++  type: 'final';
++  /**
++   * The data to be sent with the "xstate.done.state.<id>" event. The data can be
++   * static or dynamic (based on assigners).
++   */
++  output?: Mapper<TContext, TEvent, any>;
++}
++
+ export type SimpleOrStateNodeConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+@@ -1057,10 +1058,7 @@ export interface MachineImplementationsSimplified<
+   actors: Record<
+     string,
+     | AnyActorLogic
+-    | {
+-        src: AnyActorLogic;
+-        input: Mapper<TContext, TEvent, unknown, TEvent> | NonReducibleUnknown;
+-      }
++    | { src: AnyActorLogic; input: Mapper<TContext, TEvent, any> | any }
+   >;
+   delays: DelayFunctionMap<TContext, TEvent, TAction>;
+ }
+@@ -1129,8 +1127,7 @@ type MachineImplementationsActors<
+           | Mapper<
+               TContext,
+               MaybeNarrowedEvent<TIndexedEvents, TEventsCausingActors, K>,
+-              InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>,
+-              Cast<Prop<TIndexedEvents, keyof TIndexedEvents>, EventObject>
++              InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>
+             >
+           | InputFrom<Cast<Prop<TIndexedActors[K], 'logic'>, AnyActorLogic>>;
+       };
+@@ -1327,6 +1324,42 @@ export type ContextFactory<
+   TInput
+ > = ({ spawn, input }: { spawn: Spawner<TActor>; input: TInput }) => TContext;
+ 
++type RootStateNodeConfig<
++  TContext extends MachineContext,
++  TEvent extends EventObject,
++  TActor extends ProvidedActor,
++  TAction extends ParameterizedObject,
++  TGuard extends ParameterizedObject,
++  TDelay extends string,
++  TTag extends string,
++  TOutput
++> = Omit<
++  StateNodeConfig<
++    TContext,
++    TEvent,
++    TActor,
++    TAction,
++    TGuard,
++    TDelay,
++    TTag,
++    TOutput
++  >,
++  'states'
++> & {
++  states?:
++    | StatesConfig<
++        TContext,
++        TEvent,
++        TActor,
++        TAction,
++        TGuard,
++        TDelay,
++        TTag,
++        TOutput
++      >
++    | undefined;
++};
++
+ export type MachineConfig<
+   TContext extends MachineContext,
+   TEvent extends EventObject,
+@@ -1338,18 +1371,15 @@ export type MachineConfig<
+   TInput = any,
+   TOutput = unknown,
+   TTypesMeta = TypegenDisabled
+-> = (Omit<
+-  StateNodeConfig<
+-    NoInfer<TContext>,
+-    NoInfer<TEvent>,
+-    NoInfer<TActor>,
+-    NoInfer<TAction>,
+-    NoInfer<TGuard>,
+-    NoInfer<TDelay>,
+-    NoInfer<TTag>,
+-    NoInfer<TOutput>
+-  >,
+-  'output'
++> = (RootStateNodeConfig<
++  NoInfer<TContext>,
++  NoInfer<TEvent>,
++  NoInfer<TActor>,
++  NoInfer<TAction>,
++  NoInfer<TGuard>,
++  NoInfer<TDelay>,
++  NoInfer<TTag>,
++  NoInfer<TOutput>
+ > & {
+   /**
+    * The initial context (extended state)
+@@ -1370,8 +1400,6 @@ export type MachineConfig<
+     TOutput,
+     TTypesMeta
+   >;
+-  // TODO: make it conditionally required
+-  output?: Mapper<TContext, DoneStateEvent, TOutput, TEvent> | TOutput;
+ }) &
+   (Equals<TContext, MachineContext> extends true
+     ? { context?: InitialContext<LowInfer<TContext>, TActor, TInput> }
+@@ -1610,18 +1638,22 @@ export type PropertyAssigner<
+ 
+ export type Mapper<
+   TContext extends MachineContext,
+-  TExpressionEvent extends EventObject,
+-  TResult,
+-  TEvent extends EventObject
++  TEvent extends EventObject,
++  TResult
+ > = (args: {
+   context: TContext;
+-  event: TExpressionEvent;
+-  self: ActorRef<
+-    TEvent,
+-    MachineSnapshot<TContext, TEvent, ProvidedActor, string, unknown>
+-  >;
++  event: TEvent;
++  self: ActorRef<TEvent, any>;
+ }) => TResult;
+ 
++export type PropertyMapper<
++  TContext extends MachineContext,
++  TEvent extends EventObject,
++  TParams extends {}
++> = {
++  [K in keyof TParams]?: Mapper<TContext, TEvent, TParams[K]> | TParams[K];
++};
++
+ export interface TransitionDefinition<
+   TContext extends MachineContext,
+   TEvent extends EventObject
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index 026dde6bc5..2607fc6b36 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -6,6 +6,7 @@ import type {
+   ActorLogic,
+   AnyEventObject,
+   EventObject,
++  InvokeConfig,
+   MachineContext,
+   Mapper,
+   Observer,
+@@ -14,10 +15,12 @@ import type {
+   StateLike,
+   StateValue,
+   Subscribable,
++  TransitionConfig,
+   TransitionConfigTarget,
++  TODO,
+   AnyActorRef,
+   AnyTransitionConfig,
+-  NonReducibleUnknown
++  AnyInvokeConfig
+ } from './types.ts';
+ 
+ export function keys<T extends object>(value: T): Array<keyof T & string> {
+@@ -222,24 +225,21 @@ export function toArray<T>(value: readonly T[] | T | undefined): readonly T[] {
+   return toArrayStrict(value);
+ }
+ 
+-export function resolveOutput<
++export function mapContext<
+   TContext extends MachineContext,
+-  TExpressionEvent extends EventObject
++  TEvent extends EventObject
+ >(
+-  mapper:
+-    | Mapper<TContext, TExpressionEvent, unknown, EventObject>
+-    | NonReducibleUnknown,
++  mapper: Mapper<TContext, TEvent, any>,
+   context: TContext,
+-  event: TExpressionEvent,
++  event: TEvent,
+   self: AnyActorRef
+-): unknown {
++): any {
+   if (typeof mapper === 'function') {
+     return mapper({ context, event, self });
+   }
+ 
+   if (
+     isDevelopment &&
+-    !!mapper &&
+     typeof mapper === 'object' &&
+     Object.values(mapper).some((val) => typeof val === 'function')
+   ) {
+@@ -412,12 +412,7 @@ export function createInvokeId(stateNodeId: string, index: number): string {
+ export function resolveReferencedActor(
+   referenced:
+     | AnyActorLogic
+-    | {
+-        src: AnyActorLogic;
+-        input:
+-          | Mapper<MachineContext, EventObject, unknown, EventObject>
+-          | NonReducibleUnknown;
+-      }
++    | { src: AnyActorLogic; input: Mapper<any, any, any> | any }
+     | undefined
+ ) {
+   return referenced
+diff --git a/packages/core/test/final.test.ts b/packages/core/test/final.test.ts
+index 5c3019765c..8c235425e2 100644
+--- a/packages/core/test/final.test.ts
++++ b/packages/core/test/final.test.ts
+@@ -163,10 +163,10 @@ describe('final states', () => {
+           }
+         },
+         end: {
+-          type: 'final'
++          type: 'final',
++          output: spy
+         }
+-      },
+-      output: spy
++      }
+     });
+ 
+     const service = createActor(machine).start();
+@@ -184,10 +184,10 @@ describe('final states', () => {
+       initial: 'done',
+       states: {
+         done: {
+-          type: 'final'
++          type: 'final',
++          output: ({ self }) => ({ selfRef: self })
+         }
+-      },
+-      output: ({ self }) => ({ selfRef: self })
++      }
+     });
+ 
+     const actor = createActor(machine).start();
+diff --git a/packages/core/test/invoke.test.ts b/packages/core/test/invoke.test.ts
+index 3caae39253..2936b0b4a7 100644
+--- a/packages/core/test/invoke.test.ts
++++ b/packages/core/test/invoke.test.ts
+@@ -25,6 +25,79 @@ import {
+ 
+ const user = { name: 'David' };
+ 
++const fetchMachine = createMachine({
++  types: {} as {
++    context: { userId: string | undefined };
++    events: { type: 'RESOLVE'; user: { name: string } };
++    input: { userId: string };
++  },
++  id: 'fetch',
++  context: ({ input }) => ({
++    userId: input.userId
++  }),
++  initial: 'pending',
++  states: {
++    pending: {
++      entry: raise({ type: 'RESOLVE', user }),
++      on: {
++        RESOLVE: {
++          target: 'success',
++          guard: ({ context }) => context.userId !== undefined
++        }
++      }
++    },
++    success: {
++      type: 'final',
++      output: ({ event }) => ({ user: event.user })
++    },
++    failure: {
++      entry: sendParent({ type: 'REJECT' })
++    }
++  }
++});
++
++const fetcherMachine = createMachine({
++  id: 'fetcher',
++  initial: 'idle',
++  context: {
++    selectedUserId: '42',
++    user: undefined
++  },
++  states: {
++    idle: {
++      on: {
++        GO_TO_WAITING: 'waiting',
++        GO_TO_WAITING_MACHINE: 'waitingInvokeMachine'
++      }
++    },
++    waiting: {
++      invoke: {
++        src: fetchMachine,
++        input: ({ context }: any) => ({
++          userId: context.selectedUserId
++        }),
++        onDone: {
++          target: 'received',
++          guard: ({ event }) => {
++            // Should receive { user: { name: 'David' } } as event data
++            return (event.output as any).user.name === 'David';
++          }
++        }
++      }
++    },
++    waitingInvokeMachine: {
++      invoke: {
++        src: fetchMachine,
++        input: { userId: '55' },
++        onDone: 'received'
++      }
++    },
++    received: {
++      type: 'final'
++    }
++  }
++});
++
+ describe('invoke', () => {
+   it('child can immediately respond to the parent with multiple events', () => {
+     const childMachine = createMachine({
+@@ -107,7 +180,7 @@ describe('invoke', () => {
+     const childMachine = createMachine({
+       id: 'fetch',
+       types: {} as {
+-        context: { userId: string | undefined; user?: typeof user | undefined };
++        context: { userId: string | undefined };
+         events: {
+           type: 'RESOLVE';
+           user: typeof user;
+@@ -132,15 +205,12 @@ describe('invoke', () => {
+         },
+         success: {
+           type: 'final',
+-          entry: assign({
+-            user: ({ event }) => event.user
+-          })
++          output: ({ event }) => ({ user: event.user })
+         },
+         failure: {
+           entry: sendParent({ type: 'REJECT' })
+         }
+-      },
+-      output: ({ context }) => ({ user: context.user })
++      }
+     });
+ 
+     const machine = createMachine({
+@@ -194,54 +264,14 @@ describe('invoke', () => {
+   });
+ 
+   it('should start services (explicit machine, invoke = machine)', (done) => {
+-    const childMachine = createMachine({
+-      types: {} as {
+-        events: { type: 'RESOLVE' };
+-        input: { userId: string };
+-      },
+-      initial: 'pending',
+-      states: {
+-        pending: {
+-          entry: raise({ type: 'RESOLVE' }),
+-          on: {
+-            RESOLVE: {
+-              target: 'success'
+-            }
+-          }
+-        },
+-        success: {
+-          type: 'final'
+-        }
+-      }
+-    });
+-
+-    const machine = createMachine({
+-      initial: 'idle',
+-      states: {
+-        idle: {
+-          on: {
+-            GO_TO_WAITING: 'waiting'
+-          }
+-        },
+-        waiting: {
+-          invoke: {
+-            src: childMachine,
+-            onDone: 'received'
+-          }
+-        },
+-        received: {
+-          type: 'final'
+-        }
+-      }
+-    });
+-    const actor = createActor(machine);
++    const actor = createActor(fetcherMachine);
+     actor.subscribe({
+       complete: () => {
+         done();
+       }
+     });
+     actor.start();
+-    actor.send({ type: 'GO_TO_WAITING' });
++    actor.send({ type: 'GO_TO_WAITING_MACHINE' });
+   });
+ 
+   it('should start services (machine as invoke config)', (done) => {
+@@ -517,10 +547,10 @@ describe('invoke', () => {
+         initial: 'active',
+         states: {
+           active: {
+-            type: 'final'
++            type: 'final',
++            output: { secret: 'pingpong' }
+           }
+-        },
+-        output: { secret: 'pingpong' }
++        }
+       });
+ 
+       const pingMachine = createMachine({
+diff --git a/packages/core/test/json.test.ts b/packages/core/test/json.test.ts
+index 82082e2ad2..bbcaa86d4d 100644
+--- a/packages/core/test/json.test.ts
++++ b/packages/core/test/json.test.ts
+@@ -88,8 +88,7 @@ describe('json', () => {
+             }
+           }
+         }
+-      },
+-      output: { result: 42 }
++      }
+     });
+ 
+     const json = JSON.parse(JSON.stringify(machine.definition));
+diff --git a/packages/core/test/types.test.ts b/packages/core/test/types.test.ts
+index 9879f892b1..e712a86a8d 100644
+--- a/packages/core/test/types.test.ts
++++ b/packages/core/test/types.test.ts
+@@ -216,17 +216,29 @@ describe('output', () => {
+       types: {} as {
+         output: number;
+       },
+-      output: 42
++      initial: 'done',
++      states: {
++        done: {
++          type: 'final',
++          output: 42
++        }
++      }
+     });
+   });
+ 
+   it('should reject invalid static output', () => {
+-    createMachine({
++    const machine = createMachine({
+       types: {} as {
+         output: number;
+       },
+-      // @ts-expect-error
+-      output: 'a string'
++      initial: 'done',
++      states: {
++        done: {
++          type: 'final',
++          // @ts-expect-error
++          output: 'a string'
++        }
++      }
+     });
+   });
+ 
+@@ -235,17 +247,29 @@ describe('output', () => {
+       types: {} as {
+         output: number;
+       },
+-      output: () => 42
++      initial: 'done',
++      states: {
++        done: {
++          type: 'final',
++          output: () => 42
++        }
++      }
+     });
+   });
+ 
+   it('should reject invalid dynamic output', () => {
+-    createMachine({
++    const machine = createMachine({
+       types: {} as {
+         output: number;
+       },
+-      // @ts-expect-error
+-      output: () => 'a string'
++      initial: 'done',
++      states: {
++        done: {
++          type: 'final',
++          // @ts-expect-error
++          output: () => 'a string'
++        }
++      }
+     });
+   });
+ 
+@@ -258,13 +282,19 @@ describe('output', () => {
+         };
+       },
+       context: { password: 'okoń' },
+-      output: ({ context }) => {
+-        ((_accept: string) => {})(context.password);
+-        // @ts-expect-error
+-        ((_accept: number) => {})(context.password);
+-        return {
+-          secret: 'the secret'
+-        };
++      initial: 'done',
++      states: {
++        done: {
++          type: 'final',
++          output: ({ context }) => {
++            ((_accept: string) => {})(context.password);
++            // @ts-expect-error
++            ((_accept: number) => {})(context.password);
++            return {
++              secret: 'the secret'
++            };
++          }
++        }
+       }
+     });
+   });
+diff --git a/packages/xstate-react/test/useActor.test.tsx b/packages/xstate-react/test/useActor.test.tsx
+index bc8e3877fe..f57d3c1d7e 100644
+--- a/packages/xstate-react/test/useActor.test.tsx
++++ b/packages/xstate-react/test/useActor.test.tsx
+@@ -70,10 +70,10 @@ describeEachReactMode('useActor (%s)', ({ suiteKey, render }) => {
+           initial: 'done',
+           states: {
+             done: {
+-              type: 'final'
++              type: 'final',
++              output: 'persisted data'
+             }
+-          },
+-          output: 'persisted data'
++          }
+         }) as any
+       }
+     })
+diff --git a/packages/xstate-solid/test/useMachine.test.tsx b/packages/xstate-solid/test/useMachine.test.tsx
+index 5e0b57083a..e3f3ac1182 100644
+--- a/packages/xstate-solid/test/useMachine.test.tsx
++++ b/packages/xstate-solid/test/useMachine.test.tsx
+@@ -78,10 +78,10 @@ describe('useMachine hook', () => {
+           initial: 'done',
+           states: {
+             done: {
+-              type: 'final'
++              type: 'final',
++              output: 'persisted data'
+             }
+-          },
+-          output: 'persisted data'
++          }
+         }) as any
+       }
+     })
+diff --git a/packages/xstate-svelte/test/useMachine.test.ts b/packages/xstate-svelte/test/useMachine.test.ts
+index 5bf98b782e..9b1568a0ad 100644
+--- a/packages/xstate-svelte/test/useMachine.test.ts
++++ b/packages/xstate-svelte/test/useMachine.test.ts
+@@ -11,10 +11,10 @@ const actorRef = createActor(
+         initial: 'done',
+         states: {
+           done: {
+-            type: 'final'
++            type: 'final',
++            output: 'persisted data'
+           }
+-        },
+-        output: 'persisted data'
++        }
+       }) as any
+     }
+   })
+diff --git a/packages/xstate-vue/test/useMachine.test.ts b/packages/xstate-vue/test/useMachine.test.ts
+index 712d3e5802..b0f58c0d8b 100644
+--- a/packages/xstate-vue/test/useMachine.test.ts
++++ b/packages/xstate-vue/test/useMachine.test.ts
+@@ -47,10 +47,10 @@ describe('useMachine composition function', () => {
+           initial: 'done',
+           states: {
+             done: {
+-              type: 'final'
++              type: 'final',
++              output: 'persisted data'
+             }
+-          },
+-          output: 'persisted data'
++          }
+         }) as any
+       }
+     })

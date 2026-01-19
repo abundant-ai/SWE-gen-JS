@@ -1,0 +1,138 @@
+diff --git a/.changeset/red-berries-occur.md b/.changeset/red-berries-occur.md
+new file mode 100644
+index 0000000000..774ff4e375
+--- /dev/null
++++ b/.changeset/red-berries-occur.md
+@@ -0,0 +1,30 @@
++---
++'xstate': patch
++---
++
++Guard objects can now reference other guard objects:
++
++```ts
++const machine = createMachine(
++  {
++    initial: 'home',
++    states: {
++      home: {
++        on: {
++          NEXT: {
++            target: 'success',
++            guard: 'hasSelection'
++          }
++        }
++      },
++      success: {}
++    }
++  },
++  {
++    guards: {
++      // `hasSelection` is a guard object that references the `stateIn` guard
++      hasSelection: stateIn('selected')
++    }
++  }
++);
++```
+diff --git a/packages/core/src/guards.ts b/packages/core/src/guards.ts
+index d1fb9d1121..65f7db598e 100644
+--- a/packages/core/src/guards.ts
++++ b/packages/core/src/guards.ts
+@@ -108,14 +108,29 @@ export function toGuardDefinition<
+   TEvent extends EventObject
+ >(
+   guardConfig: GuardConfig<TContext, TEvent>,
+-  getPredicate?: (guardType: string) => GuardPredicate<TContext, TEvent>
++  getPredicate?: (
++    guardType: string
++  ) => GuardPredicate<TContext, TEvent> | GuardDefinition<TContext, TEvent>
+ ): GuardDefinition<TContext, TEvent> {
++  // TODO: check for cycles and consider a refactor to more lazily evaluated guards
++  // TODO: resolve this more recursively: https://github.com/statelyai/xstate/pull/4064#discussion_r1229915724
+   if (isString(guardConfig)) {
+-    return {
+-      type: guardConfig,
+-      predicate: getPredicate?.(guardConfig) || undefined,
+-      params: { type: guardConfig }
+-    };
++    const predicateOrDef = getPredicate?.(guardConfig);
++
++    if (isFunction(predicateOrDef)) {
++      return {
++        type: guardConfig,
++        predicate: predicateOrDef,
++        params: { type: guardConfig }
++      };
++    } else if (predicateOrDef) {
++      return predicateOrDef;
++    } else {
++      return {
++        type: guardConfig,
++        params: { type: guardConfig }
++      };
++    }
+   }
+ 
+   if (isFunction(guardConfig)) {
+@@ -129,13 +144,28 @@ export function toGuardDefinition<
+     };
+   }
+ 
+-  return {
+-    type: guardConfig.type,
+-    params: guardConfig.params || guardConfig,
+-    children: (
+-      guardConfig.children as Array<GuardConfig<TContext, TEvent>>
+-    )?.map((childGuard) => toGuardDefinition(childGuard, getPredicate)),
+-    predicate:
+-      getPredicate?.(guardConfig.type) || (guardConfig as any).predicate
+-  };
++  const predicateOrDef = getPredicate?.(guardConfig.type);
++
++  if (isFunction(predicateOrDef)) {
++    return {
++      type: guardConfig.type,
++      params: guardConfig.params || guardConfig,
++      children: (
++        guardConfig.children as Array<GuardConfig<TContext, TEvent>>
++      )?.map((childGuard) => toGuardDefinition(childGuard, getPredicate)),
++      predicate:
++        getPredicate?.(guardConfig.type) || (guardConfig as any).predicate
++    };
++  } else if (predicateOrDef) {
++    return predicateOrDef;
++  } else {
++    return {
++      type: guardConfig.type,
++      params: guardConfig.params || guardConfig,
++      children: (
++        guardConfig.children as Array<GuardConfig<TContext, TEvent>>
++      )?.map((childGuard) => toGuardDefinition(childGuard, getPredicate)),
++      predicate: (guardConfig as any).predicate
++    };
++  }
+ }
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index d744a7087a..659421747d 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -834,10 +834,15 @@ type MachineImplementationsGuards<
+   >,
+   TIndexedEvents = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedEvents'>
+ > = {
+-  [K in keyof TEventsCausingGuards]?: GuardPredicate<
+-    TContext,
+-    Cast<Prop<TIndexedEvents, TEventsCausingGuards[K]>, EventObject>
+-  >;
++  [K in keyof TEventsCausingGuards]?:
++    | GuardPredicate<
++        TContext,
++        Cast<Prop<TIndexedEvents, TEventsCausingGuards[K]>, EventObject>
++      >
++    | GuardConfig<
++        TContext,
++        Cast<Prop<TIndexedEvents, TEventsCausingGuards[K]>, EventObject>
++      >;
+ };
+ 
+ type MachineImplementationsActors<

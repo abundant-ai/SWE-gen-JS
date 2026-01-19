@@ -1,0 +1,325 @@
+import { PostgrestClient } from '@supabase/postgrest-js'
+import { createClient, SupabaseClient } from '../../src/index'
+import { Database } from '../types'
+
+const URL = 'http://localhost:3000'
+const KEY = 'some.fake.key'
+
+describe('SupabaseClient', () => {
+  test('it should create a client with third-party auth accessToken', async () => {
+    const client = createClient(URL, KEY, {
+      accessToken: async () => {
+        return 'jwt'
+      },
+    })
+
+    expect(() => client.auth.getUser()).toThrow(
+      '@supabase/supabase-js: Supabase Client is configured with the accessToken option, accessing supabase.auth.getUser is not possible'
+    )
+  })
+
+  test('it should create the client connection', async () => {
+    const supabase = createClient(URL, KEY)
+    expect(supabase).toBeDefined()
+    expect(supabase).toBeInstanceOf(SupabaseClient)
+  })
+
+  test('it should throw an error if no valid params are provided', async () => {
+    expect(() => createClient('', KEY)).toThrow('supabaseUrl is required.')
+    expect(() => createClient(URL, '')).toThrow('supabaseKey is required.')
+  })
+
+  describe('URL Construction', () => {
+    test('should construct URLs correctly', () => {
+      const client = createClient(URL, KEY)
+
+      // @ts-ignore
+      expect(client.authUrl.toString()).toEqual('http://localhost:3000/auth/v1')
+      // @ts-ignore
+      expect(client.realtimeUrl.toString()).toEqual('ws://localhost:3000/realtime/v1')
+      // @ts-ignore
+      expect(client.storageUrl.toString()).toEqual('http://localhost:3000/storage/v1')
+      // @ts-ignore
+      expect(client.functionsUrl.toString()).toEqual('http://localhost:3000/functions/v1')
+      // @ts-ignore
+      expect(client.rest.url).toEqual('http://localhost:3000/rest/v1')
+    })
+
+    test('should preserve paths in supabaseUrl', () => {
+      const baseUrlWithPath = 'http://localhost:3000/custom/base'
+      const client = createClient(baseUrlWithPath, KEY)
+
+      // @ts-ignore
+      expect(client.authUrl.toString()).toEqual('http://localhost:3000/custom/base/auth/v1')
+      // @ts-ignore
+      expect(client.realtimeUrl.toString()).toEqual('ws://localhost:3000/custom/base/realtime/v1')
+      // @ts-ignore
+      expect(client.storageUrl.toString()).toEqual('http://localhost:3000/custom/base/storage/v1')
+      // @ts-ignore
+      expect(client.functionsUrl.toString()).toEqual(
+        'http://localhost:3000/custom/base/functions/v1'
+      )
+      // @ts-ignore
+      expect(client.rest.url).toEqual('http://localhost:3000/custom/base/rest/v1')
+    })
+
+    test('should handle HTTPS URLs correctly', () => {
+      const client = createClient('https://localhost:3000', KEY)
+      // @ts-ignore
+      expect(client.realtimeUrl.toString()).toEqual('wss://localhost:3000/realtime/v1')
+    })
+  })
+
+  describe('Custom Headers', () => {
+    test('should have custom header set', () => {
+      const customHeader = { 'X-Test-Header': 'value' }
+      const request = createClient(URL, KEY, { global: { headers: customHeader } }).rpc('')
+      //@ts-expect-error headers is protected attribute
+      const requestHeader = request.headers.get('X-Test-Header')
+      expect(requestHeader).toBe(customHeader['X-Test-Header'])
+    })
+
+    test('should merge custom headers with default headers', () => {
+      const customHeader = { 'X-Test-Header': 'value' }
+      const request = createClient(URL, KEY, { global: { headers: customHeader } }).rpc('')
+
+      //@ts-expect-error headers is protected attribute
+      const requestHeader = request.headers.get('X-Test-Header')
+      expect(requestHeader).toBe(customHeader['X-Test-Header'])
+      //@ts-expect-error headers is protected attribute
+      expect(request.headers.get('X-Client-Info')).not.toBeNull()
+    })
+  })
+
+  describe('Storage Key', () => {
+    test('should use default storage key based on project ref', () => {
+      const client = createClient('https://project-ref.supabase.co', KEY)
+      // @ts-ignore
+      expect(client.storageKey).toBe('sb-project-ref-auth-token')
+    })
+
+    test('should use custom storage key when provided', () => {
+      const customStorageKey = 'custom-storage-key'
+      const client = createClient(URL, KEY, {
+        auth: { storageKey: customStorageKey },
+      })
+      // @ts-ignore
+      expect(client.storageKey).toBe(customStorageKey)
+    })
+
+    test('should handle undefined storageKey and headers', () => {
+      const client = createClient(URL, KEY, {
+        auth: { storageKey: undefined },
+        global: { headers: undefined },
+      })
+      expect(client).toBeDefined()
+      // @ts-ignore
+      expect(client.storageKey).toBe('')
+      // @ts-ignore
+      expect(client.headers).toHaveProperty('X-Client-Info')
+    })
+  })
+
+  describe('Client Methods', () => {
+    test('should initialize functions client', () => {
+      const client = createClient(URL, KEY)
+      const functions = client.functions
+      expect(functions).toBeDefined()
+      // @ts-ignore
+      expect(functions.url).toBe('http://localhost:3000/functions/v1')
+    })
+
+    test('should initialize storage client', () => {
+      const client = createClient(URL, KEY)
+      const storage = client.storage
+      expect(storage).toBeDefined()
+      // @ts-ignore
+      expect(storage.url).toBe('http://localhost:3000/storage/v1')
+    })
+
+    test('should initialize realtime client', () => {
+      const client = createClient(URL, KEY)
+      expect(client.realtime).toBeDefined()
+      // @ts-ignore
+      expect(client.realtime.endPoint).toBe('ws://localhost:3000/realtime/v1/websocket')
+    })
+  })
+
+  describe('Realtime Channel Management', () => {
+    test('should create and manage channels', () => {
+      const client = createClient(URL, KEY)
+      const channel = client.channel('test-channel')
+      expect(channel).toBeDefined()
+      expect(client.getChannels()).toHaveLength(1)
+    })
+
+    test('should remove channel', async () => {
+      const client = createClient(URL, KEY)
+      const channel = client.channel('test-channel')
+      const result = await client.removeChannel(channel)
+      expect(result).toBe('ok')
+      expect(client.getChannels()).toHaveLength(0)
+    })
+
+    test('should remove all channels', async () => {
+      const client = createClient(URL, KEY)
+      client.channel('channel1')
+      client.channel('channel2')
+      const results = await client.removeAllChannels()
+      expect(results).toEqual(['ok', 'ok'])
+      expect(client.getChannels()).toHaveLength(0)
+    })
+  })
+
+  describe('Schema Management', () => {
+    test('should switch schema', () => {
+      const client = createClient<Database>(URL, KEY)
+      const schemaClient = client.schema('personal')
+      expect(schemaClient).toBeDefined()
+      expect(schemaClient).toBeInstanceOf(PostgrestClient)
+    })
+  })
+
+  describe('Table/View Queries', () => {
+    test('should query table with string relation', () => {
+      const client = createClient<Database>(URL, KEY)
+      const queryBuilder = client.from('users')
+      expect(queryBuilder).toBeDefined()
+    })
+  })
+
+  describe('RPC Calls', () => {
+    test('should make RPC call with arguments', () => {
+      const client = createClient<Database>(URL, KEY)
+      const rpcCall = client.rpc('get_status', { name_param: 'test' })
+      expect(rpcCall).toBeDefined()
+    })
+
+    test('should make RPC call with options', () => {
+      const client = createClient<Database>(URL, KEY)
+      const rpcCall = client.rpc('get_status', { name_param: 'test' }, { head: true })
+      expect(rpcCall).toBeDefined()
+    })
+  })
+
+  describe('Access Token Handling', () => {
+    test('should use custom accessToken when provided', async () => {
+      const customToken = 'custom-jwt-token'
+      const client = createClient(URL, KEY, {
+        accessToken: async () => customToken,
+      })
+
+      // Access the private method through the client instance
+      const accessToken = await (client as any)._getAccessToken()
+      expect(accessToken).toBe(customToken)
+    })
+
+    test('should fallback to session access token when no custom accessToken', async () => {
+      const client = createClient(URL, KEY)
+
+      // Mock the auth.getSession method
+      const mockSession = {
+        data: {
+          session: {
+            access_token: 'session-jwt-token',
+          },
+        },
+      }
+      client.auth.getSession = jest.fn().mockResolvedValue(mockSession)
+
+      const accessToken = await (client as any)._getAccessToken()
+      expect(accessToken).toBe('session-jwt-token')
+    })
+
+    test('should fallback to supabaseKey when no session', async () => {
+      const client = createClient(URL, KEY)
+
+      // Mock the auth.getSession method to return no session
+      const mockSession = {
+        data: {
+          session: null,
+        },
+      }
+      client.auth.getSession = jest.fn().mockResolvedValue(mockSession)
+
+      const accessToken = await (client as any)._getAccessToken()
+      expect(accessToken).toBe(KEY)
+    })
+  })
+
+  describe('Auth Event Handling', () => {
+    test('should handle TOKEN_REFRESHED event', () => {
+      const client = createClient(URL, KEY)
+      const newToken = 'new-refreshed-token'
+
+      // Mock realtime.setAuth
+      client.realtime.setAuth = jest.fn()
+      ;(client as any)._handleTokenChanged('TOKEN_REFRESHED', 'CLIENT', newToken)
+
+      expect((client as any).changedAccessToken).toBe(newToken)
+    })
+
+    test('should listen for auth events', () => {
+      const client = createClient(URL, KEY)
+
+      // Mock auth.onAuthStateChange
+      const mockCallback = jest.fn()
+      client.auth.onAuthStateChange = jest.fn().mockReturnValue(mockCallback)
+
+      // Call the private method
+      const result = (client as any)._listenForAuthEvents()
+
+      expect(client.auth.onAuthStateChange).toHaveBeenCalled()
+      expect(result).toBe(mockCallback)
+    })
+
+    test('should handle SIGNED_IN event', () => {
+      const client = createClient(URL, KEY)
+      const newToken = 'new-signed-in-token'
+
+      // Mock realtime.setAuth
+      client.realtime.setAuth = jest.fn()
+      ;(client as any)._handleTokenChanged('SIGNED_IN', 'CLIENT', newToken)
+
+      expect((client as any).changedAccessToken).toBe(newToken)
+    })
+
+    test('should not update token if it is the same', () => {
+      const client = createClient(URL, KEY)
+      const existingToken = 'existing-token'
+      ;(client as any).changedAccessToken = existingToken
+
+      // Mock realtime.setAuth
+      client.realtime.setAuth = jest.fn()
+      ;(client as any)._handleTokenChanged('TOKEN_REFRESHED', 'CLIENT', existingToken)
+
+      expect((client as any).changedAccessToken).toBe(existingToken)
+    })
+
+    test('should handle SIGNED_OUT event from CLIENT source', () => {
+      const client = createClient(URL, KEY)
+      ;(client as any).changedAccessToken = 'old-token'
+
+      // Mock realtime.setAuth
+      client.realtime.setAuth = jest.fn()
+      ;(client as any)._handleTokenChanged('SIGNED_OUT', 'CLIENT')
+
+      expect(client.realtime.setAuth).toHaveBeenCalled()
+      expect((client as any).changedAccessToken).toBeUndefined()
+    })
+
+    test('should handle SIGNED_OUT event from STORAGE source', () => {
+      const client = createClient(URL, KEY)
+      ;(client as any).changedAccessToken = 'old-token'
+
+      // Mock realtime.setAuth and auth.signOut
+      client.realtime.setAuth = jest.fn()
+      client.auth.signOut = jest.fn()
+      ;(client as any)._handleTokenChanged('SIGNED_OUT', 'STORAGE')
+
+      expect(client.realtime.setAuth).toHaveBeenCalled()
+      expect(client.auth.signOut).toHaveBeenCalled()
+      expect((client as any).changedAccessToken).toBeUndefined()
+    })
+  })
+})

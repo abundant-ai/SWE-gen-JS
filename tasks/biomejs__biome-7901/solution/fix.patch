@@ -1,0 +1,146 @@
+diff --git a/.changeset/proud-peaches-hide.md b/.changeset/proud-peaches-hide.md
+new file mode 100644
+index 0000000000..f0fe76f8e4
+--- /dev/null
++++ b/.changeset/proud-peaches-hide.md
+@@ -0,0 +1,5 @@
++---
++"@biomejs/biome": patch
++---
++
++Fixed [#7837](https://github.com/biomejs/biome/issues/7837), where Biome couldn't properly parse text expressions that contained nested curly brackets. This was breaking parsing in Astro and Svelte files.
+diff --git a/.changeset/wild-eels-send.md b/.changeset/wild-eels-send.md
+new file mode 100644
+index 0000000000..979d79bd89
+--- /dev/null
++++ b/.changeset/wild-eels-send.md
+@@ -0,0 +1,5 @@
++---
++"@biomejs/biome": patch
++---
++
++Fixed [#7837](https://github.com/biomejs/biome/issues/7837), where Biome Language Server panicked when opening HTML-ish files when the experimental full support is enabled.
+diff --git a/crates/biome_html_parser/src/lexer/mod.rs b/crates/biome_html_parser/src/lexer/mod.rs
+index 4e4fdf116c..a935e36bd7 100644
+--- a/crates/biome_html_parser/src/lexer/mod.rs
++++ b/crates/biome_html_parser/src/lexer/mod.rs
+@@ -221,22 +221,33 @@ impl<'src> HtmlLexer<'src> {
+         }
+     }
+ 
+-    fn consume_single_text_expression(&mut self, current: u8) -> HtmlSyntaxKind {
+-        match current {
+-            b'}' if !self.at_closing_double_text_expression() => self.consume_byte(T!['}']),
+-            b'<' => self.consume_byte(T![<]),
+-            _ => {
+-                while let Some(current) = self.current_byte() {
+-                    match current {
+-                        b'}' if !self.at_closing_double_text_expression() => break,
+-                        _ => {
+-                            self.advance(1);
+-                        }
++    fn consume_single_text_expression(&mut self) -> HtmlSyntaxKind {
++        let mut brackets_stack = 0;
++        if self.prev_byte() == Some(b'{') {
++            brackets_stack += 1;
++        }
++        while let Some(current) = self.current_byte() {
++            match current {
++                b'}' => {
++                    brackets_stack -= 1;
++                    if brackets_stack == 0 {
++                        break;
++                    } else {
++                        self.advance(1);
+                     }
+                 }
+-                HTML_LITERAL
++                b'{' => {
++                    brackets_stack += 1;
++                    self.advance(1);
++                }
++
++                _ => {
++                    self.advance(1);
++                }
+             }
+         }
++
++        HTML_LITERAL
+     }
+ 
+     fn consume_comment(&mut self) -> HtmlSyntaxKind {
+@@ -767,7 +778,7 @@ impl<'src> Lexer<'src> for HtmlLexer<'src> {
+                     }
+                     HtmlLexContext::TextExpression(kind) => match kind {
+                         TextExpressionKind::Double => self.consume_double_text_expression(current),
+-                        TextExpressionKind::Single => self.consume_single_text_expression(current),
++                        TextExpressionKind::Single => self.consume_single_text_expression(),
+                     },
+                     HtmlLexContext::CdataSection => self.consume_inside_cdata(current),
+                     HtmlLexContext::AstroFencedCodeBlock => {
+diff --git a/crates/biome_html_parser/src/syntax/mod.rs b/crates/biome_html_parser/src/syntax/mod.rs
+index 0a3654a825..87bfbd7d94 100644
+--- a/crates/biome_html_parser/src/syntax/mod.rs
++++ b/crates/biome_html_parser/src/syntax/mod.rs
+@@ -570,7 +570,7 @@ impl TextExpression {
+                         HtmlLexContext::TextExpression(self.kind),
+                     );
+                 } else {
+-                    p.bump_remap_any_with_context(HtmlLexContext::TextExpression(self.kind));
++                    p.bump_remap_with_context(HTML_LITERAL, HtmlLexContext::InsideTag);
+                 }
+             }
+             TextExpressionKind::Double => {
+diff --git a/crates/biome_lsp/src/handlers/text_document.rs b/crates/biome_lsp/src/handlers/text_document.rs
+index 8df0a544fa..5bfd758d17 100644
+--- a/crates/biome_lsp/src/handlers/text_document.rs
++++ b/crates/biome_lsp/src/handlers/text_document.rs
+@@ -32,7 +32,6 @@ pub(crate) async fn did_open(
+ 
+     let path = session.file_path(&url)?;
+ 
+-    eprintln!("Session id {:?}", session.key);
+     let project_key = match session.project_for_path(&path) {
+         Some(project_key) => project_key,
+         None => {
+diff --git a/crates/biome_service/src/workspace/server.rs b/crates/biome_service/src/workspace/server.rs
+index 94661d1bf8..3fcb144e20 100644
+--- a/crates/biome_service/src/workspace/server.rs
++++ b/crates/biome_service/src/workspace/server.rs
+@@ -305,10 +305,23 @@ impl WorkspaceServer {
+             .get_settings_based_on_path(project_key, &path)
+             .ok_or_else(WorkspaceError::no_project)?;
+ 
+-        let mut source = document_file_source.unwrap_or(DocumentFileSource::from_path(
+-            &path,
+-            settings.experimental_full_html_support_enabled(),
+-        ));
++        let mut source = if let Some(document_file_source) = document_file_source {
++            // TODO: remove once HTML full support is stable
++            // document_file_source is given by the LSP, and we have to change it if full support is enabled.
++            // The workspace knows that, but the LSP doesn't, so we have to do the modification here
++            if document_file_source.is_javascript_like()
++                && matches!(path.extension(), Some("astro" | "vue" | "svelte" | "html"))
++            {
++                DocumentFileSource::from_path(
++                    &path,
++                    settings.experimental_full_html_support_enabled(),
++                )
++            } else {
++                document_file_source
++            }
++        } else {
++            DocumentFileSource::from_path(&path, settings.experimental_full_html_support_enabled())
++        };
+ 
+         if let DocumentFileSource::Js(js) = &mut source {
+             match path.extension() {
+@@ -385,6 +398,7 @@ impl WorkspaceServer {
+         {
+             // Second-pass parsing for HTML files with embedded JavaScript and CSS content
+ 
++            debug!("{:#?}", &any_parse);
+             let mut node_cache = NodeCache::default();
+             self.parse_embedded_language_snippets(
+                 &biome_path,

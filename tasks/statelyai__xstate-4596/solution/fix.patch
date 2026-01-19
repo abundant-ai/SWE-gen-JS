@@ -1,0 +1,258 @@
+diff --git a/.changeset/khaki-monkeys-clap.md b/.changeset/khaki-monkeys-clap.md
+new file mode 100644
+index 0000000000..d21bd17ab6
+--- /dev/null
++++ b/.changeset/khaki-monkeys-clap.md
+@@ -0,0 +1,30 @@
++---
++'xstate': minor
++---
++
++Introduce `getNextSnapshot(...)`, which determines the next snapshot for the given `actorLogic` based on the given `snapshot` and `event`.
++
++If the `snapshot` is `undefined`, the initial snapshot of the `actorLogic` is used.
++
++```ts
++import { getNextSnapshot } from 'xstate';
++import { trafficLightMachine } from './trafficLightMachine.ts';
++
++const nextSnapshot = getNextSnapshot(
++  trafficLightMachine, // actor logic
++  undefined, // snapshot (or initial state if undefined)
++  { type: 'TIMER' }
++); // event object
++
++console.log(nextSnapshot.value);
++// => 'yellow'
++
++const nextSnapshot2 = getNextSnapshot(
++  trafficLightMachine, // actor logic
++  nextSnapshot, // snapshot
++  { type: 'TIMER' }
++); // event object
++
++console.log(nextSnapshot2.value);
++// =>'red'
++```
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 9f0e5ee1ff..28b3531c94 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -471,7 +471,7 @@ export class StateMachine<
+ 
+       const actorRef = createActor(logic, {
+         id: actorId,
+-        parent: _actorScope?.self,
++        parent: _actorScope.self,
+         syncSnapshot: actorData.syncSnapshot,
+         snapshot: childState,
+         src,
+diff --git a/packages/core/src/actions/assign.ts b/packages/core/src/actions/assign.ts
+index 3a0b9d830f..78e7a08b2b 100644
+--- a/packages/core/src/actions/assign.ts
++++ b/packages/core/src/actions/assign.ts
+@@ -54,8 +54,8 @@ function resolveAssign(
+       actionArgs.event,
+       spawnedChildren
+     ),
+-    self: actorScope?.self,
+-    system: actorScope?.system
++    self: actorScope.self,
++    system: actorScope.system
+   };
+   let partialUpdate: Record<string, unknown> = {};
+   if (typeof assignment === 'function') {
+diff --git a/packages/core/src/actions/send.ts b/packages/core/src/actions/send.ts
+index 3d5b27517f..26248a8ca0 100644
+--- a/packages/core/src/actions/send.ts
++++ b/packages/core/src/actions/send.ts
+@@ -92,9 +92,9 @@ function resolveSendTo(
+ 
+   if (typeof resolvedTarget === 'string') {
+     if (resolvedTarget === SpecialTargets.Parent) {
+-      targetActorRef = actorScope?.self._parent;
++      targetActorRef = actorScope.self._parent;
+     } else if (resolvedTarget === SpecialTargets.Internal) {
+-      targetActorRef = actorScope?.self;
++      targetActorRef = actorScope.self;
+     } else if (resolvedTarget.startsWith('#_')) {
+       // SCXML compatibility: https://www.w3.org/TR/scxml/#SCXMLEventProcessor
+       // #_invokeid. If the target is the special term '#_invokeid', where invokeid is the invokeid of an SCXML session that the sending session has created by <invoke>, the Processor must add the event to the external queue of that session.
+@@ -110,7 +110,7 @@ function resolveSendTo(
+       );
+     }
+   } else {
+-    targetActorRef = resolvedTarget || actorScope?.self;
++    targetActorRef = resolvedTarget || actorScope.self;
+   }
+ 
+   return [
+diff --git a/packages/core/src/actions/spawnChild.ts b/packages/core/src/actions/spawnChild.ts
+index d1662832f2..b9f11990d4 100644
+--- a/packages/core/src/actions/spawnChild.ts
++++ b/packages/core/src/actions/spawnChild.ts
+@@ -61,7 +61,7 @@ function resolveSpawn(
+     actorRef = createActor(logic, {
+       id: resolvedId,
+       src,
+-      parent: actorScope?.self,
++      parent: actorScope.self,
+       syncSnapshot,
+       systemId,
+       input:
+@@ -69,7 +69,7 @@ function resolveSpawn(
+           ? input({
+               context: snapshot.context,
+               event: actionArgs.event,
+-              self: actorScope?.self
++              self: actorScope.self
+             })
+           : input
+     });
+diff --git a/packages/core/src/getNextSnapshot.ts b/packages/core/src/getNextSnapshot.ts
+new file mode 100644
+index 0000000000..0ef191fed0
+--- /dev/null
++++ b/packages/core/src/getNextSnapshot.ts
+@@ -0,0 +1,76 @@
++import { createActor } from './createActor.ts';
++import {
++  ActorScope,
++  AnyActorLogic,
++  AnyActorScope,
++  EventFromLogic,
++  InputFrom,
++  SnapshotFrom
++} from './types.ts';
++
++/** @internal */
++export function createInertActorScope<T extends AnyActorLogic>(
++  actorLogic: T
++): AnyActorScope {
++  const self = createActor(actorLogic as AnyActorLogic);
++  const inertActorScope: ActorScope<SnapshotFrom<T>, EventFromLogic<T>, any> = {
++    self,
++    defer: () => {},
++    id: '',
++    logger: () => {},
++    sessionId: '',
++    stopChild: () => {},
++    system: self.system
++  };
++
++  return inertActorScope;
++}
++
++export function getInitialSnapshot<T extends AnyActorLogic>(
++  actorLogic: T,
++  ...[input]: undefined extends InputFrom<T>
++    ? [input?: InputFrom<T>]
++    : [input: InputFrom<T>]
++): SnapshotFrom<T> {
++  const actorScope = createInertActorScope(actorLogic);
++  return actorLogic.getInitialSnapshot(actorScope, input);
++}
++
++/**
++ * Determines the next snapshot for the given `actorLogic` based on
++ * the given `snapshot` and `event`.
++ *
++ * If the `snapshot` is `undefined`, the initial snapshot of the
++ * `actorLogic` is used.
++ *
++ * @example
++  ```ts
++  import { getNextSnapshot } from 'xstate';
++  import { trafficLightMachine } from './trafficLightMachine.ts';
++
++  const nextSnapshot = getNextSnapshot(
++    trafficLightMachine, // actor logic
++    undefined, // snapshot (or initial state if undefined)
++    { type: 'TIMER' }); // event object
++
++  console.log(nextSnapshot.value);
++  // => 'yellow'
++
++  const nextSnapshot2 = getNextSnapshot(
++    trafficLightMachine, // actor logic
++    nextSnapshot, // snapshot
++    { type: 'TIMER' }); // event object
++
++  console.log(nextSnapshot2.value);
++  // =>'red'
++  ```
++ */
++export function getNextSnapshot<T extends AnyActorLogic>(
++  actorLogic: T,
++  snapshot: SnapshotFrom<T>,
++  event: EventFromLogic<T>
++): SnapshotFrom<T> {
++  const inertActorScope = createInertActorScope(actorLogic);
++  (inertActorScope.self as any)._snapshot = snapshot;
++  return actorLogic.transition(snapshot, event, inertActorScope);
++}
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 6537a6cc42..b0177584bb 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -9,6 +9,7 @@ export * from './typegenTypes.ts';
+ export * from './types.ts';
+ export { waitFor } from './waitFor.ts';
+ import { createMachine } from './createMachine.ts';
++export { getNextSnapshot } from './getNextSnapshot.ts';
+ import { Actor, createActor, interpret, Interpreter } from './createActor.ts';
+ import { StateNode } from './StateNode.ts';
+ // TODO: decide from where those should be exported
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index c98ebf49ce..5360a1da34 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1505,8 +1505,8 @@ function resolveActionsAndContextWorker(
+     const actionArgs = {
+       context: intermediateSnapshot.context,
+       event,
+-      self: actorScope?.self,
+-      system: actorScope?.system
++      self: actorScope.self,
++      system: actorScope.system
+     };
+ 
+     const actionParams =
+@@ -1519,10 +1519,10 @@ function resolveActionsAndContextWorker(
+           : undefined;
+ 
+     if (!('resolve' in resolvedAction)) {
+-      if (actorScope?.self._processingStatus === ProcessingStatus.Running) {
++      if (actorScope.self._processingStatus === ProcessingStatus.Running) {
+         resolvedAction(actionArgs, actionParams);
+       } else {
+-        actorScope?.defer(() => {
++        actorScope.defer(() => {
+           resolvedAction(actionArgs, actionParams);
+         });
+       }
+@@ -1546,12 +1546,10 @@ function resolveActionsAndContextWorker(
+     }
+ 
+     if ('execute' in builtinAction) {
+-      if (actorScope?.self._processingStatus === ProcessingStatus.Running) {
+-        builtinAction.execute(actorScope!, params);
++      if (actorScope.self._processingStatus === ProcessingStatus.Running) {
++        builtinAction.execute(actorScope, params);
+       } else {
+-        actorScope?.defer(
+-          builtinAction.execute.bind(null, actorScope!, params)
+-        );
++        actorScope.defer(builtinAction.execute.bind(null, actorScope, params));
+       }
+     }
+ 
+@@ -1655,7 +1653,7 @@ export function macrostep(
+       snapshot,
+       actorScope,
+       nextEvent,
+-      false,
++      false, // isInitial
+       internalQueue
+     );
+     states.push(nextSnapshot);

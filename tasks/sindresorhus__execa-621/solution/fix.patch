@@ -1,0 +1,405 @@
+diff --git a/index.d.ts b/index.d.ts
+index 4e267f5..92af32c 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -22,6 +22,8 @@ export type StdinOption =
+ 
+ export type StdoutStderrOption =
+ 	| StdioOption
++	| URL
++	| string
+ 	| WritableStream;
+ 
+ type EncodingOption =
+@@ -107,7 +109,7 @@ export type CommonOptions<EncodingType extends EncodingOption = DefaultEncodingO
+ 	/**
+ 	Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+-	It can also be a web stream ([`WritableStream`](https://developer.mozilla.org/en-US/docs/Web/API/WritableStream)), unless [`execaSync()`](#execasyncfile-arguments-options) is used.
++	It can also be a file path, a file URL, a web stream ([`WritableStream`](https://developer.mozilla.org/en-US/docs/Web/API/WritableStream)), unless [`execaSync()`](#execasyncfile-arguments-options) is used. If the file path is relative, it must start with `.`.
+ 
+ 	@default 'pipe'
+ 	*/
+@@ -116,7 +118,7 @@ export type CommonOptions<EncodingType extends EncodingOption = DefaultEncodingO
+ 	/**
+ 	Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+-	It can also be a web stream ([`WritableStream`](https://developer.mozilla.org/en-US/docs/Web/API/WritableStream)), unless [`execaSync()`](#execasyncfile-arguments-options) is used.
++	It can also be a file path, a file URL, a web stream ([`WritableStream`](https://developer.mozilla.org/en-US/docs/Web/API/WritableStream)), unless [`execaSync()`](#execasyncfile-arguments-options) is used. If the file path is relative, it must start with `.`.
+ 
+ 	@default 'pipe'
+ 	*/
+diff --git a/index.js b/index.js
+index b34b342..ad62e94 100644
+--- a/index.js
++++ b/index.js
+@@ -7,7 +7,7 @@ import stripFinalNewline from 'strip-final-newline';
+ import {npmRunPathEnv} from 'npm-run-path';
+ import onetime from 'onetime';
+ import {makeError} from './lib/error.js';
+-import {handleStdioOption, handleInputOption, pipeStdioOption, normalizeStdioNode} from './lib/stdio.js';
++import {handleStdioOption, handleInputSync, handleOutputSync, pipeStdioOptions, normalizeStdioNode} from './lib/stdio.js';
+ import {spawnedKill, spawnedCancel, setupTimeout, validateTimeout, setExitHandler} from './lib/kill.js';
+ import {addPipeMethods} from './lib/pipe.js';
+ import {getSpawnedResult, makeAllStream} from './lib/stream.js';
+@@ -158,7 +158,7 @@ export function execa(file, args, options) {
+ 
+ 	const handlePromiseOnce = onetime(handlePromise);
+ 
+-	pipeStdioOption(spawned, stdioStreams);
++	pipeStdioOptions(spawned, stdioStreams);
+ 
+ 	spawned.all = makeAllStream(spawned, parsed.options);
+ 
+@@ -169,7 +169,7 @@ export function execa(file, args, options) {
+ 
+ export function execaSync(file, args, options) {
+ 	const parsed = handleArguments(file, args, options);
+-	handleInputOption(parsed.options);
++	const stdioArray = handleInputSync(parsed.options);
+ 
+ 	const command = joinCommand(file, args);
+ 	const escapedCommand = getEscapedCommand(file, args);
+@@ -193,6 +193,7 @@ export function execaSync(file, args, options) {
+ 		});
+ 	}
+ 
++	handleOutputSync(stdioArray, result);
+ 	const stdout = handleOutput(parsed.options, result.stdout, result.error);
+ 	const stderr = handleOutput(parsed.options, result.stderr, result.error);
+ 
+diff --git a/index.test-d.ts b/index.test-d.ts
+index a062c37..c3a301a 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -176,6 +176,8 @@ execa('unicorns', {stdout: 'ignore'});
+ execa('unicorns', {stdout: 'inherit'});
+ execa('unicorns', {stdout: process.stdout});
+ execa('unicorns', {stdout: new WritableStream()});
++execa('unicorns', {stdout: new URL('file:///test')});
++execa('unicorns', {stdout: './test'});
+ execa('unicorns', {stdout: 1});
+ execa('unicorns', {stdout: undefined});
+ execa('unicorns', {stderr: 'pipe'});
+@@ -185,6 +187,8 @@ execa('unicorns', {stderr: 'ignore'});
+ execa('unicorns', {stderr: 'inherit'});
+ execa('unicorns', {stderr: process.stderr});
+ execa('unicorns', {stderr: new WritableStream()});
++execa('unicorns', {stderr: new URL('file:///test')});
++execa('unicorns', {stderr: './test'});
+ execa('unicorns', {stderr: 1});
+ execa('unicorns', {stderr: undefined});
+ execa('unicorns', {all: true});
+diff --git a/lib/stdio.js b/lib/stdio.js
+index cd69619..c25b2c9 100644
+--- a/lib/stdio.js
++++ b/lib/stdio.js
+@@ -1,10 +1,8 @@
+-import {createReadStream, readFileSync} from 'node:fs';
++import {createReadStream, createWriteStream, readFileSync, writeFileSync} from 'node:fs';
+ import {isAbsolute} from 'node:path';
+ import {Readable, Writable} from 'node:stream';
+ import {isStream as isNodeStream} from 'is-stream';
+ 
+-const aliases = ['stdin', 'stdout', 'stderr'];
+-
+ const arrifyStdio = (stdio = []) => Array.isArray(stdio) ? stdio : [stdio, stdio, stdio];
+ 
+ const isIterableStdin = stdinOption => typeof stdinOption === 'object'
+@@ -42,14 +40,14 @@ const cannotPipeStdin = stdinOption => NO_PIPE_STDIO.has(stdinOption)
+ const NO_PIPE_STDIO = new Set(['ipc', 'ignore', 'inherit']);
+ const KNOWN_STDIO = new Set([...NO_PIPE_STDIO, 'overlapped', 'pipe']);
+ 
+-const validateFileSdio = stdioOption => {
++const validateFileSdio = (stdioOption, optionName) => {
+ 	if (isRegularUrl(stdioOption)) {
+-		throw new TypeError(`The \`stdin: URL\` option must use the \`file:\` scheme.
++		throw new TypeError(`The \`${optionName}: URL\` option must use the \`file:\` scheme.
+ For example, you can use the \`pathToFileURL()\` method of the \`url\` core module.`);
+ 	}
+ 
+ 	if (isUnknownStdioString(stdioOption)) {
+-		throw new TypeError('The `stdin: filePath` option must either be an absolute file path or start with `.`.');
++		throw new TypeError(`The \`${optionName}: filePath\` option must either be an absolute file path or start with \`.\`.`);
+ 	}
+ };
+ 
+@@ -67,32 +65,34 @@ const validateInputOptions = (stdioArray, input, inputFile) => {
+ 		throw new TypeError('The `inputFile` and `stdin` options cannot be both set.');
+ 	}
+ 
+-	validateFileSdio(stdioArray[0]);
++	validateFileSdio(stdioArray[0], 'stdin');
++	validateFileSdio(stdioArray[1], 'stdout');
++	validateFileSdio(stdioArray[2], 'stderr');
+ };
+ 
+-const getStdioStreams = (stdioArray, {input, inputFile}) => ({
+-	...getStdinStream(stdioArray[0], input, inputFile),
+-	...getStdoutStream(stdioArray[1]),
+-	...getStderrStream(stdioArray[2]),
+-});
++const getStdioStreams = (stdioArray, {input, inputFile}) => [
++	{...getStdinStream(stdioArray[0], input, inputFile), isInput: true},
++	getOutputStream(stdioArray[1]),
++	getOutputStream(stdioArray[2]),
++];
+ 
+ const getStdinStream = (stdinOption, input, inputFile) => {
+ 	const iterableStdin = getIterableStdin(stdinOption);
+ 
+ 	if (iterableStdin !== undefined) {
+-		return {stdinStream: Readable.from(iterableStdin)};
++		return {value: Readable.from(iterableStdin)};
+ 	}
+ 
+ 	if (isReadableStream(stdinOption)) {
+-		return {stdinStream: Readable.fromWeb(stdinOption)};
++		return {value: Readable.fromWeb(stdinOption)};
+ 	}
+ 
+ 	if (isFileUrl(stdinOption) || isFilePath(stdinOption)) {
+-		return {stdinStream: createReadStream(stdinOption)};
++		return {value: createReadStream(stdinOption), finite: true};
+ 	}
+ 
+ 	if (inputFile !== undefined) {
+-		return {stdinStream: createReadStream(inputFile)};
++		return {value: createReadStream(inputFile), finite: true};
+ 	}
+ 
+ 	if (input === undefined) {
+@@ -100,54 +100,34 @@ const getStdinStream = (stdinOption, input, inputFile) => {
+ 	}
+ 
+ 	if (isNodeStream(input)) {
+-		return {stdinStream: input};
++		return {value: input};
+ 	}
+ 
+-	return {stdinInput: input};
+-};
+-
+-const getStdoutStream = stdoutOption => {
+-	const stdoutStream = getOutputStream(stdoutOption);
+-	return stdoutStream === undefined ? {} : {stdoutStream};
+-};
+-
+-const getStderrStream = stderrOption => {
+-	const stderrStream = getOutputStream(stderrOption);
+-	return stderrStream === undefined ? {} : {stderrStream};
++	return {value: input, single: true};
+ };
+ 
+ const getOutputStream = stdioOption => {
+ 	if (isWritableStream(stdioOption)) {
+-		return Writable.fromWeb(stdioOption);
++		return {value: Writable.fromWeb(stdioOption)};
+ 	}
+-};
+ 
+-// When the `stdin: Iterable | ReadableStream | URL | filePath`, `input` or `inputFile` option is used, we pipe to `spawned.std*`.
+-// Therefore the `std*` options must be either `pipe` or `overlapped`. Other values do not set `spawned.std*`.
+-const willPipeStreams = (index, {stdinStream, stdinInput, stdoutStream, stderrStream}) => {
+-	if (index === 0) {
+-		return stdinStream !== undefined || stdinInput !== undefined;
+-	}
+-
+-	if (index === 1) {
+-		return stdoutStream !== undefined;
++	if (isFileUrl(stdioOption) || isFilePath(stdioOption)) {
++		return {value: createWriteStream(stdioOption), finite: true};
+ 	}
+ 
+-	if (index === 2) {
+-		return stderrStream !== undefined;
+-	}
+-
+-	return false;
++	return {};
+ };
+ 
++// When the `stdin: Iterable | ReadableStream | URL | filePath`, `input` or `inputFile` option is used, we pipe to `spawned.std*`.
++// Therefore the `std*` options must be either `pipe` or `overlapped`. Other values do not set `spawned.std*`.
+ const transformStdioItem = (stdioItem, index, stdioStreams) =>
+-	willPipeStreams(index, stdioStreams) && stdioItem !== 'overlapped' ? 'pipe' : stdioItem;
++	stdioStreams[index]?.value !== undefined && stdioItem !== 'overlapped' ? 'pipe' : stdioItem;
+ 
+ const transformStdio = (stdio, stdioStreams) => Array.isArray(stdio)
+ 	? stdio.map((stdioItem, index) => transformStdioItem(stdioItem, index, stdioStreams))
+ 	: stdio;
+ 
+-// Handle `input`, `inputFile` and `stdin` options, before spawning, in async mode
++// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in async mode
+ export const handleStdioOption = options => {
+ 	const stdio = normalizeStdio(options);
+ 	const stdioArray = arrifyStdio(stdio);
+@@ -157,23 +137,29 @@ export const handleStdioOption = options => {
+ 	return stdioStreams;
+ };
+ 
+-// Handle `input`, `inputFile` and `stdin` options, after spawning, in async mode
+-export const pipeStdioOption = (spawned, {stdinStream, stdinInput, stdoutStream, stderrStream}) => {
+-	if (stdinStream !== undefined) {
+-		stdinStream.pipe(spawned.stdin);
++// Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, after spawning, in async mode
++export const pipeStdioOptions = (spawned, stdioStreams) => {
++	for (const [index, stdioStream] of stdioStreams.entries()) {
++		pipeStdioOption(spawned.stdio[index], stdioStream);
+ 	}
++};
+ 
+-	if (stdinInput !== undefined) {
+-		spawned.stdin.end(stdinInput);
++const pipeStdioOption = (childStream, {single, value, isInput}) => {
++	if (value === undefined) {
++		return;
+ 	}
+ 
+-	if (stdoutStream !== undefined) {
+-		spawned.stdout.pipe(stdoutStream);
++	if (!isInput) {
++		childStream.pipe(value);
++		return;
+ 	}
+ 
+-	if (stderrStream !== undefined) {
+-		spawned.stderr.pipe(stderrStream);
++	if (single) {
++		childStream.end(value);
++		return;
+ 	}
++
++	value.pipe(childStream);
+ };
+ 
+ const transformStdioItemSync = stdioItem => isFileUrl(stdioItem) || isFilePath(stdioItem) ? 'pipe' : stdioItem;
+@@ -222,7 +208,7 @@ const getInputOption = (stdinOption, {input, inputFile}) => {
+ };
+ 
+ // Handle `input`, `inputFile` and `stdin` options, before spawning, in sync mode
+-export const handleInputOption = options => {
++export const handleInputSync = options => {
+ 	const stdio = normalizeStdio(options);
+ 	const stdioArray = arrifyStdio(stdio);
+ 	validateOptionsSync(stdioArray, options);
+@@ -233,8 +219,27 @@ export const handleInputOption = options => {
+ 	}
+ 
+ 	options.stdio = transformStdioSync(stdio);
++	return stdioArray;
+ };
+ 
++// Handle `stdout` and `stderr` options, before spawning, in sync mode
++const handleOutputOption = (stdioOption, result) => {
++	if (result === null) {
++		return;
++	}
++
++	if (isFileUrl(stdioOption) || isFilePath(stdioOption)) {
++		writeFileSync(stdioOption, result);
++	}
++};
++
++export const handleOutputSync = (stdioArray, {stdout, stderr}) => {
++	handleOutputOption(stdioArray[1], stdout);
++	handleOutputOption(stdioArray[2], stderr);
++};
++
++const aliases = ['stdin', 'stdout', 'stderr'];
++
+ const hasAlias = options => aliases.some(alias => options[alias] !== undefined);
+ 
+ export const normalizeStdio = options => {
+diff --git a/lib/stream.js b/lib/stream.js
+index 1885aa2..222f6ae 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -1,5 +1,6 @@
+ import {once} from 'node:events';
+ import {setTimeout} from 'node:timers/promises';
++import {finished} from 'node:stream/promises';
+ import getStream, {getStreamAsBuffer} from 'get-stream';
+ import mergeStreams from '@sindresorhus/merge-streams';
+ 
+@@ -53,9 +54,19 @@ const applyEncoding = async (stream, maxBuffer, encoding) => {
+ 	return buffer.toString(encoding);
+ };
+ 
+-// Handle any errors thrown by the iterable passed to the `stdin`/`stdout`/`stderr` option, if any.
+-// We do not consume nor wait on those streams though, since it could potentially be infinite (like `process.stdin` in an interactive TTY).
+-const throwOnStreamsError = streams => streams.filter(Boolean).map(stream => throwOnStreamError(stream));
++// We need to handle any `error` coming from the `stdin|stdout|stderr` options.
++// However, those might be infinite streams, e.g. a TTY passed as input or output.
++// We wait for completion or not depending on whether `finite` is `true`.
++// In either case, we handle `error` events while the process is running.
++const waitForStreamEnd = ({value, finite, single}, processDone) => {
++	if (value === undefined || single) {
++		return;
++	}
++
++	return finite
++		? finished(value)
++		: Promise.race([processDone, throwOnStreamError(value)]);
++};
+ 
+ const throwOnStreamError = async stream => {
+ 	const [error] = await once(stream, 'error');
+@@ -63,14 +74,24 @@ const throwOnStreamError = async stream => {
+ };
+ 
+ // Retrieve result of child process: exit code, signal, error, streams (stdout/stderr/all)
+-export const getSpawnedResult = async (spawned, {encoding, buffer, maxBuffer}, {stdinStream, stdoutStream, stderrStream}, processDone) => {
++export const getSpawnedResult = async (
++	spawned,
++	{encoding, buffer, maxBuffer},
++	stdioStreams,
++	processDone,
++) => {
+ 	const stdoutPromise = getStreamPromise(spawned.stdout, {encoding, buffer, maxBuffer});
+ 	const stderrPromise = getStreamPromise(spawned.stderr, {encoding, buffer, maxBuffer});
+ 	const allPromise = getStreamPromise(spawned.all, {encoding, buffer, maxBuffer: maxBuffer * 2});
+-	const processDoneOrStreamsError = Promise.race([processDone, ...throwOnStreamsError([stdinStream, stdoutStream, stderrStream])]);
+ 
+ 	try {
+-		return await Promise.all([processDoneOrStreamsError, stdoutPromise, stderrPromise, allPromise]);
++		return await Promise.all([
++			processDone,
++			stdoutPromise,
++			stderrPromise,
++			allPromise,
++			...stdioStreams.map(stdioStream => waitForStreamEnd(stdioStream, processDone)),
++		]);
+ 	} catch (error) {
+ 		spawned.kill();
+ 		return Promise.all([
+diff --git a/readme.md b/readme.md
+index 9da497a..197a712 100644
+--- a/readme.md
++++ b/readme.md
+@@ -568,20 +568,22 @@ It can also be a file path, a file URL, a web stream ([`ReadableStream`](https:/
+ 
+ #### stdout
+ 
+-Type: `string | number | stream.Writable | WritableStream | undefined`\
++Type: `string | number | stream.Writable | WritableStream | undefined | URL`\
+ Default: `pipe`
+ 
+ Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
+-It can also be a web stream ([`WritableStream`](https://developer.mozilla.org/en-US/docs/Web/API/WritableStream)), unless [`execaSync()`](#execasyncfile-arguments-options) is used.
++It can also be a file path, a file URL, a web stream ([`WritableStream`](https://developer.mozilla.org/en-US/docs/Web/API/WritableStream)), unless [`execaSync()`](#execasyncfile-arguments-options) is used. If the file path is relative, it must start with `.`.
+ 
+ #### stderr
+ 
+-Type: `string | number | stream.Writable | WritableStream | undefined`\
++Type: `string | number | stream.Writable | WritableStream | undefined | URL`\
+ Default: `pipe`
+ 
+ Same options as [`stdio`](https://nodejs.org/dist/latest-v6.x/docs/api/child_process.html#child_process_options_stdio).
+ 
++It can also be a file path, a file URL, a web stream ([`WritableStream`](https://developer.mozilla.org/en-US/docs/Web/API/WritableStream)), unless [`execaSync()`](#execasyncfile-arguments-options) is used. If the file path is relative, it must start with `.`.
++
+ #### all
+ 
+ Type: `boolean`\

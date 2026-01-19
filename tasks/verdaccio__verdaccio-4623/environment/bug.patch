@@ -1,0 +1,447 @@
+diff --git a/.changeset/poor-seals-turn.md b/.changeset/poor-seals-turn.md
+deleted file mode 100644
+index 421a9e668..000000000
+--- a/.changeset/poor-seals-turn.md
++++ /dev/null
+@@ -1,6 +0,0 @@
+----
+-'@verdaccio/tarball': patch
+-'@verdaccio/store': patch
+----
+-
+-revert #4600
+diff --git a/packages/core/tarball/package.json b/packages/core/tarball/package.json
+index 0a89df7b9..284c923c7 100644
+--- a/packages/core/tarball/package.json
++++ b/packages/core/tarball/package.json
+@@ -37,7 +37,9 @@
+     "@verdaccio/url": "workspace:12.0.0-next-7.14",
+     "@verdaccio/utils": "workspace:7.0.0-next-7.14",
+     "debug": "4.3.4",
+-    "lodash": "4.17.21"
++    "gunzip-maybe": "^1.4.2",
++    "lodash": "4.17.21",
++    "tar-stream": "^3.1.7"
+   },
+   "devDependencies": {
+     "@verdaccio/types": "workspace:12.0.0-next.2",
+diff --git a/packages/core/tarball/src/getTarballDetails.ts b/packages/core/tarball/src/getTarballDetails.ts
+new file mode 100644
+index 000000000..df1841a23
+--- /dev/null
++++ b/packages/core/tarball/src/getTarballDetails.ts
+@@ -0,0 +1,34 @@
++import gunzipMaybe from 'gunzip-maybe';
++import { Readable } from 'stream';
++import * as tarStream from 'tar-stream';
++
++export type TarballDetails = {
++  fileCount: number;
++  unpackedSize: number; // in bytes
++};
++
++export async function getTarballDetails(readable: Readable): Promise<TarballDetails> {
++  let fileCount = 0;
++  let unpackedSize = 0;
++
++  const unpack = tarStream.extract();
++
++  return new Promise((resolve, reject) => {
++    readable
++      .pipe(gunzipMaybe())
++      .pipe(unpack)
++      .on('entry', (header, stream, next) => {
++        fileCount++;
++        unpackedSize += Number(header.size);
++        stream.resume(); // important to ensure that "entry" events keep firing
++        next();
++      })
++      .on('finish', () => {
++        resolve({
++          fileCount,
++          unpackedSize,
++        });
++      })
++      .on('error', reject);
++  });
++}
+diff --git a/packages/core/tarball/src/index.ts b/packages/core/tarball/src/index.ts
+index 29e7e81fe..27d742065 100644
+--- a/packages/core/tarball/src/index.ts
++++ b/packages/core/tarball/src/index.ts
+@@ -5,5 +5,6 @@ export {
+   convertDistVersionToLocalTarballsUrl,
+ } from './convertDistRemoteToLocalTarballUrls';
+ export { extractTarballFromUrl, getLocalRegistryTarballUri } from './getLocalRegistryTarballUri';
++export { TarballDetails, getTarballDetails } from './getTarballDetails';
+ 
+ export { RequestOptions };
+diff --git a/packages/core/tarball/tests/assets/tarball.tar b/packages/core/tarball/tests/assets/tarball.tar
+new file mode 100644
+index 000000000..e15803f3e
+Binary files /dev/null and b/packages/core/tarball/tests/assets/tarball.tar differ
+diff --git a/packages/core/tarball/tests/assets/tarball.tgz b/packages/core/tarball/tests/assets/tarball.tgz
+new file mode 100644
+index 000000000..f25e82149
+Binary files /dev/null and b/packages/core/tarball/tests/assets/tarball.tgz differ
+diff --git a/packages/core/tarball/tests/getTarballDetails.spec.ts b/packages/core/tarball/tests/getTarballDetails.spec.ts
+new file mode 100644
+index 000000000..4f48eea05
+--- /dev/null
++++ b/packages/core/tarball/tests/getTarballDetails.spec.ts
+@@ -0,0 +1,37 @@
++import fs from 'fs';
++import path from 'path';
++import { Readable } from 'stream';
++
++import { getTarballDetails } from '../src/getTarballDetails.ts';
++
++const getFilePath = (filename: string): string => {
++  return path.resolve(__dirname, `assets/${filename}`);
++};
++
++const getFileBuffer = async (filename: string): Promise<Buffer> => {
++  return fs.promises.readFile(getFilePath(filename));
++};
++
++describe('getTarballDetails', () => {
++  test('should return stats of tarball (gzipped)', async () => {
++    const buffer = await getFileBuffer('tarball.tgz');
++    const readable = Readable.from(buffer);
++    const details = await getTarballDetails(readable);
++    expect(details.fileCount).toBe(2);
++    expect(details.unpackedSize).toBe(1280);
++  });
++
++  test('should return stats of tarball (uncompressed)', async () => {
++    const buffer = await getFileBuffer('tarball.tar');
++    const readable = Readable.from(buffer);
++    const details = await getTarballDetails(readable);
++    expect(details.fileCount).toBe(2);
++    expect(details.unpackedSize).toBe(1280);
++  });
++
++  test('should throw an error if the buffer is corrupt', async () => {
++    const corruptBuffer = Buffer.from('this is not a tarball');
++    const readable = Readable.from(corruptBuffer);
++    await expect(getTarballDetails(readable)).rejects.toThrow();
++  });
++});
+diff --git a/packages/store/src/storage.ts b/packages/store/src/storage.ts
+index 9f58ea890..48625532a 100644
+--- a/packages/store/src/storage.ts
++++ b/packages/store/src/storage.ts
+@@ -34,9 +34,11 @@ import {
+ } from '@verdaccio/proxy';
+ import Search from '@verdaccio/search';
+ import {
++  TarballDetails,
+   convertDistRemoteToLocalTarballUrls,
+   convertDistVersionToLocalTarballsUrl,
+   extractTarballFromUrl,
++  getTarballDetails,
+ } from '@verdaccio/tarball';
+ import {
+   AbbreviatedManifest,
+@@ -1044,6 +1046,8 @@ class Storage {
+     // at this point document is either created or existed before
+     const [firstAttachmentKey] = Object.keys(_attachments);
+     const buffer = this.getBufferManifest(body._attachments[firstAttachmentKey].data as string);
++    const readable = Readable.from(buffer);
++    const tarballStats = await this.getTarballStats(versions[versionToPublish], readable);
+ 
+     try {
+       // we check if package exist already locally
+@@ -1082,7 +1086,7 @@ class Storage {
+           _.isNil(manifest.readme) === false ? String(manifest.readme) : '';
+       }
+       // addVersion will move the readme from the the published version to the root level
+-      await this.addVersion(name, versionToPublish, versions[versionToPublish], null);
++      await this.addVersion(name, versionToPublish, versions[versionToPublish], null, tarballStats);
+     } catch (err: any) {
+       logger.error({ err: err.message }, 'updated version has failed: @{err}');
+       debug('error on create a version for %o with error %o', name, err.message);
+@@ -1110,7 +1114,6 @@ class Storage {
+ 
+     // 3. upload the tarball to the storage
+     try {
+-      const readable = Readable.from(buffer);
+       await this.uploadTarball(name, basename(firstAttachmentKey), readable, {
+         signal: options.signal,
+       });
+@@ -1283,7 +1286,8 @@ class Storage {
+     name: string,
+     version: string,
+     metadata: Version,
+-    tag: StringValue
++    tag: StringValue,
++    tarballStats: TarballDetails
+   ): Promise<void> {
+     debug(`add version %s package for %s`, version, name);
+     await this.updatePackage(name, async (data: Manifest): Promise<Manifest> => {
+@@ -1295,6 +1299,12 @@ class Storage {
+       metadata.contributors = normalizeContributors(metadata.contributors as Author[]);
+       debug('%s` contributors normalized', name);
+ 
++      // Update tarball stats
++      if (metadata.dist) {
++        metadata.dist.fileCount = tarballStats.fileCount;
++        metadata.dist.unpackedSize = tarballStats.unpackedSize;
++      }
++
+       // if uploaded tarball has a different shasum, it's very likely that we
+       // have some kind of error
+       if (validatioUtils.isObject(metadata.dist) && _.isString(metadata.dist.tarball)) {
+@@ -1905,6 +1915,25 @@ class Storage {
+       return cacheManifest;
+     }
+   }
++
++  private async getTarballStats(version: Version, readable: Readable): Promise<TarballDetails> {
++    if (
++      version.dist == undefined ||
++      version.dist?.fileCount == undefined ||
++      version.dist?.unpackedSize == undefined
++    ) {
++      debug('tarball stats not found, calculating');
++      try {
++        return await getTarballDetails(readable);
++      } catch (err: any) {
++        logger.error({ err: err.message }, 'getting tarball details has failed: @{err}');
++        throw err;
++      }
++    } else {
++      debug('tarball stats found');
++      return { fileCount: version.dist.fileCount, unpackedSize: version.dist.unpackedSize };
++    }
++  }
+ }
+ 
+ export { Storage };
+diff --git a/packages/store/test/storage.spec.ts b/packages/store/test/storage.spec.ts
+index 1e767ad61..f21a25299 100644
+--- a/packages/store/test/storage.spec.ts
++++ b/packages/store/test/storage.spec.ts
+@@ -262,10 +262,12 @@ describe('storage', () => {
+         expect(manifestVersion._id).toEqual(`${pkgName}@1.0.1`);
+         expect(manifestVersion.description).toEqual('package generated');
+         expect(manifestVersion.dist).toEqual({
++          fileCount: 4,
+           integrity:
+             'sha512-6gHiERpiDgtb3hjqpQH5/i7zRmvYi9pmCjQf2ZMy3QEa9wVk9RgdZaPWUt7ZOnWUPFjcr9cmE6dUBf+XoPoH4g==',
+           shasum: '2c03764f651a9f016ca0b7620421457b619151b9',
+           tarball: 'http://localhost:5555/upstream/-/upstream-1.0.1.tgz',
++          unpackedSize: 543,
+         });
+ 
+         expect(manifestVersion.contributors).toEqual([]);
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index b530ae3f2..d6f8e6f39 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -731,9 +731,15 @@ importers:
+       debug:
+         specifier: 4.3.4
+         version: 4.3.4(supports-color@5.5.0)
++      gunzip-maybe:
++        specifier: ^1.4.2
++        version: 1.4.2
+       lodash:
+         specifier: 4.17.21
+         version: 4.17.21
++      tar-stream:
++        specifier: ^3.1.7
++        version: 3.1.7
+     devDependencies:
+       '@verdaccio/types':
+         specifier: workspace:12.0.0-next.2
+@@ -13607,6 +13613,10 @@ packages:
+       dequal: 2.0.3
+     dev: false
+ 
++  /b4a@1.6.6:
++    resolution: {integrity: sha512-5Tk1HLk6b6ctmjIkAcU/Ujv/1WqiDl0F0JdRCR80VsOcUlHcu7pWeWRlOqQLHfDEsVx9YH/aif5AG4ehoCtTmg==}
++    dev: false
++
+   /babel-core@7.0.0-bridge.0(@babel/core@7.23.9):
+     resolution: {integrity: sha512-poPX9mZH/5CSanm50Q+1toVci6pv5KSRv/5TWCwtzQS5XEwn40BcCrgIeMFWP9CKKIniKXNxoIOnOq4VVlGXhg==}
+     peerDependencies:
+@@ -13922,6 +13932,12 @@ packages:
+     resolution: {integrity: sha512-1ugUSr8BHXRnK23KfuYS+gVMC3LB8QGH9W1iGtDPsNWoQbgtXSExkBu2aDR4epiGWZOjZsj6lDl/N/AqqTC3UA==}
+     dev: true
+ 
++  /bare-events@2.2.2:
++    resolution: {integrity: sha512-h7z00dWdG0PYOQEvChhOSWvOfkIKsdZGkWr083FgN/HyoQuebSew/cgirYqh9SCuy/hRvxc5Vy6Fw8xAmYHLkQ==}
++    requiresBuild: true
++    dev: false
++    optional: true
++
+   /base16@1.0.0:
+     resolution: {integrity: sha512-pNdYkNPiJUnEhnfXV56+sQy8+AaPcG3POZAUnwr4EeqCUZFz4u2PePbo3e5Gj4ziYPCWGUZT9RHisvJKnwFuBQ==}
+ 
+@@ -14193,6 +14209,12 @@ packages:
+       safe-buffer: 5.2.1
+     dev: true
+ 
++  /browserify-zlib@0.1.4:
++    resolution: {integrity: sha512-19OEpq7vWgsH6WkvkBJQDFvJS1uPcbFOQ4v9CU839dO+ZZXUZO6XpE6hNCqvlIIj+4fZvRiJ6DsAQ382GwiyTQ==}
++    dependencies:
++      pako: 0.2.9
++    dev: false
++
+   /browserify-zlib@0.2.0:
+     resolution: {integrity: sha512-Z942RysHXmJrhqk88FmKBVq/v5tqmSkDz7p54G/MGyjMnCFFnC79XWNbg+Vta8W6Wb2qtSZTSxIGkJrRpCFEiA==}
+     dependencies:
+@@ -16799,7 +16821,6 @@ packages:
+       inherits: 2.0.4
+       readable-stream: 2.3.8
+       stream-shift: 1.0.1
+-    dev: true
+ 
+   /duplexify@4.1.2:
+     resolution: {integrity: sha512-fz3OjcNCHmRP12MJoZMPglx8m4rrFP8rovnk4vT8Fs+aonZoCwGg10dSsQsfP/E62eZcPTMSMP6686fu9Qlqtw==}
+@@ -18078,6 +18099,10 @@ packages:
+     resolution: {integrity: sha512-VxPP4NqbUjj6MaAOafWeUn2cXWLcCtljklUtZf0Ind4XQ+QPtmA0b18zZy0jIQx+ExRVCR/ZQpBmik5lXshNsw==}
+     dev: false
+ 
++  /fast-fifo@1.3.2:
++    resolution: {integrity: sha512-/d9sfos4yxzpwkDkuN7k2SqFKtYNmCTzgfEpz82x34IM9/zc8KGxQoXg1liNC/izpRM/MBdt44Nmx41ZWqk+FQ==}
++    dev: false
++
+   /fast-glob@2.2.7:
+     resolution: {integrity: sha512-g1KuQwHOZAmOZMuBtHdxDtju+T2RT8jgCC9aANsbpdiDDTSnjgfuVsIBNKbUeJI3oKMRExcfNDtJl4OhbffMsw==}
+     engines: {node: '>=4.0.0'}
+@@ -19138,6 +19163,18 @@ packages:
+       section-matter: 1.0.0
+       strip-bom-string: 1.0.0
+ 
++  /gunzip-maybe@1.4.2:
++    resolution: {integrity: sha512-4haO1M4mLO91PW57BMsDFf75UmwoRX0GkdD+Faw+Lr+r/OZrOCS0pIBwOL1xCKQqnQzbNFGgK2V2CpBUPeFNTw==}
++    hasBin: true
++    dependencies:
++      browserify-zlib: 0.1.4
++      is-deflate: 1.0.0
++      is-gzip: 1.0.0
++      peek-stream: 1.1.3
++      pumpify: 1.5.1
++      through2: 2.0.5
++    dev: false
++
+   /gzip-size@5.1.1:
+     resolution: {integrity: sha512-FNHi6mmoHvs1mxZAds4PpdCS6QG8B4C1krxJsMutgxl5t3+GlRTzzI3NEkifXx2pVsOvJdOGSmIgDhQ55FwdPA==}
+     engines: {node: '>=6'}
+@@ -20098,6 +20135,10 @@ packages:
+   /is-decimal@2.0.1:
+     resolution: {integrity: sha512-AAB9hiomQs5DXWcRB1rqsxGUstbRroFOPPVAomNk/3XHR5JyEZChOyTWe2oayKnsSsr/kcGqF+z6yuH6HHpN0A==}
+ 
++  /is-deflate@1.0.0:
++    resolution: {integrity: sha512-YDoFpuZWu1VRXlsnlYMzKyVRITXj7Ej/V9gXQ2/pAe7X1J7M/RNOqaIYi6qUn+B7nGyB9pDXrv02dsB58d2ZAQ==}
++    dev: false
++
+   /is-descriptor@0.1.6:
+     resolution: {integrity: sha512-avDYr0SB3DwO9zsMov0gKCESFYqCnE4hq/4z3TdUlukEy5t9C0YRq7HLrsN52NAcqXKaepeCD0n+B0arnVG3Hg==}
+     engines: {node: '>=0.10.0'}
+@@ -20187,6 +20228,11 @@ packages:
+     dependencies:
+       is-extglob: 2.1.1
+ 
++  /is-gzip@1.0.0:
++    resolution: {integrity: sha512-rcfALRIb1YewtnksfRIHGcIY93QnK8BIQ/2c9yDYcG/Y6+vRoJuTWBmmSEbyLLYtXm7q35pHOHbZFQBaLrhlWQ==}
++    engines: {node: '>=0.10.0'}
++    dev: false
++
+   /is-hexadecimal@1.0.4:
+     resolution: {integrity: sha512-gyPJuv83bHMpocVYoqof5VDiZveEoGoFL8m3BXNb2VW8Xs+rz9kqO8LOQ5DH6EsuvilT1ApazU0pyl+ytbPtlw==}
+ 
+@@ -23613,6 +23659,10 @@ packages:
+       registry-url: 5.1.0
+       semver: 6.3.1
+ 
++  /pako@0.2.9:
++    resolution: {integrity: sha512-NUcwaKxUxWrZLpDG+z/xZaCgQITkA/Dv4V/T6bw7VON6l1Xz/VnrBqrYjZQ12TamKHzITTfOEIYUj48y2KXImA==}
++    dev: false
++
+   /pako@1.0.11:
+     resolution: {integrity: sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==}
+     dev: true
+@@ -23836,6 +23886,14 @@ packages:
+       sha.js: 2.4.11
+     dev: true
+ 
++  /peek-stream@1.1.3:
++    resolution: {integrity: sha512-FhJ+YbOSBb9/rIl2ZeE/QHEsWn7PqNYt8ARAY3kIgNGOk13g9FGyIY6JIl/xB/3TFRVoTv5as0l11weORrTekA==}
++    dependencies:
++      buffer-from: 1.1.2
++      duplexify: 3.7.1
++      through2: 2.0.5
++    dev: false
++
+   /pend@1.2.0:
+     resolution: {integrity: sha512-F3asv42UuXchdzt+xXqfW1OGlVBe+mxa2mqI0pg5yAHZPvFmY3Y6drSf/GQ1A86WgWEN9Kzh/WrgKa6iGcHXLg==}
+     dev: true
+@@ -25076,7 +25134,6 @@ packages:
+     dependencies:
+       end-of-stream: 1.4.4
+       once: 1.4.0
+-    dev: true
+ 
+   /pump@3.0.0:
+     resolution: {integrity: sha512-LwZy+p3SFs1Pytd/jYct4wpv49HiYCqd9Rlc5ZVdk0V+8Yzv6jR5Blk3TRmPL1ft69TxP0IMZGJ+WPFU2BFhww==}
+@@ -25090,7 +25147,6 @@ packages:
+       duplexify: 3.7.1
+       inherits: 2.0.4
+       pump: 2.0.1
+-    dev: true
+ 
+   /punycode@1.3.2:
+     resolution: {integrity: sha512-RofWgt/7fL5wP1Y7fxE7/EmTLzQVnB0ycyibJ0OOHIlJqTNzglYFxVwETOcIoJqJmpDXJ9xImDv+Fq34F/d4Dw==}
+@@ -25155,6 +25211,10 @@ packages:
+   /queue-microtask@1.2.3:
+     resolution: {integrity: sha512-NuaNSa6flKT5JaSYQzJok04JzTL1CA6aGhv5rfLW3PgqA+M2ChpZQnAC8h8i4ZFkBS8X5RqkDBHA7r4hej3K9A==}
+ 
++  /queue-tick@1.0.1:
++    resolution: {integrity: sha512-kJt5qhMxoszgU/62PLP1CJytzd2NKetjSRnyuj31fDd3Rlcz3fzlFdFLD1SItunPwyqEOkca6GbV612BWfaBag==}
++    dev: false
++
+   /queue@6.0.2:
+     resolution: {integrity: sha512-iHZWu+q3IdFZFX36ro/lKBkSvfkztY5Y7HMiPlOUjhupPcG2JMfst2KKEpu5XndviX/3UhFbRngUPNKtgvtZiA==}
+     dependencies:
+@@ -27329,6 +27389,15 @@ packages:
+       mixme: 0.5.9
+     dev: true
+ 
++  /streamx@2.16.1:
++    resolution: {integrity: sha512-m9QYj6WygWyWa3H1YY69amr4nVgy61xfjys7xO7kviL5rfIEc2naf+ewFiOA+aEJD7y0JO3h2GoiUv4TDwEGzQ==}
++    dependencies:
++      fast-fifo: 1.3.2
++      queue-tick: 1.0.1
++    optionalDependencies:
++      bare-events: 2.2.2
++    dev: false
++
+   /strict-event-emitter@0.2.8:
+     resolution: {integrity: sha512-KDf/ujU8Zud3YaLtMCcTI4xkZlZVIYxTLr+XIULexP+77EEVWixeXroLUXQXiVtH4XH2W7jr/3PT1v3zBuvc3A==}
+     dependencies:
+@@ -27879,6 +27948,14 @@ packages:
+     resolution: {integrity: sha512-GNzQvQTOIP6RyTfE2Qxb8ZVlNmw0n88vp1szwWRimP02mnTsx3Wtn5qRdqY9w2XduFNUgvOwhNnQsjwCp+kqaQ==}
+     engines: {node: '>=6'}
+ 
++  /tar-stream@3.1.7:
++    resolution: {integrity: sha512-qJj60CXt7IU1Ffyc3NJMjh6EkuCFej46zUqJ4J7pqYlThyd9bO0XBTmcOIhSzZJVWfsLks0+nle/j538YAW9RQ==}
++    dependencies:
++      b4a: 1.6.6
++      fast-fifo: 1.3.2
++      streamx: 2.16.1
++    dev: false
++
+   /tar@4.4.19:
+     resolution: {integrity: sha512-a20gEsvHnWe0ygBY8JbxoM4w3SJdhc7ZAuxkLqh+nvNQN2IOt0B5lLgM490X5Hl8FF0dl0tOf2ewFYAlIFgzVA==}
+     engines: {node: '>=4.5'}
+@@ -28067,7 +28144,6 @@ packages:
+     dependencies:
+       readable-stream: 2.3.8
+       xtend: 4.0.2
+-    dev: true
+ 
+   /through@2.3.8:
+     resolution: {integrity: sha512-w89qg7PI8wAdvX60bMDP+bFoD5Dvhm9oLheFp5O4a2QF0cSBGsBX4qZmadPMvVqlLJBBci+WqGGOAPvcDeNSVg==}

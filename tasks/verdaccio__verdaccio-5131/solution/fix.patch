@@ -1,0 +1,403 @@
+diff --git a/.changeset/gold-files-speak.md b/.changeset/gold-files-speak.md
+new file mode 100644
+index 000000000..01dfa97c4
+--- /dev/null
++++ b/.changeset/gold-files-speak.md
+@@ -0,0 +1,9 @@
++---
++'@verdaccio/config': patch
++'@verdaccio/search': patch
++'@verdaccio/proxy': patch
++'@verdaccio/store': patch
++'@verdaccio/utils': patch
++---
++
++fix: uplink processing order
+diff --git a/packages/config/src/uplinks.ts b/packages/config/src/uplinks.ts
+index 467d9bf2c..15c328ad9 100644
+--- a/packages/config/src/uplinks.ts
++++ b/packages/config/src/uplinks.ts
+@@ -48,9 +48,13 @@ export function sanityCheckUplinksProps(configUpLinks: UpLinksConfList): UpLinks
+   return uplinks;
+ }
+ 
+-export function hasProxyTo(pkg: string, upLink: string, packages: PackageList): boolean {
++export function getProxiesForPackage(pkg: string, packages: PackageList): string[] {
+   const matchedPkg = getMatchedPackagesSpec(pkg, packages);
+-  const proxyList = typeof matchedPkg !== 'undefined' ? matchedPkg.proxy : [];
++  return matchedPkg?.proxy || [];
++}
++
++export function hasProxyTo(pkg: string, upLink: string, packages: PackageList): boolean {
++  const proxyList = getProxiesForPackage(pkg, packages);
+   if (proxyList) {
+     return proxyList.some((curr) => upLink === curr);
+   }
+diff --git a/packages/proxy/src/proxy.ts b/packages/proxy/src/proxy.ts
+index ec7712ec6..779868f30 100644
+--- a/packages/proxy/src/proxy.ts
++++ b/packages/proxy/src/proxy.ts
+@@ -60,6 +60,7 @@ export type ProxySearchParams = {
+   retry?: Partial<RetryOptions>;
+ };
+ export interface IProxy {
++  uplinkName: string;
+   config: UpLinkConfLocal;
+   failed_requests: number;
+   userAgent: string;
+@@ -71,7 +72,6 @@ export interface IProxy {
+   timeout: Delays;
+   max_fails: number;
+   fail_timeout: number;
+-  upname: string;
+   search(options: ProxySearchParams): Promise<Stream.Readable>;
+   getRemoteMetadata(
+     name: string,
+@@ -97,6 +97,7 @@ export interface ISyncUplinksOptions extends Options {
+  * (same for storage.js, local-storage.js, up-storage.js)
+  */
+ class ProxyStorage implements IProxy {
++  public uplinkName: string;
+   public config: UpLinkConfLocal;
+   public failed_requests: number;
+   public userAgent: string;
+@@ -109,9 +110,6 @@ class ProxyStorage implements IProxy {
+   public max_fails: number;
+   public fail_timeout: number;
+   public agent_options: AgentOptionsConf;
+-  // FIXME: upname is assigned to each instance
+-  // @ts-ignore
+-  public upname: string;
+   public proxy: string | undefined;
+   private agent: Agents;
+   // @ts-ignore
+@@ -119,7 +117,14 @@ class ProxyStorage implements IProxy {
+   public strict_ssl: boolean;
+   private retry: Partial<RetryOptions>;
+ 
+-  public constructor(config: UpLinkConfLocal, mainConfig: Config, logger: Logger, agent?: Agents) {
++  public constructor(
++    uplinkName: string,
++    config: UpLinkConfLocal,
++    mainConfig: Config,
++    logger: Logger,
++    agent?: Agents
++  ) {
++    this.uplinkName = uplinkName;
+     this.config = config;
+     this.failed_requests = 0;
+     this.userAgent = mainConfig.user_agent ?? 'hidden';
+@@ -205,17 +210,21 @@ class ProxyStorage implements IProxy {
+     let token: any;
+     const tokenConf: any = auth;
+     if (_.isNil(tokenConf.token) === false && _.isString(tokenConf.token)) {
++      debug('use token from config');
+       token = tokenConf.token;
+     } else if (_.isNil(tokenConf.token_env) === false) {
+       if (typeof tokenConf.token_env === 'string') {
++        debug('use token from env %o', tokenConf.token_env);
+         token = process.env[tokenConf.token_env];
+       } else if (typeof tokenConf.token_env === 'boolean' && tokenConf.token_env) {
++        debug('use token from env NPM_TOKEN');
+         token = process.env.NPM_TOKEN;
+       } else {
+         this.logger.error(constants.ERROR_CODE.token_required);
+         this._throwErrorAuth(constants.ERROR_CODE.token_required);
+       }
+     } else {
++      debug('use token from env NPM_TOKEN');
+       token = process.env.NPM_TOKEN;
+     }
+ 
+@@ -225,6 +234,7 @@ class ProxyStorage implements IProxy {
+ 
+     // define type Auth allow basic and bearer
+     const type = tokenConf.type || TOKEN_BASIC;
++    debug('token type %o', type);
+     this._setHeaderAuthorization(headers, type, token);
+ 
+     return headers;
+@@ -254,7 +264,6 @@ class ProxyStorage implements IProxy {
+       this._throwErrorAuth(`Auth type '${_type}' not allowed`);
+     }
+ 
+-    type = _.upperFirst(type);
+     headers[HEADERS.AUTHORIZATION] = buildToken(type, token);
+   }
+ 
+@@ -276,20 +285,7 @@ class ProxyStorage implements IProxy {
+ 
+    * @param {Object} headers
+    * @private
+-   * @deprecated use applyUplinkHeaders
+    */
+-  private _overrideWithUpLinkConfLocaligHeaders(headers: Headers): any {
+-    if (!this.config.headers) {
+-      return headers;
+-    }
+-
+-    // add/override headers specified in the config
+-    /* eslint guard-for-in: 0 */
+-    for (const key in this.config.headers) {
+-      headers[key] = this.config.headers[key];
+-    }
+-  }
+-
+   private applyUplinkHeaders(headers: gotHeaders): gotHeaders {
+     if (!this.config.headers) {
+       return headers;
+@@ -504,7 +500,10 @@ class ProxyStorage implements IProxy {
+     try {
+       // Incoming URL is relative ie /-/v1/search...
+       const uri = new URL(url, this.url).href;
+-      this.logger.http({ uri, uplink: this.upname }, 'search request to uplink @{uplink} - @{uri}');
++      this.logger.http(
++        { uri, uplink: this.uplinkName },
++        'search request to uplink @{uplink} - @{uri}'
++      );
+       debug('searching on %o', uri);
+       const response = got(uri, {
+         signal: abort ? abort.signal : {},
+@@ -527,7 +526,7 @@ class ProxyStorage implements IProxy {
+         throw errorUtils.getInternalError(`bad status code ${err.response.statusCode} from uplink`);
+       }
+       this.logger.error(
+-        { errorMessage: err?.message, name: this.upname },
++        { errorMessage: err?.message, name: this.uplinkName },
+         'proxy uplink @{name} search error: @{errorMessage}'
+       );
+       throw err;
+diff --git a/packages/proxy/src/uplink-util.ts b/packages/proxy/src/uplink-util.ts
+index 0f8afac64..ad97bfc0f 100644
+--- a/packages/proxy/src/uplink-util.ts
++++ b/packages/proxy/src/uplink-util.ts
+@@ -12,15 +12,10 @@ export interface ProxyInstanceList {
+ export function setupUpLinks(config: Config, logger: Logger): ProxyInstanceList {
+   const uplinks: ProxyInstanceList = {};
+ 
+-  for (const uplinkName in config.uplinks) {
+-    if (Object.prototype.hasOwnProperty.call(config.uplinks, uplinkName)) {
+-      // instance for each up-link definition
+-      const proxy: IProxy = new ProxyStorage(config.uplinks[uplinkName], config, logger);
+-      // TODO: review this can be inside ProxyStorage
+-      proxy.upname = uplinkName;
+-
+-      uplinks[uplinkName] = proxy;
+-    }
++  for (const uplinkName of Object.keys(config.uplinks)) {
++    // instance for each up-link definition
++    const proxy: IProxy = new ProxyStorage(uplinkName, config.uplinks[uplinkName], config, logger);
++    uplinks[uplinkName] = proxy;
+   }
+ 
+   return uplinks;
+@@ -35,7 +30,7 @@ export function updateVersionsHiddenUpLinkNext(manifest: Manifest, upLink: IProx
+ 
+   for (const version of versionsList) {
+     // holds a "hidden" value to be used by the package storage.
+-    versions[version][Symbol.for('__verdaccio_uplink')] = upLink.upname;
++    versions[version][Symbol.for('__verdaccio_uplink')] = upLink.uplinkName;
+   }
+ 
+   return { ...manifest, versions };
+diff --git a/packages/search/src/search.ts b/packages/search/src/search.ts
+index 97e267270..bf49e052f 100644
+--- a/packages/search/src/search.ts
++++ b/packages/search/src/search.ts
+@@ -36,13 +36,13 @@ class Search {
+     // const transformResults = new TransFormResults({ objectMode: true });
+     const streamPassThrough = new PassThrough({ objectMode: true });
+     debug('uplinks found %s', upLinkList.length);
+-    const searchUplinksStreams = upLinkList.map((uplinkId: string) => {
+-      const uplink = this.uplinks[uplinkId];
++    const searchUplinksStreams = upLinkList.map((uplinkName: string) => {
++      const uplink = this.uplinks[uplinkName];
+       if (!uplink) {
+         // this line should never happens
+-        this.logger.error({ uplinkId }, 'uplink @upLinkId not found');
++        this.logger.error({ uplinkName }, 'uplink @uplinkName not found');
+       }
+-      return this.consumeSearchStream(uplinkId, uplink, options, streamPassThrough);
++      return this.consumeSearchStream(uplinkName, uplink, options, streamPassThrough);
+     });
+ 
+     try {
+@@ -82,7 +82,7 @@ class Search {
+    * Consume the upstream and pipe it to a transformable stream.
+    */
+   private consumeSearchStream(
+-    uplinkId: string,
++    uplinkName: string,
+     uplink: IProxy,
+     options: ProxySearchParams,
+     searchPassThrough: PassThrough
+@@ -91,8 +91,8 @@ class Search {
+       bodyStream.pipe(searchPassThrough, { end: false });
+       bodyStream.on('error', (err: any): void => {
+         this.logger.error(
+-          { uplinkId, err: err },
+-          'search error for uplink @{uplinkId}: @{err?.message}'
++          { uplinkName, err: err },
++          'search error for uplink @{uplinkName}: @{err?.message}'
+         );
+         searchPassThrough.end();
+       });
+diff --git a/packages/store/package.json b/packages/store/package.json
+index 1836fe2f0..7fcc12a56 100644
+--- a/packages/store/package.json
++++ b/packages/store/package.json
+@@ -34,7 +34,7 @@
+   },
+   "scripts": {
+     "clean": "rimraf ./build",
+-    "test": "vitest run",
++    "test": "vitest run --testTimeout 20000",
+     "type-check": "tsc --noEmit -p tsconfig.build.json",
+     "build:types": "tsc --emitDeclarationOnly -p tsconfig.build.json",
+     "build:js": "babel src/ --out-dir build/ --copy-files --extensions \".ts,.tsx\" --source-maps",
+diff --git a/packages/store/src/lib/storage-utils.ts b/packages/store/src/lib/storage-utils.ts
+index 584d396dc..6a2566eec 100644
+--- a/packages/store/src/lib/storage-utils.ts
++++ b/packages/store/src/lib/storage-utils.ts
+@@ -213,10 +213,10 @@ export function mergeUplinkTimeIntoLocalNext(
+   return cacheManifest;
+ }
+ 
+-export function updateUpLinkMetadata(uplinkId, manifest: Manifest, etag: string) {
++export function updateUpLinkMetadata(uplinkName: string, manifest: Manifest, etag: string) {
+   const _uplinks = {
+     ...manifest._uplinks,
+-    [uplinkId]: {
++    [uplinkName]: {
+       etag,
+       fetched: Date.now(),
+     },
+diff --git a/packages/store/src/storage.ts b/packages/store/src/storage.ts
+index 1d4683413..31a7e0e32 100644
+--- a/packages/store/src/storage.ts
++++ b/packages/store/src/storage.ts
+@@ -6,7 +6,7 @@ import { PassThrough, Readable, Transform } from 'stream';
+ import { pipeline } from 'stream/promises';
+ import { default as URL } from 'url';
+ 
+-import { hasProxyTo } from '@verdaccio/config';
++import { getProxiesForPackage, hasProxyTo } from '@verdaccio/config';
+ import {
+   API_ERROR,
+   API_MESSAGE,
+@@ -316,10 +316,19 @@ class Storage {
+             return;
+           }
+ 
++          if (res.statusCode === HTTP_STATUS.UNAUTHORIZED) {
++            debug('remote stream response 401');
++            passThroughRemoteStream.emit(
++              'error',
++              errorUtils.getUnauthorized(errorUtils.API_ERROR.UNAUTHORIZED_ACCESS)
++            );
++            return;
++          }
++
+           if (
+             !(res.statusCode >= HTTP_STATUS.OK && res.statusCode < HTTP_STATUS.MULTIPLE_CHOICES)
+           ) {
+-            debug('remote stream response ok');
++            debug('remote stream response %o', res.statusCode);
+             passThroughRemoteStream.emit(
+               'error',
+               errorUtils.getInternalError(`bad uplink status code: ${res.statusCode}`)
+@@ -898,16 +907,17 @@ class Storage {
+   private getUpLinkForDistFile(pkgName: string, distFile: DistFile): IProxy {
+     let uplink: IProxy | null = null;
+ 
+-    for (const uplinkId in this.uplinks) {
++    for (const uplinkName in this.uplinks) {
+       // refer to https://github.com/verdaccio/verdaccio/issues/1642
+-      if (hasProxyTo(pkgName, uplinkId, this.config.packages)) {
+-        uplink = this.uplinks[uplinkId];
++      if (hasProxyTo(pkgName, uplinkName, this.config.packages)) {
++        uplink = this.uplinks[uplinkName];
+       }
+     }
+ 
+     if (uplink == null) {
+-      debug('upstream not found creating one for %o', pkgName);
++      debug('upstream not found, creating one for %o', pkgName);
+       uplink = new ProxyStorage(
++        `verdaccio-${pkgName}`,
+         {
+           url: distFile.url,
+           cache: true,
+@@ -1700,13 +1710,13 @@ class Storage {
+       # one uplink setup
+       proxy: npmjs
+ 
+-    A package requires uplinks syncronization if enables the proxy section, uplinks
+-    can be more than one, the more are the most slow request will take, the request
+-    are made in serial and if 1st call fails, the second will be triggered, otherwise
++    A package requires uplinks syncronization if the proxy section is defined. There can be
++    more than one uplink. The more uplinks are defined, the longer the request will take. 
++    The requests are made in serial and if 1st call fails, the second will be triggered, otherwise
+     the 1st will reply and others will be discarded. The order is important.
+ 
+-    Errors on upkinks are considered are, time outs, connection fails and http status 304,
+-    in that case the request returns empty body and we want ask next on the list if has fresh
++    Errors on uplinks that are considered are time outs, connection fails, and http status 304.
++    In these cases the request returns empty body and we want ask next on the list if has fresh
+     updates.
+    */
+   public async syncUplinksMetadata(
+@@ -1716,20 +1726,18 @@ class Storage {
+   ): Promise<[Manifest | null, any]> {
+     let found = localManifest !== null;
+     let syncManifest: Manifest | null = null;
+-    const upLinks: string[] = [];
++    let upLinks: string[] = [];
+     const hasToLookIntoUplinks = _.isNil(options.uplinksLook) || options.uplinksLook;
+     debug('is sync uplink enabled %o', hasToLookIntoUplinks);
+ 
+-    for (const uplink in this.uplinks) {
+-      if (hasProxyTo(name, uplink, this.config.packages) && hasToLookIntoUplinks) {
+-        debug('sync uplink %o', uplink);
+-        upLinks.push(uplink);
+-      }
++    if (hasToLookIntoUplinks) {
++      upLinks = getProxiesForPackage(name, this.config.packages);
++      debug('uplinks found for %o: %o', name, upLinks);
+     }
+ 
+-    //  if none uplink match we return the local manifest
++    //  if no uplinks match we return the local manifest
+     if (upLinks.length === 0) {
+-      debug('no uplinks found for %o upstream update aborted', name);
++      debug('no uplinks found for %o, upstream update aborted', name);
+       return [localManifest, []];
+     }
+ 
+@@ -1808,7 +1816,7 @@ class Storage {
+     options: Partial<ISyncUplinksOptions>
+   ): Promise<Manifest> {
+     // we store which uplink is updating the manifest
+-    const upLinkMeta = cachedManifest._uplinks[uplink.upname];
++    const upLinkMeta = cachedManifest._uplinks[uplink.uplinkName];
+     let _cacheManifest = { ...cachedManifest };
+ 
+     if (validatioUtils.isObject(upLinkMeta)) {
+@@ -1816,7 +1824,7 @@ class Storage {
+ 
+       // we check the uplink cache is fresh
+       if (fetched && Date.now() - fetched < uplink.maxage) {
+-        debug('returning cached manifest for %o', uplink.upname);
++        debug('returning cached manifest for %o', uplink.uplinkName);
+         return cachedManifest;
+       }
+     }
+@@ -1838,7 +1846,7 @@ class Storage {
+       throw err;
+     }
+     // updates the _uplink metadata fields, cache, etc
+-    _cacheManifest = updateUpLinkMetadata(uplink.upname, _cacheManifest, etag);
++    _cacheManifest = updateUpLinkMetadata(uplink.uplinkName, _cacheManifest, etag);
+     // merge time field cache and remote
+     _cacheManifest = mergeUplinkTimeIntoLocalNext(_cacheManifest, remoteManifest);
+     // update the _uplinks field in the cache

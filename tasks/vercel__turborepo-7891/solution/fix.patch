@@ -1,0 +1,285 @@
+diff --git a/packages/turbo-telemetry/package.json b/packages/turbo-telemetry/package.json
+index 1e72befc68..9c8e06a087 100644
+--- a/packages/turbo-telemetry/package.json
++++ b/packages/turbo-telemetry/package.json
+@@ -27,14 +27,15 @@
+   "dependencies": {
+     "chalk": "^4.1.2",
+     "got": "^11.8.6",
+-    "uuid": "^9.0.0"
++    "uuid": "^9.0.1",
++    "zod": "^3.22.4"
+   },
+   "devDependencies": {
+     "@turbo/eslint-config": "workspace:*",
+     "@turbo/test-utils": "workspace:*",
+-    "@turbo/utils": "workspace:*",
+     "@turbo/tsconfig": "workspace:*",
+     "@turbo/types": "workspace:*",
++    "@turbo/utils": "workspace:*",
+     "@types/jest": "^27.4.0",
+     "@types/node": "^20.11.30",
+     "@types/uuid": "^9.0.0",
+diff --git a/packages/turbo-telemetry/src/cli.ts b/packages/turbo-telemetry/src/cli.ts
+index c6e02ea8a8..421c15b6d8 100644
+--- a/packages/turbo-telemetry/src/cli.ts
++++ b/packages/turbo-telemetry/src/cli.ts
+@@ -35,7 +35,7 @@ function status(options: TelemetryCLIOptions) {
+ 
+ function telemetry(action: TelemetryCLIAction, options: TelemetryCLIOptions) {
+   if (!options.telemetry) {
+-    logger.error("Telemetry client not found");
++    logger.error("Telemetry could not be initialized");
+     return;
+   }
+ 
+diff --git a/packages/turbo-telemetry/src/client.ts b/packages/turbo-telemetry/src/client.ts
+index dcda016660..32b285885a 100644
+--- a/packages/turbo-telemetry/src/client.ts
++++ b/packages/turbo-telemetry/src/client.ts
+@@ -1,6 +1,6 @@
+ import got, { type Response } from "got";
+ import { logger } from "@turbo/utils";
+-import { v4 as uuid } from "uuid";
++import { v4 as uuidv4 } from "uuid";
+ import { buildUserAgent } from "./utils";
+ import { TelemetryConfig } from "./config";
+ import type { Event, PackageInfo } from "./events/types";
+@@ -25,7 +25,7 @@ export class TelemetryClient {
+   private packageInfo: PackageInfo;
+   private batchSize = DEFAULT_BATCH_SIZE;
+   private timeout = 250;
+-  private sessionId = uuid();
++  private sessionId = uuidv4();
+   private eventBatches: Array<Promise<Response<string> | undefined>> = [];
+   private events: Array<Record<"package", Event>> = [];
+ 
+@@ -95,7 +95,7 @@ export class TelemetryClient {
+     isSensitive?: boolean;
+   }): Event {
+     const event = {
+-      id: uuid(),
++      id: uuidv4(),
+       key,
+       value: isSensitive ? this.config.oneWayHash(value) : value,
+       package_name: this.packageInfo.name,
+diff --git a/packages/turbo-telemetry/src/config.ts b/packages/turbo-telemetry/src/config.ts
+index eec4002806..f649a981df 100644
+--- a/packages/turbo-telemetry/src/config.ts
++++ b/packages/turbo-telemetry/src/config.ts
+@@ -1,6 +1,8 @@
+-import { readFileSync, writeFileSync } from "node:fs";
++import { readFileSync, writeFileSync, rmSync } from "node:fs";
+ import { logger } from "@turbo/utils";
+ import chalk from "chalk";
++import { v4 as uuidv4 } from "uuid";
++import { z } from "zod";
+ import { defaultConfigPath, oneWayHashWithSalt } from "./utils";
+ 
+ const DEBUG_ENV_VAR = "TURBO_TELEMETRY_DEBUG";
+@@ -8,12 +10,14 @@ const DISABLED_ENV_VAR = "TURBO_TELEMETRY_DISABLED";
+ const DISABLED_MESSAGE_ENV_VAR = "TURBO_TELEMETRY_MESSAGE_DISABLED";
+ const DO_NOT_TRACK_ENV_VAR = "DO_NOT_TRACK";
+ 
+-interface Config {
+-  telemetry_enabled: boolean;
+-  telemetry_id: string;
+-  telemetry_salt: string;
+-  telemetry_alerted?: Date;
+-}
++const ConfigSchema = z.object({
++  telemetry_enabled: z.boolean(),
++  telemetry_id: z.string(),
++  telemetry_salt: z.string(),
++  telemetry_alerted: z.date().optional(),
++});
++
++type Config = z.infer<typeof ConfigSchema>;
+ 
+ /**
+  * NOTE: This package is a direct port of the telemetry config struct from the turbo-telemetry crate. Any changes
+@@ -30,20 +34,85 @@ export class TelemetryConfig {
+     this.configPath = configPath;
+   }
+ 
+-  static async fromDefaultConfig(): Promise<TelemetryConfig | undefined> {
++  static fromConfigPath(configPath: string): TelemetryConfig | undefined {
+     try {
+-      const configPath = await defaultConfigPath();
+       const file = readFileSync(configPath, "utf-8");
+-      const config = JSON.parse(file) as Config;
++      const rawConfig = JSON.parse(file) as unknown;
++      const config = TelemetryConfig.validateConfig(rawConfig);
+       return new TelemetryConfig({ configPath, config });
+     } catch (e) {
++      if (TelemetryConfig.tryRemove({ configPath })) {
++        return TelemetryConfig.create({ configPath });
++      }
++
+       return undefined;
+     }
+   }
+ 
+-  write() {
+-    const json = JSON.stringify(this.config, null, 2);
+-    writeFileSync(this.configPath, json);
++  static async fromDefaultConfig(): Promise<TelemetryConfig | undefined> {
++    try {
++      const configPath = await defaultConfigPath();
++      return TelemetryConfig.fromConfigPath(configPath);
++    } catch (e) {
++      return undefined;
++    }
++  }
++
++  static validateConfig(config: unknown): Config {
++    try {
++      return ConfigSchema.parse(config);
++    } catch (e) {
++      throw new Error("Config is invalid.");
++    }
++  }
++
++  static create({
++    configPath,
++  }: {
++    configPath: string;
++  }): TelemetryConfig | undefined {
++    const RawTelemetryId = uuidv4();
++    const telemetrySalt = uuidv4();
++    const telemetryId = oneWayHashWithSalt({
++      input: RawTelemetryId,
++      salt: telemetrySalt,
++    });
++
++    const config = new TelemetryConfig({
++      configPath,
++      config: {
++        telemetry_enabled: true,
++        telemetry_id: telemetryId,
++        telemetry_salt: telemetrySalt,
++      },
++    });
++
++    const saved = config.tryWrite();
++    if (saved) {
++      return config;
++    }
++    return undefined;
++  }
++
++  tryWrite(): boolean {
++    try {
++      const json = JSON.stringify(this.config, null, 2);
++      writeFileSync(this.configPath, json);
++      return true;
++    } catch (e) {
++      return false;
++    }
++  }
++
++  static tryRemove({ configPath }: { configPath: string }): boolean {
++    try {
++      rmSync(configPath, {
++        force: true,
++      });
++      return true;
++    } catch (e) {
++      return false;
++    }
+   }
+ 
+   hasSeenAlert(): boolean {
+@@ -81,7 +150,7 @@ export class TelemetryConfig {
+     return this.config.telemetry_id;
+   }
+ 
+-  showAlert() {
++  showAlert(): void {
+     if (
+       !this.hasSeenAlert() &&
+       this.isEnabled() &&
+@@ -104,34 +173,34 @@ export class TelemetryConfig {
+     this.alertShown();
+   }
+ 
+-  enable() {
++  enable(): void {
+     this.config.telemetry_enabled = true;
+-    this.write();
++    this.tryWrite();
+   }
+ 
+-  disable() {
++  disable(): void {
+     this.config.telemetry_enabled = false;
+-    this.write();
++    this.tryWrite();
+   }
+ 
+-  alertShown() {
++  alertShown(): boolean {
+     if (this.hasSeenAlert()) {
+       return true;
+     }
+ 
+     this.config.telemetry_alerted = new Date();
+-    this.write();
++    this.tryWrite();
+     return true;
+   }
+ 
+-  oneWayHash(input: string) {
++  oneWayHash(input: string): string {
+     return oneWayHashWithSalt({
+       input,
+       salt: this.config.telemetry_salt,
+     });
+   }
+ 
+-  static isDebug() {
++  static isDebug(): boolean {
+     const debug = process.env[DEBUG_ENV_VAR] || "0";
+     return debug === "1" || debug.toLowerCase() === "true";
+   }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 708a363dc8..5d892ed80b 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -689,8 +689,11 @@ importers:
+         specifier: ^11.8.6
+         version: 11.8.6
+       uuid:
+-        specifier: ^9.0.0
+-        version: 9.0.0
++        specifier: ^9.0.1
++        version: 9.0.1
++      zod:
++        specifier: ^3.22.4
++        version: 3.22.4
+     devDependencies:
+       '@turbo/eslint-config':
+         specifier: workspace:*
+@@ -12515,6 +12518,11 @@ packages:
+     hasBin: true
+     dev: false
+ 
++  /uuid@9.0.1:
++    resolution: {integrity: sha512-b+1eJOlsR9K8HJpow9Ok3fiWOWSIcIzXodvv0rQjVoOVNpWMpxf1wZNpt4y9h10odCNrqnYp1OBzRktckBe3sA==}
++    hasBin: true
++    dev: false
++
+   /v8-compile-cache-lib@3.0.1:
+     resolution: {integrity: sha512-wa7YjyUGfNZngI/vtK0UHAN+lgDCxBPCylVXGp0zu59Fz5aiGtNXaq3DhIov063MorB+VfufLh3JlF2KdTK3xg==}
+ 
+@@ -13272,6 +13280,10 @@ packages:
+     resolution: {integrity: sha512-m46AKbrzKVzOzs/DZgVnG5H55N1sv1M8qZU3A8RIKbs3mrACDNeIOeilDymVb2HdmP8uwshOCF4uJ8uM9rCqJw==}
+     dev: true
+ 
++  /zod@3.22.4:
++    resolution: {integrity: sha512-iC+8Io04lddc+mVqQ9AZ7OQ2MrUKGN+oIQyq1vemgt46jwCwLfhq7/pwnBnNXXXZb8VTVLKwp9EDkx+ryxIWmg==}
++    dev: false
++
+   /zx@7.2.3:
+     resolution: {integrity: sha512-QODu38nLlYXg/B/Gw7ZKiZrvPkEsjPN3LQ5JFXM7h0JvwhEdPNNl+4Ao1y4+o3CLNiDUNcwzQYZ4/Ko7kKzCMA==}
+     engines: {node: '>= 16.0.0'}

@@ -1,0 +1,384 @@
+diff --git a/.changeset/large-snails-decide.md b/.changeset/large-snails-decide.md
+deleted file mode 100644
+index 7257e0123f..0000000000
+--- a/.changeset/large-snails-decide.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': patch
+----
+-
+-Fixed an issue with targeted ancestors not being correctly exited when reented during external transitions.
+diff --git a/.changeset/rich-monkeys-relate.md b/.changeset/rich-monkeys-relate.md
+deleted file mode 100644
+index 42f52d2056..0000000000
+--- a/.changeset/rich-monkeys-relate.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': patch
+----
+-
+-Fixed an issue with the _active_ descendants of the targeted ancestor not being correctly reentered during external transitions.
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index 61d4a15a52..707ce5a9ba 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -837,6 +837,7 @@ class StateNode<
+     if (!willTransition) {
+       return this.next(state, _event);
+     }
++    const entryNodes = flatten(stateTransitions.map((t) => t.entrySet));
+ 
+     const configuration = flatten(
+       Object.keys(transitionMap).map((key) => transitionMap[key].configuration)
+@@ -844,6 +845,7 @@ class StateNode<
+ 
+     return {
+       transitions: enabledTransitions,
++      entrySet: entryNodes,
+       exitSet: flatten(stateTransitions.map((t) => t.exitSet)),
+       configuration,
+       source: state,
+@@ -937,6 +939,7 @@ class StateNode<
+     if (!nextStateNodes.length) {
+       return {
+         transitions: [selectedTransition],
++        entrySet: [],
+         exitSet: [],
+         configuration: state.value ? [this] : [],
+         source: state,
+@@ -952,35 +955,35 @@ class StateNode<
+ 
+     const isInternal = !!selectedTransition.internal;
+ 
++    const reentryNodes: StateNode<any, any, any, any, any>[] = [];
++
++    if (!isInternal) {
++      nextStateNodes.forEach((targetNode) => {
++        reentryNodes.push(...this.getExternalReentryNodes(targetNode));
++      });
++    }
++
+     return {
+       transitions: [selectedTransition],
+-      exitSet: isInternal
+-        ? []
+-        : flatten(
+-            nextStateNodes.map((targetNode) =>
+-              this.getPotentiallyReenteringNodes(targetNode)
+-            )
+-          ),
++      entrySet: reentryNodes,
++      exitSet: isInternal ? [] : [this],
+       configuration: allNextStateNodes,
+       source: state,
+       actions
+     };
+   }
+ 
+-  // even though the name of this function mentions reentry nodes
+-  // we are pushing its result into `exitSet`
+-  // that's because what we exit might be reentered (it's an invariant of reentrancy)
+-  private getPotentiallyReenteringNodes(
++  private getExternalReentryNodes(
+     targetNode: StateNode<TContext, any, TEvent, any, any, any>
+   ): Array<StateNode<TContext, any, TEvent, any, any, any>> {
+-    if (this.order < targetNode.order) {
+-      return [this];
++    if (this.order > targetNode.order) {
++      return [targetNode];
+     }
+ 
+     const nodes: Array<StateNode<TContext, any, TEvent, any, any, any>> = [];
+     let marker:
+       | StateNode<TContext, any, TEvent, any, any, any>
+-      | undefined = this;
++      | undefined = targetNode;
+     let possibleAncestor: StateNode<
+       TContext,
+       any,
+@@ -988,7 +991,7 @@ class StateNode<
+       any,
+       any,
+       any
+-    > = targetNode;
++    > = this;
+ 
+     while (marker && marker !== possibleAncestor) {
+       nodes.push(marker);
+@@ -1012,20 +1015,17 @@ class StateNode<
+     prevState?: State<TContext, any, any, any, any>,
+     predictableExec?: PredictableActionArgumentsExec
+   ): Array<Array<ActionObject<TContext, TEvent>>> {
+-    const prevConfig = prevState
+-      ? getConfiguration([], this.getStateNodes(prevState.value))
+-      : [];
+-    const entrySet = new Set<StateNode<any, any, any, any, any, any>>();
++    const prevConfig = getConfiguration(
++      [],
++      prevState ? this.getStateNodes(prevState.value) : [this]
++    );
+ 
+-    for (const sn of Array.from(resolvedConfig).sort(
+-      (a, b) => a.order - b.order
+-    )) {
++    for (const sn of resolvedConfig) {
+       if (
+         !has(prevConfig, sn) ||
+-        has(transition.exitSet, sn) ||
+-        (sn.parent && entrySet.has(sn.parent))
++        (has(transition.entrySet, sn.parent) && !has(transition.entrySet, sn))
+       ) {
+-        entrySet.add(sn);
++        transition.entrySet.push(sn);
+       }
+     }
+     for (const sn of prevConfig) {
+@@ -1034,13 +1034,8 @@ class StateNode<
+       }
+     }
+ 
+-    transition.exitSet.sort((a, b) => b.order - a.order);
+-
+-    const entryStates = Array.from(entrySet).sort((a, b) => a.order - b.order);
+-    const exitStates = new Set(transition.exitSet);
+-
+     const doneEvents = flatten(
+-      entryStates.map((sn) => {
++      transition.entrySet.map((sn) => {
+         const events: DoneEventObject[] = [];
+ 
+         if (sn.type !== 'final') {
+@@ -1079,7 +1074,13 @@ class StateNode<
+       })
+     );
+ 
+-    const entryActions = entryStates
++    transition.exitSet.sort((a, b) => b.order - a.order);
++    transition.entrySet.sort((a, b) => a.order - b.order);
++
++    const entryStates = new Set(transition.entrySet);
++    const exitStates = new Set(transition.exitSet);
++
++    const entryActions = Array.from(entryStates)
+       .map((stateNode) => {
+         const entryActions = stateNode.onEntry;
+         const invokeActions = stateNode.activities.map((activity) =>
+@@ -1191,6 +1192,7 @@ class StateNode<
+     ) || {
+       transitions: [],
+       configuration: [],
++      entrySet: [],
+       exitSet: [],
+       source: currentState,
+       actions: []
+@@ -1673,6 +1675,7 @@ class StateNode<
+     return this.resolveTransition(
+       {
+         configuration,
++        entrySet: configuration,
+         exitSet: [],
+         transitions: [],
+         source: undefined,
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index d15676a365..e0ff3c022f 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -1134,6 +1134,7 @@ export interface ActivityMap {
+ export interface StateTransition<TContext, TEvent extends EventObject> {
+   transitions: Array<TransitionDefinition<TContext, TEvent>>;
+   configuration: Array<StateNode<TContext, any, TEvent, any, any, any>>;
++  entrySet: Array<StateNode<TContext, any, TEvent, any, any, any>>;
+   exitSet: Array<StateNode<TContext, any, TEvent, any, any, any>>;
+   /**
+    * The source state that preceded the transition.
+diff --git a/packages/core/test/actions.test.ts b/packages/core/test/actions.test.ts
+index 9421f161a6..783b3673c0 100644
+--- a/packages/core/test/actions.test.ts
++++ b/packages/core/test/actions.test.ts
+@@ -463,7 +463,6 @@ describe('entry/exit actions', () => {
+ 
+       expect(flushTracked()).toEqual([
+         'exit: loaded.idle',
+-        'exit: loaded',
+         'enter: loaded',
+         'enter: loaded.idle'
+       ]);
+@@ -648,7 +647,6 @@ describe('entry/exit actions', () => {
+       expect(flushTracked()).toEqual([
+         'exit: A.A2.A2_child',
+         'exit: A.A2',
+-        'exit: A',
+         'enter: A',
+         'enter: A.A1'
+       ]);
+@@ -727,115 +725,9 @@ describe('entry/exit actions', () => {
+         'exit: a.a1',
+         'exit: a',
+         'enter: a',
+-        'enter: a.a1',
+-        'enter: a.a1.a11'
+-      ]);
+-    });
+-
+-    it('should reenter leaf state during its self-transition', () => {
+-      const m = createMachine({
+-        initial: 'a',
+-        states: {
+-          a: {
+-            initial: 'a1',
+-            states: {
+-              a1: {
+-                on: {
+-                  EV: 'a1'
+-                }
+-              }
+-            }
+-          }
+-        }
+-      });
+-
+-      const flushTracked = trackEntries(m);
+-
+-      const service = interpret(m).start();
+-
+-      flushTracked();
+-      service.send('EV');
+-
+-      expect(flushTracked()).toEqual(['exit: a.a1', 'enter: a.a1']);
+-    });
+-
+-    it('should not enter exited state when targeting its ancestor and when its former descendant gets selected through initial state', () => {
+-      const m = createMachine({
+-        initial: 'a',
+-        states: {
+-          a: {
+-            id: 'parent',
+-            initial: 'a1',
+-            states: {
+-              a1: {
+-                on: {
+-                  EV: 'a2'
+-                }
+-              },
+-              a2: {
+-                on: {
+-                  EV: '#parent'
+-                }
+-              }
+-            }
+-          }
+-        }
+-      });
+-
+-      const flushTracked = trackEntries(m);
+-
+-      const service = interpret(m).start();
+-      service.send('EV');
+-
+-      flushTracked();
+-      service.send('EV');
+-
+-      expect(flushTracked()).toEqual([
+-        'exit: a.a2',
+-        'exit: a',
+-        'enter: a',
+         'enter: a.a1'
+       ]);
+     });
+-
+-    it('should not enter exited state when targeting its ancestor and when its latter descendant gets selected through initial state', () => {
+-      const m = createMachine({
+-        initial: 'a',
+-        states: {
+-          a: {
+-            id: 'parent',
+-            initial: 'a2',
+-            states: {
+-              a1: {
+-                on: {
+-                  EV: '#parent'
+-                }
+-              },
+-              a2: {
+-                on: {
+-                  EV: 'a1'
+-                }
+-              }
+-            }
+-          }
+-        }
+-      });
+-
+-      const flushTracked = trackEntries(m);
+-
+-      const service = interpret(m).start();
+-      service.send('EV');
+-
+-      flushTracked();
+-      service.send('EV');
+-
+-      expect(flushTracked()).toEqual([
+-        'exit: a.a1',
+-        'exit: a',
+-        'enter: a',
+-        'enter: a.a2'
+-      ]);
+-    });
+   });
+ 
+   describe('parallel states', () => {
+@@ -873,6 +765,8 @@ describe('entry/exit actions', () => {
+     });
+ 
+     it('should reenter parallel region when a parallel state gets reentered while targeting another region', () => {
++      const actions: string[] = [];
++
+       const machine = createMachine({
+         initial: 'ready',
+         states: {
+@@ -882,8 +776,13 @@ describe('entry/exit actions', () => {
+               FOO: '#cameraOff'
+             },
+             states: {
+-              devicesInfo: {},
++              devicesInfo: {
++                entry: () => actions.push('entry devicesInfo'),
++                exit: () => actions.push('exit devicesInfo')
++              },
+               camera: {
++                entry: () => actions.push('entry camera'),
++                exit: () => actions.push('exit camera'),
+                 initial: 'on',
+                 states: {
+                   on: {},
+@@ -897,22 +796,16 @@ describe('entry/exit actions', () => {
+         }
+       });
+ 
+-      const flushTracked = trackEntries(machine);
+-
+       const service = interpret(machine).start();
+ 
+-      flushTracked();
++      actions.length = 0;
+       service.send('FOO');
+ 
+-      expect(flushTracked()).toEqual([
+-        'exit: ready.camera.on',
+-        'exit: ready.camera',
+-        'exit: ready.devicesInfo',
+-        'exit: ready',
+-        'enter: ready',
+-        'enter: ready.devicesInfo',
+-        'enter: ready.camera',
+-        'enter: ready.camera.off'
++      expect(actions).toEqual([
++        'exit camera',
++        'exit devicesInfo',
++        'entry devicesInfo',
++        'entry camera'
+       ]);
+     });
+   });

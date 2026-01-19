@@ -1,0 +1,799 @@
+diff --git a/crates/turborepo-lib/src/hash/mod.rs b/crates/turborepo-lib/src/hash/mod.rs
+index 74fd46ccbd..6558c36c86 100644
+--- a/crates/turborepo-lib/src/hash/mod.rs
++++ b/crates/turborepo-lib/src/hash/mod.rs
+@@ -67,7 +67,6 @@ pub struct GlobalHashable<'a> {
+     // These are None in single package mode
+     pub root_external_dependencies_hash: Option<&'a str>,
+     pub root_internal_dependencies_hash: Option<&'a str>,
+-    pub engines: HashMap<&'a str, &'a str>,
+     pub env: &'a [String],
+     pub resolved_env_vars: EnvironmentVariablePairs,
+     pub pass_through_env: &'a [String],
+@@ -304,24 +303,6 @@ impl From<GlobalHashable<'_>> for Builder<HeapAllocator> {
+             }
+         }
+ 
+-        {
+-            let mut entries = builder
+-                .reborrow()
+-                .init_engines(hashable.engines.len() as u32);
+-
+-            // get a sorted iterator over keys and values of the hashmap
+-            // and set the entries in the capnp message
+-
+-            let mut hashable: Vec<_> = hashable.engines.iter().collect();
+-            hashable.sort_by(|a, b| a.0.cmp(b.0));
+-
+-            for (i, (key, value)) in hashable.iter().enumerate() {
+-                let mut entry = entries.reborrow().get(i as u32);
+-                entry.set_key(key);
+-                entry.set_value(value);
+-            }
+-        }
+-
+         if let Some(root_external_dependencies_hash) = hashable.root_external_dependencies_hash {
+             builder.set_root_external_deps_hash(root_external_dependencies_hash);
+         }
+@@ -426,7 +407,6 @@ mod test {
+             global_file_hash_map: &global_file_hash_map,
+             root_external_dependencies_hash: Some("0000000000000000"),
+             root_internal_dependencies_hash: Some("0000000000000001"),
+-            engines: Default::default(),
+             env: &["env".to_string()],
+             resolved_env_vars: vec![],
+             pass_through_env: &["pass_through_env".to_string()],
+@@ -434,7 +414,7 @@ mod test {
+             framework_inference: true,
+         };
+ 
+-        assert_eq!(global_hash.hash(), "5072bd005ec02799");
++        assert_eq!(global_hash.hash(), "8d5ecbdc3ff2b3f2");
+     }
+ 
+     #[test_case(vec![], "459c029558afe716" ; "empty")]
+diff --git a/crates/turborepo-lib/src/hash/proto.capnp b/crates/turborepo-lib/src/hash/proto.capnp
+index 9486bf0c04..19cf20915e 100644
+--- a/crates/turborepo-lib/src/hash/proto.capnp
++++ b/crates/turborepo-lib/src/hash/proto.capnp
+@@ -41,7 +41,6 @@ struct GlobalHashable {
+   passThroughEnv @6 :List(Text);
+   envMode @7 :EnvMode;
+   frameworkInference @8 :Bool;
+-  engines @9 :List(Entry);
+ 
+ 
+   enum EnvMode {
+diff --git a/crates/turborepo-lib/src/run/global_hash.rs b/crates/turborepo-lib/src/run/global_hash.rs
+index d4a405c8ef..ece8fa8cca 100644
+--- a/crates/turborepo-lib/src/run/global_hash.rs
++++ b/crates/turborepo-lib/src/run/global_hash.rs
+@@ -11,10 +11,7 @@ use tracing::debug;
+ use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf, RelativeUnixPathBuf};
+ use turborepo_env::{get_global_hashable_env_vars, DetailedMap, EnvironmentVariableMap};
+ use turborepo_lockfiles::Lockfile;
+-use turborepo_repository::{
+-    package_graph::PackageInfo,
+-    package_manager::{self, PackageManager},
+-};
++use turborepo_repository::package_manager::{self, PackageManager};
+ use turborepo_scm::SCM;
+ 
+ use crate::{
+@@ -44,10 +41,9 @@ pub enum Error {
+ pub struct GlobalHashableInputs<'a> {
+     pub global_cache_key: &'static str,
+     pub global_file_hash_map: HashMap<RelativeUnixPathBuf, String>,
+-    // This is `None` in single package mode
++    // These are `None` in single package mode
+     pub root_external_dependencies_hash: Option<&'a str>,
+     pub root_internal_dependencies_hash: Option<&'a str>,
+-    pub engines: Option<HashMap<&'a str, &'a str>>,
+     pub env: &'a [String],
+     // Only Option to allow #[derive(Default)]
+     pub resolved_env_vars: Option<DetailedMap>,
+@@ -61,7 +57,6 @@ pub struct GlobalHashableInputs<'a> {
+ pub fn get_global_hash_inputs<'a, L: ?Sized + Lockfile>(
+     root_external_dependencies_hash: Option<&'a str>,
+     root_internal_dependencies_hash: Option<&'a str>,
+-    root_package: &'a PackageInfo,
+     root_path: &AbsoluteSystemPath,
+     package_manager: &PackageManager,
+     lockfile: Option<&L>,
+@@ -73,8 +68,6 @@ pub fn get_global_hash_inputs<'a, L: ?Sized + Lockfile>(
+     framework_inference: bool,
+     hasher: &SCM,
+ ) -> Result<GlobalHashableInputs<'a>, Error> {
+-    let engines = root_package.package_json.engines();
+-
+     let global_hashable_env_vars =
+         get_global_hashable_env_vars(env_at_execution_start, global_env)?;
+ 
+@@ -111,7 +104,6 @@ pub fn get_global_hash_inputs<'a, L: ?Sized + Lockfile>(
+         global_file_hash_map,
+         root_external_dependencies_hash,
+         root_internal_dependencies_hash,
+-        engines,
+         env: global_env,
+         resolved_env_vars: Some(global_hashable_env_vars),
+         pass_through_env: global_pass_through_env,
+@@ -188,7 +180,6 @@ impl<'a> GlobalHashableInputs<'a> {
+             global_file_hash_map: &self.global_file_hash_map,
+             root_external_dependencies_hash: self.root_external_dependencies_hash,
+             root_internal_dependencies_hash: self.root_internal_dependencies_hash,
+-            engines: self.engines.clone().unwrap_or_default(),
+             env: self.env,
+             resolved_env_vars: self
+                 .resolved_env_vars
+@@ -209,7 +200,7 @@ mod tests {
+     use turbopath::AbsoluteSystemPathBuf;
+     use turborepo_env::EnvironmentVariableMap;
+     use turborepo_lockfiles::Lockfile;
+-    use turborepo_repository::{package_graph::PackageInfo, package_manager::PackageManager};
++    use turborepo_repository::package_manager::PackageManager;
+     use turborepo_scm::SCM;
+ 
+     use super::get_global_hash_inputs;
+@@ -231,7 +222,6 @@ mod tests {
+             .unwrap();
+ 
+         let env_var_map = EnvironmentVariableMap::default();
+-        let package_info = PackageInfo::default();
+         let lockfile: Option<&dyn Lockfile> = None;
+         #[cfg(windows)]
+         let file_deps = ["C:\\some\\path".to_string()];
+@@ -240,7 +230,6 @@ mod tests {
+         let result = get_global_hash_inputs(
+             None,
+             None,
+-            &package_info,
+             &root,
+             &PackageManager::Pnpm,
+             lockfile,
+diff --git a/crates/turborepo-lib/src/run/mod.rs b/crates/turborepo-lib/src/run/mod.rs
+index 073dc728ea..60be2dfba1 100644
+--- a/crates/turborepo-lib/src/run/mod.rs
++++ b/crates/turborepo-lib/src/run/mod.rs
+@@ -282,7 +282,6 @@ impl Run {
+             get_global_hash_inputs(
+                 root_external_dependencies_hash.as_deref(),
+                 root_internal_dependencies_hash.as_deref(),
+-                root_workspace,
+                 &self.repo_root,
+                 self.pkg_dep_graph.package_manager(),
+                 self.pkg_dep_graph.lockfile(),
+diff --git a/crates/turborepo-lib/src/run/summary/global_hash.rs b/crates/turborepo-lib/src/run/summary/global_hash.rs
+index 3f693308ae..6eb4d68ea3 100644
+--- a/crates/turborepo-lib/src/run/summary/global_hash.rs
++++ b/crates/turborepo-lib/src/run/summary/global_hash.rs
+@@ -33,7 +33,6 @@ pub struct GlobalHashSummary<'a> {
+     pub hash_of_external_dependencies: &'a str,
+     pub hash_of_internal_dependencies: &'a str,
+     pub environment_variables: GlobalEnvVarSummary<'a>,
+-    pub engines: Option<BTreeMap<&'a str, &'a str>>,
+ }
+ 
+ impl<'a> TryFrom<GlobalHashableInputs<'a>> for GlobalHashSummary<'a> {
+@@ -49,7 +48,6 @@ impl<'a> TryFrom<GlobalHashableInputs<'a>> for GlobalHashSummary<'a> {
+             resolved_env_vars,
+             pass_through_env,
+             env_at_execution_start,
+-            engines,
+             ..
+         } = global_hashable_inputs;
+ 
+@@ -64,8 +62,6 @@ impl<'a> TryFrom<GlobalHashableInputs<'a>> for GlobalHashSummary<'a> {
+             )
+             .transpose()?;
+ 
+-        let engines = engines.map(|engines| engines.into_iter().collect());
+-
+         Ok(Self {
+             root_key: global_cache_key,
+             files: global_file_hash_map.into_iter().collect(),
+@@ -85,7 +81,6 @@ impl<'a> TryFrom<GlobalHashableInputs<'a>> for GlobalHashSummary<'a> {
+                     .map(|vars| vars.by_source.matching.to_secret_hashable()),
+                 pass_through,
+             },
+-            engines,
+         })
+     }
+ }
+diff --git a/crates/turborepo-lib/src/run/summary/mod.rs b/crates/turborepo-lib/src/run/summary/mod.rs
+index 0c6a0bd8fe..36ab46baef 100644
+--- a/crates/turborepo-lib/src/run/summary/mod.rs
++++ b/crates/turborepo-lib/src/run/summary/mod.rs
+@@ -538,20 +538,6 @@ impl<'a> RunSummary<'a> {
+                 .unwrap_or_default()
+                 .join(", ")
+         )?;
+-        cwriteln!(
+-            tab_writer,
+-            ui,
+-            GREY,
+-            "  Engines Values\t=\t{}",
+-            self.global_hash_summary
+-                .engines
+-                .as_ref()
+-                .map(|engines| engines
+-                    .iter()
+-                    .map(|(key, value)| format!("{key}={value}"))
+-                    .join(", "))
+-                .unwrap_or_default()
+-        )?;
+ 
+         tab_writer.flush()?;
+         println!();
+diff --git a/crates/turborepo-repository/src/package_json.rs b/crates/turborepo-repository/src/package_json.rs
+index b1ba183177..aa2c4130c8 100644
+--- a/crates/turborepo-repository/src/package_json.rs
++++ b/crates/turborepo-repository/src/package_json.rs
+@@ -1,7 +1,4 @@
+-use std::{
+-    collections::{BTreeMap, HashMap},
+-    str::FromStr,
+-};
++use std::{collections::BTreeMap, str::FromStr};
+ 
+ use anyhow::Result;
+ use serde::{Deserialize, Serialize};
+@@ -82,19 +79,6 @@ impl PackageJson {
+             .filter(|command| !command.is_empty())
+             .map(|command| command.as_str())
+     }
+-
+-    pub fn engines(&self) -> Option<HashMap<&str, &str>> {
+-        let engines = self.other.get("engines")?.as_object()?;
+-        Some(
+-            engines
+-                .iter()
+-                .filter_map(|(key, value)| {
+-                    let value = value.as_str()?;
+-                    Some((key.as_str(), value))
+-                })
+-                .collect(),
+-        )
+-    }
+ }
+ 
+ impl FromStr for PackageJson {
+diff --git a/packages/eslint-plugin-turbo/lib/utils/calculate-inputs.ts b/packages/eslint-plugin-turbo/lib/utils/calculate-inputs.ts
+index 3965ad2498..656cd770e2 100644
+--- a/packages/eslint-plugin-turbo/lib/utils/calculate-inputs.ts
++++ b/packages/eslint-plugin-turbo/lib/utils/calculate-inputs.ts
+@@ -4,7 +4,8 @@ import path from "node:path";
+ import type { WorkspaceConfig } from "@turbo/utils";
+ import { getWorkspaceConfigs } from "@turbo/utils";
+ import type { Pipeline } from "@turbo/types";
+-import type { RootSchema } from "@turbo/types/src/types/config";
++import type { RootSchema, RootSchemaV1 } from "@turbo/types/src/types/config";
++import { forEachTaskDef } from "@turbo/utils/src/getTurboConfigs";
+ import { dotEnv } from "./dotenv-processing";
+ import { wildcardTests } from "./wildcard-processing";
+ 
+@@ -131,7 +132,7 @@ function processDotEnv(
+ 
+ function processGlobal(
+   workspacePath: string,
+-  rootTurboJson: RootSchema
++  rootTurboJson: RootSchema | RootSchemaV1
+ ): EnvironmentConfig {
+   return {
+     legacyConfig: processLegacyConfig(rootTurboJson.globalDependencies),
+@@ -314,7 +315,8 @@ export class Project {
+         this.projectRoot.turboConfig
+       );
+ 
+-      Object.entries(this.projectRoot.turboConfig.pipeline).forEach(
++      forEachTaskDef(
++        this.projectRoot.turboConfig,
+         ([taskName, taskDefinition]) => {
+           const { workspaceName, scriptName } = getTaskAddress(taskName);
+           if (workspaceName) {
+@@ -341,7 +343,8 @@ export class Project {
+         return;
+       }
+ 
+-      Object.entries(projectWorkspace.turboConfig.pipeline).forEach(
++      forEachTaskDef(
++        projectWorkspace.turboConfig,
+         ([taskName, taskDefinition]) => {
+           const { workspaceName: erroneousWorkspaceName, scriptName } =
+             getTaskAddress(taskName);
+diff --git a/packages/turbo-codemod/src/transforms/clean-globs.ts b/packages/turbo-codemod/src/transforms/clean-globs.ts
+index b5a663be10..2cda0f942a 100644
+--- a/packages/turbo-codemod/src/transforms/clean-globs.ts
++++ b/packages/turbo-codemod/src/transforms/clean-globs.ts
+@@ -1,5 +1,5 @@
+ import path from "node:path";
+-import type { Schema as TurboJsonSchema } from "@turbo/types";
++import type { SchemaV1 } from "@turbo/types/src/types/config";
+ import { readJsonSync } from "fs-extra";
+ import { getTurboConfigs } from "@turbo/utils";
+ import type { TransformerArgs, Transformer } from "../types";
+@@ -24,7 +24,7 @@ export function transformer({
+ 
+   const turboConfigPath = path.join(root, "turbo.json");
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
++  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateConfig(turboJson),
+@@ -34,16 +34,18 @@ export function transformer({
+   const workspaceConfigs = getTurboConfigs(root);
+   workspaceConfigs.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath } = workspaceConfig;
+-    runner.modifyFile({
+-      filePath,
+-      after: migrateConfig(config),
+-    });
++    if ("pipeline" in config) {
++      runner.modifyFile({
++        filePath,
++        after: migrateConfig(config),
++      });
++    }
+   });
+ 
+   return runner.finish();
+ }
+ 
+-function migrateConfig(config: TurboJsonSchema) {
++function migrateConfig(config: SchemaV1) {
+   const mapGlob = (glob: string) => fixGlobPattern(glob);
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     taskDef.inputs = taskDef.inputs?.map(mapGlob);
+diff --git a/packages/turbo-codemod/src/transforms/migrate-env-var-dependencies.ts b/packages/turbo-codemod/src/transforms/migrate-env-var-dependencies.ts
+index b6f36f646c..d2a17b7a95 100644
+--- a/packages/turbo-codemod/src/transforms/migrate-env-var-dependencies.ts
++++ b/packages/turbo-codemod/src/transforms/migrate-env-var-dependencies.ts
+@@ -1,7 +1,8 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { Schema as TurboJsonSchema, Pipeline } from "@turbo/types";
++import type { Pipeline } from "@turbo/types";
++import type { SchemaV1 } from "@turbo/types/src/types/config";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+ import type { Transformer, TransformerArgs } from "../types";
+@@ -12,7 +13,7 @@ const DESCRIPTION =
+   'Migrate environment variable dependencies from "dependsOn" to "env" in `turbo.json`';
+ const INTRODUCED_IN = "1.5.0";
+ 
+-export function hasLegacyEnvVarDependencies(config: TurboJsonSchema) {
++export function hasLegacyEnvVarDependencies(config: SchemaV1) {
+   const dependsOn = [
+     "extends" in config ? [] : config.globalDependencies,
+     Object.values(config.pipeline).flatMap(
+@@ -68,7 +69,7 @@ export function migratePipeline(pipeline: Pipeline) {
+   return migratedPipeline;
+ }
+ 
+-export function migrateGlobal(config: TurboJsonSchema) {
++export function migrateGlobal(config: SchemaV1) {
+   if ("extends" in config) {
+     return config;
+   }
+@@ -91,7 +92,7 @@ export function migrateGlobal(config: TurboJsonSchema) {
+   return migratedConfig;
+ }
+ 
+-export function migrateConfig(config: TurboJsonSchema) {
++export function migrateConfig(config: SchemaV1) {
+   const migratedConfig = migrateGlobal(config);
+   Object.keys(config.pipeline).forEach((pipelineKey) => {
+     config.pipeline;
+@@ -144,7 +145,7 @@ export function transformer({
+     });
+   }
+ 
+-  let turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
++  let turboJson = readJsonSync(turboConfigPath) as SchemaV1;
+   if (hasLegacyEnvVarDependencies(turboJson).hasKeys) {
+     turboJson = migrateConfig(turboJson);
+   }
+@@ -158,7 +159,7 @@ export function transformer({
+   const workspaceConfigs = getTurboConfigs(root);
+   workspaceConfigs.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath } = workspaceConfig;
+-    if (hasLegacyEnvVarDependencies(config).hasKeys) {
++    if ("pipeline" in config && hasLegacyEnvVarDependencies(config).hasKeys) {
+       runner.modifyFile({
+         filePath,
+         after: migrateConfig(config),
+diff --git a/packages/turbo-codemod/src/transforms/rename-output-mode.ts b/packages/turbo-codemod/src/transforms/rename-output-mode.ts
+index 0ffeae82e7..df372718c4 100644
+--- a/packages/turbo-codemod/src/transforms/rename-output-mode.ts
++++ b/packages/turbo-codemod/src/transforms/rename-output-mode.ts
+@@ -1,7 +1,8 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { Schema as TurboJsonSchema, OutputMode } from "@turbo/types";
++import type { OutputMode } from "@turbo/types";
++import type { SchemaV1 } from "@turbo/types/src/types/config";
+ import type { Transformer, TransformerArgs } from "../types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+@@ -12,7 +13,7 @@ const DESCRIPTION =
+   'Rename the "outputMode" key to "outputLogs" in `turbo.json`';
+ const INTRODUCED_IN = "2.0.0";
+ 
+-function migrateConfig(config: TurboJsonSchema) {
++function migrateConfig(config: SchemaV1) {
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     if (Object.prototype.hasOwnProperty.call(taskDef, "outputMode")) {
+       //@ts-expect-error - outputMode is no longer in the schema
+@@ -61,7 +62,7 @@ export function transformer({
+     });
+   }
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
++  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateConfig(turboJson),
+@@ -71,10 +72,12 @@ export function transformer({
+   const workspaceConfigs = getTurboConfigs(root);
+   workspaceConfigs.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath } = workspaceConfig;
+-    runner.modifyFile({
+-      filePath,
+-      after: migrateConfig(config),
+-    });
++    if ("pipeline" in config) {
++      runner.modifyFile({
++        filePath,
++        after: migrateConfig(config),
++      });
++    }
+   });
+ 
+   return runner.finish();
+diff --git a/packages/turbo-codemod/src/transforms/rename-pipeline.ts b/packages/turbo-codemod/src/transforms/rename-pipeline.ts
+new file mode 100644
+index 0000000000..5217631bbb
+--- /dev/null
++++ b/packages/turbo-codemod/src/transforms/rename-pipeline.ts
+@@ -0,0 +1,67 @@
++import path from "node:path";
++import { readJsonSync, existsSync } from "fs-extra";
++import { getTurboConfigs } from "@turbo/utils";
++import type { Schema, SchemaV1 } from "@turbo/types/src/types/config";
++import type { Transformer, TransformerArgs } from "../types";
++import { getTransformerHelpers } from "../utils/getTransformerHelpers";
++import type { TransformerResults } from "../runner";
++
++// transformer details
++const TRANSFORMER = "rename-pipeline";
++const DESCRIPTION = 'Rename the "pipeline" key to "tasks" in `turbo.json`';
++const INTRODUCED_IN = "2.0.0";
++
++function migrateConfig(config: SchemaV1): Schema {
++  const { pipeline, ...rest } = config;
++
++  return { tasks: pipeline, ...rest };
++}
++
++export function transformer({
++  root,
++  options,
++}: TransformerArgs): TransformerResults {
++  const { log, runner } = getTransformerHelpers({
++    transformer: TRANSFORMER,
++    rootPath: root,
++    options,
++  });
++
++  log.info(`Renaming \`pipeline\` key in turbo.json to \`tasks\``);
++  const turboConfigPath = path.join(root, "turbo.json");
++  if (!existsSync(turboConfigPath)) {
++    return runner.abortTransform({
++      reason: `No turbo.json found at ${root}. Is the path correct?`,
++    });
++  }
++
++  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
++  runner.modifyFile({
++    filePath: turboConfigPath,
++    after: migrateConfig(turboJson),
++  });
++
++  // find and migrate any workspace configs
++  const workspaceConfigs = getTurboConfigs(root);
++  workspaceConfigs.forEach((workspaceConfig) => {
++    const { config, turboConfigPath: filePath } = workspaceConfig;
++    if ("pipeline" in config) {
++      runner.modifyFile({
++        filePath,
++        after: migrateConfig(config),
++      });
++    }
++  });
++
++  return runner.finish();
++}
++
++const transformerMeta: Transformer = {
++  name: TRANSFORMER,
++  description: DESCRIPTION,
++  introducedIn: INTRODUCED_IN,
++  transformer,
++};
++
++// eslint-disable-next-line import/no-default-export -- transforms require default export
++export default transformerMeta;
+diff --git a/packages/turbo-codemod/src/transforms/set-default-outputs.ts b/packages/turbo-codemod/src/transforms/set-default-outputs.ts
+index 5eb99ac776..5de94265c2 100644
+--- a/packages/turbo-codemod/src/transforms/set-default-outputs.ts
++++ b/packages/turbo-codemod/src/transforms/set-default-outputs.ts
+@@ -1,7 +1,7 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { Schema as TurboJsonSchema } from "@turbo/types";
++import type { SchemaV1 } from "@turbo/types/src/types/config";
+ import type { Transformer, TransformerArgs } from "../types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+@@ -14,7 +14,7 @@ const DESCRIPTION =
+   'Add the "outputs" key with defaults where it is missing in `turbo.json`';
+ const INTRODUCED_IN = "1.7.0";
+ 
+-function migrateConfig(config: TurboJsonSchema) {
++function migrateConfig(config: SchemaV1) {
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     if (taskDef.cache !== false) {
+       if (!taskDef.outputs) {
+@@ -67,7 +67,7 @@ export function transformer({
+     });
+   }
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
++  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateConfig(turboJson),
+@@ -77,10 +77,12 @@ export function transformer({
+   const workspaceConfigs = getTurboConfigs(root);
+   workspaceConfigs.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath } = workspaceConfig;
+-    runner.modifyFile({
+-      filePath,
+-      after: migrateConfig(config),
+-    });
++    if ("pipeline" in config) {
++      runner.modifyFile({
++        filePath,
++        after: migrateConfig(config),
++      });
++    }
+   });
+ 
+   return runner.finish();
+diff --git a/packages/turbo-codemod/src/transforms/stabilize-env-mode.ts b/packages/turbo-codemod/src/transforms/stabilize-env-mode.ts
+index de69532b51..9f88843d85 100644
+--- a/packages/turbo-codemod/src/transforms/stabilize-env-mode.ts
++++ b/packages/turbo-codemod/src/transforms/stabilize-env-mode.ts
+@@ -1,8 +1,7 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { Schema as TurboJsonSchema } from "@turbo/types";
+-import type { RootSchema } from "@turbo/types/src/types/config";
++import type { SchemaV1, RootSchemaV1 } from "@turbo/types/src/types/config";
+ import type { Transformer, TransformerArgs } from "../types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+@@ -13,7 +12,7 @@ const DESCRIPTION =
+   "Rewrite experimentalPassThroughEnv and experimentalGlobalPassThroughEnv";
+ const INTRODUCED_IN = "1.10.0";
+ 
+-function migrateRootConfig(config: RootSchema) {
++function migrateRootConfig(config: RootSchemaV1) {
+   const oldConfig = config.experimentalGlobalPassThroughEnv;
+   const newConfig = config.globalPassThroughEnv;
+   // Set to an empty array is meaningful, so we have undefined as an option here.
+@@ -45,7 +44,7 @@ function migrateRootConfig(config: RootSchema) {
+   return migrateTaskConfigs(config);
+ }
+ 
+-function migrateTaskConfigs(config: TurboJsonSchema) {
++function migrateTaskConfigs(config: SchemaV1) {
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     const oldConfig = taskDef.experimentalPassThroughEnv;
+     const newConfig = taskDef.passThroughEnv;
+@@ -119,7 +118,7 @@ export function transformer({
+     });
+   }
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
++  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateRootConfig(turboJson),
+@@ -129,7 +128,7 @@ export function transformer({
+   const allTurboJsons = getTurboConfigs(root);
+   allTurboJsons.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath, isRootConfig } = workspaceConfig;
+-    if (!isRootConfig) {
++    if (!isRootConfig && "pipeline" in config) {
+       runner.modifyFile({
+         filePath,
+         after: migrateTaskConfigs(config),
+diff --git a/packages/turbo-codemod/src/transforms/transform-env-literals-to-wildcards.ts b/packages/turbo-codemod/src/transforms/transform-env-literals-to-wildcards.ts
+index d83e61ae0d..adc5f6add4 100644
+--- a/packages/turbo-codemod/src/transforms/transform-env-literals-to-wildcards.ts
++++ b/packages/turbo-codemod/src/transforms/transform-env-literals-to-wildcards.ts
+@@ -1,8 +1,8 @@
+ import path from "node:path";
+ import { readJsonSync, existsSync } from "fs-extra";
+ import { type PackageJson, getTurboConfigs } from "@turbo/utils";
+-import type { EnvWildcard, Schema as TurboJsonSchema } from "@turbo/types";
+-import type { RootSchema } from "@turbo/types/src/types/config";
++import type { EnvWildcard } from "@turbo/types";
++import type { RootSchemaV1, SchemaV1 } from "@turbo/types/src/types/config";
+ import type { Transformer, TransformerArgs } from "../types";
+ import { getTransformerHelpers } from "../utils/getTransformerHelpers";
+ import type { TransformerResults } from "../runner";
+@@ -27,7 +27,7 @@ function transformEnvVarName(envVarName: string): EnvWildcard {
+   return output;
+ }
+ 
+-function migrateRootConfig(config: RootSchema) {
++function migrateRootConfig(config: RootSchemaV1) {
+   const { globalEnv, globalPassThroughEnv } = config;
+ 
+   if (Array.isArray(globalEnv)) {
+@@ -40,7 +40,7 @@ function migrateRootConfig(config: RootSchema) {
+   return migrateTaskConfigs(config);
+ }
+ 
+-function migrateTaskConfigs(config: TurboJsonSchema) {
++function migrateTaskConfigs(config: SchemaV1) {
+   for (const [_, taskDef] of Object.entries(config.pipeline)) {
+     const { env, passThroughEnv } = taskDef;
+ 
+@@ -91,7 +91,7 @@ export function transformer({
+     });
+   }
+ 
+-  const turboJson = readJsonSync(turboConfigPath) as TurboJsonSchema;
++  const turboJson = readJsonSync(turboConfigPath) as SchemaV1;
+   runner.modifyFile({
+     filePath: turboConfigPath,
+     after: migrateRootConfig(turboJson),
+@@ -101,7 +101,7 @@ export function transformer({
+   const allTurboJsons = getTurboConfigs(root);
+   allTurboJsons.forEach((workspaceConfig) => {
+     const { config, turboConfigPath: filePath, isRootConfig } = workspaceConfig;
+-    if (!isRootConfig) {
++    if (!isRootConfig && "pipeline" in config) {
+       runner.modifyFile({
+         filePath,
+         after: migrateTaskConfigs(config),
+diff --git a/packages/turbo-types/src/types/config.ts b/packages/turbo-types/src/types/config.ts
+index 9319ff42a1..8861150963 100644
+--- a/packages/turbo-types/src/types/config.ts
++++ b/packages/turbo-types/src/types/config.ts
+@@ -1,6 +1,11 @@
+ /* This file generates the `schema.json` file. */
+ export type Schema = RootSchema | WorkspaceSchema;
+ 
++/* Used to support codemods that target turbo 1 */
++export type LegacySchema = LegacyRootSchema | LegacyWorkspaceSchema;
++
++export type SchemaV1 = RootSchemaV1 | WorkspaceSchemaV1;
++
+ export interface BaseSchema {
+   /** @defaultValue https://turbo.build/schema.json */
+   $schema?: string;
+@@ -14,7 +19,7 @@ export interface BaseSchema {
+    * @defaultValue `{}`
+    */
+   // eslint-disable-next-line @typescript-eslint/consistent-indexed-object-style -- it's more readable to specify a name for the key
+-  pipeline: {
++  tasks: {
+     /**
+      * The name of a task that can be executed by turbo. If turbo finds a workspace
+      * package with a package.json scripts object with a matching key, it will apply the
+@@ -24,6 +29,15 @@ export interface BaseSchema {
+   };
+ }
+ 
++export interface BaseSchemaV1 {
++  // eslint-disable-next-line @typescript-eslint/consistent-indexed-object-style -- it's more readable to specify a name for the key
++  pipeline: {
++    [script: string]: Pipeline;
++  };
++}
++
++export type LegacyBaseSchema = BaseSchema | BaseSchemaV1;
++
+ export interface WorkspaceSchema extends BaseSchema {
+   /**
+    * This key is only available in Workspace Configs
+@@ -40,6 +54,10 @@ export interface WorkspaceSchema extends BaseSchema {
+   extends: Array<string>;
+ }
+ 
++export type LegacyWorkspaceSchema = WorkspaceSchema & LegacyBaseSchema;
++
++export type WorkspaceSchemaV1 = Omit<WorkspaceSchema, "tasks"> & BaseSchemaV1;
++
+ export interface RootSchema extends BaseSchema {
+   /**
+    * A list of globs to include in the set of implicit global hash dependencies.
+@@ -122,6 +140,10 @@ export interface RootSchema extends BaseSchema {
+   experimentalUI?: boolean;
+ }
+ 
++export type LegacyRootSchema = RootSchema & LegacyBaseSchema;
++
++export type RootSchemaV1 = Omit<RootSchema, "tasks"> & BaseSchemaV1;
++
+ export interface Pipeline {
+   /**
+    * The list of tasks that this task depends on.
+diff --git a/packages/turbo-utils/src/getTurboConfigs.ts b/packages/turbo-utils/src/getTurboConfigs.ts
+index 04a7e8e8b7..a7cdd185e2 100644
+--- a/packages/turbo-utils/src/getTurboConfigs.ts
++++ b/packages/turbo-utils/src/getTurboConfigs.ts
+@@ -2,7 +2,7 @@ import fs from "node:fs";
+ import path from "node:path";
+ import yaml from "js-yaml";
+ import { sync } from "fast-glob";
+-import type { Schema } from "@turbo/types";
++import type { LegacySchema, Pipeline } from "@turbo/types/src/types/config";
+ import JSON5 from "json5";
+ import * as logger from "./logger";
+ import { getTurboRoot } from "./getTurboRoot";
+@@ -15,11 +15,11 @@ export interface WorkspaceConfig {
+   workspaceName: string;
+   workspacePath: string;
+   isWorkspaceRoot: boolean;
+-  turboConfig?: Schema;
++  turboConfig?: LegacySchema;
+ }
+ 
+ export interface TurboConfig {
+-  config: Schema;
++  config: LegacySchema;
+   turboConfigPath: string;
+   workspacePath: string;
+   isRootConfig: boolean;
+@@ -92,7 +92,7 @@ export function getTurboConfigs(cwd?: string, opts?: Options): TurboConfigs {
+       try {
+         const raw = fs.readFileSync(configPath, "utf8");
+         // eslint-disable-next-line import/no-named-as-default-member -- json5 exports different objects depending on if you're using esm or cjs (https://github.com/json5/json5/issues/240)
+-        const turboJsonContent: Schema = JSON5.parse(raw);
++        const turboJsonContent: LegacySchema = JSON5.parse(raw);
+         // basic config validation
+         const isRootConfig = path.dirname(configPath) === turboRoot;
+         if (isRootConfig) {
+@@ -163,7 +163,7 @@ export function getWorkspaceConfigs(
+         // Try and get turbo.json
+         const turboJsonPath = path.join(workspacePath, "turbo.json");
+         let rawTurboJson = null;
+-        let turboConfig: Schema | undefined;
++        let turboConfig: LegacySchema | undefined;
+         try {
+           rawTurboJson = fs.readFileSync(turboJsonPath, "utf8");
+           // eslint-disable-next-line import/no-named-as-default-member -- json5 exports different objects depending on if you're using esm or cjs (https://github.com/json5/json5/issues/240)
+@@ -204,3 +204,14 @@ export function getWorkspaceConfigs(
+ 
+   return configs;
+ }
++
++export function forEachTaskDef(
++  config: LegacySchema,
++  f: (value: [string, Pipeline]) => void
++) {
++  if ("pipeline" in config) {
++    Object.entries(config.pipeline).forEach(f);
++  } else {
++    Object.entries(config.tasks).forEach(f);
++  }
++}

@@ -1,0 +1,590 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index ff0f1953d..c2ee74329 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -33,8 +33,6 @@ jobs:
+       run: npm run lint:scss
+     - name: Lint Docs JS Files
+       run: node Makefile lintDocsJS
+-    - name: Check Rule Examples
+-      run: node Makefile checkRuleExamples
+     - name: Build Docs Website
+       working-directory: docs
+       run: npm run build
+diff --git a/Makefile.js b/Makefile.js
+index 692168ad7..a0f60a2c1 100644
+--- a/Makefile.js
++++ b/Makefile.js
+@@ -867,17 +867,6 @@ target.checkRuleFiles = function() {
+ 
+ };
+ 
+-target.checkRuleExamples = function() {
+-    const { execFileSync } = require("child_process");
+-
+-    // We don't need the stack trace of execFileSync if the command fails.
+-    try {
+-        execFileSync(process.execPath, ["tools/check-rule-examples.js", "docs/src/rules/*.md"], { stdio: "inherit" });
+-    } catch {
+-        exit(1);
+-    }
+-};
+-
+ target.checkLicenses = function() {
+ 
+     /**
+diff --git a/docs/.eleventy.js b/docs/.eleventy.js
+index 5a156c211..75a372d3d 100644
+--- a/docs/.eleventy.js
++++ b/docs/.eleventy.js
+@@ -14,8 +14,6 @@ const { highlighter, lineNumberPlugin } = require("./src/_plugins/md-syntax-high
+ const {
+     DateTime
+ } = require("luxon");
+-const markdownIt = require("markdown-it");
+-const markdownItRuleExample = require("./tools/markdown-it-rule-example");
+ 
+ module.exports = function(eleventyConfig) {
+ 
+@@ -115,7 +113,7 @@ module.exports = function(eleventyConfig) {
+      * Source: https://github.com/11ty/eleventy/issues/658
+      */
+     eleventyConfig.addFilter("markdown", value => {
+-        const markdown = markdownIt({
++        const markdown = require("markdown-it")({
+             html: true
+         });
+ 
+@@ -193,39 +191,57 @@ module.exports = function(eleventyConfig) {
+         return btoa(unescape(encodeURIComponent(text)));
+     }
+ 
+-    // markdown-it plugin options for playground-linked code blocks in rule examples.
+-    const ruleExampleOptions = markdownItRuleExample({
+-        open(type, code, parserOptions) {
+-
+-            // See https://github.com/eslint/eslint.org/blob/ac38ab41f99b89a8798d374f74e2cce01171be8b/src/playground/App.js#L44
+-            const state = encodeToBase64(
+-                JSON.stringify({
+-                    options: { parserOptions },
+-                    text: code
+-                })
+-            );
+-            const prefix = process.env.CONTEXT && process.env.CONTEXT !== "deploy-preview"
+-                ? ""
+-                : "https://eslint.org";
+-
+-            return `
+-                        <div class="${type}">
++    /**
++     * Creates markdownItContainer settings for a playground-linked codeblock.
++     * @param {string} name Plugin name and class name to add to the code block.
++     * @returns {[string, object]} Plugin name and options for markdown-it.
++     */
++    function withPlaygroundRender(name) {
++        return [
++            name,
++            {
++                render(tokens, index) {
++                    if (tokens[index].nesting !== 1) {
++                        return "</div>";
++                    }
++
++                    // See https://github.com/eslint/eslint.org/blob/ac38ab41f99b89a8798d374f74e2cce01171be8b/src/playground/App.js#L44
++                    const parserOptionsJSON = tokens[index].info?.split("correct ")[1]?.trim();
++                    const parserOptions = { sourceType: "module", ...(parserOptionsJSON && JSON.parse(parserOptionsJSON)) };
++
++                    // Remove trailing newline and presentational `⏎` characters (https://github.com/eslint/eslint/issues/17627):
++                    const content = tokens[index + 1].content
++                        .replace(/\n$/u, "")
++                        .replace(/⏎(?=\n)/gu, "");
++                    const state = encodeToBase64(
++                        JSON.stringify({
++                            options: { parserOptions },
++                            text: content
++                        })
++                    );
++                    const prefix = process.env.CONTEXT && process.env.CONTEXT !== "deploy-preview"
++                        ? ""
++                        : "https://eslint.org";
++
++                    return `
++                        <div class="${name}">
+                             <a class="c-btn c-btn--secondary c-btn--playground" href="${prefix}/play#${state}" target="_blank">
+                                 Open in Playground
+                             </a>
+-            `.trim();
+-        },
+-        close() {
+-            return "</div>";
+-        }
+-    });
++                    `.trim();
++                }
++            }
++        ];
++    }
+ 
++    const markdownIt = require("markdown-it");
+     const md = markdownIt({ html: true, linkify: true, typographer: true, highlight: (str, lang) => highlighter(md, str, lang) })
+         .use(markdownItAnchor, {
+             slugify: s => slug(s)
+         })
+         .use(markdownItContainer, "img-container", {})
+-        .use(markdownItContainer, "rule-example", ruleExampleOptions)
++        .use(markdownItContainer, ...withPlaygroundRender("correct"))
++        .use(markdownItContainer, ...withPlaygroundRender("incorrect"))
+         .use(markdownItContainer, "warning", {
+             render(tokens, idx) {
+                 return generateAlertMarkup("warning", tokens, idx);
+diff --git a/docs/tools/markdown-it-rule-example.js b/docs/tools/markdown-it-rule-example.js
+deleted file mode 100644
+index 232971879..000000000
+--- a/docs/tools/markdown-it-rule-example.js
++++ /dev/null
+@@ -1,88 +0,0 @@
+-"use strict";
+-
+-/** @typedef {import("../../lib/shared/types").ParserOptions} ParserOptions */
+-
+-/**
+- * A callback function to handle the opening of container blocks.
+- * @callback OpenHandler
+- * @param {"correct" | "incorrect"} type The type of the example.
+- * @param {string} code The example code.
+- * @param {ParserOptions} parserOptions The parser options to be passed to the Playground.
+- * @param {Object} codeBlockToken The `markdown-it` token for the code block inside the container.
+- * @returns {string | undefined} If a text is returned, it will be appended to the rendered output
+- * of `markdown-it`.
+- */
+-
+-/**
+- * A callback function to handle the closing of container blocks.
+- * @callback CloseHandler
+- * @returns {string | undefined} If a text is returned, it will be appended to the rendered output
+- * of `markdown-it`.
+- */
+-
+-/**
+- * This is a utility to simplify the creation of `markdown-it-container` options to handle rule
+- * examples in the documentation.
+- * It is designed to automate the following common tasks:
+- *
+- * - Ensure that the plugin instance only matches container blocks tagged with 'correct' or
+- * 'incorrect'.
+- * - Parse the optional `parserOptions` after the correct/incorrect tag.
+- * - Apply common transformations to the code inside the code block, like stripping '⏎' at the end
+- * of a line or the last newline character.
+- *
+- * Additionally, the opening and closing of the container blocks are handled by two distinct
+- * callbacks, of which only the `open` callback is required.
+- * @param {Object} options The options object.
+- * @param {OpenHandler} options.open The open callback.
+- * @param {CloseHandler} [options.close] The close callback.
+- * @returns {Object} The `markdown-it-container` options.
+- * @example
+- * const markdownIt = require("markdown-it");
+- * const markdownItContainer = require("markdown-it-container");
+- *
+- * markdownIt()
+- *     .use(markdownItContainer, "rule-example", markdownItRuleExample({
+- *         open(type, code, parserOptions, codeBlockToken) {
+- *             // do something
+- *         }
+- *         close() {
+- *             // do something
+- *         }
+- *     }))
+- *     .render(text);
+- *
+- */
+-function markdownItRuleExample({ open, close }) {
+-    return {
+-        validate(info) {
+-            return /^\s*(?:in)?correct(?!\S)/u.test(info);
+-        },
+-        render(tokens, index) {
+-            const tagToken = tokens[index];
+-
+-            if (tagToken.nesting < 0) {
+-                const text = close ? close() : void 0;
+-
+-                // Return an empty string to avoid appending unexpected text to the output.
+-                return typeof text === "string" ? text : "";
+-            }
+-
+-            const { type, parserOptionsJSON } = /^\s*(?<type>\S+)(\s+(?<parserOptionsJSON>\S.*?))?\s*$/u.exec(tagToken.info).groups;
+-            const parserOptions = { sourceType: "module", ...(parserOptionsJSON && JSON.parse(parserOptionsJSON)) };
+-            const codeBlockToken = tokens[index + 1];
+-
+-            // Remove trailing newline and presentational `⏎` characters (https://github.com/eslint/eslint/issues/17627):
+-            const code = codeBlockToken.content
+-                .replace(/\n$/u, "")
+-                .replace(/⏎(?=\n)/gu, "");
+-
+-            const text = open(type, code, parserOptions, codeBlockToken);
+-
+-            // Return an empty string to avoid appending unexpected text to the output.
+-            return typeof text === "string" ? text : "";
+-        }
+-    };
+-}
+-
+-module.exports = markdownItRuleExample;
+diff --git a/package.json b/package.json
+index b88d6c974..30e3d8966 100644
+--- a/package.json
++++ b/package.json
+@@ -19,7 +19,6 @@
+     "build:readme": "node tools/update-readme.js",
+     "lint": "node Makefile.js lint",
+     "lint:docs:js": "node Makefile.js lintDocsJS",
+-    "lint:docs:rule-examples": "node Makefile.js checkRuleExamples",
+     "lint:fix": "node Makefile.js lint -- fix",
+     "lint:fix:docs:js": "node Makefile.js lintDocsJS -- fix",
+     "release:generate:alpha": "node Makefile.js generatePrerelease -- alpha",
+@@ -43,7 +42,6 @@
+       "git add packages/js/src/configs/eslint-all.js"
+     ],
+     "docs/src/rules/*.md": [
+-      "node tools/check-rule-examples.js",
+       "node tools/fetch-docs-links.js",
+       "git add docs/src/_data/further_reading_links.json"
+     ],
+@@ -134,8 +132,6 @@
+     "gray-matter": "^4.0.3",
+     "lint-staged": "^11.0.0",
+     "load-perf": "^0.2.0",
+-    "markdown-it": "^12.2.0",
+-    "markdown-it-container": "^3.0.0",
+     "markdownlint": "^0.31.1",
+     "markdownlint-cli": "^0.37.0",
+     "marked": "^4.0.8",
+diff --git a/tests/fixtures/bad-examples.md b/tests/fixtures/bad-examples.md
+deleted file mode 100644
+index a8f10c34c..000000000
+--- a/tests/fixtures/bad-examples.md
++++ /dev/null
+@@ -1,26 +0,0 @@
+----
+-title: Lorem Ipsum
+----
+-
+-This file contains rule example code with syntax errors.
+-
+-<!-- markdownlint-capture -->
+-<!-- markdownlint-disable MD040 -->
+-::: incorrect { "sourceType": "script" }
+-
+-```
+-export default "foo";
+-```
+-
+-:::
+-<!-- markdownlint-restore -->
+-
+-:::correct
+-
+-````ts
+-const foo = "bar";
+-
+-const foo = "baz";
+-````
+-
+-:::
+diff --git a/tests/fixtures/good-examples.md b/tests/fixtures/good-examples.md
+deleted file mode 100644
+index c68dd09c9..000000000
+--- a/tests/fixtures/good-examples.md
++++ /dev/null
+@@ -1,33 +0,0 @@
+-This file contains rule example code without syntax errors.
+-
+-::: incorrect
+-
+-```js
+-export default⏎
+-"foo";
+-```
+-
+-:::
+-
+-::: correct { "ecmaFeatures": { "jsx": true } }
+-
+-```jsx
+-const foo = <bar></bar>;
+-```
+-
+-:::
+-
+-A test with multiple spaces after 'correct':
+-<!-- markdownlint-disable-next-line no-trailing-spaces -->
+-:::correct  
+-
+-```js
+-```
+-
+-:::
+-
+-The following code block is not a rule example, so it won't be checked:
+-
+-```js
+-!@#$%^&*()
+-```
+diff --git a/tests/tools/check-rule-examples.js b/tests/tools/check-rule-examples.js
+deleted file mode 100644
+index 10741c3dd..000000000
+--- a/tests/tools/check-rule-examples.js
++++ /dev/null
+@@ -1,95 +0,0 @@
+-"use strict";
+-
+-//------------------------------------------------------------------------------
+-// Requirements
+-//------------------------------------------------------------------------------
+-
+-const assert = require("assert");
+-const { execFile } = require("child_process");
+-const { promisify } = require("util");
+-
+-//------------------------------------------------------------------------------
+-// Helpers
+-//------------------------------------------------------------------------------
+-
+-/**
+- * Runs check-rule-examples on the specified files.
+- * @param {...string} filenames Files to be passed to check-rule-examples.
+- * @returns {Promise<ChildProcess>} An object with properties `stdout` and `stderr` on success.
+- * @throws An object with properties `code`, `stdout` and `stderr` on success.
+- */
+-async function runCheckRuleExamples(...filenames) {
+-    return await promisify(execFile)(
+-        process.execPath,
+-        ["--no-deprecation", "tools/check-rule-examples.js", ...filenames],
+-        { env: { FORCE_COLOR: "3" } } // 24-bit color mode
+-    );
+-}
+-
+-//------------------------------------------------------------------------------
+-// Tests
+-//------------------------------------------------------------------------------
+-
+-describe("check-rule-examples", () => {
+-
+-    it("succeeds when not passed any files", async () => {
+-        const childProcess = await runCheckRuleExamples();
+-
+-        assert.strictEqual(childProcess.stdout, "");
+-        assert.strictEqual(childProcess.stderr, "");
+-    });
+-
+-    it("succeeds when passed a syntax error free file", async () => {
+-        const childProcess = await runCheckRuleExamples("tests/fixtures/good-examples.md");
+-
+-        assert.strictEqual(childProcess.stdout, "");
+-        assert.strictEqual(childProcess.stderr, "");
+-    });
+-
+-    it("fails when passed a file with a syntax error", async () => {
+-        const promise = runCheckRuleExamples("tests/fixtures/good-examples.md", "tests/fixtures/bad-examples.md");
+-
+-        await assert.rejects(
+-            promise,
+-            {
+-                code: 1,
+-                stdout: "",
+-                stderr:
+-                "\x1B[0m\x1B[0m\n" +
+-                "\x1B[0m\x1B[4mtests/fixtures/bad-examples.md\x1B[24m\x1B[0m\n" +
+-                "\x1B[0m  \x1B[2m11:4\x1B[22m  \x1B[31merror\x1B[39m  Missing language tag: use one of 'javascript', 'js' or 'jsx'\x1B[0m\n" +
+-                "\x1B[0m  \x1B[2m12:1\x1B[22m  \x1B[31merror\x1B[39m  Syntax error: 'import' and 'export' may appear only with 'sourceType: module'\x1B[0m\n" +
+-                "\x1B[0m  \x1B[2m20:5\x1B[22m  \x1B[31merror\x1B[39m  Nonstandard language tag 'ts': use one of 'javascript', 'js' or 'jsx'\x1B[0m\n" +
+-                "\x1B[0m  \x1B[2m23:7\x1B[22m  \x1B[31merror\x1B[39m  Syntax error: Identifier 'foo' has already been declared\x1B[0m\n" +
+-                "\x1B[0m\x1B[0m\n" +
+-                "\x1B[0m\x1B[31m\x1B[1m✖ 4 problems (4 errors, 0 warnings)\x1B[22m\x1B[39m\x1B[0m\n" +
+-                "\x1B[0m\x1B[31m\x1B[1m\x1B[22m\x1B[39m\x1B[0m\n"
+-            }
+-        );
+-    });
+-
+-    it("fails when a file cannot be processed", async () => {
+-        const promise = runCheckRuleExamples("tests/fixtures/non-existing-examples.md");
+-
+-        await assert.rejects(
+-            promise,
+-            ({ code, stdout, stderr }) => {
+-                assert.strictEqual(code, 1);
+-                assert.strictEqual(stdout, "");
+-                const expectedStderr =
+-                "\x1B[0m\x1B[0m\n" +
+-                "\x1B[0m\x1B[4mtests/fixtures/non-existing-examples.md\x1B[24m\x1B[0m\n" +
+-                "\x1B[0m  \x1B[2m0:0\x1B[22m  \x1B[31merror\x1B[39m  Error checking file: ENOENT: no such file or directory, open <FILE>\x1B[0m\n" +
+-                "\x1B[0m\x1B[0m\n" +
+-                "\x1B[0m\x1B[31m\x1B[1m✖ 1 problem (1 error, 0 warnings)\x1B[22m\x1B[39m\x1B[0m\n" +
+-                "\x1B[0m\x1B[31m\x1B[1m\x1B[22m\x1B[39m\x1B[0m\n";
+-
+-                // Replace filename as it's OS-dependent.
+-                const normalizedStderr = stderr.replace(/'.+'/u, "<FILE>");
+-
+-                assert.strictEqual(normalizedStderr, expectedStderr);
+-                return true;
+-            }
+-        );
+-    });
+-});
+diff --git a/tools/check-rule-examples.js b/tools/check-rule-examples.js
+deleted file mode 100644
+index bf8c44b3a..000000000
+--- a/tools/check-rule-examples.js
++++ /dev/null
+@@ -1,150 +0,0 @@
+-"use strict";
+-
+-//------------------------------------------------------------------------------
+-// Requirements
+-//------------------------------------------------------------------------------
+-
+-const { parse } = require("espree");
+-const { readFile } = require("fs").promises;
+-const glob = require("glob");
+-const markdownIt = require("markdown-it");
+-const markdownItContainer = require("markdown-it-container");
+-const { promisify } = require("util");
+-const markdownItRuleExample = require("../docs/tools/markdown-it-rule-example");
+-
+-//------------------------------------------------------------------------------
+-// Typedefs
+-//------------------------------------------------------------------------------
+-
+-/** @typedef {import("../lib/shared/types").LintMessage} LintMessage */
+-/** @typedef {import("../lib/shared/types").LintResult} LintResult */
+-/** @typedef {import("../lib/shared/types").ParserOptions} ParserOptions */
+-
+-//------------------------------------------------------------------------------
+-// Helpers
+-//------------------------------------------------------------------------------
+-
+-const STANDARD_LANGUAGE_TAGS = new Set(["javascript", "js", "jsx"]);
+-
+-/**
+- * Tries to parse a specified JavaScript code with Playground presets.
+- * @param {string} code The JavaScript code to parse.
+- * @param {ParserOptions} parserOptions Explicitly specified parser options.
+- * @returns {SyntaxError | null} A `SyntaxError` object if the code cannot be parsed, or `null`.
+- */
+-function tryParseForPlayground(code, parserOptions) {
+-    try {
+-        parse(code, { ecmaVersion: "latest", ...parserOptions });
+-    } catch (error) {
+-        return error;
+-    }
+-    return null;
+-}
+-
+-/**
+- * Checks the example code blocks in a rule documentation file.
+- * @param {string} filename The file to be checked.
+- * @returns {Promise<LintMessage[]>} A promise of problems found. The promise will be rejected if an error occurs.
+- */
+-async function findProblems(filename) {
+-    const text = await readFile(filename, "UTF-8");
+-    const problems = [];
+-    const ruleExampleOptions = markdownItRuleExample({
+-        open(type, code, parserOptions, codeBlockToken) {
+-            const languageTag = codeBlockToken.info;
+-
+-            if (!STANDARD_LANGUAGE_TAGS.has(languageTag)) {
+-
+-                /*
+-                 * Missing language tags are also reported by Markdownlint rule MD040 for all code blocks,
+-                 * but the message we output here is more specific.
+-                 */
+-                const message = `${languageTag
+-                    ? `Nonstandard language tag '${languageTag}'`
+-                    : "Missing language tag"}: use one of 'javascript', 'js' or 'jsx'`;
+-
+-                problems.push({
+-                    fatal: false,
+-                    severity: 2,
+-                    message,
+-                    line: codeBlockToken.map[0] + 1,
+-                    column: codeBlockToken.markup.length + 1
+-                });
+-            }
+-
+-            const error = tryParseForPlayground(code, parserOptions);
+-
+-            if (error) {
+-                const message = `Syntax error: ${error.message}`;
+-                const line = codeBlockToken.map[0] + 1 + error.lineNumber;
+-                const { column } = error;
+-
+-                problems.push({
+-                    fatal: false,
+-                    severity: 2,
+-                    message,
+-                    line,
+-                    column
+-                });
+-            }
+-        }
+-    });
+-
+-    // Run `markdown-it` to check rule examples in the current file.
+-    markdownIt({ html: true })
+-        .use(markdownItContainer, "rule-example", ruleExampleOptions)
+-        .render(text);
+-    return problems;
+-}
+-
+-/**
+- * Checks the example code blocks in a rule documentation file.
+- * @param {string} filename The file to be checked.
+- * @returns {Promise<LintResult>} The result of checking the file.
+- */
+-async function checkFile(filename) {
+-    let fatalErrorCount = 0,
+-        problems;
+-
+-    try {
+-        problems = await findProblems(filename);
+-    } catch (error) {
+-        fatalErrorCount = 1;
+-        problems = [{
+-            fatal: true,
+-            severity: 2,
+-            message: `Error checking file: ${error.message}`
+-        }];
+-    }
+-    return {
+-        filePath: filename,
+-        errorCount: problems.length,
+-        warningCount: 0,
+-        fatalErrorCount,
+-        messages: problems
+-    };
+-}
+-
+-//------------------------------------------------------------------------------
+-// Main
+-//------------------------------------------------------------------------------
+-
+-const patterns = process.argv.slice(2);
+-
+-(async function() {
+-    const globAsync = promisify(glob);
+-
+-    // determine which files to check
+-    const filenames = (await Promise.all(patterns.map(pattern => globAsync(pattern, { nonull: true })))).flat();
+-    const results = await Promise.all(filenames.map(checkFile));
+-
+-    if (results.every(result => result.errorCount === 0)) {
+-        return;
+-    }
+-
+-    const formatter = require("../lib/cli-engine/formatters/stylish");
+-    const output = formatter(results);
+-
+-    console.error(output);
+-    process.exitCode = 1;
+-}());

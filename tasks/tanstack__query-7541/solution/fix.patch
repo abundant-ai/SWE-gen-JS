@@ -1,0 +1,202 @@
+diff --git a/docs/framework/react/reference/useQuery.md b/docs/framework/react/reference/useQuery.md
+index 170427fd1..02137a3cd 100644
+--- a/docs/framework/react/reference/useQuery.md
++++ b/docs/framework/react/reference/useQuery.md
+@@ -88,11 +88,12 @@ const {
+   - This function receives a `retryAttempt` integer and the actual Error and returns the delay to apply before the next attempt in milliseconds.
+   - A function like `attempt => Math.min(attempt > 1 ? 2 ** attempt * 1000 : 1000, 30 * 1000)` applies exponential backoff.
+   - A function like `attempt => attempt * 1000` applies linear backoff.
+-- `staleTime: number | Infinity`
++- `staleTime: number | ((query: Query) => number)`
+   - Optional
+   - Defaults to `0`
+   - The time in milliseconds after data is considered stale. This value only applies to the hook it is defined on.
+   - If set to `Infinity`, the data will never be considered stale
++  - If set to a function, the function will be executed with the query to compute a `staleTime`.
+ - `gcTime: number | Infinity`
+   - Defaults to `5 * 60 * 1000` (5 minutes) or `Infinity` during SSR
+   - The time in milliseconds that unused/inactive cache data remains in memory. When a query's cache becomes unused or inactive, that cache data will be garbage collected after this duration. When different garbage collection times are specified, the longest one will be used.
+diff --git a/packages/query-core/src/queryCache.ts b/packages/query-core/src/queryCache.ts
+index 53fcbd46f..5222b2793 100644
+--- a/packages/query-core/src/queryCache.ts
++++ b/packages/query-core/src/queryCache.ts
+@@ -97,7 +97,12 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
+     this.#queries = new Map<string, Query>()
+   }
+ 
+-  build<TQueryFnData, TError, TData, TQueryKey extends QueryKey>(
++  build<
++    TQueryFnData = unknown,
++    TError = DefaultError,
++    TData = TQueryFnData,
++    TQueryKey extends QueryKey = QueryKey,
++  >(
+     client: QueryClient,
+     options: WithRequired<
+       QueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+diff --git a/packages/query-core/src/queryClient.ts b/packages/query-core/src/queryClient.ts
+index cbfb6d99d..1bc89fccb 100644
+--- a/packages/query-core/src/queryClient.ts
++++ b/packages/query-core/src/queryClient.ts
+@@ -4,6 +4,7 @@ import {
+   hashQueryKeyByOptions,
+   noop,
+   partialMatchKey,
++  resolveStaleTime,
+   skipToken,
+ } from './utils'
+ import { QueryCache } from './queryCache'
+@@ -142,7 +143,7 @@ export class QueryClient {
+ 
+       if (
+         options.revalidateIfStale &&
+-        query.isStaleByTime(defaultedOptions.staleTime)
++        query.isStaleByTime(resolveStaleTime(defaultedOptions.staleTime, query))
+       ) {
+         void this.prefetchQuery(defaultedOptions)
+       }
+@@ -343,7 +344,9 @@ export class QueryClient {
+ 
+     const query = this.#queryCache.build(this, defaultedOptions)
+ 
+-    return query.isStaleByTime(defaultedOptions.staleTime)
++    return query.isStaleByTime(
++      resolveStaleTime(defaultedOptions.staleTime, query),
++    )
+       ? query.fetch(defaultedOptions)
+       : Promise.resolve(query.state.data as TData)
+   }
+diff --git a/packages/query-core/src/queryObserver.ts b/packages/query-core/src/queryObserver.ts
+index f4783938b..ef25d32e8 100644
+--- a/packages/query-core/src/queryObserver.ts
++++ b/packages/query-core/src/queryObserver.ts
+@@ -3,6 +3,7 @@ import {
+   isValidTimeout,
+   noop,
+   replaceData,
++  resolveStaleTime,
+   shallowEqualObjects,
+   timeUntilStale,
+ } from './utils'
+@@ -190,7 +191,8 @@ export class QueryObserver<
+       mounted &&
+       (this.#currentQuery !== prevQuery ||
+         this.options.enabled !== prevOptions.enabled ||
+-        this.options.staleTime !== prevOptions.staleTime)
++        resolveStaleTime(this.options.staleTime, this.#currentQuery) !==
++          resolveStaleTime(prevOptions.staleTime, this.#currentQuery))
+     ) {
+       this.#updateStaleTimeout()
+     }
+@@ -338,19 +340,16 @@ export class QueryObserver<
+ 
+   #updateStaleTimeout(): void {
+     this.#clearStaleTimeout()
++    const staleTime = resolveStaleTime(
++      this.options.staleTime,
++      this.#currentQuery,
++    )
+ 
+-    if (
+-      isServer ||
+-      this.#currentResult.isStale ||
+-      !isValidTimeout(this.options.staleTime)
+-    ) {
++    if (isServer || this.#currentResult.isStale || !isValidTimeout(staleTime)) {
+       return
+     }
+ 
+-    const time = timeUntilStale(
+-      this.#currentResult.dataUpdatedAt,
+-      this.options.staleTime,
+-    )
++    const time = timeUntilStale(this.#currentResult.dataUpdatedAt, staleTime)
+ 
+     // The timeout is sometimes triggered 1 ms before the stale time expiration.
+     // To mitigate this issue we always add 1 ms to the timeout.
+@@ -742,7 +741,10 @@ function isStale(
+   query: Query<any, any, any, any>,
+   options: QueryObserverOptions<any, any, any, any, any>,
+ ): boolean {
+-  return options.enabled !== false && query.isStaleByTime(options.staleTime)
++  return (
++    options.enabled !== false &&
++    query.isStaleByTime(resolveStaleTime(options.staleTime, query))
++  )
+ }
+ 
+ // this function would decide if we will update the observer's 'current'
+diff --git a/packages/query-core/src/types.ts b/packages/query-core/src/types.ts
+index 420365964..7b812a061 100644
+--- a/packages/query-core/src/types.ts
++++ b/packages/query-core/src/types.ts
+@@ -47,6 +47,13 @@ export type QueryFunction<
+   TPageParam = never,
+ > = (context: QueryFunctionContext<TQueryKey, TPageParam>) => T | Promise<T>
+ 
++export type StaleTime<
++  TQueryFnData = unknown,
++  TError = DefaultError,
++  TData = TQueryFnData,
++  TQueryKey extends QueryKey = QueryKey,
++> = number | ((query: Query<TQueryFnData, TError, TData, TQueryKey>) => number)
++
+ export type QueryPersister<
+   T = unknown,
+   TQueryKey extends QueryKey = QueryKey,
+@@ -254,8 +261,9 @@ export interface QueryObserverOptions<
+   /**
+    * The time in milliseconds after data is considered stale.
+    * If set to `Infinity`, the data will never be considered stale.
++   * If set to a function, the function will be executed with the query to compute a `staleTime`.
+    */
+-  staleTime?: number
++  staleTime?: StaleTime<TQueryFnData, TError, TQueryData, TQueryKey>
+   /**
+    * If set to a number, the query will continuously refetch at this frequency in milliseconds.
+    * If set to a function, the function will be executed with the latest data and query to compute a frequency
+@@ -427,7 +435,7 @@ export interface FetchQueryOptions<
+    * The time in milliseconds after data is considered stale.
+    * If the data is fresh it will be returned from the cache.
+    */
+-  staleTime?: number
++  staleTime?: StaleTime<TQueryFnData, TError, TData, TQueryKey>
+ }
+ 
+ export interface EnsureQueryDataOptions<
+diff --git a/packages/query-core/src/utils.ts b/packages/query-core/src/utils.ts
+index 977a6e61f..3cb9374e5 100644
+--- a/packages/query-core/src/utils.ts
++++ b/packages/query-core/src/utils.ts
+@@ -1,10 +1,12 @@
+ import type {
++  DefaultError,
+   FetchStatus,
+   MutationKey,
+   MutationStatus,
+   QueryFunction,
+   QueryKey,
+   QueryOptions,
++  StaleTime,
+ } from './types'
+ import type { Mutation } from './mutation'
+ import type { FetchOptions, Query } from './query'
+@@ -86,6 +88,18 @@ export function timeUntilStale(updatedAt: number, staleTime?: number): number {
+   return Math.max(updatedAt + (staleTime || 0) - Date.now(), 0)
+ }
+ 
++export function resolveStaleTime<
++  TQueryFnData = unknown,
++  TError = DefaultError,
++  TData = TQueryFnData,
++  TQueryKey extends QueryKey = QueryKey,
++>(
++  staleTime: undefined | StaleTime<TQueryFnData, TError, TData, TQueryKey>,
++  query: Query<TQueryFnData, TError, TData, TQueryKey>,
++): number | undefined {
++  return typeof staleTime === 'function' ? staleTime(query) : staleTime
++}
++
+ export function matchQuery(
+   filters: QueryFilters,
+   query: Query<any, any, any, any>,

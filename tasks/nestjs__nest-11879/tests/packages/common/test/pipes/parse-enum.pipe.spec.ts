@@ -1,0 +1,71 @@
+import * as chai from 'chai';
+import { expect } from 'chai';
+import * as chaiAsPromised from 'chai-as-promised';
+import { HttpException } from '../../exceptions';
+import { ArgumentMetadata } from '../../interfaces';
+import { ParseEnumPipe } from '../../pipes/parse-enum.pipe';
+chai.use(chaiAsPromised);
+
+class CustomTestError extends HttpException {
+  constructor() {
+    super('This is a TestException', 418);
+  }
+}
+
+describe('ParseEnumPipe', () => {
+  enum Direction {
+    Up = 'UP',
+  }
+  let target: ParseEnumPipe;
+  let tatargetWithOptionIsTrue: ParseEnumPipe;
+
+  beforeEach(() => {
+    target = new ParseEnumPipe(Direction, {
+      exceptionFactory: (error: any) => new CustomTestError(),
+    });
+
+    tatargetWithOptionIsTrue = new ParseEnumPipe(Direction, {
+      exceptionFactory: (error: any) => new CustomTestError(),
+      optional: true,
+    });
+  });
+  describe('transform', () => {
+    describe('when validation passes', () => {
+      it('should return enum value', async () => {
+        expect(await target.transform('UP', {} as ArgumentMetadata)).to.equal(
+          Direction.Up,
+        );
+      });
+
+      it('should not throw an error if enumType is undefined/null and optional is true', async () => {
+        const target = new ParseEnumPipe('DOWN', { optional: true });
+        const value = await target.transform(undefined, {} as ArgumentMetadata);
+        expect(value).to.equal(undefined);
+      });
+    });
+    describe('when validation fails', () => {
+      it('should throw an error', async () => {
+        return expect(
+          target.transform('DOWN', {} as ArgumentMetadata),
+        ).to.be.rejectedWith(CustomTestError);
+      });
+
+      it('should throw an error if enumType is wrong even optional is true', async () => {
+        return expect(
+          tatargetWithOptionIsTrue.transform('DOWN', {} as ArgumentMetadata),
+        ).to.be.rejectedWith(CustomTestError);
+      });
+    });
+  });
+  describe('constructor', () => {
+    it('should throw an error if "enumType" is undefined/null', () => {
+      try {
+        new ParseEnumPipe(null);
+      } catch (err) {
+        expect(err.message).to.equal(
+          `"ParseEnumPipe" requires "enumType" argument specified (to validate input values).`,
+        );
+      }
+    });
+  });
+});

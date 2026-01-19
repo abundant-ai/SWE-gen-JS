@@ -1,0 +1,196 @@
+diff --git a/packages/toolkit/src/query/createApi.ts b/packages/toolkit/src/query/createApi.ts
+index 4b2ce149..2b2daec3 100644
+--- a/packages/toolkit/src/query/createApi.ts
++++ b/packages/toolkit/src/query/createApi.ts
+@@ -249,22 +249,8 @@ export function buildCreateApi<Modules extends [Module<any>, ...Module<any>[]]>(
+       serializeQueryArgs(queryArgsApi) {
+         let finalSerializeQueryArgs = defaultSerializeQueryArgs
+         if ('serializeQueryArgs' in queryArgsApi.endpointDefinition) {
+-          const endpointSQA =
++          finalSerializeQueryArgs =
+             queryArgsApi.endpointDefinition.serializeQueryArgs!
+-          finalSerializeQueryArgs = (queryArgsApi) => {
+-            const initialResult = endpointSQA(queryArgsApi)
+-            if (typeof initialResult === 'string') {
+-              // If the user function returned a string, use it as-is
+-              return initialResult
+-            } else {
+-              // Assume they returned an object (such as a subset of the original
+-              // query args) or a primitive, and serialize it ourselves
+-              return defaultSerializeQueryArgs({
+-                ...queryArgsApi,
+-                queryArgs: initialResult,
+-              })
+-            }
+-          }
+         } else if (options.serializeQueryArgs) {
+           finalSerializeQueryArgs = options.serializeQueryArgs
+         }
+diff --git a/packages/toolkit/src/query/defaultSerializeQueryArgs.ts b/packages/toolkit/src/query/defaultSerializeQueryArgs.ts
+index 61bd2e55..07d6335b 100644
+--- a/packages/toolkit/src/query/defaultSerializeQueryArgs.ts
++++ b/packages/toolkit/src/query/defaultSerializeQueryArgs.ts
+@@ -19,11 +19,11 @@ export const defaultSerializeQueryArgs: SerializeQueryArgs<any> = ({
+   )})`
+ }
+ 
+-export type SerializeQueryArgs<QueryArgs, ReturnType = string> = (_: {
++export type SerializeQueryArgs<QueryArgs> = (_: {
+   queryArgs: QueryArgs
+   endpointDefinition: EndpointDefinition<any, any, any, any>
+   endpointName: string
+-}) => ReturnType
++}) => string
+ 
+ export type InternalSerializeQueryArgs = (_: {
+   queryArgs: any
+diff --git a/packages/toolkit/src/query/endpointDefinitions.ts b/packages/toolkit/src/query/endpointDefinitions.ts
+index f5243f29..8ef6ec36 100644
+--- a/packages/toolkit/src/query/endpointDefinitions.ts
++++ b/packages/toolkit/src/query/endpointDefinitions.ts
+@@ -330,13 +330,10 @@ export interface QueryExtraOptions<
+   invalidatesTags?: never
+ 
+   /**
+-   * Can be provided to return a custom cache key value based on the query arguments.
++   * Can be provided to return a custom cache key string based on the provided arguments.
+    *
+    * This is primarily intended for cases where a non-serializable value is passed as part of the query arg object and should be excluded from the cache key.  It may also be used for cases where an endpoint should only have a single cache entry, such as an infinite loading / pagination implementation.
+    *
+-   * Unlike the `createApi` version which can _only_ return a string, this per-endpoint option can also return an an object, number, or boolean.  If it returns a string, that value will be used as the cache key directly.  If it returns an object / number / boolean, that value will be passed to the built-in `defaultSerializeQueryArgs`.  This simplifies the use case of stripping out args you don't want included in the cache key.
+-   *
+-   *
+    * @example
+    *
+    * ```ts
+@@ -365,18 +362,13 @@ export interface QueryExtraOptions<
+    *      // highlight-start
+    *      serializeQueryArgs: ({ queryArgs, endpointDefinition, endpointName }) => {
+    *        const { id } = queryArgs
+-   *        // This can return a string, an object, a number, or a boolean.
+-   *        // If it returns an object, number or boolean, that value
+-   *        // will be serialized automatically via `defaultSerializeQueryArgs`
+-   *        return { id } // omit `client` from the cache key
+-   *
+-   *        // Alternately, you can use `defaultSerializeQueryArgs` yourself:
+-   *        // return defaultSerializeQueryArgs({
+-   *        //   endpointName,
+-   *        //   queryArgs: { id },
+-   *        //   endpointDefinition
+-   *        // })
+-   *        // Or  create and return a string yourself:
++   *        // You can use `defaultSerializeQueryArgs` to do the work:
++   *        return defaultSerializeQueryArgs({
++   *          endpointName,
++   *          queryArgs: { id },
++   *          endpointDefinition
++   *        })
++   *        // Or alternately, create a string yourself:
+    *        // return `getPost(${id})`
+    *      },
+    *      // highlight-end
+@@ -385,10 +377,7 @@ export interface QueryExtraOptions<
+    *})
+    * ```
+    */
+-  serializeQueryArgs?: SerializeQueryArgs<
+-    QueryArg,
+-    string | number | boolean | Record<any, any>
+-  >
++  serializeQueryArgs?: SerializeQueryArgs<QueryArg>
+ 
+   /**
+    * Can be provided to merge an incoming response value into the current cache data.
+diff --git a/packages/toolkit/src/query/tests/createApi.test.ts b/packages/toolkit/src/query/tests/createApi.test.ts
+index d79fcc9f..e21546c8 100644
+--- a/packages/toolkit/src/query/tests/createApi.test.ts
++++ b/packages/toolkit/src/query/tests/createApi.test.ts
+@@ -854,16 +854,6 @@ describe('custom serializeQueryArgs per endpoint', () => {
+ 
+   const serializer1 = jest.fn(customArgsSerializer)
+ 
+-  interface MyApiClient {
+-    fetchPost: (id: string) => Promise<SuccessResponse>
+-  }
+-
+-  const dummyClient: MyApiClient = {
+-    async fetchPost(id) {
+-      return { value: 'success' }
+-    },
+-  }
+-
+   const api = createApi({
+     baseQuery: fetchBaseQuery({ baseUrl: 'https://example.com' }),
+     serializeQueryArgs: ({ endpointName, queryArgs }) =>
+@@ -876,34 +866,6 @@ describe('custom serializeQueryArgs per endpoint', () => {
+         query: (arg) => `${arg}`,
+         serializeQueryArgs: serializer1,
+       }),
+-      queryWithCustomObjectSerializer: build.query<
+-        SuccessResponse,
+-        { id: number; client: MyApiClient }
+-      >({
+-        query: (arg) => `${arg.id}`,
+-        serializeQueryArgs: ({
+-          endpointDefinition,
+-          endpointName,
+-          queryArgs,
+-        }) => {
+-          const { id } = queryArgs
+-          return { id }
+-        },
+-      }),
+-      queryWithCustomNumberSerializer: build.query<
+-        SuccessResponse,
+-        { id: number; client: MyApiClient }
+-      >({
+-        query: (arg) => `${arg.id}`,
+-        serializeQueryArgs: ({
+-          endpointDefinition,
+-          endpointName,
+-          queryArgs,
+-        }) => {
+-          const { id } = queryArgs
+-          return id
+-        },
+-      }),
+       listItems: build.query<string[], number>({
+         query: (pageNumber) => `/listItems?page=${pageNumber}`,
+         serializeQueryArgs: ({ endpointName }) => {
+@@ -969,36 +931,6 @@ describe('custom serializeQueryArgs per endpoint', () => {
+     ).toBeTruthy()
+   })
+ 
+-  test('Serializes a returned object for query args', async () => {
+-    await storeRef.store.dispatch(
+-      api.endpoints.queryWithCustomObjectSerializer.initiate({
+-        id: 42,
+-        client: dummyClient,
+-      })
+-    )
+-
+-    expect(
+-      storeRef.store.getState().api.queries[
+-        'queryWithCustomObjectSerializer({"id":42})'
+-      ]
+-    ).toBeTruthy()
+-  })
+-
+-  test('Serializes a returned primitive for query args', async () => {
+-    await storeRef.store.dispatch(
+-      api.endpoints.queryWithCustomNumberSerializer.initiate({
+-        id: 42,
+-        client: dummyClient,
+-      })
+-    )
+-
+-    expect(
+-      storeRef.store.getState().api.queries[
+-        'queryWithCustomNumberSerializer(42)'
+-      ]
+-    ).toBeTruthy()
+-  })
+-
+   test('serializeQueryArgs + merge allows refetching as args change with same cache key', async () => {
+     const allItems = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'i']
+     const PAGE_SIZE = 3

@@ -1,0 +1,268 @@
+diff --git a/src/classes/job-scheduler.ts b/src/classes/job-scheduler.ts
+index 1f3493c6e6..bd47466ce5 100644
+--- a/src/classes/job-scheduler.ts
++++ b/src/classes/job-scheduler.ts
+@@ -11,7 +11,7 @@ import { Job } from './job';
+ import { QueueBase } from './queue-base';
+ import { RedisConnection } from './redis-connection';
+ import { SpanKind, TelemetryAttributes } from '../enums';
+-import { optsAsJSON, optsFromJSON } from '../utils';
++import { array2obj, optsAsJSON, optsFromJSON } from '../utils';
+ 
+ export class JobScheduler extends QueueBase {
+   private repeatStrategy: RepeatStrategy;
+@@ -202,13 +202,21 @@ export class JobScheduler extends QueueBase {
+     return this.scripts.removeJobScheduler(jobSchedulerId);
+   }
+ 
+-  private async getSchedulerData(
++  private async getSchedulerData<D>(
+     client: RedisClient,
+     key: string,
+     next?: number,
+-  ): Promise<JobSchedulerJson> {
++  ): Promise<JobSchedulerJson<D>> {
+     const jobData = await client.hgetall(this.toKey('repeat:' + key));
+ 
++    return this.transformSchedulerData<D>(key, jobData, next);
++  }
++
++  private async transformSchedulerData<D>(
++    key: string,
++    jobData: any,
++    next?: number,
++  ): Promise<JobSchedulerJson<D>> {
+     if (jobData) {
+       return {
+         key,
+@@ -217,6 +225,11 @@ export class JobScheduler extends QueueBase {
+         tz: jobData.tz || null,
+         pattern: jobData.pattern || null,
+         every: jobData.every || null,
++        ...(jobData.data || jobData.opts
++          ? {
++              template: this.getTemplateFromJSON<D>(jobData.data, jobData.opts),
++            }
++          : {}),
+         next,
+       };
+     }
+@@ -239,30 +252,14 @@ export class JobScheduler extends QueueBase {
+     };
+   }
+ 
+-  async getJobScheduler<D = any>(id: string): Promise<JobSchedulerJson<D>> {
+-    const client = await this.client;
+-    const schedulerAttributes = await client.hgetall(
+-      this.toKey('repeat:' + id),
+-    );
++  async getScheduler<D = any>(id: string): Promise<JobSchedulerJson<D>> {
++    const [rawJobData, next] = await this.scripts.getJobScheduler(id);
+ 
+-    if (schedulerAttributes) {
+-      return {
+-        key: id,
+-        name: schedulerAttributes.name,
+-        endDate: parseInt(schedulerAttributes.endDate) || null,
+-        tz: schedulerAttributes.tz || null,
+-        pattern: schedulerAttributes.pattern || null,
+-        every: schedulerAttributes.every || null,
+-        ...(schedulerAttributes.data || schedulerAttributes.opts
+-          ? {
+-              template: this.getTemplateFromJSON<D>(
+-                schedulerAttributes.data,
+-                schedulerAttributes.opts,
+-              ),
+-            }
+-          : {}),
+-      };
+-    }
++    return this.transformSchedulerData<D>(
++      id,
++      rawJobData ? array2obj(rawJobData) : null,
++      next ? parseInt(next) : null,
++    );
+   }
+ 
+   private getTemplateFromJSON<D = any>(
+@@ -279,11 +276,11 @@ export class JobScheduler extends QueueBase {
+     return template;
+   }
+ 
+-  async getJobSchedulers(
++  async getJobSchedulers<D = any>(
+     start = 0,
+     end = -1,
+     asc = false,
+-  ): Promise<JobSchedulerJson[]> {
++  ): Promise<JobSchedulerJson<D>[]> {
+     const client = await this.client;
+     const jobSchedulersKey = this.keys.repeat;
+ 
+@@ -294,7 +291,7 @@ export class JobScheduler extends QueueBase {
+     const jobs = [];
+     for (let i = 0; i < result.length; i += 2) {
+       jobs.push(
+-        this.getSchedulerData(client, result[i], parseInt(result[i + 1])),
++        this.getSchedulerData<D>(client, result[i], parseInt(result[i + 1])),
+       );
+     }
+     return Promise.all(jobs);
+diff --git a/src/classes/queue.ts b/src/classes/queue.ts
+index 3afa5691c0..1525d13254 100644
+--- a/src/classes/queue.ts
++++ b/src/classes/queue.ts
+@@ -573,7 +573,7 @@ export class Queue<
+    * @param id - identifier of scheduler.
+    */
+   async getJobScheduler(id: string): Promise<JobSchedulerJson<DataType>> {
+-    return (await this.jobScheduler).getJobScheduler(id);
++    return (await this.jobScheduler).getScheduler<DataType>(id);
+   }
+ 
+   /**
+@@ -588,8 +588,12 @@ export class Queue<
+     start?: number,
+     end?: number,
+     asc?: boolean,
+-  ): Promise<RepeatableJob[]> {
+-    return (await this.jobScheduler).getJobSchedulers(start, end, asc);
++  ): Promise<JobSchedulerJson<DataType>[]> {
++    return (await this.jobScheduler).getJobSchedulers<DataType>(
++      start,
++      end,
++      asc,
++    );
+   }
+ 
+   /**
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 0897d905a9..dc487b42d1 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -1088,6 +1088,20 @@ export class Scripts {
+     ]);
+   }
+ 
++  getJobSchedulerArgs(id: string): string[] {
++    const keys: string[] = [this.queue.keys.repeat];
++
++    return keys.concat([id]);
++  }
++
++  async getJobScheduler(id: string): Promise<[any, string | null]> {
++    const client = await this.queue.client;
++
++    const args = this.getJobSchedulerArgs(id);
++
++    return this.execCommand(client, 'getJobScheduler', args);
++  }
++
+   retryJobArgs(
+     jobId: string,
+     lifo: boolean,
+diff --git a/src/commands/getJobScheduler-1.lua b/src/commands/getJobScheduler-1.lua
+new file mode 100644
+index 0000000000..324bdb58eb
+--- /dev/null
++++ b/src/commands/getJobScheduler-1.lua
+@@ -0,0 +1,19 @@
++--[[
++  Get job scheduler record.
++
++  Input:
++    KEYS[1] 'repeat' key
++
++    ARGV[1] id
++]]
++
++local rcall = redis.call
++local jobSchedulerKey = KEYS[1] .. ":" .. ARGV[1]
++
++local score = rcall("ZSCORE", KEYS[1], ARGV[1])
++
++if score then
++  return {rcall("HGETALL", jobSchedulerKey), score} -- get job data
++end
++
++return {nil, nil}
+diff --git a/src/commands/updateJobOption-1.lua b/src/commands/updateJobOption-1.lua
+deleted file mode 100644
+index 03949faf29..0000000000
+--- a/src/commands/updateJobOption-1.lua
++++ /dev/null
+@@ -1,26 +0,0 @@
+---[[
+-  Update a job option
+-
+-  Input:
+-    KEYS[1] Job id key
+-
+-    ARGV[1] field
+-    ARGV[2] value
+-
+-  Output:
+-    0 - OK
+-   -1 - Missing job.
+-]]
+-local rcall = redis.call
+-
+-if rcall("EXISTS", KEYS[1]) == 1 then -- // Make sure job exists
+-
+-    local opts = rcall("HGET", KEYS[1], "opts")
+-    local jsonOpts = cjson.decode(opts)
+-    jsonOpts[ARGV[1]] = ARGV[2]
+-
+-    rcall("HSET", KEYS[1], "opts", cjson.encode(jsonOpts))
+-    return 0
+-else
+-    return -1
+-end
+diff --git a/src/interfaces/telemetry.ts b/src/interfaces/telemetry.ts
+index e55c0990dc..d39794d34a 100644
+--- a/src/interfaces/telemetry.ts
++++ b/src/interfaces/telemetry.ts
+@@ -36,8 +36,8 @@ export interface ContextManager<Context = any> {
+   /**
+    * Creates a new context and sets it as active for the fn passed as last argument
+    *
+-   * @param context
+-   * @param fn
++   * @param context -
++   * @param fn -
+    */
+   with<A extends (...args: any[]) => any>(
+     context: Context,
+@@ -54,7 +54,7 @@ export interface ContextManager<Context = any> {
+    * is the mechanism used to propagate the context across a distributed
+    * application.
+    *
+-   * @param context
++   * @param context -
+    */
+   getMetadata(context: Context): string;
+ 
+@@ -62,8 +62,8 @@ export interface ContextManager<Context = any> {
+    * Creates a new context from a serialized version effectively
+    * linking the new context to the parent context.
+    *
+-   * @param activeContext
+-   * @param metadata
++   * @param activeContext -
++   * @param metadata -
+    */
+   fromMetadata(activeContext: Context, metadata: string): Context;
+ }
+@@ -78,9 +78,9 @@ export interface Tracer<Context = any> {
+    * context. If the context is not provided, the current active context should be
+    * used.
+    *
+-   * @param name
+-   * @param options
+-   * @param context
++   * @param name -
++   * @param options -
++   * @param context -
+    */
+   startSpan(name: string, options?: SpanOptions, context?: Context): Span;
+ }

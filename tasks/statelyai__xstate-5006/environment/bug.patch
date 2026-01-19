@@ -1,0 +1,437 @@
+diff --git a/.changeset/two-hounds-march.md b/.changeset/two-hounds-march.md
+deleted file mode 100644
+index 324d18d3f0..0000000000
+--- a/.changeset/two-hounds-march.md
++++ /dev/null
+@@ -1,63 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-The state value typings for setup state machine actors (`setup({}).createMachine({ ... })`) have been improved to represent the actual expected state values.
+-
+-```ts
+-const machine = setup({}).createMachine({
+-  initial: 'green',
+-  states: {
+-    green: {},
+-    yellow: {},
+-    red: {
+-      initial: 'walk',
+-      states: {
+-        walk: {},
+-        wait: {},
+-        stop: {}
+-      }
+-    },
+-    emergency: {
+-      type: 'parallel',
+-      states: {
+-        main: {
+-          initial: 'blinking',
+-          states: {
+-            blinking: {}
+-          }
+-        },
+-        cross: {
+-          initial: 'blinking',
+-          states: {
+-            blinking: {}
+-          }
+-        }
+-      }
+-    }
+-  }
+-});
+-
+-const actor = createActor(machine).start();
+-
+-const stateValue = actor.getSnapshot().value;
+-
+-if (stateValue === 'green') {
+-  // ...
+-} else if (stateValue === 'yellow') {
+-  // ...
+-} else if ('red' in stateValue) {
+-  stateValue;
+-  // {
+-  //   red: "walk" | "wait" | "stop";
+-  // }
+-} else {
+-  stateValue;
+-  // {
+-  //   emergency: {
+-  //     main: "blinking";
+-  //     cross: "blinking";
+-  //   };
+-  // }
+-}
+-```
+diff --git a/packages/core/src/State.ts b/packages/core/src/State.ts
+index 4fbfb557a2..32ea67a23a 100644
+--- a/packages/core/src/State.ts
++++ b/packages/core/src/State.ts
+@@ -24,7 +24,7 @@ import type {
+ } from './types.ts';
+ import { matchesState } from './utils.ts';
+ 
+-export type ToTestStateValue<TStateValue extends StateValue> =
++type ToTestStateValue<TStateValue extends StateValue> =
+   TStateValue extends string
+     ? TStateValue
+     : IsNever<keyof TStateValue> extends true
+@@ -57,7 +57,7 @@ interface MachineSnapshotBase<
+   TTag extends string,
+   TOutput,
+   TMeta,
+-  TStateSchema extends StateSchema = StateSchema
++  TConfig extends StateSchema
+ > {
+   /** The state machine that produced this state snapshot. */
+   machine: StateMachine<
+@@ -74,7 +74,7 @@ interface MachineSnapshotBase<
+     TOutput,
+     EventObject, // TEmitted
+     any, // TMeta
+-    TStateSchema
++    TConfig
+   >;
+   /** The tags of the active state nodes that represent the current state value. */
+   tags: Set<string>;
+@@ -137,7 +137,7 @@ interface MachineSnapshotBase<
+   can: (event: TEvent) => boolean;
+ 
+   getMeta: () => Record<
+-    StateId<TStateSchema> & string,
++    StateId<TConfig> & string,
+     TMeta | undefined // States might not have meta defined
+   >;
+ 
+diff --git a/packages/core/src/setup.ts b/packages/core/src/setup.ts
+index 8f18d398a6..7070b19236 100644
+--- a/packages/core/src/setup.ts
++++ b/packages/core/src/setup.ts
+@@ -7,6 +7,7 @@ import {
+   AnyActorRef,
+   AnyEventObject,
+   Cast,
++  ConditionalRequired,
+   DelayConfig,
+   EventObject,
+   Invert,
+@@ -17,8 +18,8 @@ import {
+   NonReducibleUnknown,
+   ParameterizedObject,
+   SetupTypes,
++  StateSchema,
+   ToChildren,
+-  ToStateValue,
+   UnknownActorLogic,
+   Values
+ } from './types';
+@@ -66,6 +67,43 @@ type ToProvidedActor<
+         };
+       }>;
+ 
++type _GroupStateKeys<
++  T extends StateSchema,
++  S extends keyof T['states']
++> = S extends any
++  ? T['states'][S] extends { type: 'history' }
++    ? [never, never]
++    : T extends { type: 'parallel' }
++      ? [S, never]
++      : 'states' extends keyof T['states'][S]
++        ? [S, never]
++        : [never, S]
++  : never;
++
++type GroupStateKeys<T extends StateSchema, S extends keyof T['states']> = {
++  nonLeaf: _GroupStateKeys<T, S & string>[0];
++  leaf: _GroupStateKeys<T, S & string>[1];
++};
++
++type ToStateValue<T extends StateSchema> = T extends {
++  states: Record<infer S, any>;
++}
++  ? IsNever<S> extends true
++    ? {}
++    :
++        | GroupStateKeys<T, S>['leaf']
++        | (IsNever<GroupStateKeys<T, S>['nonLeaf']> extends false
++            ? ConditionalRequired<
++                {
++                  [K in GroupStateKeys<T, S>['nonLeaf']]?: ToStateValue<
++                    T['states'][K]
++                  >;
++                },
++                T extends { type: 'parallel' } ? true : false
++              >
++            : never)
++  : {};
++
+ type RequiredSetupKeys<TChildrenMap> = IsNever<keyof TChildrenMap> extends true
+   ? never
+   : 'actors';
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index c84c91281d..13fbbcf924 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -2551,45 +2551,3 @@ export type GetConcreteByKey<
+   TKey extends keyof T,
+   TValue extends T[TKey]
+ > = T & Record<TKey, TValue>;
+-
+-type _GroupStateKeys<
+-  T extends StateSchema,
+-  S extends keyof T['states']
+-> = S extends any
+-  ? T['states'][S] extends { type: 'history' }
+-    ? [never, never]
+-    : T extends { type: 'parallel' }
+-      ? [S, never]
+-      : 'states' extends keyof T['states'][S]
+-        ? [S, never]
+-        : [never, S]
+-  : never;
+-
+-type GroupStateKeys<T extends StateSchema, S extends keyof T['states']> = {
+-  nonLeaf: _GroupStateKeys<T, S & string>[0];
+-  leaf: _GroupStateKeys<T, S & string>[1];
+-};
+-
+-export type ToStateValue<T extends StateSchema> = T extends {
+-  states: Record<infer S, any>;
+-}
+-  ? IsNever<S> extends true
+-    ? {}
+-    :
+-        | GroupStateKeys<T, S>['leaf']
+-        | (IsNever<GroupStateKeys<T, S>['nonLeaf']> extends false
+-            ? T extends { type: 'parallel' }
+-              ? {
+-                  [K in GroupStateKeys<T, S>['nonLeaf']]: ToStateValue<
+-                    T['states'][K]
+-                  >;
+-                }
+-              : Compute<
+-                  Values<{
+-                    [K in GroupStateKeys<T, S>['nonLeaf']]: {
+-                      [StateKey in K]: ToStateValue<T['states'][K]>;
+-                    };
+-                  }>
+-                >
+-            : never)
+-  : {};
+diff --git a/packages/core/test/setup.types.test.ts b/packages/core/test/setup.types.test.ts
+index f573ef24bf..0b41886dd2 100644
+--- a/packages/core/test/setup.types.test.ts
++++ b/packages/core/test/setup.types.test.ts
+@@ -12,7 +12,6 @@ import {
+   fromPromise,
+   fromTransition,
+   log,
+-  matchesState,
+   not,
+   raise,
+   sendParent,
+@@ -1480,13 +1479,10 @@ describe('setup()', () => {
+ 
+     const snapshot = createActor(machine).getSnapshot();
+ 
+-    type ExpectedType =
+-      | {
+-          a: 'a1' | 'a2';
+-        }
+-      | {
+-          b: 'b1' | 'b2';
+-        };
++    type ExpectedType = {
++      a?: 'a1' | 'a2';
++      b?: 'b1' | 'b2';
++    };
+ 
+     snapshot.value satisfies ExpectedType;
+     ({}) as ExpectedType satisfies typeof snapshot.value;
+@@ -1576,10 +1572,10 @@ describe('setup()', () => {
+     type ExpectedType =
+       | 'a'
+       | {
+-          b:
++          b?:
+             | 'b2'
+             | {
+-                b1: 'b11' | 'b12';
++                b1?: 'b11' | 'b12';
+               };
+         };
+ 
+@@ -1587,168 +1583,6 @@ describe('setup()', () => {
+     ({}) as ExpectedType satisfies typeof snapshot.value;
+   });
+ 
+-  it('state.value from setup state machine actors should be strongly-typed', () => {
+-    const machine = setup({}).createMachine({
+-      initial: 'green',
+-      states: {
+-        green: {},
+-        yellow: {},
+-        red: {
+-          initial: 'walk',
+-          states: {
+-            walk: {},
+-            wait: {},
+-            stop: {}
+-          }
+-        },
+-        emergency: {
+-          type: 'parallel',
+-          states: {
+-            main: {
+-              initial: 'blinking',
+-              states: {
+-                blinking: {}
+-              }
+-            },
+-            cross: {
+-              initial: 'blinking',
+-              states: {
+-                blinking: {}
+-              }
+-            }
+-          }
+-        }
+-      }
+-    });
+-
+-    const actor = createActor(machine).start();
+-
+-    const stateValue = actor.getSnapshot().value;
+-
+-    'green' satisfies typeof stateValue;
+-
+-    'yellow' satisfies typeof stateValue;
+-
+-    // @ts-expect-error compound state
+-    'red' satisfies typeof stateValue;
+-
+-    // @ts-expect-error parallel state
+-    'emergency' satisfies typeof stateValue;
+-
+-    const _redWalk = { red: 'walk' } satisfies typeof stateValue;
+-    const _redWait = { red: 'wait' } satisfies typeof stateValue;
+-
+-    const _redUnknown = {
+-      // @ts-expect-error
+-      red: 'unknown'
+-    } satisfies typeof stateValue;
+-
+-    const _emergency0 = {
+-      emergency: {
+-        main: 'blinking',
+-        cross: 'blinking'
+-      }
+-    } satisfies typeof stateValue;
+-
+-    const _emergency1 = {
+-      // @ts-expect-error
+-      emergency: 'main'
+-    } satisfies typeof stateValue;
+-
+-    const _emergency2 = {
+-      // @ts-expect-error
+-      emergency: {
+-        main: 'blinking'
+-      }
+-    } satisfies typeof stateValue;
+-
+-    const _emergency3 = {
+-      emergency: {
+-        // @ts-expect-error
+-        main: 'unknown',
+-        cross: 'blinking'
+-      }
+-    } satisfies typeof stateValue;
+-  });
+-
+-  it('state.value is exhaustive', () => {
+-    const machine = setup({}).createMachine({
+-      initial: 'green',
+-      states: {
+-        green: {},
+-        yellow: {},
+-        red: {
+-          initial: 'walk',
+-          states: {
+-            walk: {},
+-            wait: {},
+-            stop: {}
+-          }
+-        },
+-        emergency: {
+-          type: 'parallel',
+-          states: {
+-            main: {
+-              initial: 'blinking',
+-              states: {
+-                blinking: {}
+-              }
+-            },
+-            cross: {
+-              initial: 'blinking',
+-              states: {
+-                blinking: {}
+-              }
+-            }
+-          }
+-        }
+-      }
+-    });
+-    const actor = createActor(machine);
+-    const { value } = actor.getSnapshot();
+-    if (value === 'green') {
+-      // ...
+-    } else {
+-      value satisfies 'yellow' | { red: any } | { emergency: any };
+-      if (value === 'yellow') {
+-        // ...
+-      } else {
+-        value satisfies { red: any } | { emergency: any };
+-        if ('red' in value) {
+-          value.red satisfies 'walk' | 'wait' | 'stop';
+-          // @ts-expect-error
+-          value.red satisfies 'other';
+-        } else {
+-          value satisfies {
+-            emergency: {
+-              main: 'blinking';
+-              cross: 'blinking';
+-            };
+-          };
+-        }
+-      }
+-    }
+-    // Nested state exhaustiveness
+-    if (typeof value === 'object' && 'red' in value) {
+-      // @ts-expect-error
+-      value satisfies 'green';
+-      // @ts-expect-error
+-      value satisfies 'red';
+-      // @ts-expect-error
+-      value.emergency;
+-      value.red satisfies 'walk' | 'wait' | 'stop';
+-    }
+-    if (
+-      value !== 'green' &&
+-      value !== 'yellow' &&
+-      !('red' in value) &&
+-      !('emergency' in value)
+-    ) {
+-      // Exhaustive check
+-      value satisfies never;
+-    }
+-  });
+-
+   it('should accept `assign` when no actor and children types are provided', () => {
+     setup({}).createMachine({
+       on: {

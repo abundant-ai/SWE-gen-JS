@@ -1,0 +1,2107 @@
+diff --git a/docs/src/rules/logical-assignment-operators.md b/docs/src/rules/logical-assignment-operators.md
+deleted file mode 100644
+index d462d6ef4..000000000
+--- a/docs/src/rules/logical-assignment-operators.md
++++ /dev/null
+@@ -1,131 +0,0 @@
+----
+-title: logical-assignment-operators
+-layout: doc
+-rule_type: suggestion
+----
+-
+-ES2021 introduces the assignment operator shorthand for the logical operators `||`, `&&` and `??`.
+-Before, this was only allowed for mathematical operations such as `+` or `*` (see the rule [operator-assignment](./operator-assignment)).
+-The shorthand can be used if the assignment target and the left expression of a logical expression are the same.
+-For example `a = a || b` can be shortened to `a ||= b`.
+-
+-## Rule Details
+-
+-This rule requires or disallows logical assignment operator shorthand.  
+-
+-### Options
+-
+-This rule has a string and an object option.
+-String option:
+-
+-* `"always"` (default)
+-* `"never"`
+-
+-Object option (only available if string option is set to `"always"`):
+-
+-* `"enforceForIfStatements": false`(default) Do *not* check for equivalent `if` statements
+-* `"enforceForIfStatements": true` Check for equivalent `if` statements
+-
+-#### always
+-
+-Examples of **incorrect** code for this rule with the default `"always"` option:
+-
+-::: incorrect
+-
+-```js
+-/*eslint logical-assignment-operators: ["error", "always"]*/
+-
+-a = a || b
+-a = a && b
+-a = a ?? b
+-a || (a = b)
+-a && (a = b)
+-a ?? (a = b)
+-```
+-
+-:::
+-
+-Examples of **correct** code for this rule with the default `"always"` option:
+-
+-::: correct
+-
+-```js
+-/*eslint logical-assignment-operators: ["error", "always"]*/
+-
+-a = b
+-a += b
+-a ||= b
+-a = b || c
+-a || (b = c)
+-
+-if (a) a = b
+-```
+-
+-:::
+-
+-#### never
+-
+-Examples of **incorrect** code for this rule with the `"never"` option:
+-
+-::: incorrect
+-
+-```js
+-/*eslint logical-assignment-operators: ["error", "never"]*/
+-
+-a ||= b
+-a &&= b
+-a ??= b
+-```
+-
+-:::
+-
+-Examples of **correct** code for this rule with the `"never"` option:
+-
+-::: correct
+-
+-```js
+-/*eslint logical-assignment-operators: ["error", "never"]*/
+-
+-a = a || b
+-a = a && b
+-a = a ?? b
+-```
+-
+-:::
+-
+-#### enforceForIfStatements
+-
+-This option checks for additional patterns with if statements which could be expressed with the logical assignment operator.
+-
+-::: incorrect
+-
+-Examples of **incorrect** code for this rule with the `["always", { enforceIfStatements: true }]` option:
+-
+-```js
+-/*eslint logical-assignment-operators: ["error", "always", { enforceForIfStatements: true }]*/
+-
+-if (a) a = b // <=> a &&= b
+-if (!a) a = b // <=> a ||= b
+-
+-if (a == null) a = b // <=> a ??= b
+-if (a === null || a === undefined) a = b // <=> a ??= b
+-```
+-
+-:::
+-
+-Examples of **correct** code for this rule with the `["always", { enforceIfStatements: true }]` option:
+-
+-::: correct
+-
+-```js
+-/*eslint logical-assignment-operators: ["error", "always", { enforceForIfStatements: true }]*/
+-
+-if (a) b = c
+-if (a === 0) a = b
+-```
+-
+-:::
+-
+-## When Not To Use It
+-
+-Use of logical operator assignment shorthand is a stylistic choice. Leaving this rule turned off would allow developers to choose which style is more readable on a case-by-case basis.
+diff --git a/lib/rules/index.js b/lib/rules/index.js
+index 565648c09..aef47f5ca 100644
+--- a/lib/rules/index.js
++++ b/lib/rules/index.js
+@@ -72,7 +72,6 @@ module.exports = new LazyLoadingRuleMap(Object.entries({
+     "lines-around-comment": () => require("./lines-around-comment"),
+     "lines-around-directive": () => require("./lines-around-directive"),
+     "lines-between-class-members": () => require("./lines-between-class-members"),
+-    "logical-assignment-operators": () => require("./logical-assignment-operators"),
+     "max-classes-per-file": () => require("./max-classes-per-file"),
+     "max-depth": () => require("./max-depth"),
+     "max-len": () => require("./max-len"),
+diff --git a/lib/rules/logical-assignment-operators.js b/lib/rules/logical-assignment-operators.js
+deleted file mode 100644
+index bd2357acf..000000000
+--- a/lib/rules/logical-assignment-operators.js
++++ /dev/null
+@@ -1,474 +0,0 @@
+-/**
+- * @fileoverview Rule to replace assignment expressions with logical operator assignment
+- * @author Daniel Martens
+- */
+-"use strict";
+-
+-//------------------------------------------------------------------------------
+-// Requirements
+-//------------------------------------------------------------------------------
+-const astUtils = require("./utils/ast-utils.js");
+-
+-//------------------------------------------------------------------------------
+-// Helpers
+-//------------------------------------------------------------------------------
+-
+-const baseTypes = new Set(["Identifier", "Super", "ThisExpression"]);
+-
+-/**
+- * Returns true iff either "undefined" or a void expression (eg. "void 0")
+- * @param {ASTNode} expression Expression to check
+- * @param {import('eslint-scope').Scope} scope Scope of the expression
+- * @returns {boolean} True iff "undefined" or "void ..."
+- */
+-function isUndefined(expression, scope) {
+-    if (expression.type === "Identifier" && expression.name === "undefined") {
+-        return astUtils.isReferenceToGlobalVariable(scope, expression);
+-    }
+-
+-    return expression.type === "UnaryExpression" &&
+-           expression.operator === "void" &&
+-           expression.argument.type === "Literal" &&
+-           expression.argument.value === 0;
+-}
+-
+-/**
+- * Returns true iff the reference is either an identifier or member expression
+- * @param {ASTNode} expression Expression to check
+- * @returns {boolean} True for identifiers and member expressions
+- */
+-function isReference(expression) {
+-    return (expression.type === "Identifier" && expression.name !== "undefined") ||
+-           expression.type === "MemberExpression";
+-}
+-
+-/**
+- * Returns true iff the expression checks for nullish with loose equals.
+- * Examples: value == null, value == void 0
+- * @param {ASTNode} expression Test condition
+- * @param {import('eslint-scope').Scope} scope Scope of the expression
+- * @returns {boolean} True iff implicit nullish comparison
+- */
+-function isImplicitNullishComparison(expression, scope) {
+-    if (expression.type !== "BinaryExpression" || expression.operator !== "==") {
+-        return false;
+-    }
+-
+-    const reference = isReference(expression.left) ? "left" : "right";
+-    const nullish = reference === "left" ? "right" : "left";
+-
+-    return isReference(expression[reference]) &&
+-           (astUtils.isNullLiteral(expression[nullish]) || isUndefined(expression[nullish], scope));
+-}
+-
+-/**
+- * Condition with two equal comparisons.
+- * @param {ASTNode} expression Condition
+- * @returns {boolean} True iff matches ? === ? || ? === ?
+- */
+-function isDoubleComparison(expression) {
+-    return expression.type === "LogicalExpression" &&
+-           expression.operator === "||" &&
+-           expression.left.type === "BinaryExpression" &&
+-           expression.left.operator === "===" &&
+-           expression.right.type === "BinaryExpression" &&
+-           expression.right.operator === "===";
+-}
+-
+-/**
+- * Returns true iff the expression checks for undefined and null.
+- * Example: value === null || value === undefined
+- * @param {ASTNode} expression Test condition
+- * @param {import('eslint-scope').Scope} scope Scope of the expression
+- * @returns {boolean} True iff explicit nullish comparison
+- */
+-function isExplicitNullishComparison(expression, scope) {
+-    if (!isDoubleComparison(expression)) {
+-        return false;
+-    }
+-    const leftReference = isReference(expression.left.left) ? "left" : "right";
+-    const leftNullish = leftReference === "left" ? "right" : "left";
+-    const rightReference = isReference(expression.right.left) ? "left" : "right";
+-    const rightNullish = rightReference === "left" ? "right" : "left";
+-
+-    return astUtils.isSameReference(expression.left[leftReference], expression.right[rightReference]) &&
+-           ((astUtils.isNullLiteral(expression.left[leftNullish]) && isUndefined(expression.right[rightNullish], scope)) ||
+-           (isUndefined(expression.left[leftNullish], scope) && astUtils.isNullLiteral(expression.right[rightNullish])));
+-}
+-
+-/**
+- * Returns true for Boolean(arg) calls
+- * @param {ASTNode} expression Test condition
+- * @param {import('eslint-scope').Scope} scope Scope of the expression
+- * @returns {boolean} Whether the expression is a boolean cast
+- */
+-function isBooleanCast(expression, scope) {
+-    return expression.type === "CallExpression" &&
+-           expression.callee.name === "Boolean" &&
+-           expression.arguments.length === 1 &&
+-           astUtils.isReferenceToGlobalVariable(scope, expression.callee);
+-}
+-
+-/**
+- * Returns true for:
+- * truthiness checks:  value, Boolean(value), !!value
+- * falsyness checks:   !value, !Boolean(value)
+- * nullish checks:     value == null, value === undefined || value === null
+- * @param {ASTNode} expression Test condition
+- * @param {import('eslint-scope').Scope} scope Scope of the expression
+- * @returns {?{ reference: ASTNode, operator: '??'|'||'|'&&'}} Null if not a known existence
+- */
+-function getExistence(expression, scope) {
+-    const isNegated = expression.type === "UnaryExpression" && expression.operator === "!";
+-    const base = isNegated ? expression.argument : expression;
+-
+-    switch (true) {
+-        case isReference(base):
+-            return { reference: base, operator: isNegated ? "||" : "&&" };
+-        case base.type === "UnaryExpression" && base.operator === "!" && isReference(base.argument):
+-            return { reference: base.argument, operator: "&&" };
+-        case isBooleanCast(base, scope) && isReference(base.arguments[0]):
+-            return { reference: base.arguments[0], operator: isNegated ? "||" : "&&" };
+-        case isImplicitNullishComparison(expression, scope):
+-            return { reference: isReference(expression.left) ? expression.left : expression.right, operator: "??" };
+-        case isExplicitNullishComparison(expression, scope):
+-            return { reference: isReference(expression.left.left) ? expression.left.left : expression.left.right, operator: "??" };
+-        default: return null;
+-    }
+-}
+-
+-/**
+- * Returns true iff the node is inside a with block
+- * @param {ASTNode} node Node to check
+- * @returns {boolean} True iff passed node is inside a with block
+- */
+-function isInsideWithBlock(node) {
+-    if (node.type === "Program") {
+-        return false;
+-    }
+-
+-    return node.parent.type === "WithStatement" && node.parent.body === node ? true : isInsideWithBlock(node.parent);
+-}
+-
+-//------------------------------------------------------------------------------
+-// Rule Definition
+-//------------------------------------------------------------------------------
+-/** @type {import('../shared/types').Rule} */
+-module.exports = {
+-    meta: {
+-        type: "suggestion",
+-
+-        docs: {
+-            description: "Require or disallow logical assignment logical operator shorthand",
+-            recommended: false,
+-            url: "https://eslint.org/docs/rules/logical-assignment-operators"
+-        },
+-
+-        schema: {
+-            type: "array",
+-            oneOf: [{
+-                items: [
+-                    { const: "always" },
+-                    {
+-                        type: "object",
+-                        properties: {
+-                            enforceForIfStatements: {
+-                                type: "boolean"
+-                            }
+-                        },
+-                        additionalProperties: false
+-                    }
+-                ],
+-                minItems: 0, // 0 for allowing passing no options
+-                maxItems: 2
+-            }, {
+-                items: [{ const: "never" }],
+-                minItems: 1,
+-                maxItems: 1
+-            }]
+-        },
+-        fixable: "code",
+-        // eslint-disable-next-line eslint-plugin/require-meta-has-suggestions -- Does not detect conditional suggestions
+-        hasSuggestions: true,
+-        messages: {
+-            assignment: "Assignment (=) can be replaced with operator assignment ({{operator}}).",
+-            useLogicalOperator: "Convert this assignment to use the operator {{ operator }}.",
+-            logical: "Logical expression can be replaced with an assignment ({{ operator }}).",
+-            convertLogical: "Replace this logical expression with an assignment with the operator {{ operator }}.",
+-            if: "'if' statement can be replaced with a logical operator assignment with operator {{ operator }}.",
+-            convertIf: "Replace this 'if' statement with a logical assignment with operator {{ operator }}.",
+-            unexpected: "Unexpected logical operator assignment ({{operator}}) shorthand.",
+-            separate: "Separate the logical assignment into an assignment with a logical operator."
+-        }
+-    },
+-
+-    create(context) {
+-        const mode = context.options[0] === "never" ? "never" : "always";
+-        const checkIf = mode === "always" && context.options.length > 1 && context.options[1].enforceForIfStatements;
+-        const sourceCode = context.getSourceCode();
+-        const isStrict = context.getScope().isStrict;
+-
+-        /**
+-         * Returns false if the access could be a getter
+-         * @param {ASTNode} node Assignment expression
+-         * @returns {boolean} True iff the fix is safe
+-         */
+-        function cannotBeGetter(node) {
+-            return node.type === "Identifier" &&
+-                   (isStrict || !isInsideWithBlock(node));
+-        }
+-
+-        /**
+-         * Check whether only a single property is accessed
+-         * @param {ASTNode} node reference
+-         * @returns {boolean} True iff a single property is accessed
+-         */
+-        function accessesSingleProperty(node) {
+-            if (!isStrict && isInsideWithBlock(node)) {
+-                return node.type === "Identifier";
+-            }
+-
+-            return node.type === "MemberExpression" &&
+-                   baseTypes.has(node.object.type) &&
+-                   (!node.computed || (node.property.type !== "MemberExpression" && node.property.type !== "ChainExpression"));
+-        }
+-
+-        /**
+-         * Adds a fixer or suggestion whether on the fix is safe.
+-         * @param {{ messageId: string, node: ASTNode }} descriptor Report descriptor without fix or suggest
+-         * @param {{ messageId: string, fix: Function }} suggestion Adds the fix or the whole suggestion as only element in "suggest" to suggestion
+-         * @param {boolean} shouldBeFixed Fix iff the condition is true
+-         * @returns {Object} Descriptor with either an added fix or suggestion
+-         */
+-        function createConditionalFixer(descriptor, suggestion, shouldBeFixed) {
+-            if (shouldBeFixed) {
+-                return {
+-                    ...descriptor,
+-                    fix: suggestion.fix
+-                };
+-            }
+-
+-            return {
+-                ...descriptor,
+-                suggest: [suggestion]
+-            };
+-        }
+-
+-
+-        /**
+-         * Returns the operator token for assignments and binary expressions
+-         * @param {ASTNode} node AssignmentExpression or BinaryExpression
+-         * @returns {import('eslint').AST.Token} Operator token between the left and right expression
+-         */
+-        function getOperatorToken(node) {
+-            return sourceCode.getFirstTokenBetween(node.left, node.right, token => token.value === node.operator);
+-        }
+-
+-        if (mode === "never") {
+-            return {
+-
+-                // foo ||= bar
+-                "AssignmentExpression"(assignment) {
+-                    if (!astUtils.isLogicalAssignmentOperator(assignment.operator)) {
+-                        return;
+-                    }
+-
+-                    const descriptor = {
+-                        messageId: "unexpected",
+-                        node: assignment,
+-                        data: { operator: assignment.operator }
+-                    };
+-                    const suggestion = {
+-                        messageId: "separate",
+-                        *fix(ruleFixer) {
+-                            if (sourceCode.getCommentsInside(assignment).length > 0) {
+-                                return;
+-                            }
+-
+-                            const operatorToken = getOperatorToken(assignment);
+-
+-                            // -> foo = bar
+-                            yield ruleFixer.replaceText(operatorToken, "=");
+-
+-                            const assignmentText = sourceCode.getText(assignment.left);
+-                            const operator = assignment.operator.slice(0, -1);
+-
+-                            // -> foo = foo || bar
+-                            yield ruleFixer.insertTextAfter(operatorToken, ` ${assignmentText} ${operator}`);
+-
+-                            const precedence = astUtils.getPrecedence(assignment.right) <= astUtils.getPrecedence({ type: "LogicalExpression", operator });
+-
+-                            // ?? and || / && cannot be mixed but have same precedence
+-                            const mixed = assignment.operator === "??=" && astUtils.isLogicalExpression(assignment.right);
+-
+-                            if (!astUtils.isParenthesised(sourceCode, assignment.right) && (precedence || mixed)) {
+-
+-                                // -> foo = foo || (bar)
+-                                yield ruleFixer.insertTextBefore(assignment.right, "(");
+-                                yield ruleFixer.insertTextAfter(assignment.right, ")");
+-                            }
+-                        }
+-                    };
+-
+-                    context.report(createConditionalFixer(descriptor, suggestion, cannotBeGetter(assignment.left)));
+-                }
+-            };
+-        }
+-
+-        return {
+-
+-            // foo = foo || bar
+-            "AssignmentExpression[operator='='][right.type='LogicalExpression']"(assignment) {
+-                if (!astUtils.isSameReference(assignment.left, assignment.right.left)) {
+-                    return;
+-                }
+-
+-                const descriptor = {
+-                    messageId: "assignment",
+-                    node: assignment,
+-                    data: { operator: `${assignment.right.operator}=` }
+-                };
+-                const suggestion = {
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: `${assignment.right.operator}=` },
+-                    *fix(ruleFixer) {
+-                        if (sourceCode.getCommentsInside(assignment).length > 0) {
+-                            return;
+-                        }
+-
+-                        // No need for parenthesis around the assignment based on precedence as the precedence stays the same even with changed operator
+-                        const assignmentOperatorToken = getOperatorToken(assignment);
+-
+-                        // -> foo ||= foo || bar
+-                        yield ruleFixer.insertTextBefore(assignmentOperatorToken, assignment.right.operator);
+-
+-                        // -> foo ||= bar
+-                        const logicalOperatorToken = getOperatorToken(assignment.right);
+-                        const firstRightOperandToken = sourceCode.getTokenAfter(logicalOperatorToken);
+-
+-                        yield ruleFixer.removeRange([assignment.right.range[0], firstRightOperandToken.range[0]]);
+-                    }
+-                };
+-
+-                context.report(createConditionalFixer(descriptor, suggestion, cannotBeGetter(assignment.left)));
+-            },
+-
+-            // foo || (foo = bar)
+-            'LogicalExpression[right.type="AssignmentExpression"][right.operator="="]'(logical) {
+-
+-                // Right side has to be parenthesized, otherwise would be parsed as (foo || foo) = bar which is illegal
+-                if (isReference(logical.left) && astUtils.isSameReference(logical.left, logical.right.left)) {
+-                    const descriptor = {
+-                        messageId: "logical",
+-                        node: logical,
+-                        data: { operator: `${logical.operator}=` }
+-                    };
+-                    const suggestion = {
+-                        messageId: "convertLogical",
+-                        data: { operator: `${logical.operator}=` },
+-                        *fix(ruleFixer) {
+-                            if (sourceCode.getCommentsInside(logical).length > 0) {
+-                                return;
+-                            }
+-
+-                            const requiresOuterParenthesis = logical.parent.type !== "ExpressionStatement" &&
+-                                                             (astUtils.getPrecedence({ type: "AssignmentExpression" }) < astUtils.getPrecedence(logical.parent));
+-
+-                            if (!astUtils.isParenthesised(sourceCode, logical) && requiresOuterParenthesis) {
+-                                yield ruleFixer.insertTextBefore(logical, "(");
+-                                yield ruleFixer.insertTextAfter(logical, ")");
+-                            }
+-
+-                            // Also removes all opening parenthesis
+-                            yield ruleFixer.removeRange([logical.range[0], logical.right.range[0]]); // -> foo = bar)
+-
+-                            // Also removes all ending parenthesis
+-                            yield ruleFixer.removeRange([logical.right.range[1], logical.range[1]]); // -> foo = bar
+-
+-                            const operatorToken = getOperatorToken(logical.right);
+-
+-                            yield ruleFixer.insertTextBefore(operatorToken, logical.operator); // -> foo ||= bar
+-                        }
+-                    };
+-                    const fix = cannotBeGetter(logical.left) || accessesSingleProperty(logical.left);
+-
+-                    context.report(createConditionalFixer(descriptor, suggestion, fix));
+-                }
+-            },
+-
+-            // if (foo) foo = bar
+-            "IfStatement[alternate=null]"(ifNode) {
+-                if (!checkIf) {
+-                    return;
+-                }
+-
+-                const hasBody = ifNode.consequent.type === "BlockStatement";
+-
+-                if (hasBody && ifNode.consequent.body.length !== 1) {
+-                    return;
+-                }
+-
+-                const body = hasBody ? ifNode.consequent.body[0] : ifNode.consequent;
+-                const scope = context.getScope();
+-                const existence = getExistence(ifNode.test, scope);
+-
+-                if (
+-                    body.type === "ExpressionStatement" &&
+-                    body.expression.type === "AssignmentExpression" &&
+-                    body.expression.operator === "=" &&
+-                    existence !== null &&
+-                    astUtils.isSameReference(existence.reference, body.expression.left)
+-                ) {
+-                    const descriptor = {
+-                        messageId: "if",
+-                        node: ifNode,
+-                        data: { operator: `${existence.operator}=` }
+-                    };
+-                    const suggestion = {
+-                        messageId: "convertIf",
+-                        data: { operator: `${existence.operator}=` },
+-                        *fix(ruleFixer) {
+-                            if (sourceCode.getCommentsInside(ifNode).length > 0) {
+-                                return;
+-                            }
+-
+-                            const firstBodyToken = sourceCode.getFirstToken(body);
+-                            const prevToken = sourceCode.getTokenBefore(ifNode);
+-
+-                            if (
+-                                prevToken !== null &&
+-                                prevToken.value !== ";" &&
+-                                prevToken.value !== "{" &&
+-                                firstBodyToken.type !== "Identifier" &&
+-                                firstBodyToken.type !== "Keyword"
+-                            ) {
+-
+-                                // Do not fix if the fixed statement could be part of the previous statement (eg. fn() if (a == null) (a) = b --> fn()(a) ??= b)
+-                                return;
+-                            }
+-
+-
+-                            const operatorToken = getOperatorToken(body.expression);
+-
+-                            yield ruleFixer.insertTextBefore(operatorToken, existence.operator); // -> if (foo) foo ||= bar
+-
+-                            yield ruleFixer.removeRange([ifNode.range[0], body.range[0]]); // -> foo ||= bar
+-
+-                            yield ruleFixer.removeRange([body.range[1], ifNode.range[1]]); // -> foo ||= bar, only present if "if" had a body
+-
+-                            const nextToken = sourceCode.getTokenAfter(body.expression);
+-
+-                            if (hasBody && (nextToken !== null && nextToken.value !== ";")) {
+-                                yield ruleFixer.insertTextAfter(ifNode, ";");
+-                            }
+-                        }
+-                    };
+-                    const shouldBeFixed = cannotBeGetter(existence.reference) ||
+-                                          (ifNode.test.type !== "LogicalExpression" && accessesSingleProperty(existence.reference));
+-
+-                    context.report(createConditionalFixer(descriptor, suggestion, shouldBeFixed));
+-                }
+-            }
+-        };
+-    }
+-};
+diff --git a/tests/lib/rules/logical-assignment-operators.js b/tests/lib/rules/logical-assignment-operators.js
+deleted file mode 100644
+index ba839b5c6..000000000
+--- a/tests/lib/rules/logical-assignment-operators.js
++++ /dev/null
+@@ -1,1460 +0,0 @@
+-/**
+- * @fileoverview Tests for logical-assignment-operators.
+- * @author Daniel Martens
+- */
+-"use strict";
+-
+-//------------------------------------------------------------------------------
+-// Requirements
+-//------------------------------------------------------------------------------
+-
+-const rule = require("../../../lib/rules/logical-assignment-operators"),
+-    { RuleTester } = require("../../../lib/rule-tester");
+-
+-//------------------------------------------------------------------------------
+-// Tests
+-//------------------------------------------------------------------------------
+-
+-const ruleTester = new RuleTester({ parserOptions: { ecmaVersion: 2021 } });
+-
+-ruleTester.run("logical-assignment-operators", rule, {
+-    valid: [
+-
+-        // Unrelated
+-        "a || b",
+-        "a && b",
+-        "a ?? b",
+-        "a || a || b",
+-        "var a = a || b",
+-        "a === undefined ? a : b",
+-        "while (a) a = b",
+-
+-        // Preferred
+-        "a ||= b",
+-        "a &&= b",
+-        "a ??= b",
+-
+-        // > Operator
+-        "a += a || b",
+-        "a *= a || b",
+-        "a ||= a || b",
+-        "a &&= a || b",
+-
+-        // > Right
+-        "a = a",
+-        "a = b",
+-        "a = a === b",
+-        "a = a + b",
+-        "a = a / b",
+-        "a = fn(a) || b",
+-
+-        // > Reference
+-        "a = false || c",
+-        "a = f() || g()",
+-        "a = b || c",
+-        "a = b || a",
+-        "object.a = object.b || c",
+-        "[a] = a || b",
+-        "({ a } = a || b)",
+-
+-        // Logical
+-        "(a = b) || a",
+-        "a + (a = b)",
+-        "a || (b ||= c)",
+-        "a || (b &&= c)",
+-        "a || b === 0",
+-        "a || fn()",
+-        "a || (b && c)",
+-        "a || (b ?? c)",
+-
+-        // > Reference
+-        "a || (b = c)",
+-        "a || (a ||= b)",
+-        "fn() || (a = b)",
+-        "a.b || (a = b)",
+-        "a?.b || (a.b = b)",
+-        {
+-            code: "class Class { #prop; constructor() { this.#prop || (this.prop = value) } }",
+-            parserOptions: { ecmaVersion: 2022 }
+-        }, {
+-            code: "class Class { #prop; constructor() { this.prop || (this.#prop = value) } }",
+-            parserOptions: { ecmaVersion: 2022 }
+-        },
+-
+-        // If
+-        "if (a) a = b",
+-        {
+-            code: "if (a) a = b",
+-            options: ["always", { enforceForIfStatements: false }]
+-        }, {
+-            code: "if (a) { a = b } else {}",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) { a = b } else if (a) {}",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (unrelated) {} else if (a) a = b; else {}",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (unrelated) {} else if (a) a = b; else if (unrelated) {}",
+-            options: ["always", { enforceForIfStatements: true }]
+-        },
+-
+-        // > Body
+-        {
+-            code: "if (a) {}",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) { before; a = b }",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) { a = b; after }",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) throw new Error()",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) a",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) a ||= b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) b = a",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) { a() }",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a) { a += a || b }",
+-            options: ["always", { enforceForIfStatements: true }]
+-        },
+-
+-        // > Test
+-        {
+-            code: "if (true) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (predicate(a)) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a?.b) a.b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (!a?.b) a.b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === b) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === undefined) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a != null) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null && a === undefined) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === 0 || a === undefined) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === 1) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a == null || a == undefined) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === !0) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === +0) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === null) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === undefined || a === void 0) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === void void 0) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === void 'string') a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === void fn()) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        },
+-
+-        // > Test > Yoda
+-        {
+-            code: "if (a == a) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a == b) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (null == null) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (undefined == undefined) undefined = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (null == x) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (null == fn()) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (null === a || a === 0) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (0 === a || null === a) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (1 === a || a === undefined) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (undefined === a || 1 === a) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === b) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (b === undefined || a === null) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (null === a || b === a) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (null === null || undefined === undefined) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (null === null || a === a) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (undefined === undefined || a === a) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (null === undefined || a === a) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        },
+-
+-        // > Test > Undefined
+-        {
+-            code: [
+-                "{",
+-                "   const undefined = 0;",
+-                "   if (a == undefined) a = b",
+-                "}"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: [
+-                "(() => {",
+-                "   const undefined = 0;",
+-                "   if (condition) {",
+-                "       if (a == undefined) a = b",
+-                "   }",
+-                "})()"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: [
+-                "{",
+-                "   if (a == undefined) a = b",
+-                "}",
+-                "var undefined = 0;"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: [
+-                "{",
+-                "   const undefined = 0;",
+-                "   if (undefined == null) undefined = b",
+-                "}"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: [
+-                "{",
+-                "   const undefined = 0;",
+-                "   if (a === undefined || a === null) a = b",
+-                "}"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: [
+-                "{",
+-                "   const undefined = 0;",
+-                "   if (undefined === a || null === a) a = b",
+-                "}"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }]
+-        },
+-
+-        // > Reference
+-        {
+-            code: "if (a) b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (!a) b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (!!a) b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a == null) b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || a === undefined) b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || b === undefined) a = b",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (a === null || b === undefined) b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: "if (Boolean(a)) b = c",
+-            options: ["always", { enforceForIfStatements: true }]
+-        }, {
+-            code: [
+-                "function fn(Boolean) {",
+-                "   if (Boolean(a)) a = b",
+-                "}"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }]
+-        },
+-
+-        // Never
+-        {
+-            code: "a = a || b",
+-            options: ["never"]
+-        }, {
+-            code: "a = a && b",
+-            options: ["never"]
+-        }, {
+-            code: "a = a ?? b",
+-            options: ["never"]
+-        }, {
+-            code: "a = b",
+-            options: ["never"]
+-        }, {
+-            code: "a += b",
+-            options: ["never"]
+-        }, {
+-            code: "a -= b",
+-            options: ["never"]
+-        }, {
+-            code: "a.b = a.b || c",
+-            options: ["never"]
+-        }
+-    ],
+-    invalid: [
+-
+-        // Assignment
+-        {
+-            code: "a = a || b",
+-            output: "a ||= b",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a && b",
+-            output: "a &&= b",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "&&=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a ?? b",
+-            output: "a ??= b",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "??=" }, suggestions: [] }]
+-        }, {
+-            code: "foo = foo || bar",
+-            output: "foo ||= bar",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        },
+-
+-        // > Right
+-        {
+-            code: "a = a || fn()",
+-            output: "a ||= fn()",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || b && c",
+-            output: "a ||= b && c",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || (b || c)",
+-            output: "a ||= (b || c)",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || (b ? c : d)",
+-            output: "a ||= (b ? c : d)",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        },
+-
+-        // > Comments
+-        {
+-            code: "/* before */ a = a || b",
+-            output: "/* before */ a ||= b",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || b // after",
+-            output: "a ||= b // after",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a /* between */ = a || b",
+-            output: null,
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = /** @type */ a || b",
+-            output: null,
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || /* between */ b",
+-            output: null,
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        },
+-
+-        // > Parenthesis
+-        {
+-            code: "(a) = a || b",
+-            output: "(a) ||= b",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = (a) || b",
+-            output: "a ||= b",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || (b)",
+-            output: "a ||= (b)",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || ((b))",
+-            output: "a ||= ((b))",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "(a = a || b)",
+-            output: "(a ||= b)",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || (f(), b)",
+-            output: "a ||= (f(), b)",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        },
+-
+-        // > Suggestions
+-        {
+-            code: "a.b = a.b ?? c",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "??=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "??=" },
+-                    output: "a.b ??= c"
+-                }]
+-            }]
+-        }, {
+-            code: "a.b.c = a.b.c ?? d",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "??=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "??=" },
+-                    output: "a.b.c ??= d"
+-                }]
+-            }]
+-        }, {
+-            code: "a[b] = a[b] ?? c",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "??=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "??=" },
+-                    output: "a[b] ??= c"
+-                }]
+-            }]
+-        }, {
+-            code: "a['b'] = a['b'] ?? c",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "??=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "??=" },
+-                    output: "a['b'] ??= c"
+-                }]
+-            }]
+-        }, {
+-            code: "a.b = a['b'] ?? c",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "??=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "??=" },
+-                    output: "a.b ??= c"
+-                }]
+-            }]
+-        }, {
+-            code: "a['b'] = a.b ?? c",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "??=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "??=" },
+-                    output: "a['b'] ??= c"
+-                }]
+-            }]
+-        }, {
+-            code: "this.prop = this.prop ?? {}",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "??=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "??=" },
+-                    output: "this.prop ??= {}"
+-                }]
+-            }]
+-        },
+-
+-        // > With
+-        {
+-            code: "with (object) a = a || b",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "||=" },
+-
+-                    output: "with (object) a ||= b"
+-                }]
+-            }]
+-        }, {
+-            code: "with (object) { a = a || b }",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "||=" },
+-                    output: "with (object) { a ||= b }"
+-                }]
+-            }]
+-        }, {
+-            code: "with (object) { if (condition) a = a || b }",
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "||=" },
+-                    output: "with (object) { if (condition) a ||= b }"
+-                }]
+-            }]
+-        }, {
+-            code: "with (a = a || b) {}",
+-            output: "with (a ||= b) {}",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "with (object) {} a = a || b",
+-            output: "with (object) {} a ||= b",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = a || b; with (object) {}",
+-            output: "a ||= b; with (object) {}",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "if (condition) a = a || b",
+-            output: "if (condition) a ||= b",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: [
+-                "with (object) {",
+-                '  "use strict";',
+-                "   a = a || b",
+-                "}"
+-            ].join("\n"),
+-            output: null,
+-            errors: [{
+-                messageId: "assignment",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "useLogicalOperator",
+-                    data: { operator: "||=" },
+-                    output: [
+-                        "with (object) {",
+-                        '  "use strict";',
+-                        "   a ||= b",
+-                        "}"
+-                    ].join("\n")
+-                }]
+-            }]
+-        },
+-
+-        // > Context
+-        {
+-            code: "fn(a = a || b)",
+-            output: "fn(a ||= b)",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "fn((a = a || b))",
+-            output: "fn((a ||= b))",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "(a = a || b) ? c : d",
+-            output: "(a ||= b) ? c : d",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        }, {
+-            code: "a = b = b || c",
+-            output: "a = b ||= c",
+-            errors: [{ messageId: "assignment", type: "AssignmentExpression", data: { operator: "||=" }, suggestions: [] }]
+-        },
+-
+-        // Logical
+-        {
+-            code: "a || (a = b)",
+-            output: "a ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a && (a = b)",
+-            output: "a &&= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "&&=" } }]
+-        }, {
+-            code: "a ?? (a = b)",
+-            output: "a ??= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "??=" } }]
+-        }, {
+-            code: "foo ?? (foo = bar)",
+-            output: "foo ??= bar",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "??=" } }]
+-        },
+-
+-        // > Right
+-        {
+-            code: "a || (a = 0)",
+-            output: "a ||= 0",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || (a = fn())",
+-            output: "a ||= fn()",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || (a = (b || c))",
+-            output: "a ||= (b || c)",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        },
+-
+-        // > Parenthesis
+-        {
+-            code: "(a) || (a = b)",
+-            output: "a ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || ((a) = b)",
+-            output: "(a) ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || (a = (b))",
+-            output: "a ||= (b)",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || ((a = b))",
+-            output: "a ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || (((a = b)))",
+-            output: "a ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || ( ( a = b ) )",
+-            output: "a ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        },
+-
+-        // > Comments
+-        {
+-            code: "/* before */ a || (a = b)",
+-            output: "/* before */ a ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || (a = b) // after",
+-            output: "a ||= b // after",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a /* between */ || (a = b)",
+-            output: null,
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || /* between */ (a = b)",
+-            output: null,
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        },
+-
+-        // > Fix Condition
+-        {
+-            code: "a.b || (a.b = c)",
+-            output: "a.b ||= c",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "class Class { #prop; constructor() { this.#prop || (this.#prop = value) } }",
+-            output: "class Class { #prop; constructor() { this.#prop ||= value } }",
+-            parserOptions: { ecmaVersion: 2022 },
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a['b'] || (a['b'] = c)",
+-            output: "a['b'] ||= c",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a[0] || (a[0] = b)",
+-            output: "a[0] ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a[this] || (a[this] = b)",
+-            output: "a[this] ||= b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "foo.bar || (foo.bar = baz)",
+-            output: "foo.bar ||= baz",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a.b.c || (a.b.c = d)",
+-            output: null,
+-            errors: [{
+-                messageId: "logical",
+-                type: "LogicalExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "convertLogical",
+-                    data: { operator: "||=" },
+-                    output: "a.b.c ||= d"
+-                }]
+-            }]
+-        }, {
+-            code: "a[b.c] || (a[b.c] = d)",
+-            output: null,
+-            errors: [{
+-                messageId: "logical",
+-                type: "LogicalExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "convertLogical",
+-                    data: { operator: "||=" },
+-                    output: "a[b.c] ||= d"
+-                }]
+-            }]
+-        }, {
+-            code: "a[b?.c] || (a[b?.c] = d)",
+-            output: null,
+-            errors: [{
+-                messageId: "logical",
+-                type: "LogicalExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "convertLogical",
+-                    data: { operator: "||=" },
+-                    output: "a[b?.c] ||= d"
+-                }]
+-            }]
+-        }, {
+-            code: "with (object) a.b || (a.b = c)",
+-            output: null,
+-            errors: [{
+-                messageId: "logical",
+-                type: "LogicalExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "convertLogical",
+-                    data: { operator: "||=" },
+-                    output: "with (object) a.b ||= c"
+-                }]
+-            }]
+-        },
+-
+-        // > Context
+-        {
+-            code: "a = a.b || (a.b = {})",
+-            output: "a = a.b ||= {}",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" }, suggestions: [] }]
+-        },
+-        {
+-            code: "a || (a = 0) || b",
+-            output: "(a ||= 0) || b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "(a || (a = 0)) || b",
+-            output: "(a ||= 0) || b",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || (b || (b = 0))",
+-            output: "a || (b ||= 0)",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a = b || (b = c)",
+-            output: "a = b ||= c",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a || (a = 0) ? b : c",
+-            output: "(a ||= 0) ? b : c",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "fn(a || (a = 0))",
+-            output: "fn(a ||= 0)",
+-            errors: [{ messageId: "logical", type: "LogicalExpression", data: { operator: "||=" } }]
+-        },
+-
+-        // If
+-        {
+-            code: "if (a) a = b",
+-            output: "a &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (Boolean(a)) a = b",
+-            output: "a &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (!!a) a = b",
+-            output: "a &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (!a) a = b",
+-            output: "a ||= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "||=" } }]
+-        }, {
+-            code: "if (!Boolean(a)) a = b",
+-            output: "a ||= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "||=" } }]
+-        }, {
+-            code: "if (a == undefined) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" } }]
+-        }, {
+-            code: "if (a == null) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" } }]
+-        }, {
+-            code: "if (a === null || a === undefined) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" } }]
+-        }, {
+-            code: "if (a === undefined || a === null) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" } }]
+-        }, {
+-            code: "if (a === null || a === void 0) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" } }]
+-        }, {
+-            code: "if (a === void 0 || a === null) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" } }]
+-        }, {
+-            code: "if (a) { a = b; }",
+-            output: "a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: [
+-                "{ const undefined = 0; }",
+-                "if (a == undefined) a = b"
+-            ].join("\n"),
+-            output: [
+-                "{ const undefined = 0; }",
+-                "a ??= b"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" } }]
+-        }, {
+-            code: [
+-                "if (a == undefined) a = b",
+-                "{ const undefined = 0; }"
+-            ].join("\n"),
+-            output: [
+-                "a ??= b",
+-                "{ const undefined = 0; }"
+-            ].join("\n"),
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" } }]
+-        },
+-
+-        // > Yoda
+-        {
+-            code: "if (null == a) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" }, suggestions: [] }]
+-        }, {
+-            code: "if (undefined == a) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" }, suggestions: [] }]
+-        }, {
+-            code: "if (undefined === a || a === null) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" }, suggestions: [] }]
+-        }, {
+-            code: "if (a === undefined || null === a) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" }, suggestions: [] }]
+-        }, {
+-            code: "if (undefined === a || null === a) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" }, suggestions: [] }]
+-        }, {
+-            code: "if (null === a || a === undefined) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" }, suggestions: [] }]
+-        }, {
+-            code: "if (a === null || undefined === a) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" }, suggestions: [] }]
+-        }, {
+-            code: "if (null === a || undefined === a) a = b",
+-            output: "a ??= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "??=" }, suggestions: [] }]
+-        },
+-
+-        // > Parenthesis
+-        {
+-            code: "if ((a)) a = b",
+-            output: "a &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) (a) = b",
+-            output: "(a) &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) a = (b)",
+-            output: "a &&= (b)",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) (a = b)",
+-            output: "(a &&= b)",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        },
+-
+-        // > Previous statement
+-        {
+-            code: ";if (a) (a) = b",
+-            output: ";(a) &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "{ if (a) (a) = b }",
+-            output: "{ (a) &&= b }",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "fn();if (a) (a) = b",
+-            output: "fn();(a) &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "fn()\nif (a) a = b",
+-            output: "fn()\na &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "id\nif (a) (a) = b",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "object.prop\nif (a) (a) = b",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "object[computed]\nif (a) (a) = b",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "fn()\nif (a) (a) = b",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        },
+-
+-        // > Adding semicolon
+-        {
+-            code: "if (a) a = b; fn();",
+-            output: "a &&= b; fn();",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) { a = b }",
+-            output: "a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) { a = b; }\nfn();",
+-            output: "a &&= b;\nfn();",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) { a = b }\nfn();",
+-            output: "a &&= b;\nfn();",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) { a = b } fn();",
+-            output: "a &&= b; fn();",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) { a = b\n} fn();",
+-            output: "a &&= b; fn();",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        },
+-
+-        // > Spacing
+-        {
+-            code: "if (a) a  =  b",
+-            output: "a  &&=  b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a)\n a = b",
+-            output: "a &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) {\n a = b; \n}",
+-            output: "a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        },
+-
+-        // > Comments
+-        {
+-            code: "/* before */ if (a) a = b",
+-            output: "/* before */ a &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) a = b /* after */",
+-            output: "a &&= b /* after */",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) /* between */ a = b",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) a = /* between */ b",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        },
+-
+-        // > Members > Single Property Access
+-        {
+-            code: "if (a.b) a.b = c",
+-            output: "a.b &&= c",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" }, suggestions: [] }]
+-        }, {
+-            code: "if (a[b]) a[b] = c",
+-            output: "a[b] &&= c",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" }, suggestions: [] }]
+-        }, {
+-            code: "if (a['b']) a['b'] = c",
+-            output: "a['b'] &&= c",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" }, suggestions: [] }]
+-        }, {
+-            code: "if (this.prop) this.prop = value",
+-            output: "this.prop &&= value",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", suggestions: [] }]
+-        }, {
+-            code: "(class extends SuperClass { method() { if (super.prop) super.prop = value } })",
+-            output: "(class extends SuperClass { method() { super.prop &&= value } })",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" }, suggestions: [] }]
+-        }, {
+-            code: "with (object) if (a) a = b",
+-            output: "with (object) a &&= b",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" }, suggestions: [] }]
+-        },
+-
+-        // > Members > Possible Multiple Property Accesses
+-        {
+-            code: "if (a.b === undefined || a.b === null) a.b = c",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{
+-                messageId: "if",
+-                type: "IfStatement",
+-                data: { operator: "??=" },
+-                suggestions: [{
+-                    messageId: "convertIf",
+-                    data: { operator: "??=" },
+-                    output: "a.b ??= c"
+-                }]
+-            }]
+-        }, {
+-            code: "if (a.b.c) a.b.c = d",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{
+-                messageId: "if",
+-                type: "IfStatement",
+-                data: { operator: "&&=" },
+-                suggestions: [{
+-                    messageId: "convertIf",
+-                    data: { operator: "&&=" },
+-                    output: "a.b.c &&= d"
+-                }]
+-            }]
+-        }, {
+-            code: "if (a.b.c.d) a.b.c.d = e",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{
+-                messageId: "if",
+-                type: "IfStatement",
+-                data: { operator: "&&=" },
+-                suggestions: [{
+-                    messageId: "convertIf",
+-                    data: { operator: "&&=" },
+-                    output: "a.b.c.d &&= e"
+-                }]
+-            }]
+-        }, {
+-            code: "if (a[b].c) a[b].c = d",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{
+-                messageId: "if",
+-                type: "IfStatement",
+-                data: { operator: "&&=" },
+-                suggestions: [{
+-                    messageId: "convertIf",
+-                    data: { operator: "&&=" },
+-                    output: "a[b].c &&= d"
+-                }]
+-            }]
+-        }, {
+-            code: "with (object) if (a.b) a.b = c",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{
+-                messageId: "if",
+-                type: "IfStatement",
+-                data: { operator: "&&=" },
+-                suggestions: [{
+-                    messageId: "convertIf",
+-                    data: { operator: "&&=" },
+-                    output: "with (object) a.b &&= c"
+-                }]
+-            }]
+-        },
+-
+-        // > Else if
+-        {
+-            code: "if (unrelated) {} else if (a) a = b;",
+-            output: "if (unrelated) {} else a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (a) {} else if (b) {} else if (a) a = b;",
+-            output: "if (a) {} else if (b) {} else a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (unrelated) {} else\nif (a) a = b;",
+-            output: "if (unrelated) {} else\na &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (unrelated) {\n}\nelse if (a) {\na = b;\n}",
+-            output: "if (unrelated) {\n}\nelse a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (unrelated) statement; else if (a) a = b;",
+-            output: "if (unrelated) statement; else a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (unrelated) id\nelse if (a) (a) = b",
+-            output: null,
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (unrelated) {} else if (a) a = b; else if (c) c = d",
+-            output: "if (unrelated) {} else if (a) a = b; else c &&= d",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        },
+-
+-        // > Else if > Comments
+-        {
+-            code: "if (unrelated) { /* body */ } else if (a) a = b;",
+-            output: "if (unrelated) { /* body */ } else a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (unrelated) {} /* before else */ else if (a) a = b;",
+-            output: "if (unrelated) {} /* before else */ else a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (unrelated) {} else // Line\nif (a) a = b;",
+-            output: "if (unrelated) {} else // Line\na &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        }, {
+-            code: "if (unrelated) {} else /* Block */ if (a) a = b;",
+-            output: "if (unrelated) {} else /* Block */ a &&= b;",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        },
+-
+-        // > Patterns
+-        {
+-            code: "if (array) array = array.filter(predicate)",
+-            output: "array &&= array.filter(predicate)",
+-            options: ["always", { enforceForIfStatements: true }],
+-            errors: [{ messageId: "if", type: "IfStatement", data: { operator: "&&=" } }]
+-        },
+-
+-        // Never
+-        {
+-            code: "a ||= b",
+-            output: "a = a || b",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a &&= b",
+-            output: "a = a && b",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "&&=" } }]
+-        }, {
+-            code: "a ??= b",
+-            output: "a = a ?? b",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "??=" } }]
+-        }, {
+-            code: "foo ||= bar",
+-            output: "foo = foo || bar",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        },
+-
+-        // > Suggestions
+-        {
+-            code: "a.b ||= c",
+-            output: null,
+-            options: ["never"],
+-            errors: [{
+-                messageId: "unexpected",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "separate",
+-                    output: "a.b = a.b || c"
+-                }]
+-            }]
+-        }, {
+-            code: "a[b] ||= c",
+-            output: null,
+-            options: ["never"],
+-            errors: [{
+-                messageId: "unexpected",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "separate",
+-                    output: "a[b] = a[b] || c"
+-                }]
+-            }]
+-        }, {
+-            code: "a['b'] ||= c",
+-            output: null,
+-            options: ["never"],
+-            errors: [{
+-                messageId: "unexpected",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "separate",
+-                    output: "a['b'] = a['b'] || c"
+-                }]
+-            }]
+-        }, {
+-            code: "this.prop ||= 0",
+-            output: null,
+-            options: ["never"],
+-            errors: [{
+-                messageId: "unexpected",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "separate",
+-                    output: "this.prop = this.prop || 0"
+-                }]
+-            }]
+-        }, {
+-            code: "with (object) a ||= b",
+-            output: null,
+-            options: ["never"],
+-            errors: [{
+-                messageId: "unexpected",
+-                type: "AssignmentExpression",
+-                data: { operator: "||=" },
+-                suggestions: [{
+-                    messageId: "separate",
+-                    output: "with (object) a = a || b"
+-                }]
+-            }]
+-        },
+-
+-        // > Parenthesis
+-        {
+-            code: "(a) ||= b",
+-            output: "(a) = a || b",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a ||= (b)",
+-            output: "a = a || (b)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "(a ||= b)",
+-            output: "(a = a || b)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        },
+-
+-        // > Comments
+-        {
+-            code: "/* before */ a ||= b",
+-            output: "/* before */ a = a || b",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a ||= b // after",
+-            output: "a = a || b // after",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a /* before */ ||= b",
+-            output: null,
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a ||= /* after */ b",
+-            output: null,
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        },
+-
+-        // > Precedence
+-        {
+-            code: "a ||= b && c",
+-            output: "a = a || b && c",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a &&= b || c",
+-            output: "a = a && (b || c)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "&&=" } }]
+-        }, {
+-            code: "a ||= b || c",
+-            output: "a = a || (b || c)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "||=" } }]
+-        }, {
+-            code: "a &&= b && c",
+-            output: "a = a && (b && c)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "&&=" } }]
+-        },
+-
+-        // > Mixed
+-        {
+-            code: "a ??= b || c",
+-            output: "a = a ?? (b || c)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "??=" } }]
+-        }, {
+-            code: "a ??= b && c",
+-            output: "a = a ?? (b && c)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "??=" } }]
+-        }, {
+-            code: "a ??= b ?? c",
+-            output: "a = a ?? (b ?? c)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "??=" } }]
+-        }, {
+-            code: "a ??= (b || c)",
+-            output: "a = a ?? (b || c)",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "??=" } }]
+-        }, {
+-            code: "a ??= b + c",
+-            output: "a = a ?? b + c",
+-            options: ["never"],
+-            errors: [{ messageId: "unexpected", type: "AssignmentExpression", data: { operator: "??=" } }]
+-        }]
+-});
+diff --git a/tools/rule-types.json b/tools/rule-types.json
+index 9867d6b2f..d69028448 100644
+--- a/tools/rule-types.json
++++ b/tools/rule-types.json
+@@ -59,7 +59,6 @@
+     "lines-around-comment": "layout",
+     "lines-around-directive": "layout",
+     "lines-between-class-members": "layout",
+-    "logical-assignment-operators": "suggestion",
+     "max-classes-per-file": "suggestion",
+     "max-depth": "suggestion",
+     "max-len": "layout",

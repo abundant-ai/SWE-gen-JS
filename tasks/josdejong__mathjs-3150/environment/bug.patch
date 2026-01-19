@@ -1,0 +1,507 @@
+diff --git a/docs/expressions/customization.md b/docs/expressions/customization.md
+index 2833f0b52..20895b2f8 100644
+--- a/docs/expressions/customization.md
++++ b/docs/expressions/customization.md
+@@ -107,17 +107,16 @@ allowing the function to process the arguments in a customized way. Raw
+ functions are called as:
+ 
+ ```
+-rawFunction(args: Node[], math: Object, scope: Map)
++rawFunction(args: Node[], math: Object, scope: Object)
+ ```
+ 
+ Where :
+ 
+ - `args` is an Array with nodes of the parsed arguments.
+ - `math` is the math namespace against which the expression was compiled.
+-- `scope` is a `Map` containing the variables defined in the scope passed 
+-  via `evaluate(scope)`. In case of using a custom defined function like
+-  `f(x) = rawFunction(x) ^ 2`, the scope passed to `rawFunction` also contains
+-  the current value of parameter `x`.
++- `scope` is a shallow _copy_ of the `scope` object provided when evaluating 
++  the expression, optionally extended with nested variables like a function 
++  parameter `x` of in a custom defined function like `f(x) = x^2`.
+ 
+ Raw functions must be imported in the `math` namespace, as they need to be
+ processed at compile time. They are not supported when passed via a scope
+diff --git a/src/expression/node/OperatorNode.js b/src/expression/node/OperatorNode.js
+index 6890db6ec..5a4bb60c7 100644
+--- a/src/expression/node/OperatorNode.js
++++ b/src/expression/node/OperatorNode.js
+@@ -1,6 +1,5 @@
+ import { isNode, isConstantNode, isOperatorNode, isParenthesisNode } from '../../utils/is.js'
+ import { map } from '../../utils/array.js'
+-import { createSubScope } from '../../utils/scope.js'
+ import { escape } from '../../utils/string.js'
+ import { getSafeProperty, isSafeMethod } from '../../utils/customs.js'
+ import { getAssociativity, getPrecedence, isAssociativeWith, properties } from '../operators.js'
+@@ -310,7 +309,7 @@ export const createOperatorNode = /* #__PURE__ */ factory(name, dependencies, ({
+         // "raw" evaluation
+         const rawArgs = this.args
+         return function evalOperatorNode (scope, args, context) {
+-          return fn(rawArgs, math, createSubScope(scope, args))
++          return fn(rawArgs, math, scope)
+         }
+       } else if (evalArgs.length === 1) {
+         const evalArg0 = evalArgs[0]
+diff --git a/src/expression/transform/utils/compileInlineExpression.js b/src/expression/transform/utils/compileInlineExpression.js
+index 093aa535b..4f62d3eff 100644
+--- a/src/expression/transform/utils/compileInlineExpression.js
++++ b/src/expression/transform/utils/compileInlineExpression.js
+@@ -1,11 +1,11 @@
+ import { isSymbolNode } from '../../../utils/is.js'
+-import { PartitionedMap } from '../../../utils/map.js'
++import { createSubScope } from '../../../utils/scope.js'
+ 
+ /**
+  * Compile an inline expression like "x > 0"
+  * @param {Node} expression
+  * @param {Object} math
+- * @param {Map} scope
++ * @param {Object} scope
+  * @return {function} Returns a function with one argument which fills in the
+  *                    undefined variable (like "x") and evaluates the expression
+  */
+@@ -23,11 +23,10 @@ export function compileInlineExpression (expression, math, scope) {
+ 
+   // create a test function for this equation
+   const name = symbol.name // variable name
+-  const argsScope = new Map()
+-  const subScope = new PartitionedMap(scope, argsScope, new Set([name]))
++  const subScope = createSubScope(scope)
+   const eq = expression.compile()
+   return function inlineExpression (x) {
+-    argsScope.set(name, x)
++    subScope.set(name, x)
+     return eq.evaluate(subScope)
+   }
+ }
+diff --git a/src/utils/map.js b/src/utils/map.js
+index 7228bbb05..cb9a4eb86 100644
+--- a/src/utils/map.js
++++ b/src/utils/map.js
+@@ -15,7 +15,7 @@ export class ObjectWrappingMap {
+   }
+ 
+   keys () {
+-    return Object.keys(this.wrappedObject).values()
++    return Object.keys(this.wrappedObject)
+   }
+ 
+   get (key) {
+@@ -30,125 +30,6 @@ export class ObjectWrappingMap {
+   has (key) {
+     return hasSafeProperty(this.wrappedObject, key)
+   }
+-
+-  entries () {
+-    return mapIterator(this.keys(), key => [key, this.get(key)])
+-  }
+-
+-  forEach (callback) {
+-    for (const key of this.keys()) {
+-      callback(this.get(key), key, this)
+-    }
+-  }
+-
+-  delete (key) {
+-    delete this.wrappedObject[key]
+-  }
+-
+-  clear () {
+-    for (const key of this.keys()) {
+-      this.delete(key)
+-    }
+-  }
+-
+-  get size () {
+-    return Object.keys(this.wrappedObject).length
+-  }
+-}
+-
+-/**
+- * Create a map with two partitions: a and b.
+- * The set with bKeys determines which keys/values are read/written to map b,
+- * all other values are read/written to map a
+- *
+- * For example:
+- *
+- *   const a = new Map()
+- *   const b = new Map()
+- *   const p = new PartitionedMap(a, b, new Set(['x', 'y']))
+- *
+- * In this case, values `x` and `y` are read/written to map `b`,
+- * all other values are read/written to map `a`.
+- */
+-export class PartitionedMap {
+-  /**
+-   * @param {Map} a
+-   * @param {Map} b
+-   * @param {Set} bKeys
+-   */
+-  constructor (a, b, bKeys) {
+-    this.a = a
+-    this.b = b
+-    this.bKeys = bKeys
+-  }
+-
+-  get (key) {
+-    return this.bKeys.has(key)
+-      ? this.b.get(key)
+-      : this.a.get(key)
+-  }
+-
+-  set (key, value) {
+-    if (this.bKeys.has(key)) {
+-      this.b.set(key, value)
+-    } else {
+-      this.a.set(key, value)
+-    }
+-    return this
+-  }
+-
+-  has (key) {
+-    return this.b.has(key) || this.a.has(key)
+-  }
+-
+-  keys () {
+-    return new Set([
+-      ...this.a.keys(),
+-      ...this.b.keys()
+-    ])[Symbol.iterator]()
+-  }
+-
+-  entries () {
+-    return mapIterator(this.keys(), key => [key, this.get(key)])
+-  }
+-
+-  forEach (callback) {
+-    for (const key of this.keys()) {
+-      callback(this.get(key), key, this)
+-    }
+-  }
+-
+-  delete (key) {
+-    return this.bKeys.has(key)
+-      ? this.b.delete(key)
+-      : this.a.delete(key)
+-  }
+-
+-  clear () {
+-    this.a.clear()
+-    this.b.clear()
+-  }
+-
+-  get size () {
+-    return [...this.keys()].length
+-  }
+-}
+-
+-/**
+- * Create a new iterator that maps over the provided iterator, applying a mapping function to each item
+- */
+-function mapIterator (it, callback) {
+-  return {
+-    next: () => {
+-      const n = it.next()
+-      return (n.done)
+-        ? n
+-        : {
+-            value: callback(n.value),
+-            done: false
+-          }
+-    }
+-  }
+ }
+ 
+ /**
+diff --git a/src/utils/scope.js b/src/utils/scope.js
+index df35f4969..3fdd03584 100644
+--- a/src/utils/scope.js
++++ b/src/utils/scope.js
+@@ -1,4 +1,4 @@
+-import { ObjectWrappingMap, PartitionedMap } from './map.js'
++import { createEmptyMap, assign } from './map.js'
+ 
+ /**
+  * Create a new scope which can access the parent scope,
+@@ -10,13 +10,13 @@ import { ObjectWrappingMap, PartitionedMap } from './map.js'
+  * the remaining `args`.
+  *
+  * @param {Map} parentScope
+- * @param  {Object} args
+- * @returns {PartitionedMap}
++ * @param  {...any} args
++ * @returns {Map}
+  */
+-export function createSubScope (parentScope, args) {
+-  return new PartitionedMap(
+-    parentScope,
+-    new ObjectWrappingMap(args),
+-    new Set(Object.keys(args))
+-  )
++export function createSubScope (parentScope, ...args) {
++  if (typeof parentScope.createSubScope === 'function') {
++    return assign(parentScope.createSubScope(), ...args)
++  }
++
++  return assign(createEmptyMap(), parentScope, ...args)
+ }
+diff --git a/test/unit-tests/expression/parse.test.js b/test/unit-tests/expression/parse.test.js
+index fe3190ea5..5e5cfc153 100644
+--- a/test/unit-tests/expression/parse.test.js
++++ b/test/unit-tests/expression/parse.test.js
+@@ -141,13 +141,6 @@ describe('parse', function () {
+       assert.strictEqual(scope.f(3), 9)
+     })
+ 
+-    it('should support variable assignment inside a function definition', function () {
+-      const scope = {}
+-      parse('f(x)=(y=x)*2').compile().evaluate(scope)
+-      assert.strictEqual(scope.f(2), 4)
+-      assert.strictEqual(scope.y, 2)
+-    })
+-
+     it('should spread a function over multiple lines', function () {
+       assert.deepStrictEqual(parse('add(\n4\n,\n2\n)').compile().evaluate(), 6)
+     })
+@@ -1545,23 +1538,6 @@ describe('parse', function () {
+       assert.deepStrictEqual(scope, { a: false })
+     })
+ 
+-    it('should parse logical and inside a function definition', function () {
+-      const scope = {}
+-      const f = parseAndEval('f(x) = x > 2 and x < 4', scope)
+-      assert.strictEqual(f(1), false)
+-      assert.strictEqual(f(3), true)
+-      assert.strictEqual(f(5), false)
+-    })
+-
+-    it('should use a variable assignment with a rawArgs function inside a function definition', function () {
+-      const scope = {}
+-      const f = parseAndEval('f(x) = (a=false) and (b=true)', scope)
+-      assert.deepStrictEqual(parseAndEval('f(2)', scope), false)
+-      assert.deepStrictEqual(Object.keys(scope), ['f', 'a'])
+-      assert.strictEqual(scope.f, f)
+-      assert.strictEqual(scope.a, false)
+-    })
+-
+     it('should parse logical xor', function () {
+       assert.strictEqual(parseAndEval('2 xor 6'), false)
+       assert.strictEqual(parseAndEval('2 xor 0'), true)
+@@ -1584,14 +1560,6 @@ describe('parse', function () {
+       assert.throws(function () { parseAndEval('false or undefined') }, TypeError)
+     })
+ 
+-    it('should parse logical or inside a function definition', function () {
+-      const scope = {}
+-      const f = parseAndEval('f(x) = x < 2 or x > 4', scope)
+-      assert.strictEqual(f(1), true)
+-      assert.strictEqual(f(3), false)
+-      assert.strictEqual(f(5), true)
+-    })
+-
+     it('should parse logical or lazily', function () {
+       const scope = {}
+       parseAndEval('(a=true) or (b=true)', scope)
+diff --git a/test/unit-tests/utils/map.test.js b/test/unit-tests/utils/map.test.js
+index 743fc66a7..66b956376 100644
+--- a/test/unit-tests/utils/map.test.js
++++ b/test/unit-tests/utils/map.test.js
+@@ -1,5 +1,5 @@
+ import assert from 'assert'
+-import { isMap, ObjectWrappingMap, toObject, createMap, assign, PartitionedMap } from '../../../src/utils/map.js'
++import { isMap, ObjectWrappingMap, toObject, createMap, assign } from '../../../src/utils/map.js'
+ 
+ describe('maps', function () {
+   it('should provide isMap, a function to tell maps from non-maps', function () {
+@@ -69,188 +69,17 @@ describe('maps', function () {
+     }
+ 
+     // keys()
+-    assert.deepStrictEqual([...map.keys()], ['a', 'b', 'c', 'd', 'e', 'f', 'g'])
++    assert.deepStrictEqual(map.keys(), ['a', 'b', 'c', 'd', 'e', 'f', 'g'])
+ 
+     for (const key of map.keys()) {
+       assert.ok(map.has(key))
+     }
+ 
+-    // size(
+-    assert.strictEqual(map.size, 7)
+-
+-    // delete
+-    map.delete('g')
+-    assert.deepStrictEqual([...map.keys()], ['a', 'b', 'c', 'd', 'e', 'f'])
+-
+     assert.ok(!map.has('not-in-this-map'))
+ 
+-    // forEach
+-    const log = []
+-    map.forEach((value, key) => (log.push([key, value])))
+-    assert.deepStrictEqual(log, [
+-      ['a', 1],
+-      ['b', 2],
+-      ['c', 3],
+-      ['d', 4],
+-      ['e', 5],
+-      ['f', 6]
+-    ])
+-
+-    // entries
+-    const it = map.entries()
+-    assert.deepStrictEqual(it.next(), { done: false, value: ['a', 1] })
+-    assert.deepStrictEqual(it.next(), { done: false, value: ['b', 2] })
+-    assert.deepStrictEqual(it.next(), { done: false, value: ['c', 3] })
+-    assert.deepStrictEqual(it.next(), { done: false, value: ['d', 4] })
+-    assert.deepStrictEqual(it.next(), { done: false, value: ['e', 5] })
+-    assert.deepStrictEqual(it.next(), { done: false, value: ['f', 6] })
+-    assert.deepStrictEqual(it.next(), { done: true, value: undefined })
+-
+     // We can get the same object out using toObject
+     const innerObject = toObject(map)
+     assert.strictEqual(innerObject, obj)
+-
+-    // clear
+-    map.clear()
+-    assert.deepStrictEqual([...map.keys()], [])
+-    assert.deepStrictEqual(Object.keys(obj), [])
+-  })
+-
+-  describe('PartitionedMap', function () {
+-    function createPartitionedMap (bKeys) {
+-      const a = new Map()
+-      const b = new Map()
+-      const p = new PartitionedMap(a, b, new Set(bKeys))
+-      return { a, b, p }
+-    }
+-
+-    it('get, set', function () {
+-      const { a, b, p } = createPartitionedMap(['b'])
+-      p
+-        .set('a', 2)
+-        .set('b', 3)
+-
+-      assert.strictEqual(p.get('a'), 2)
+-      assert.strictEqual(p.get('b'), 3)
+-      assert.strictEqual(p.get('c'), undefined)
+-
+-      assert.strictEqual(a.get('a'), 2)
+-      assert.strictEqual(a.get('b'), undefined)
+-
+-      assert.strictEqual(b.get('a'), undefined)
+-      assert.strictEqual(b.get('b'), 3)
+-    })
+-
+-    it('has', function () {
+-      const { a, b, p } = createPartitionedMap(['b'])
+-      p
+-        .set('a', 2)
+-        .set('b', 3)
+-
+-      assert.strictEqual(p.has('a'), true)
+-      assert.strictEqual(p.has('b'), true)
+-      assert.strictEqual(p.has('c'), false)
+-
+-      assert.strictEqual(a.has('a'), true)
+-      assert.strictEqual(a.has('b'), false)
+-
+-      assert.strictEqual(b.has('a'), false)
+-      assert.strictEqual(b.has('b'), true)
+-
+-      assert.deepStrictEqual([...p.keys()], ['a', 'b'])
+-      assert.deepStrictEqual([...a.keys()], ['a'])
+-      assert.deepStrictEqual([...b.keys()], ['b'])
+-    })
+-
+-    it('keys', function () {
+-      const { a, b, p } = createPartitionedMap(['b'])
+-      p.set('a', 2)
+-      p.set('b', 3)
+-
+-      assert.deepStrictEqual([...p.keys()], ['a', 'b'])
+-      assert.deepStrictEqual([...a.keys()], ['a'])
+-      assert.deepStrictEqual([...b.keys()], ['b'])
+-    })
+-
+-    it('forEach', function () {
+-      const { a, b, p } = createPartitionedMap(['b'])
+-      p.set('a', 2)
+-      p.set('b', 3)
+-      p.set('c', 4)
+-
+-      const pLog = []
+-      p.forEach((value, key) => (pLog.push([key, value])))
+-      assert.deepStrictEqual(pLog, [
+-        ['a', 2],
+-        ['c', 4],
+-        ['b', 3]
+-      ])
+-
+-      const aLog = []
+-      a.forEach((value, key) => (aLog.push([key, value])))
+-      assert.deepStrictEqual(aLog, [
+-        ['a', 2],
+-        ['c', 4]
+-      ])
+-
+-      const bLog = []
+-      b.forEach((value, key) => (bLog.push([key, value])))
+-      assert.deepStrictEqual(bLog, [
+-        ['b', 3]
+-      ])
+-    })
+-
+-    it('entries', function () {
+-      const { p } = createPartitionedMap(['b'])
+-      p.set('a', 2)
+-      p.set('b', 3)
+-      p.set('c', 4)
+-
+-      const it = p.entries()
+-
+-      assert.deepStrictEqual(it.next(), { done: false, value: ['a', 2] })
+-      assert.deepStrictEqual(it.next(), { done: false, value: ['c', 4] })
+-      assert.deepStrictEqual(it.next(), { done: false, value: ['b', 3] })
+-      assert.deepStrictEqual(it.next(), { done: true, value: undefined })
+-    })
+-
+-    it('size', function () {
+-      const { p } = createPartitionedMap(['b'])
+-      p.set('a', 2)
+-      p.set('b', 3)
+-      assert.strictEqual(p.size, 2)
+-
+-      p.set('c', 4)
+-      assert.strictEqual(p.size, 3)
+-
+-      p.delete('c')
+-      assert.strictEqual(p.size, 2)
+-    })
+-
+-    it('delete', function () {
+-      const { a, b, p } = createPartitionedMap(['b'])
+-      p
+-        .set('a', 2)
+-        .set('b', 3)
+-
+-      p.delete('a')
+-
+-      assert.deepStrictEqual([...p.keys()], ['b'])
+-      assert.deepStrictEqual([...a.keys()], [])
+-      assert.deepStrictEqual([...b.keys()], ['b'])
+-    })
+-
+-    it('clear', function () {
+-      const { a, b, p } = createPartitionedMap(['b'])
+-      a.set('a', 2)
+-      b.set('b', 3)
+-
+-      p.clear()
+-
+-      assert.deepStrictEqual([...p.keys()], [])
+-      assert.deepStrictEqual([...a.keys()], [])
+-      assert.deepStrictEqual([...b.keys()], [])
+-    })
+   })
+ 
+   it('should create a map from objects, maps, or undefined', function () {

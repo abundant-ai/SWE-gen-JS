@@ -1,0 +1,262 @@
+diff --git a/integration/versioning/src/app.module.ts b/integration/versioning/src/app.module.ts
+index aac4b7a58..d1483685a 100644
+--- a/integration/versioning/src/app.module.ts
++++ b/integration/versioning/src/app.module.ts
+@@ -1,11 +1,14 @@
+-import { Module } from '@nestjs/common';
++import { MiddlewareConsumer, Module } from '@nestjs/common';
+ import { AppV1Controller } from './app-v1.controller';
+ import { AppV2Controller } from './app-v2.controller';
++import { MiddlewareController } from './middleware.controller';
++import { MultipleMiddlewareVersionController } from './multiple-middleware.controller';
+ import { MultipleVersionController } from './multiple.controller';
+-import { NoVersioningController } from './no-versioning.controller';
++import { VersionNeutralMiddlewareController } from './neutral-middleware.controller';
+ import { VersionNeutralController } from './neutral.controller';
+-import { OverrideController } from './override.controller';
++import { NoVersioningController } from './no-versioning.controller';
+ import { OverridePartialController } from './override-partial.controller';
++import { OverrideController } from './override.controller';
+ 
+ @Module({
+   imports: [],
+@@ -17,6 +20,19 @@ import { OverridePartialController } from './override-partial.controller';
+     VersionNeutralController,
+     OverrideController,
+     OverridePartialController,
++    MiddlewareController,
++    MultipleMiddlewareVersionController,
++    VersionNeutralMiddlewareController,
+   ],
+ })
+-export class AppModule {}
++export class AppModule {
++  configure(consumer: MiddlewareConsumer) {
++    consumer
++      .apply((req, res) => res.end('Hello from middleware function!'))
++      .forRoutes(
++        MiddlewareController,
++        MultipleMiddlewareVersionController,
++        VersionNeutralMiddlewareController,
++      );
++  }
++}
+diff --git a/integration/versioning/src/middleware.controller.ts b/integration/versioning/src/middleware.controller.ts
+new file mode 100644
+index 000000000..9d0ece0d9
+--- /dev/null
++++ b/integration/versioning/src/middleware.controller.ts
+@@ -0,0 +1,18 @@
++import { Controller, Get, Version } from '@nestjs/common';
++
++@Controller({
++  path: 'middleware',
++  version: '1',
++})
++export class MiddlewareController {
++  @Get('/')
++  hello() {
++    return 'Hello from "MiddlewareController"!';
++  }
++
++  @Version('2')
++  @Get('/override')
++  hellov2() {
++    return 'Hello from "MiddlewareController"!';
++  }
++}
+diff --git a/integration/versioning/src/multiple-middleware.controller.ts b/integration/versioning/src/multiple-middleware.controller.ts
+new file mode 100644
+index 000000000..f3611568d
+--- /dev/null
++++ b/integration/versioning/src/multiple-middleware.controller.ts
+@@ -0,0 +1,12 @@
++import { Controller, Get } from '@nestjs/common';
++
++@Controller({
++  version: ['1', '2'],
++  path: 'middleware',
++})
++export class MultipleMiddlewareVersionController {
++  @Get('/multiple')
++  multiple() {
++    return 'Multiple Versions 1 or 2';
++  }
++}
+diff --git a/integration/versioning/src/neutral-middleware.controller.ts b/integration/versioning/src/neutral-middleware.controller.ts
+new file mode 100644
+index 000000000..1daa67746
+--- /dev/null
++++ b/integration/versioning/src/neutral-middleware.controller.ts
+@@ -0,0 +1,12 @@
++import { Controller, Get, VERSION_NEUTRAL } from '@nestjs/common';
++
++@Controller({
++  path: 'middleware',
++  version: VERSION_NEUTRAL,
++})
++export class VersionNeutralMiddlewareController {
++  @Get('/neutral')
++  neutral() {
++    return 'Neutral';
++  }
++}
+diff --git a/packages/core/middleware/middleware-module.ts b/packages/core/middleware/middleware-module.ts
+index 627ede62b..043ca75a8 100644
+--- a/packages/core/middleware/middleware-module.ts
++++ b/packages/core/middleware/middleware-module.ts
+@@ -66,7 +66,7 @@ export class MiddlewareModule<
+       config,
+       appRef,
+     );
+-    this.routesMapper = new RoutesMapper(container);
++    this.routesMapper = new RoutesMapper(container, config);
+     this.resolver = new MiddlewareResolver(middlewareContainer, injector);
+     this.routeInfoPathExtractor = new RouteInfoPathExtractor(config);
+     this.injector = injector;
+diff --git a/packages/core/middleware/routes-mapper.ts b/packages/core/middleware/routes-mapper.ts
+index d6f98ec57..90193250a 100644
+--- a/packages/core/middleware/routes-mapper.ts
++++ b/packages/core/middleware/routes-mapper.ts
+@@ -1,35 +1,48 @@
+-import { MODULE_PATH, PATH_METADATA } from '@nestjs/common/constants';
+-import { RouteInfo, Type } from '@nestjs/common/interfaces';
++import {
++  MODULE_PATH,
++  PATH_METADATA,
++  VERSION_METADATA,
++} from '@nestjs/common/constants';
++import {
++  RouteInfo,
++  Type,
++  VERSION_NEUTRAL,
++  VersionValue,
++} from '@nestjs/common/interfaces';
+ import {
+   addLeadingSlash,
+   isString,
+   isUndefined,
+ } from '@nestjs/common/utils/shared.utils';
++import { ApplicationConfig } from '../application-config';
+ import { NestContainer } from '../injector/container';
+ import { Module } from '../injector/module';
+ import { MetadataScanner } from '../metadata-scanner';
+-import { PathsExplorer } from '../router/paths-explorer';
++import { PathsExplorer, RouteDefinition } from '../router/paths-explorer';
+ import { targetModulesByContainer } from '../router/router-module';
+ 
+ export class RoutesMapper {
+   private readonly pathsExplorer: PathsExplorer;
+ 
+-  constructor(private readonly container: NestContainer) {
++  constructor(
++    private readonly container: NestContainer,
++    private readonly applicationConfig: ApplicationConfig,
++  ) {
+     this.pathsExplorer = new PathsExplorer(new MetadataScanner());
+   }
+ 
+   public mapRouteToRouteInfo(
+-    route: Type<any> | RouteInfo | string,
++    controllerOrRoute: Type<any> | RouteInfo | string,
+   ): RouteInfo[] {
+-    if (isString(route)) {
+-      return this.getRouteInfoFromPath(route);
++    if (isString(controllerOrRoute)) {
++      return this.getRouteInfoFromPath(controllerOrRoute);
+     }
+-    const routePathOrPaths = this.getRoutePath(route);
+-    if (this.isRouteInfo(routePathOrPaths, route)) {
+-      return this.getRouteInfoFromObject(route);
++    const routePathOrPaths = this.getRoutePath(controllerOrRoute);
++    if (this.isRouteInfo(routePathOrPaths, controllerOrRoute)) {
++      return this.getRouteInfoFromObject(controllerOrRoute);
+     }
+ 
+-    return this.getRouteInfoFromController(route, routePathOrPaths);
++    return this.getRouteInfoFromController(controllerOrRoute, routePathOrPaths);
+   }
+ 
+   private getRouteInfoFromPath(routePath: string): RouteInfo[] {
+@@ -62,33 +75,47 @@ export class RoutesMapper {
+       Object.create(controller),
+       controller.prototype,
+     );
++    const controllerVersion = this.getVersionMetadata(controller);
++    const versioningConfig = this.applicationConfig.getVersioning();
+     const moduleRef = this.getHostModuleOfController(controller);
+     const modulePath = this.getModulePath(moduleRef?.metatype);
+ 
+     const concatPaths = <T>(acc: T[], currentValue: T[]) =>
+       acc.concat(currentValue);
+ 
++    const toUndefinedIfNeural = (version: VersionValue) =>
++      version === VERSION_NEUTRAL ? undefined : version;
++
++    const toRouteInfo = (item: RouteDefinition, prefix: string) =>
++      item.path
++        ?.map(p => {
++          let endpointPath = modulePath ?? '';
++          endpointPath += this.normalizeGlobalPath(prefix) + addLeadingSlash(p);
++
++          const routeInfo: RouteInfo = {
++            path: endpointPath,
++            method: item.requestMethod,
++          };
++          const version = item.version ?? controllerVersion;
++          if (version && versioningConfig) {
++            if (typeof version !== 'string' && Array.isArray(version)) {
++              return version.map(v => ({
++                ...routeInfo,
++                version: toUndefinedIfNeural(v),
++              }));
++            }
++            routeInfo.version = toUndefinedIfNeural(version);
++          }
++
++          return routeInfo;
++        })
++        .flat() as RouteInfo[];
++
+     return []
+       .concat(routePath)
+       .map(routePath =>
+         controllerPaths
+-          .map(item =>
+-            item.path?.map(p => {
+-              let path = modulePath ?? '';
+-              path += this.normalizeGlobalPath(routePath) + addLeadingSlash(p);
+-
+-              const routeInfo: RouteInfo = {
+-                path,
+-                method: item.requestMethod,
+-              };
+-
+-              if (item.version) {
+-                routeInfo.version = item.version;
+-              }
+-
+-              return routeInfo;
+-            }),
+-          )
++          .map(item => toRouteInfo(item, routePath))
+           .reduce(concatPaths, []),
+       )
+       .reduce(concatPaths, []);
+@@ -141,4 +168,16 @@ export class RoutesMapper {
+     );
+     return modulePath ?? Reflect.getMetadata(MODULE_PATH, metatype);
+   }
++
++  private getVersionMetadata(
++    metatype: Type<unknown> | Function,
++  ): VersionValue | undefined {
++    const versioningConfig = this.applicationConfig.getVersioning();
++    if (versioningConfig) {
++      return (
++        Reflect.getMetadata(VERSION_METADATA, metatype) ??
++        versioningConfig.defaultVersion
++      );
++    }
++  }
+ }

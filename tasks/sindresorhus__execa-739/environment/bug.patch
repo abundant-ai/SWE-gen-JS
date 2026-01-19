@@ -1,0 +1,182 @@
+diff --git a/lib/stdio/async.js b/lib/stdio/async.js
+index bb5d8a2..4105d83 100644
+--- a/lib/stdio/async.js
++++ b/lib/stdio/async.js
+@@ -5,7 +5,6 @@ import mergeStreams from '@sindresorhus/merge-streams';
+ import {handleInput} from './handle.js';
+ import {TYPE_TO_MESSAGE} from './type.js';
+ import {generatorToDuplexStream, pipeGenerator} from './generator.js';
+-import {pipeStreams} from './utils.js';
+ 
+ // Handle `input`, `inputFile`, `stdin`, `stdout` and `stderr` options, before spawning, in async mode
+ export const handleInputAsync = options => handleInput(addPropertiesAsync, options, false);
+@@ -51,7 +50,7 @@ export const pipeOutputAsync = (spawned, stdioStreamsGroups) => {
+ 
+ 	for (const [index, inputStreams] of Object.entries(inputStreamsGroups)) {
+ 		const value = inputStreams.length === 1 ? inputStreams[0] : mergeStreams(inputStreams);
+-		pipeStreams(value, spawned.stdio[index]);
++		value.pipe(spawned.stdio[index]);
+ 	}
+ };
+ 
+@@ -61,7 +60,7 @@ const pipeStdioOption = (spawned, {type, value, direction, index}, inputStreamsG
+ 	}
+ 
+ 	if (direction === 'output') {
+-		pipeStreams(spawned.stdio[index], value);
++		spawned.stdio[index].pipe(value);
+ 	} else {
+ 		inputStreamsGroups[index] = [...(inputStreamsGroups[index] ?? []), value];
+ 	}
+diff --git a/lib/stdio/generator.js b/lib/stdio/generator.js
+index 661556d..462eac8 100644
+--- a/lib/stdio/generator.js
++++ b/lib/stdio/generator.js
+@@ -2,7 +2,7 @@ import {generatorsToDuplex} from './duplex.js';
+ import {getEncodingStartGenerator} from './encoding.js';
+ import {getLinesGenerator} from './lines.js';
+ import {isGeneratorOptions} from './type.js';
+-import {isBinary, pipeStreams} from './utils.js';
++import {isBinary} from './utils.js';
+ 
+ export const normalizeGenerators = stdioStreams => {
+ 	const nonGenerators = stdioStreams.filter(({type}) => type !== 'generator');
+@@ -98,9 +98,9 @@ const validateTransformReturn = async function * (optionName, chunks) {
+ // `childProcess.stdin|stdout|stderr|stdio` is directly mutated.
+ export const pipeGenerator = (spawned, {value, direction, index}) => {
+ 	if (direction === 'output') {
+-		pipeStreams(spawned.stdio[index], value);
+-	} else {
+-		pipeStreams(value, spawned.stdio[index]);
++		spawned.stdio[index].pipe(value);
++	}	else {
++		value.pipe(spawned.stdio[index]);
+ 	}
+ 
+ 	const streamProperty = PROCESS_STREAM_PROPERTIES[index];
+diff --git a/lib/stdio/utils.js b/lib/stdio/utils.js
+index 386c6db..f9aa542 100644
+--- a/lib/stdio/utils.js
++++ b/lib/stdio/utils.js
+@@ -1,5 +1,4 @@
+ import {Buffer} from 'node:buffer';
+-import {finished} from 'node:stream/promises';
+ 
+ export const bufferToUint8Array = buffer => new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+ 
+@@ -8,16 +7,3 @@ export const isBinary = value => isUint8Array(value) || Buffer.isBuffer(value);
+ 
+ const textDecoder = new TextDecoder();
+ export const binaryToString = uint8ArrayOrBuffer => textDecoder.decode(uint8ArrayOrBuffer);
+-
+-// Like `source.pipe(destination)`, if `source` ends, `destination` ends.
+-// Like `Stream.pipeline(source, destination)`, if `source` aborts/errors, `destination` aborts.
+-// Unlike `Stream.pipeline(source, destination)`, if `destination` ends/aborts/errors, `source` does not end/abort/error.
+-export const pipeStreams = async (source, destination) => {
+-	source.pipe(destination);
+-
+-	try {
+-		await finished(source);
+-	} catch {
+-		destination.destroy();
+-	}
+-};
+diff --git a/lib/stream.js b/lib/stream.js
+index ebef5a5..001f1c7 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -115,6 +115,17 @@ const throwOnStreamError = async stream => {
+ 	throw error;
+ };
+ 
++// The streams created by the `std*` options are automatically ended by `.pipe()`.
++// However `.pipe()` only does so when the source stream ended, not when it errored.
++// Therefore, when `childProcess.stdin|stdout|stderr` errors, those streams must be manually destroyed.
++const cleanupStdioStreams = (customStreams, error) => {
++	for (const {value} of customStreams) {
++		if (!STANDARD_STREAMS.includes(value)) {
++			value.destroy(error);
++		}
++	}
++};
++
+ // Like `once()` except it never rejects, especially not on `error` event.
+ const pEvent = (eventEmitter, eventName) => new Promise(resolve => {
+ 	eventEmitter.once(eventName, (...payload) => {
+@@ -180,6 +191,7 @@ export const getSpawnedResult = async ({
+ 			Promise.all(stdioPromises.map(stdioPromise => getBufferedData(stdioPromise, encoding))),
+ 			getBufferedData(allPromise, encoding),
+ 		]);
++		cleanupStdioStreams(customStreams, error);
+ 		await Promise.allSettled(customStreamsEndPromises);
+ 		return results;
+ 	} finally {
+diff --git a/test/stdio/array.js b/test/stdio/array.js
+index 3ad6bb6..c69967d 100644
+--- a/test/stdio/array.js
++++ b/test/stdio/array.js
+@@ -242,24 +242,13 @@ test('stderr can be ["overlapped", "pipe"]', testOverlapped, 2);
+ test('stdio[*] can be ["overlapped", "pipe"]', testOverlapped, 3);
+ 
+ const testDestroyStandard = async (t, index) => {
+-	const childProcess = execa('forever.js', {...getStdio(index, [STANDARD_STREAMS[index], 'pipe']), timeout: 1});
+-	await t.throwsAsync(childProcess, {message: /timed out/});
+-	t.false(STANDARD_STREAMS[index].destroyed);
+-};
+-
+-test('Does not destroy process.stdin on child process errors', testDestroyStandard, 0);
+-test('Does not destroy process.stdout on child process errors', testDestroyStandard, 1);
+-test('Does not destroy process.stderr on child process errors', testDestroyStandard, 2);
+-
+-const testDestroyStandardStream = async (t, index) => {
+-	const childProcess = execa('forever.js', getStdio(index, [STANDARD_STREAMS[index], 'pipe']));
+-	const error = new Error('test');
+-	childProcess.stdio[index].destroy(error);
+-	const thrownError = await t.throwsAsync(childProcess);
+-	t.is(thrownError, error);
++	await t.throwsAsync(
++		execa('forever.js', {...getStdio(index, [STANDARD_STREAMS[index], 'pipe']), timeout: 1}),
++		{message: /timed out/},
++	);
+ 	t.false(STANDARD_STREAMS[index].destroyed);
+ };
+ 
+-test('Does not destroy process.stdin on stream process errors', testDestroyStandardStream, 0);
+-test('Does not destroy process.stdout on stream process errors', testDestroyStandardStream, 1);
+-test('Does not destroy process.stderr on stream process errors', testDestroyStandardStream, 2);
++test('Does not destroy process.stdin on errors', testDestroyStandard, 0);
++test('Does not destroy process.stdout on errors', testDestroyStandard, 1);
++test('Does not destroy process.stderr on errors', testDestroyStandard, 2);
+diff --git a/test/stdio/generator.js b/test/stdio/generator.js
+index b16f780..8d7b710 100644
+--- a/test/stdio/generator.js
++++ b/test/stdio/generator.js
+@@ -629,19 +629,6 @@ test('Generators errors make process fail', async t => {
+ 	);
+ });
+ 
+-test('Generators errors make process fail even when other output generators do not throw', async t => {
+-	await t.throwsAsync(
+-		execa('noop-fd.js', ['1', foobarString], {stdout: [noopGenerator(false), throwingGenerator, noopGenerator(false)]}),
+-		{message: /Generator error foobar/},
+-	);
+-});
+-
+-test('Generators errors make process fail even when other input generators do not throw', async t => {
+-	const childProcess = execa('stdin-fd.js', ['0'], {stdin: [noopGenerator(false), throwingGenerator, noopGenerator(false)]});
+-	childProcess.stdin.write('foobar\n');
+-	await t.throwsAsync(childProcess, {message: /Generator error foobar/});
+-});
+-
+ // eslint-disable-next-line require-yield
+ const errorHandlerGenerator = async function * (state, lines) {
+ 	try {
+@@ -654,7 +641,7 @@ const errorHandlerGenerator = async function * (state, lines) {
+ 	}
+ };
+ 
+-test('Process streams failures make generators throw', async t => {
++test.serial('Process streams failures make generators throw', async t => {
+ 	const state = {};
+ 	const childProcess = execa('noop-fail.js', ['1'], {stdout: errorHandlerGenerator.bind(undefined, state)});
+ 	const error = new Error('test');

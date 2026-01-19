@@ -1,0 +1,235 @@
+diff --git a/docs/api/autoBatchEnhancer.mdx b/docs/api/autoBatchEnhancer.mdx
+index 673aa4d4..d907d4db 100644
+--- a/docs/api/autoBatchEnhancer.mdx
++++ b/docs/api/autoBatchEnhancer.mdx
+@@ -65,30 +65,17 @@ const store = configureStore({
+ 
+ ```ts title="autoBatchEnhancer signature" no-transpile
+ export type SHOULD_AUTOBATCH = string
+-type AutoBatchOptions =
+-  | { type: 'tick' }
+-  | { type: 'timer'; timeout: number }
+-  | { type: 'raf' }
+-  | { type: 'callback'; queueNotification: (notify: () => void) => void }
+-
+-export type autoBatchEnhancer = (options?: AutoBatchOptions) => StoreEnhancer
++export type autoBatchEnhancer = () => StoreEnhancer
+ ```
+ 
+ Creates a new instance of the autobatch store enhancer.
+ 
+-Any action that is tagged with `action.meta[SHOULD_AUTOBATCH] = true` will be treated as "low-priority", and a notification callback will be queued. The enhancer will delay notifying subscribers until either:
++Any action that is tagged with `action.meta[SHOULD_AUTOBATCH] = true` will be treated as "low-priority", and the enhancer will delay notifying subscribers until either:
+ 
+-- The queued callback runs and triggers the notifications
++- The end of the current event loop tick happens, and a queued microtask runs the notifications
+ - A "normal-priority" action (any action _without_ `action.meta[SHOULD_AUTOBATCH] = true`) is dispatched in the same tick
+ 
+-`autoBatchEnhancer` accepts options to configure how the notification callback is queued:
+-
+-- `{type: 'tick'}: queues using `queueMicrotask` (default)
+-- `{type: 'timer, timeout: number}`: queues using `setTimeout`
+-- `{type: 'raf'}`: queues using `requestAnimationFrame`
+-- `{type: 'callback', queueNotification: (notify: () => void) => void}: lets you provide your own callback
+-
+-The default behavior is to queue the notifications at the end of the current event loop using `queueMicrotask`.
++This method currently does not accept any options. We may consider allowing customization of the delay behavior in the future.
+ 
+ The `SHOULD_AUTOBATCH` value is meant to be opaque - it's currently a string for simplicity, but could be a `Symbol` in the future.
+ 
+@@ -130,7 +117,7 @@ This enhancer is a variation of the "debounce" approach, but with a twist.
+ 
+ Instead of _just_ debouncing _all_ subscriber notifications, it watches for any actions with a specific `action.meta[SHOULD_AUTOBATCH]: true` field attached.
+ 
+-When it sees an action with that field, it queues a callback. The reducer is updated immediately, but the enhancer does _not_ notify subscribers right way. If other actions with the same field are dispatched in succession, the enhancer will continue to _not_ notify subscribers. Then, when the queued callback runs, it finally notifies all subscribers, similar to how React batches re-renders.
++When it sees an action with that field, it queues a microtask. The reducer is updated immediately, but the enhancer does _not_ notify subscribers right way. If other actions with the same field are dispatched in succession, the enhancer will continue to _not_ notify subscribers. Then, when the queued microtask runs at the end of the event loop tick, it finally notifies all subscribers, similar to how React batches re-renders.
+ 
+ The additional twist is also inspired by React's separation of updates into "low-priority" and "immediate" behavior (such as a render queued by an AJAX request vs a render queued by a user input that should be handled synchronously).
+ 
+diff --git a/packages/toolkit/src/autoBatchEnhancer.ts b/packages/toolkit/src/autoBatchEnhancer.ts
+index 5a1d6cff..8f8e44d6 100644
+--- a/packages/toolkit/src/autoBatchEnhancer.ts
++++ b/packages/toolkit/src/autoBatchEnhancer.ts
+@@ -23,21 +23,9 @@ const queueMicrotaskShim =
+           }, 0)
+         )
+ 
+-export type AutoBatchOptions =
+-  | { type: 'tick' }
+-  | { type: 'timer'; timeout: number }
+-  | { type: 'raf' }
+-  | { type: 'callback'; queueNotification: (notify: () => void) => void }
+-
+-const createQueueWithTimer = (timeout: number) => {
+-  return (notify: () => void) => {
+-    setTimeout(notify, timeout)
+-  }
+-}
+-
+ /**
+  * A Redux store enhancer that watches for "low-priority" actions, and delays
+- * notifying subscribers until either the queued callback executes or the
++ * notifying subscribers until either the end of the event loop tick or the
+  * next "standard-priority" action is dispatched.
+  *
+  * This allows dispatching multiple "low-priority" actions in a row with only
+@@ -48,17 +36,9 @@ const createQueueWithTimer = (timeout: number) => {
+  * This can be added to `action.meta` manually, or by using the
+  * `prepareAutoBatched` helper.
+  *
+- * By default, it will queue a notification for the end of the event loop tick.
+- * However, you can pass several other options to configure the behavior:
+- * - `{type: 'tick'}: queues using `queueMicrotask` (default)
+- * - `{type: 'timer, timeout: number}`: queues using `setTimeout`
+- * - `{type: 'raf'}`: queues using `requestAnimationFrame`
+- * - `{type: 'callback', queueNotification: (notify: () => void) => void}: lets you provide your own callback
+- *
+- *
+  */
+ export const autoBatchEnhancer =
+-  (options: AutoBatchOptions = { type: 'tick' }): StoreEnhancer =>
++  (): StoreEnhancer =>
+   (next) =>
+   (...args) => {
+     const store = next(...args)
+@@ -69,15 +49,6 @@ export const autoBatchEnhancer =
+ 
+     const listeners = new Set<() => void>()
+ 
+-    const queueCallback =
+-      options.type === 'tick'
+-        ? queueMicrotaskShim
+-        : options.type === 'raf'
+-        ? requestAnimationFrame
+-        : options.type === 'callback'
+-        ? options.queueNotification
+-        : createQueueWithTimer(options.timeout)
+-
+     const notifyListeners = () => {
+       // We're running at the end of the event loop tick.
+       // Run the real listener callbacks to actually update the UI.
+@@ -120,7 +91,7 @@ export const autoBatchEnhancer =
+             // Make sure we only enqueue this _once_ per tick.
+             if (!notificationQueued) {
+               notificationQueued = true
+-              queueCallback(notifyListeners)
++              queueMicrotaskShim(notifyListeners)
+             }
+           }
+           // Go ahead and process the action as usual, including reducers.
+diff --git a/packages/toolkit/src/index.ts b/packages/toolkit/src/index.ts
+index 24501035..7827f902 100644
+--- a/packages/toolkit/src/index.ts
++++ b/packages/toolkit/src/index.ts
+@@ -189,5 +189,4 @@ export {
+   SHOULD_AUTOBATCH,
+   prepareAutoBatched,
+   autoBatchEnhancer,
+-  AutoBatchOptions,
+ } from './autoBatchEnhancer'
+diff --git a/packages/toolkit/src/tests/autoBatchEnhancer.test.ts b/packages/toolkit/src/tests/autoBatchEnhancer.test.ts
+index daee5590..49c62319 100644
+--- a/packages/toolkit/src/tests/autoBatchEnhancer.test.ts
++++ b/packages/toolkit/src/tests/autoBatchEnhancer.test.ts
+@@ -1,12 +1,7 @@
+ import { configureStore } from '../configureStore'
+ import { createSlice } from '../createSlice'
+-import {
+-  autoBatchEnhancer,
+-  prepareAutoBatched,
+-  AutoBatchOptions,
+-} from '../autoBatchEnhancer'
++import { autoBatchEnhancer, prepareAutoBatched } from '../autoBatchEnhancer'
+ import { delay } from '../utils'
+-import { debounce } from 'lodash'
+ 
+ interface CounterState {
+   value: number
+@@ -31,11 +26,11 @@ const counterSlice = createSlice({
+ })
+ const { incrementBatched, decrementUnbatched } = counterSlice.actions
+ 
+-const makeStore = (autoBatchOptions?: AutoBatchOptions) => {
++const makeStore = () => {
+   return configureStore({
+     reducer: counterSlice.reducer,
+     enhancers: (existingEnhancers) => {
+-      return existingEnhancers.concat(autoBatchEnhancer(autoBatchOptions))
++      return existingEnhancers.concat(autoBatchEnhancer())
+     },
+   })
+ }
+@@ -44,29 +39,16 @@ let store: ReturnType<typeof makeStore>
+ 
+ let subscriptionNotifications = 0
+ 
+-const cases: AutoBatchOptions[] = [
+-  { type: 'tick' },
+-  { type: 'raf' },
+-  { type: 'timer', timeout: 0 },
+-  { type: 'timer', timeout: 10 },
+-  { type: 'timer', timeout: 20 },
+-  {
+-    type: 'callback',
+-    queueNotification: debounce((notify: () => void) => {
+-      notify()
+-    }, 5),
+-  },
+-]
+-
+-describe.each(cases)('autoBatchEnhancer: %j', (autoBatchOptions) => {
+-  beforeEach(() => {
+-    subscriptionNotifications = 0
+-    store = makeStore(autoBatchOptions)
++beforeEach(() => {
++  subscriptionNotifications = 0
++  store = makeStore()
+ 
+-    store.subscribe(() => {
+-      subscriptionNotifications++
+-    })
++  store.subscribe(() => {
++    subscriptionNotifications++
+   })
++})
++
++describe('autoBatchEnhancer', () => {
+   test('Does not alter normal subscription notification behavior', async () => {
+     store.dispatch(decrementUnbatched())
+     expect(subscriptionNotifications).toBe(1)
+@@ -76,7 +58,7 @@ describe.each(cases)('autoBatchEnhancer: %j', (autoBatchOptions) => {
+     expect(subscriptionNotifications).toBe(3)
+     store.dispatch(decrementUnbatched())
+ 
+-    await delay(25)
++    await delay(5)
+ 
+     expect(subscriptionNotifications).toBe(4)
+   })
+@@ -90,7 +72,7 @@ describe.each(cases)('autoBatchEnhancer: %j', (autoBatchOptions) => {
+     expect(subscriptionNotifications).toBe(0)
+     store.dispatch(incrementBatched())
+ 
+-    await delay(25)
++    await delay(5)
+ 
+     expect(subscriptionNotifications).toBe(1)
+   })
+@@ -104,7 +86,7 @@ describe.each(cases)('autoBatchEnhancer: %j', (autoBatchOptions) => {
+     expect(subscriptionNotifications).toBe(1)
+     store.dispatch(incrementBatched())
+ 
+-    await delay(25)
++    await delay(5)
+ 
+     expect(subscriptionNotifications).toBe(2)
+   })
+@@ -122,7 +104,7 @@ describe.each(cases)('autoBatchEnhancer: %j', (autoBatchOptions) => {
+     store.dispatch(decrementUnbatched())
+     expect(subscriptionNotifications).toBe(3)
+ 
+-    await delay(25)
++    await delay(5)
+ 
+     expect(subscriptionNotifications).toBe(3)
+   })

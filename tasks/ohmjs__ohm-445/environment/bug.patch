@@ -1,0 +1,436 @@
+diff --git a/packages/ohm-js/extras/extractExamples.js b/packages/ohm-js/extras/extractExamples.js
+deleted file mode 100644
+index 50dde3ca..00000000
+--- a/packages/ohm-js/extras/extractExamples.js
++++ /dev/null
+@@ -1,160 +0,0 @@
+-import * as ohm from 'ohm-js';
+-
+-export const grammarsSource = String.raw`
+-  /*
+-    Superset of the Ohm grammar that allows examples to be embedded in comments.
+-    Any valid Ohm grammar will also be matched by this grammar.
+-  */
+-
+-  // Example:
+-  //+ "//+ \"x\"\nG {\n//- \"\"\nstart = \"x\"}"
+-  OhmWithExamples <: Ohm {
+-    // The default start rule for Ohm is 'Grammars', which is syntactic rule.
+-    // When the start rule is a syntactic rule, there's no way to get access to
+-    // leading space (including comments). So, for this grammar to be useful,
+-    // you have to explicit use this rule as the start rule.
+-    grammarsWithExamples = (exampleComments applySyntactic<Grammar>)*
+-
+-    Grammar := ident SuperGrammar? "{" (#exampleComments Rule)* "}"
+-
+-    exampleComments = (spacesNoExampleComment exampleComment)*
+-
+-    // Examples:
+-    //+ "//+ \"blah\""
+-    //+ "//- \"one\", \"two\""
+-    //- "// - \"x\", "//-\"x\"
+-    exampleComment
+-      = "//+" examples  -- positive
+-      | "//-" examples  -- negative
+-
+-    examples = spaceNoNl+ nonemptyListOf<jsonString, exampleSep> spaceNoNl*
+-    exampleSep = "," spaces
+-
+-    exampleCommentPrefix = "//+" | "//-"  
+-
+-    spaceNoNl = ~"\n" space
+-    spacesNoExampleComment = (~exampleCommentPrefix space)*
+-
+-    jsonString = "\"" jsonChar* "\""
+-
+-    jsonChar
+-      = jsonEscape
+-      | ~"\\" ~"\"" "\u{0020}".."\u{10FFFF}"
+-
+-    //+ "\\n", "\\u1234"
+-    jsonEscape  (a JSON escape sequence)
+-      = "\\\""
+-      | "\\\\"
+-      | "\\/"
+-      | "\\b"
+-      | "\\f"
+-      | "\\n"
+-      | "\\r"
+-      | "\\t"
+-      | "\\u" hexDigit hexDigit hexDigit hexDigit  -- unicodeEscape
+-  }
+-
+-  /*
+-    A stricter version of the grammar that prevents many malformed example
+-    comments from being parsed as regular comments.
+-  */
+-  OhmWithExamplesStrict <: OhmWithExamples {
+-    // Redefine 'comment' to avoid malformed example comments from silently
+-    // being parsed as regular comments.
+-    comment :=
+-      | ~exampleCommentPrefix comment_singleLine
+-      | comment_multiLine
+-  }
+-`;
+-
+-export const grammars = ohm.grammars(grammarsSource, {Ohm: ohm.ohmGrammar});
+-
+-const semantics = grammars.OhmWithExamples.createSemantics().addOperation('hasExamples', {
+-  _iter(...children) {
+-    return children.some(c => c.hasExamples());
+-  },
+-  exampleComments(_, commentIter) {
+-    return commentIter.numChildren > 0;
+-  },
+-});
+-
+-semantics.addOperation('examples', {
+-  grammarsWithExamples(exampleCommentsIter, grammarIter) {
+-    const result = [];
+-    for (const [i, child] of Object.entries(grammarIter.children)) {
+-      if (exampleCommentsIter.hasExamples()) {
+-        const defaultExamples = exampleCommentsIter.child(i).examples();
+-        const grammar = child.grammarName();
+-        result.push(...defaultExamples.map(ex => ({...ex, grammar, rule: ''})));
+-      }
+-      result.push(...child.examples());
+-    }
+-    return result;
+-  },
+-  Grammar(name, _, _open, exampleCommentsIter, ruleIter, _close) {
+-    const result = [];
+-    const grammar = this.grammarName();
+-    for (let i = 0; i < ruleIter.numChildren; i++) {
+-      const rule = ruleIter.child(i).ruleName();
+-
+-      // Augment each of the examples with the grammar and rule name.
+-      const examples = exampleCommentsIter.child(i).examples();
+-      const augmentedExamples = examples.map(ex => ({...ex, grammar, rule}));
+-
+-      result.push(...augmentedExamples);
+-    }
+-    return result;
+-  },
+-  exampleComments(_, commentIter) {
+-    return commentIter.children.flatMap(c => c.examples());
+-  },
+-  exampleComment_positive(_, examples) {
+-    return examples.examples().map(ex => ({...ex, shouldMatch: true}));
+-  },
+-  exampleComment_negative(_, examples) {
+-    return examples.examples().map(ex => ({...ex, shouldMatch: false}));
+-  },
+-  examples(_ws, jsonStringList, _) {
+-    return jsonStringList.asIteration().children.map(t => {
+-      return {example: JSON.parse(t.sourceString)};
+-    });
+-  },
+-  comment_singleLine(_, commentCharIter, _nl) {
+-    return [];
+-  },
+-  comment_multiLine(_, commentCharIter, _nl) {
+-    return [];
+-  },
+-});
+-
+-semantics.addOperation('grammarName', {
+-  Grammar(name, _, _open, exampleCommentsIter, ruleIter, _close) {
+-    return name.sourceString;
+-  },
+-});
+-
+-semantics.addOperation('ruleName', {
+-  Rule_define(ident, _formals, _desc, _, _body) {
+-    return ident.sourceString;
+-  },
+-  Rule_override(ident, _formals, _, _body) {
+-    return ident.sourceString;
+-  },
+-  Rule_extend(ident, _formals, _, _body) {
+-    return ident.sourceString;
+-  },
+-});
+-
+-/** @typedef {{grammar: string, rule: string, example: string, shouldMatch: boolean}} Example */
+-
+-/**
+- * @param {string} grammarsDef - A string containing one or more grammar definitions.
+- * @return {[Example]}
+- */
+-export function extractExamples(grammarsDef) {
+-  const matchResult = grammars.OhmWithExamples.match(grammarsDef, 'grammarsWithExamples');
+-  if (matchResult.failed()) {
+-    throw new Error(matchResult.message);
+-  }
+-  return semantics(matchResult).examples();
+-}
+diff --git a/packages/ohm-js/extras/index.d.ts b/packages/ohm-js/extras/index.d.ts
+index 506721be..abe4c0bf 100644
+--- a/packages/ohm-js/extras/index.d.ts
++++ b/packages/ohm-js/extras/index.d.ts
+@@ -29,18 +29,3 @@ export function getLineAndColumnMessage(
+   offset: number,
+   ...ranges: number[][]
+ ): string;
+-
+-interface Example {
+-  grammar: string;
+-  rule: string;
+-  example: string;
+-  shouldMatch: boolean;
+-}
+-
+-/**
+- * Given a string containing one or more grammar definitions, returns an array
+- * of examples extracted from the comments.
+- * Positive examples look like `//+ "one", "two"` and negative examples like
+- * `//- "shouldn't match"`. The examples text is a JSON string.
+- */
+-export function extractExamples(grammarsDef: string): [Example];
+diff --git a/packages/ohm-js/extras/index.mjs b/packages/ohm-js/extras/index.mjs
+index 4e0b03d7..4c4e7be0 100644
+--- a/packages/ohm-js/extras/index.mjs
++++ b/packages/ohm-js/extras/index.mjs
+@@ -1,4 +1,3 @@
+ export {getLineAndColumnMessage, getLineAndColumn} from '../src/util.js';
+ export {VisitorFamily} from './VisitorFamily.js';
+ export {semanticsForToAST, toAST} from './semantics-toAST.js';
+-export {extractExamples} from './extractExamples.js';
+diff --git a/packages/ohm-js/extras/ohm-with-examples.ohm b/packages/ohm-js/extras/ohm-with-examples.ohm
+deleted file mode 100644
+index 2afbd46c..00000000
+--- a/packages/ohm-js/extras/ohm-with-examples.ohm
++++ /dev/null
+@@ -1,46 +0,0 @@
+-/*
+-  Superset of the Ohm grammar that allows examples to be embedded in comments.
+-  Any valid Ohm grammar will also be matched by this grammar.
+- */
+-
+-// Example:
+-//+ "//+ \"x\"\nG {\n//- \"\"\nstart = \"x\"}"
+-OhmWithExamples <: Ohm {
+-  // The default start rule for Ohm is 'Grammars', which is syntactic rule.
+-  // When the start rule is a syntactic rule, there's no way to get access to
+-  // leading space (including comments). So, for this grammar to be useful,
+-  // you have to explicit use this rule as the start rule.
+-  grammarsWithExamples = (exampleComments applySyntactic<Grammar>)*
+-
+-  Grammar := ident SuperGrammar? "{" (#exampleComments Rule)* "}"
+-
+-  exampleComments = (spacesNoExampleComment exampleComment)*
+-
+-  // Examples:
+-  //+ "//+ \"blah\""
+-  //+ "//- \"one\", \"two\""
+-  //- "// - \"x\", "//-\"x\"
+-  exampleComment
+-    = "//+" examples  -- positive
+-    | "//-" examples  -- negative
+-
+-  examples = spaceNoNl+ nonemptyListOf<terminal, exampleSep> spaceNoNl*
+-  exampleSep = "," spaces
+-
+-  exampleCommentPrefix = "//+" | "//-"  
+-
+-  spaceNoNl = ~"\n" space
+-  spacesNoExampleComment = (~exampleCommentPrefix space)*
+-}
+-
+-/*
+-  A stricter version of the grammar that prevents many malformed example
+-  comments from being parsed as regular comments.
+- */
+-OhmWithExamplesStrict <: OhmWithExamples {
+-  // Redefine 'comment' to avoid malformed example comments from silently
+-  // being parsed as regular comments.
+-  comment :=
+-    | ~exampleCommentPrefix comment_singleLine
+-    | comment_multiLine
+-}
+diff --git a/packages/ohm-js/test/extras/test-extractExamples.js b/packages/ohm-js/test/extras/test-extractExamples.js
+deleted file mode 100644
+index 04d3a466..00000000
+--- a/packages/ohm-js/test/extras/test-extractExamples.js
++++ /dev/null
+@@ -1,134 +0,0 @@
+-import test from 'ava';
+-import {extractExamples, grammars, grammarsSource} from '../../extras/extractExamples.js';
+-
+-test('empty', t => {
+-  t.deepEqual(extractExamples(''), []);
+-});
+-
+-test('grammar with no examples', t => {
+-  t.deepEqual(extractExamples('G { }'), []);
+-});
+-
+-test('simple positive examples', t => {
+-  let examples = extractExamples(`
+-    G {
+-      //+ "x"
+-      start = "x"
+-    }
+-  `);
+-  t.deepEqual(examples, [{grammar: 'G', rule: 'start', example: 'x', shouldMatch: true}]);
+-
+-  examples = extractExamples(`
+-    G {
+-      //+ ""
+-      start = ""
+-
+-      //+ "x"
+-      other = ""
+-    }
+-  `);
+-  t.deepEqual(examples, [
+-    {grammar: 'G', rule: 'start', example: '', shouldMatch: true},
+-    {grammar: 'G', rule: 'other', example: 'x', shouldMatch: true},
+-  ]);
+-});
+-
+-test('examples for default start rule', t => {
+-  let examples = extractExamples(`
+-    //+ "hey"
+-    G {
+-      //+ ""
+-      start = ""
+-    }
+-  `);
+-  t.deepEqual(examples, [
+-    {grammar: 'G', rule: '', example: 'hey', shouldMatch: true},
+-    {grammar: 'G', rule: 'start', example: '', shouldMatch: true},
+-  ]);
+-
+-  examples = extractExamples(`
+-    //+ "hey"
+-    G {
+-      //+ ""
+-      start = ""
+-    }
+-  `);
+-  t.deepEqual(examples, [
+-    {grammar: 'G', rule: '', example: 'hey', shouldMatch: true},
+-    {grammar: 'G', rule: 'start', example: '', shouldMatch: true},
+-  ]);
+-});
+-
+-test('top-level whitespace', t => {
+-  const expected = [{grammar: 'G', rule: '', example: '', shouldMatch: true}];
+-  t.deepEqual(extractExamples('  //+ ""\n  G{}'), expected);
+-  t.deepEqual(extractExamples('  //+ "" \nG{}'), expected);
+-  t.deepEqual(extractExamples('\n\n//+ ""\n\nG{}'), expected);
+-});
+-
+-function getExamples(input) {
+-  return extractExamples(`G { ${input}\nstart = }`).map(({example, shouldMatch}) => {
+-    return {example, shouldMatch};
+-  });
+-}
+-
+-test('example comments - negative examples', t => {
+-  t.deepEqual(getExamples('//- "blah"\n'), [{example: 'blah', shouldMatch: false}]);
+-  t.deepEqual(
+-      getExamples(`
+-      //+ "blah"
+-      //- "wooo"`),
+-      [
+-        {example: 'blah', shouldMatch: true},
+-        {example: 'wooo', shouldMatch: false},
+-      ],
+-  );
+-  //  t.throws(() => getExamples('//-"x"'), null, 'space required after "-"');
+-  t.deepEqual(getExamples('// - "x"'), [], 'parsed as a normal comment');
+-});
+-
+-test('example comments - corner cases', t => {
+-  t.deepEqual(
+-      getExamples('//+ "blah"\n\n'),
+-      [{example: 'blah', shouldMatch: true}],
+-      'extra blank lines before rule',
+-  );
+-  t.deepEqual(
+-      getExamples(`
+-      //+ "blah"
+-      //+    "wooo"`),
+-      [
+-        {example: 'blah', shouldMatch: true},
+-        {example: 'wooo', shouldMatch: true},
+-      ],
+-      'extra leading space',
+-  );
+-  // t.throws(() => {
+-  //   t.deepEqual(getExamples('//+ '), [], 'no terminals');
+-  // });
+-  t.deepEqual(getExamples('//+ "" '), [{example: '', shouldMatch: true}], 'trailing space');
+-  t.deepEqual(
+-      getExamples('//+ ""\n//- ""'),
+-      [
+-        {example: '', shouldMatch: true},
+-        {example: '', shouldMatch: false},
+-      ],
+-      'contradictory examples',
+-  );
+-  t.deepEqual(
+-      getExamples('//+ ""\n//+ ""'),
+-      [
+-        {example: '', shouldMatch: true},
+-        {example: '', shouldMatch: true},
+-      ],
+-      'duplicate examples',
+-  );
+-});
+-
+-test('extracted examples', t => {
+-  for (const {grammar, rule, example, shouldMatch} of extractExamples(grammarsSource)) {
+-    const g = grammars[grammar];
+-    const startRule = rule === '' ? undefined : rule;
+-    t.is(g.match(example, startRule).succeeded(), shouldMatch, `${example}`);
+-  }
+-});
+diff --git a/packages/packaging-tests/test/test-commonjs.cjs b/packages/packaging-tests/test/test-commonjs.cjs
+index 75a34149..618990f2 100644
+--- a/packages/packaging-tests/test/test-commonjs.cjs
++++ b/packages/packaging-tests/test/test-commonjs.cjs
+@@ -16,9 +16,8 @@ function checkExports(exports) {
+ function checkExtrasExports(extras) {
+   assert.equal(typeof extras.VisitorFamily, 'function');
+   assert.equal(typeof extras.toAST, 'function');
+-  assert.equal(typeof extras.extractExamples, 'function');
+   assert.not('default' in exports, 'there should be no default export');
+-  assert.ok(Object.keys(extras).length === 6);
++  assert.ok(Object.keys(extras).length === 5);
+ }
+ 
+ test('Core CommonJS exports', async () => {
+diff --git a/packages/packaging-tests/test/test-esm.mjs b/packages/packaging-tests/test/test-esm.mjs
+index 60fed83d..982055e5 100644
+--- a/packages/packaging-tests/test/test-esm.mjs
++++ b/packages/packaging-tests/test/test-esm.mjs
+@@ -21,8 +21,7 @@ test('Main exports (ESM)', async () => {
+ test('Extras exports (ESM)', async () => {
+   assert.equal(typeof extras.VisitorFamily, 'function');
+   assert.equal(typeof extras.toAST, 'function');
+-  assert.equal(typeof extras.extractExamples, 'function');
+-  assert.ok(Object.keys(extras).length === 6);
++  assert.ok(Object.keys(extras).length === 5);
+ 
+   const exports = await import('ohm-js/extras');
+   assert.not('default' in exports, 'there should be no default export');
+diff --git a/packages/packaging-tests/test/test-ts.ts b/packages/packaging-tests/test/test-ts.ts
+index c4af0bc8..8dd987b8 100644
+--- a/packages/packaging-tests/test/test-ts.ts
++++ b/packages/packaging-tests/test/test-ts.ts
+@@ -20,11 +20,7 @@ test('Main exports (TS)', async () => {
+ test('Extras exports (TS)', async () => {
+   //  assert.equal(typeof extras.VisitorFamily, 'function');
+   assert.equal(typeof extras.toAST, 'function');
+-  assert.ok(Object.keys(extras).length === 6);
+-
+-  const ex: {grammar: string; rule: string; example: string; shouldMatch: boolean} =
+-    extras.extractExamples('//+ ""\nG{}')[0];
+-  assert.equal(ex.grammar, 'G');
++  assert.ok(Object.keys(extras).length === 5);
+ 
+   const exports = await import('ohm-js/extras');
+   assert.equal((exports as any).default, undefined, 'there should be no default export');

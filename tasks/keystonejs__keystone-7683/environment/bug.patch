@@ -1,0 +1,2679 @@
+diff --git a/.changeset/fast-gorillas-build.md b/.changeset/fast-gorillas-build.md
+new file mode 100644
+index 000000000..c3037422f
+--- /dev/null
++++ b/.changeset/fast-gorillas-build.md
+@@ -0,0 +1,5 @@
++---
++'@keystone-6/fields-document': patch
++---
++
++Fixes pasting plain text in the document editor removing markdown link definition and usages 
+diff --git a/.changeset/light-balloons-repair.md b/.changeset/light-balloons-repair.md
+deleted file mode 100644
+index ce540580b..000000000
+--- a/.changeset/light-balloons-repair.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'@keystone-6/core': minor
+----
+-
+-Adds a new `multiselect` field type
+diff --git a/docs/pages/docs/apis/fields.mdx b/docs/pages/docs/apis/fields.mdx
+index d816583f4..d44794478 100644
+--- a/docs/pages/docs/apis/fields.mdx
++++ b/docs/pages/docs/apis/fields.mdx
+@@ -544,58 +544,6 @@ export default config({
+ });
+ ```
+ 
+-### multiselect
+-
+-A `multiselect` field represents the selection of a set of values from the defined `options`.
+-Values can be either strings, integers, or enum values, as determined by the `type` option.
+-This will determine their GraphQL data type.
+-Unlike the `select` field, the `type` will not change the database type, `multiselect` fields are always stored as a json array in the database.
+-
+-Options:
+-
+-- `type` (default: `'string'`): Sets the type of the values of this field.
+-  Must be one of `['string', 'enum', 'integer']`.
+-- `options`: An array of `{ label, value }`.
+-  `label` is a string to be displayed in the Admin UI.
+-  `value` is either a `string` (for `{ type: 'string' }` or `{ type: 'enum' }`), or a `number` (for `{ type: 'integer' }`).
+-  The `value` will be used in the GraphQL API and stored in the database.
+-- `defaultValue` (default: `[]`): This value will be used for the field when creating items if no explicit value is set.
+-- `db.map`: Adds a [Prisma `@map`](https://www.prisma.io/docs/reference/api-reference/prisma-schema-reference#map) attribute to this field which changes the column name in the database
+-- `graphql.read.isNonNull` (default: `false`): If you have no read access control and you don't intend to add any in the future,
+-  you can set this to true and the output field will be non-nullable. This is only allowed when you have no read access control because otherwise,
+-  when access is denied, `null` will be returned which will cause an error since the field is non-nullable and the error
+-  will propagate up until a nullable field is found which means the entire item will be unreadable and when doing an `items` query, all the items will be unreadable.
+-- `graphql.create.isNonNull` (default: `false`): If you have no create access control and you want to explicitly show that this is field is non-nullable in the create input
+-  you can set this to true and the create field will be non-nullable and have a default value at the GraphQL level.
+-  This is only allowed when you have no create access control because otherwise, the item will always fail access control
+-  if a user doesn't have access to create the particular field regardless of whether or not they specify the field in the create.
+-
+-```typescript
+-import { config, list } from '@keystone-6/core';
+-import { multiselect } from '@keystone-6/core/fields';
+-
+-export default config({
+-  lists: {
+-    ListName: list({
+-      fields: {
+-        fieldName: multiselect({
+-          type: 'enum',
+-          options: [
+-            { label: '...', value: '...' },
+-            /* ... */
+-          ],
+-          defaultValue: ['...'],
+-          db: { map: 'my_multiselect' },
+-        }),
+-        /* ... */
+-      },
+-    }),
+-    /* ... */
+-  },
+-  /* ... */
+-});
+-```
+-
+ ### text
+ 
+ A `text` field represents a string value.
+diff --git a/packages/core/fields/types/multiselect/views/package.json b/packages/core/fields/types/multiselect/views/package.json
+deleted file mode 100644
+index ec84a47fc..000000000
+--- a/packages/core/fields/types/multiselect/views/package.json
++++ /dev/null
+@@ -1,4 +0,0 @@
+-{
+-  "main": "dist/keystone-6-core-fields-types-multiselect-views.cjs.js",
+-  "module": "dist/keystone-6-core-fields-types-multiselect-views.esm.js"
+-}
+diff --git a/packages/core/src/fields/index.ts b/packages/core/src/fields/index.ts
+index a9000cef3..0874f6195 100644
+--- a/packages/core/src/fields/index.ts
++++ b/packages/core/src/fields/index.ts
+@@ -28,5 +28,3 @@ export { virtual } from './types/virtual';
+ export type { VirtualFieldConfig } from './types/virtual';
+ export { calendarDay } from './types/calendarDay';
+ export type { CalendarDayFieldConfig } from './types/calendarDay';
+-export { multiselect } from './types/multiselect';
+-export type { MultiselectFieldConfig } from './types/multiselect';
+diff --git a/packages/core/src/fields/types/multiselect/index.ts b/packages/core/src/fields/types/multiselect/index.ts
+deleted file mode 100644
+index 073847e25..000000000
+--- a/packages/core/src/fields/types/multiselect/index.ts
++++ /dev/null
+@@ -1,210 +0,0 @@
+-import inflection from 'inflection';
+-import { humanize } from '../../../lib/utils';
+-import {
+-  BaseListTypeInfo,
+-  FieldTypeFunc,
+-  CommonFieldConfig,
+-  FieldData,
+-  jsonFieldTypePolyfilledForSQLite,
+-} from '../../../types';
+-import { graphql } from '../../..';
+-import { assertCreateIsNonNullAllowed, assertReadIsNonNullAllowed } from '../../non-null-graphql';
+-import { resolveView } from '../../resolve-view';
+-import { userInputError } from '../../../lib/core/graphql-errors';
+-
+-export type MultiselectFieldConfig<ListTypeInfo extends BaseListTypeInfo> =
+-  CommonFieldConfig<ListTypeInfo> &
+-    (
+-      | {
+-          /**
+-           * When a value is provided as just a string, it will be formatted in the same way
+-           * as field labels are to create the label.
+-           */
+-          options: readonly ({ label: string; value: string } | string)[];
+-          /**
+-           * If `enum` is provided on SQLite, it will use an enum in GraphQL but a string in the database.
+-           */
+-          type?: 'string' | 'enum';
+-          defaultValue?: readonly string[];
+-        }
+-      | {
+-          options: readonly { label: string; value: number }[];
+-          type: 'integer';
+-          defaultValue?: readonly number[];
+-        }
+-    ) & {
+-      graphql?: {
+-        create?: {
+-          isNonNull?: boolean;
+-        };
+-        read?: {
+-          isNonNull?: boolean;
+-        };
+-      };
+-      db?: {
+-        map?: string;
+-      };
+-    };
+-
+-// These are the max and min values available to a 32 bit signed integer
+-const MAX_INT = 2147483647;
+-const MIN_INT = -2147483648;
+-
+-export const multiselect =
+-  <ListTypeInfo extends BaseListTypeInfo>({
+-    ui,
+-    defaultValue = [],
+-    ...config
+-  }: MultiselectFieldConfig<ListTypeInfo>): FieldTypeFunc<ListTypeInfo> =>
+-  meta => {
+-    if ((config as any).isIndexed === 'unique') {
+-      throw Error("isIndexed: 'unique' is not a supported option for field type multiselect");
+-    }
+-    const fieldLabel = config.label ?? humanize(meta.fieldKey);
+-    assertReadIsNonNullAllowed(meta, config, false);
+-
+-    assertCreateIsNonNullAllowed(meta, config);
+-
+-    const output = <T extends graphql.NullableOutputType>(type: T) =>
+-      config.graphql?.read?.isNonNull ? graphql.nonNull(nonNullList(type)) : nonNullList(type);
+-
+-    const create = <T extends graphql.NullableInputType>(type: T) => {
+-      const list = nonNullList(type);
+-      if (config.graphql?.read?.isNonNull) {
+-        return graphql.arg({
+-          type: graphql.nonNull(list),
+-          defaultValue: defaultValue as any,
+-        });
+-      }
+-      return graphql.arg({ type: list });
+-    };
+-
+-    const resolveCreate = <T extends string | number>(val: T[] | null | undefined): T[] => {
+-      const resolved = resolveUpdate(val);
+-      if (resolved === undefined) {
+-        return defaultValue as T[];
+-      }
+-      return resolved;
+-    };
+-    const resolveUpdate = <T extends string | number>(
+-      val: T[] | null | undefined
+-    ): T[] | undefined => {
+-      if (val === null) {
+-        throw userInputError('multiselect fields cannot be set to null');
+-      }
+-      return val;
+-    };
+-
+-    const transformedConfig = configToOptionsAndGraphQLType(config, meta);
+-
+-    const possibleValues = new Set(transformedConfig.options.map(x => x.value));
+-    if (possibleValues.size !== transformedConfig.options.length) {
+-      throw new Error(
+-        `The multiselect field at ${meta.listKey}.${meta.fieldKey} has duplicate options, this is not allowed`
+-      );
+-    }
+-
+-    return jsonFieldTypePolyfilledForSQLite(
+-      meta.provider,
+-      {
+-        ui,
+-        hooks: {
+-          ...config.hooks,
+-          async validateInput(args) {
+-            const selectedValues: readonly (string | number)[] | undefined =
+-              args.inputData[meta.fieldKey];
+-            if (selectedValues !== undefined) {
+-              for (const value of selectedValues) {
+-                if (!possibleValues.has(value)) {
+-                  args.addValidationError(`${value} is not a possible value for ${fieldLabel}`);
+-                }
+-              }
+-              const uniqueValues = new Set(selectedValues);
+-              if (uniqueValues.size !== selectedValues.length) {
+-                args.addValidationError(`${fieldLabel} must have a unique set of options selected`);
+-              }
+-            }
+-
+-            await config.hooks?.validateInput?.(args);
+-          },
+-        },
+-        views: resolveView('multiselect/views'),
+-        getAdminMeta: () => ({
+-          options: transformedConfig.options,
+-          type: config.type ?? 'string',
+-          defaultValue: [],
+-        }),
+-        input: {
+-          create: { arg: create(transformedConfig.graphqlType), resolve: resolveCreate },
+-          update: {
+-            arg: graphql.arg({ type: nonNullList(transformedConfig.graphqlType) }),
+-            resolve: resolveUpdate,
+-          },
+-        },
+-        output: graphql.field({
+-          type: output(transformedConfig.graphqlType),
+-          resolve({ value }) {
+-            return value as any;
+-          },
+-        }),
+-      },
+-      {
+-        mode: 'required',
+-        map: config?.db?.map,
+-        default: { kind: 'literal', value: JSON.stringify(defaultValue) },
+-      }
+-    );
+-  };
+-
+-function configToOptionsAndGraphQLType(
+-  config: MultiselectFieldConfig<BaseListTypeInfo>,
+-  meta: FieldData
+-) {
+-  if (config.type === 'integer') {
+-    if (
+-      config.options.some(
+-        ({ value }) => !Number.isInteger(value) || value > MAX_INT || value < MIN_INT
+-      )
+-    ) {
+-      throw new Error(
+-        `The multiselect field at ${meta.listKey}.${meta.fieldKey} specifies integer values that are outside the range of a 32 bit signed integer`
+-      );
+-    }
+-    return {
+-      type: 'integer' as const,
+-      graphqlType: graphql.Int,
+-      options: config.options,
+-    };
+-  }
+-
+-  const options = config.options.map(option => {
+-    if (typeof option === 'string') {
+-      return {
+-        label: humanize(option),
+-        value: option,
+-      };
+-    }
+-    return option;
+-  });
+-
+-  if (config.type === 'enum') {
+-    const enumName = `${meta.listKey}${inflection.classify(meta.fieldKey)}Type`;
+-    const graphqlType = graphql.enum({
+-      name: enumName,
+-      values: graphql.enumValues(options.map(x => x.value)),
+-    });
+-    return {
+-      type: 'enum' as const,
+-      graphqlType,
+-      options,
+-    };
+-  }
+-  return {
+-    type: 'string' as const,
+-    graphqlType: graphql.String,
+-    options,
+-  };
+-}
+-
+-const nonNullList = <T extends graphql.NullableType>(type: T) =>
+-  graphql.list(graphql.nonNull(type));
+diff --git a/packages/core/src/fields/types/multiselect/tests/test-fixtures.ts b/packages/core/src/fields/types/multiselect/tests/test-fixtures.ts
+deleted file mode 100644
+index d0eb612ab..000000000
+--- a/packages/core/src/fields/types/multiselect/tests/test-fixtures.ts
++++ /dev/null
+@@ -1,134 +0,0 @@
+-import { multiselect } from '..';
+-
+-type MatrixValue = typeof testMatrix[number];
+-
+-export const name = 'multiselect';
+-export const typeFunction = multiselect;
+-export const exampleValue = (matrixValue: MatrixValue) =>
+-  matrixValue === 'enum'
+-    ? ['thinkmill', 'atlassian']
+-    : matrixValue === 'string'
+-    ? ['something else', 'a string']
+-    : [1, 3];
+-export const exampleValue2 = (matrixValue: MatrixValue) =>
+-  matrixValue === 'enum'
+-    ? ['react', 'gelato']
+-    : matrixValue === 'string'
+-    ? ['a string', '1number']
+-    : [2, 4];
+-export const supportsNullInput = false;
+-export const neverNull = true;
+-export const supportsUnique = false;
+-export const supportsDbMap = true;
+-export const skipRequiredTest = true;
+-export const fieldConfig = (matrixValue: MatrixValue) => {
+-  if (matrixValue === 'enum' || matrixValue === 'string') {
+-    return {
+-      type: matrixValue,
+-      options:
+-        matrixValue === 'enum'
+-          ? [
+-              { label: 'Thinkmill', value: 'thinkmill' },
+-              { label: 'Atlassian', value: 'atlassian' },
+-              { label: 'Thomas Walker Gelato', value: 'gelato' },
+-              { label: 'Cete, or Seat, or Attend ¯\\_(ツ)_/¯', value: 'cete' },
+-              { label: 'React', value: 'react' },
+-            ]
+-          : matrixValue === 'string'
+-          ? [
+-              { label: 'A string', value: 'a string' },
+-              { label: 'Another string', value: 'another string' },
+-              { label: '1number', value: '1number' },
+-              { label: '@¯\\_(ツ)_/¯', value: '@¯\\_(ツ)_/¯' },
+-              { label: 'something else', value: 'something else' },
+-            ]
+-          : [],
+-    };
+-  }
+-  return {
+-    type: matrixValue,
+-    options: [
+-      { label: 'One', value: 1 },
+-      { label: 'Two', value: 2 },
+-      { label: 'Three', value: 3 },
+-      { label: 'Four', value: 4 },
+-      { label: 'Five', value: 5 },
+-    ],
+-  };
+-};
+-export const fieldName = 'company';
+-
+-export const testMatrix = ['enum', 'string', 'integer'] as const;
+-
+-export const getTestFields = (matrixValue: MatrixValue) => ({
+-  company: multiselect(fieldConfig(matrixValue)),
+-});
+-
+-export const initItems = (matrixValue: MatrixValue) => {
+-  if (matrixValue === 'enum') {
+-    return [
+-      { name: 'a', company: ['thinkmill', 'atlassian', 'gelato'] },
+-      { name: 'b', company: ['atlassian', 'react'] },
+-      { name: 'c', company: ['gelato'] },
+-      { name: 'd', company: ['cete'] },
+-      { name: 'e', company: ['react'] },
+-      { name: 'f', company: [] },
+-      { name: 'g' },
+-    ];
+-  } else if (matrixValue === 'string') {
+-    return [
+-      { name: 'a', company: ['a string', '@¯\\_(ツ)_/¯', '1number'] },
+-      { name: 'b', company: ['@¯\\_(ツ)_/¯'] },
+-      { name: 'c', company: ['another string'] },
+-      { name: 'd', company: ['1number'] },
+-      { name: 'e', company: ['something else'] },
+-      { name: 'f', company: [] },
+-      { name: 'g' },
+-    ];
+-  } else if (matrixValue === 'integer') {
+-    return [
+-      { name: 'a', company: [1, 2, 3] },
+-      { name: 'b', company: [2] },
+-      { name: 'c', company: [3] },
+-      { name: 'd', company: [4] },
+-      { name: 'e', company: [5] },
+-      { name: 'f', company: [] },
+-      { name: 'g' },
+-    ];
+-  }
+-  return [];
+-};
+-
+-export const storedValues = (matrixValue: MatrixValue) => {
+-  if (matrixValue === 'enum') {
+-    return [
+-      { name: 'a', company: ['thinkmill', 'atlassian', 'gelato'] },
+-      { name: 'b', company: ['atlassian', 'react'] },
+-      { name: 'c', company: ['gelato'] },
+-      { name: 'd', company: ['cete'] },
+-      { name: 'e', company: ['react'] },
+-      { name: 'f', company: [] },
+-      { name: 'g', company: [] },
+-    ];
+-  } else if (matrixValue === 'string') {
+-    return [
+-      { name: 'a', company: ['a string', '@¯\\_(ツ)_/¯', '1number'] },
+-      { name: 'b', company: ['@¯\\_(ツ)_/¯'] },
+-      { name: 'c', company: ['another string'] },
+-      { name: 'd', company: ['1number'] },
+-      { name: 'e', company: ['something else'] },
+-      { name: 'f', company: [] },
+-      { name: 'g', company: [] },
+-    ];
+-  } else if (matrixValue === 'integer') {
+-    return [
+-      { name: 'a', company: [1, 2, 3] },
+-      { name: 'b', company: [2] },
+-      { name: 'c', company: [3] },
+-      { name: 'd', company: [4] },
+-      { name: 'e', company: [5] },
+-      { name: 'f', company: [] },
+-      { name: 'g', company: [] },
+-    ];
+-  }
+-};
+diff --git a/packages/core/src/fields/types/multiselect/views/index.tsx b/packages/core/src/fields/types/multiselect/views/index.tsx
+deleted file mode 100644
+index a87c7a25a..000000000
+--- a/packages/core/src/fields/types/multiselect/views/index.tsx
++++ /dev/null
+@@ -1,107 +0,0 @@
+-/** @jsxRuntime classic */
+-/** @jsx jsx */
+-import { Fragment } from 'react';
+-import { jsx } from '@keystone-ui/core';
+-import { FieldContainer, FieldDescription, FieldLabel, MultiSelect } from '@keystone-ui/fields';
+-import {
+-  CardValueComponent,
+-  CellComponent,
+-  FieldController,
+-  FieldControllerConfig,
+-  FieldProps,
+-} from '../../../../types';
+-import { CellContainer, CellLink } from '../../../../admin-ui/components';
+-
+-export const Field = ({ field, value, onChange, autoFocus }: FieldProps<typeof controller>) => {
+-  return (
+-    <FieldContainer>
+-      <Fragment>
+-        <FieldLabel htmlFor={field.path}>{field.label}</FieldLabel>
+-        <FieldDescription id={`${field.path}-description`}>{field.description}</FieldDescription>
+-        <MultiSelect
+-          id={field.path}
+-          isClearable
+-          autoFocus={autoFocus}
+-          options={field.options}
+-          isDisabled={onChange === undefined}
+-          onChange={newVal => {
+-            onChange?.(newVal);
+-          }}
+-          value={value}
+-          aria-describedby={field.description === null ? undefined : `${field.path}-description`}
+-          portalMenu
+-        />
+-      </Fragment>
+-    </FieldContainer>
+-  );
+-};
+-
+-export const Cell: CellComponent<typeof controller> = ({ item, field, linkTo }) => {
+-  const value: readonly string[] | readonly number[] = item[field.path] ?? [];
+-  const label = value.map(value => field.valuesToOptionsWithStringValues[value].label).join(', ');
+-  return linkTo ? <CellLink {...linkTo}>{label}</CellLink> : <CellContainer>{label}</CellContainer>;
+-};
+-Cell.supportsLinkTo = true;
+-
+-export const CardValue: CardValueComponent<typeof controller> = ({ item, field }) => {
+-  const value: readonly string[] | readonly number[] = item[field.path] ?? [];
+-  const label = value.map(value => field.valuesToOptionsWithStringValues[value].label).join(', ');
+-
+-  return (
+-    <FieldContainer>
+-      <FieldLabel>{field.label}</FieldLabel>
+-      {label}
+-    </FieldContainer>
+-  );
+-};
+-
+-export type AdminMultiSelectFieldMeta = {
+-  options: readonly { label: string; value: string | number }[];
+-  type: 'string' | 'integer' | 'enum';
+-  defaultValue: string[] | number[];
+-};
+-
+-type Config = FieldControllerConfig<AdminMultiSelectFieldMeta>;
+-
+-type Option = { label: string; value: string };
+-
+-type Value = readonly Option[];
+-
+-export const controller = (
+-  config: Config
+-): FieldController<Value, Option[]> & {
+-  options: Option[];
+-  type: 'string' | 'integer' | 'enum';
+-  valuesToOptionsWithStringValues: Record<string, Option>;
+-} => {
+-  const optionsWithStringValues = config.fieldMeta.options.map(x => ({
+-    label: x.label,
+-    value: x.value.toString(),
+-  }));
+-
+-  const valuesToOptionsWithStringValues = Object.fromEntries(
+-    optionsWithStringValues.map(option => [option.value, option])
+-  );
+-
+-  const parseValue = (value: string) =>
+-    config.fieldMeta.type === 'integer' ? parseInt(value) : value;
+-
+-  return {
+-    path: config.path,
+-    label: config.label,
+-    description: config.description,
+-    graphqlSelection: config.path,
+-    defaultValue: config.fieldMeta.defaultValue.map(x => valuesToOptionsWithStringValues[x]),
+-    type: config.fieldMeta.type,
+-    options: optionsWithStringValues,
+-    valuesToOptionsWithStringValues,
+-    deserialize: data => {
+-      // if we get null from the GraphQL API (which will only happen if field read access control failed)
+-      // we'll just show it as nothing being selected for now.
+-      const values: readonly string[] | readonly number[] = data[config.path] ?? [];
+-      const selectedOptions = values.map(x => valuesToOptionsWithStringValues[x]);
+-      return selectedOptions;
+-    },
+-    serialize: value => ({ [config.path]: value.map(x => parseValue(x.value)) }),
+-  };
+-};
+diff --git a/packages/fields-document/package.json b/packages/fields-document/package.json
+index f870db185..7b37028e5 100644
+--- a/packages/fields-document/package.json
++++ b/packages/fields-document/package.json
+@@ -45,7 +45,6 @@
+     "io-ts-excess": "^1.0.1",
+     "is-hotkey": "^0.2.0",
+     "match-sorter": "^6.3.1",
+-    "mdast-util-definitions": "^4.0.0",
+     "mdast-util-from-markdown": "^0.8.5",
+     "mdast-util-gfm-autolink-literal": "^0.1.3",
+     "mdast-util-gfm-strikethrough": "^0.2.3",
+diff --git a/packages/fields-document/src/DocumentEditor/blockquote.test.tsx b/packages/fields-document/src/DocumentEditor/blockquote.test.tsx
+index 0ae582982..e5774869b 100644
+--- a/packages/fields-document/src/DocumentEditor/blockquote.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/blockquote.test.tsx
+@@ -27,9 +27,7 @@ test('inserting a blockquote with a shortcut works', () => {
+         </paragraph>
+       </blockquote>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -62,9 +60,7 @@ test('backspace at start of blockquote', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -97,9 +93,7 @@ test('enter on empty line at end of blockquote exits blockquote', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -150,9 +144,7 @@ test('enter on empty line in middle splits the blockquote', () => {
+         </paragraph>
+       </blockquote>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/code-block.test.tsx b/packages/fields-document/src/DocumentEditor/code-block.test.tsx
+index 63a7d9941..bb6afc7f9 100644
+--- a/packages/fields-document/src/DocumentEditor/code-block.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/code-block.test.tsx
+@@ -27,9 +27,7 @@ test('inserting a code block with a shortcut works', () => {
+         </text>
+       </code>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -65,9 +63,7 @@ test('insertBreak inserts a soft break', () => {
+         </text>
+       </code>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -130,14 +126,10 @@ test('non-text is removed from code blocks', () => {
+       <divider
+         @@isVoid={true}
+       >
+-        <text>
+-          
+-        </text>
++        <text />
+       </divider>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -161,25 +153,23 @@ test('insertBreak when at end with \n as last character exits code block', () =>
+   editor.insertBreak();
+ 
+   expect(editor).toMatchInlineSnapshot(`
+-      <editor>
+-        <code>
+-          <text>
+-            asdkjnajsndakjndkjnaksdjn
+-      asdasdasd
+-          </text>
+-        </code>
+-        <paragraph>
+-          <text>
+-            <cursor />
+-          </text>
+-        </paragraph>
+-        <paragraph>
+-          <text>
+-            
+-          </text>
+-        </paragraph>
+-      </editor>
+-    `);
++    <editor>
++      <code>
++        <text>
++          asdkjnajsndakjndkjnaksdjn
++    asdasdasd
++        </text>
++      </code>
++      <paragraph>
++        <text>
++          <cursor />
++        </text>
++      </paragraph>
++      <paragraph>
++        <text />
++      </paragraph>
++    </editor>
++  `);
+ });
+ 
+ test('insertBreak in the middle of the text when there is a break at the end of the text', () => {
+diff --git a/packages/fields-document/src/DocumentEditor/component-blocks/array-field.test.tsx b/packages/fields-document/src/DocumentEditor/component-blocks/array-field.test.tsx
+index 2abb8b327..d191f4cf0 100644
+--- a/packages/fields-document/src/DocumentEditor/component-blocks/array-field.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/component-blocks/array-field.test.tsx
+@@ -146,9 +146,7 @@ test('inserting a break at the end of a child field creates a new item with fres
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -226,9 +224,7 @@ test('inserting a break splits the text and uses the values from the first entry
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -297,9 +293,7 @@ test('inserting a break in an empty child removes the element and inserts a para
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -415,9 +409,7 @@ test('deleting a range of nodes removes them', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -467,15 +459,11 @@ test('inserting an item from empty works', () => {
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -512,15 +500,11 @@ test('removing an item using the preview props works', () => {
+         }
+       >
+         <component-inline-prop>
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/component-blocks/document-features-normalization.test.tsx b/packages/fields-document/src/DocumentEditor/component-blocks/document-features-normalization.test.tsx
+index dc31ef848..326b76ca9 100644
+--- a/packages/fields-document/src/DocumentEditor/component-blocks/document-features-normalization.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/component-blocks/document-features-normalization.test.tsx
+@@ -311,9 +311,7 @@ test('mark disabled in inline prop', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -354,9 +352,7 @@ test('mark enabled in inline prop', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -399,9 +395,7 @@ test('mark disabled in block prop', () => {
+         </component-block-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -446,9 +440,7 @@ test('mark enabled in block prop', () => {
+         </component-block-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -491,9 +483,7 @@ test('heading disabled in block prop', () => {
+         </component-block-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -537,9 +527,7 @@ test('heading enabled in block prop', () => {
+         </component-block-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/component-blocks/insert-break-and-delete.test.tsx b/packages/fields-document/src/DocumentEditor/component-blocks/insert-break-and-delete.test.tsx
+index c20cb408d..e6958126c 100644
+--- a/packages/fields-document/src/DocumentEditor/component-blocks/insert-break-and-delete.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/component-blocks/insert-break-and-delete.test.tsx
+@@ -83,9 +83,7 @@ test('delete backward at start', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -161,9 +159,7 @@ test('insert break in last (inline) child prop', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -236,9 +232,7 @@ test('insert break in first (block) child prop in empty paragraph', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -315,9 +309,7 @@ test('insert break in last (block) child prop in empty paragraph', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -393,9 +385,7 @@ test('insert break in first (inline) child prop', () => {
+         </component-block-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/component-blocks/insertion-and-preview-props.test.tsx b/packages/fields-document/src/DocumentEditor/component-blocks/insertion-and-preview-props.test.tsx
+index 159e041a2..194e9ee9f 100644
+--- a/packages/fields-document/src/DocumentEditor/component-blocks/insertion-and-preview-props.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/component-blocks/insertion-and-preview-props.test.tsx
+@@ -95,9 +95,7 @@ test('inserting a void component block', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -161,15 +159,11 @@ test('inserting a complex component block', () => {
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -352,9 +346,7 @@ test('preview props conditional change', () => {
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-block-prop
+           propPath={
+@@ -366,16 +358,12 @@ test('preview props conditional change', () => {
+           }
+         >
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+         </component-block-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/component-blocks/multi-child-field-in-array-field.test.tsx b/packages/fields-document/src/DocumentEditor/component-blocks/multi-child-field-in-array-field.test.tsx
+index ca773c36a..72b2bdd15 100644
+--- a/packages/fields-document/src/DocumentEditor/component-blocks/multi-child-field-in-array-field.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/component-blocks/multi-child-field-in-array-field.test.tsx
+@@ -139,9 +139,7 @@ test('deleting all child fields in an array field element when there are multipl
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-inline-prop
+           propPath={
+@@ -152,9 +150,7 @@ test('deleting all child fields in an array field element when there are multipl
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-inline-prop
+           propPath={
+@@ -165,9 +161,7 @@ test('deleting all child fields in an array field element when there are multipl
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-inline-prop
+           propPath={
+@@ -184,9 +178,7 @@ test('deleting all child fields in an array field element when there are multipl
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -248,9 +240,7 @@ test('when the wrong children exist, the children are normalized based on the pr
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-inline-prop
+           propPath={
+@@ -261,9 +251,7 @@ test('when the wrong children exist, the children are normalized based on the pr
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-inline-prop
+           propPath={
+@@ -274,9 +262,7 @@ test('when the wrong children exist, the children are normalized based on the pr
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-inline-prop
+           propPath={
+@@ -287,9 +273,7 @@ test('when the wrong children exist, the children are normalized based on the pr
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-inline-prop
+           propPath={
+@@ -300,9 +284,7 @@ test('when the wrong children exist, the children are normalized based on the pr
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-inline-prop
+           propPath={
+@@ -313,15 +295,11 @@ test('when the wrong children exist, the children are normalized based on the pr
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/component-blocks/nested-array-field.test.tsx b/packages/fields-document/src/DocumentEditor/component-blocks/nested-array-field.test.tsx
+index 1704a2760..2a5427335 100644
+--- a/packages/fields-document/src/DocumentEditor/component-blocks/nested-array-field.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/component-blocks/nested-array-field.test.tsx
+@@ -90,9 +90,7 @@ test('child field in nested array', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -228,9 +226,7 @@ test('multiple in child field in nested array', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -376,9 +372,7 @@ test('add to multiple in child field in nested array', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/component-blocks/normalization.test.tsx b/packages/fields-document/src/DocumentEditor/component-blocks/normalization.test.tsx
+index 285558006..3db809e01 100644
+--- a/packages/fields-document/src/DocumentEditor/component-blocks/normalization.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/component-blocks/normalization.test.tsx
+@@ -58,14 +58,10 @@ test('component-inline-prop and component-block-prop outside of component-block
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <paragraph>
+         <text>
+@@ -105,9 +101,7 @@ test('non component block prop in component-block', () => {
+         }
+       >
+         <component-inline-prop>
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+@@ -153,9 +147,7 @@ test('content inside of void child prop', () => {
+         }
+       >
+         <component-inline-prop>
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+@@ -203,9 +195,7 @@ test('prop path for old fake void prop is removed', () => {
+         }
+       >
+         <component-inline-prop>
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+@@ -246,9 +236,7 @@ test('inserting a void component block', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -292,9 +280,7 @@ test('extra component props are removed', () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <component-block
+         component="withChildElements"
+@@ -326,15 +312,11 @@ test('extra component props are removed', () => {
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -390,15 +372,11 @@ test('missing component props are added', () => {
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -463,9 +441,7 @@ test('prop with wrong type for a given prop path', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -518,9 +494,7 @@ test('props in wrong order', () => {
+           }
+         >
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+         </component-block-prop>
+         <component-inline-prop
+@@ -530,9 +504,7 @@ test('props in wrong order', () => {
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-block-prop
+           propPath={
+@@ -542,16 +514,12 @@ test('props in wrong order', () => {
+           }
+         >
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+         </component-block-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -610,9 +578,7 @@ test('toggling to heading when in an inline prop', () => {
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+         <component-block-prop
+           propPath={
+@@ -630,9 +596,7 @@ test('toggling to heading when in an inline prop', () => {
+         </component-block-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -718,9 +682,7 @@ test('child field in array field insertBreak', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -801,9 +763,7 @@ test('child field in array field deleteBackward at end', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -907,9 +867,7 @@ test('child field in array field deleteBackward in middle', () => {
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -950,15 +908,11 @@ test('normalization adds missing fields on object fields', () => {
+         }
+       >
+         <component-inline-prop>
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/divider.test.tsx b/packages/fields-document/src/DocumentEditor/divider.test.tsx
+index b4b3b2fc6..d1279291c 100644
+--- a/packages/fields-document/src/DocumentEditor/divider.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/divider.test.tsx
+@@ -21,9 +21,7 @@ test('inserting a divider with a shortcut works', () => {
+       <divider
+         @@isVoid={true}
+       >
+-        <text>
+-          
+-        </text>
++        <text />
+       </divider>
+       <paragraph>
+         <text>
+@@ -31,9 +29,7 @@ test('inserting a divider with a shortcut works', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/heading.test.tsx b/packages/fields-document/src/DocumentEditor/heading.test.tsx
+index c0fb99494..d81ccdc0a 100644
+--- a/packages/fields-document/src/DocumentEditor/heading.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/heading.test.tsx
+@@ -26,9 +26,7 @@ test('inserting a heading with a shortcut works', () => {
+         </text>
+       </heading>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -65,9 +63,7 @@ test('inserting a break at the end of the heading exits the heading', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -107,9 +103,7 @@ test('inserting a break in the middle of the heading splits the text and does no
+         </text>
+       </heading>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -134,9 +128,7 @@ test('inserting a break at the start of the heading inserts a paragraph above th
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <heading
+         level={1}
+@@ -147,9 +139,7 @@ test('inserting a break at the start of the heading inserts a paragraph above th
+         </text>
+       </heading>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/insert-menu.test.tsx b/packages/fields-document/src/DocumentEditor/insert-menu.test.tsx
+index ca025be38..a917fe752 100644
+--- a/packages/fields-document/src/DocumentEditor/insert-menu.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/insert-menu.test.tsx
+@@ -398,9 +398,7 @@ test('insertMenu thing typing', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -420,9 +418,7 @@ test('insertMenu thing typing', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/layouts.test.tsx b/packages/fields-document/src/DocumentEditor/layouts.test.tsx
+index d3f5095f5..ed509bdfd 100644
+--- a/packages/fields-document/src/DocumentEditor/layouts.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/layouts.test.tsx
+@@ -65,16 +65,12 @@ test('layout with not enough layout-area are added', () => {
+         </layout-area>
+         <layout-area>
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+         </layout-area>
+       </layout>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -123,9 +119,7 @@ test('layout with extra layout-areas that are empty are removed', () => {
+       >
+         <layout-area>
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+         </layout-area>
+         <layout-area>
+@@ -137,9 +131,7 @@ test('layout with extra layout-areas that are empty are removed', () => {
+         </layout-area>
+       </layout>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -198,9 +190,7 @@ test('the content of extra layout-areas are merged into the last layout-area', (
+       >
+         <layout-area>
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+         </layout-area>
+         <layout-area>
+@@ -229,9 +219,7 @@ test('the content of extra layout-areas are merged into the last layout-area', (
+         </layout-area>
+       </layout>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -274,24 +262,16 @@ test('enter in layout area never exits layout area', () => {
+       >
+         <layout-area>
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+           <paragraph>
+             <text>
+@@ -301,9 +281,7 @@ test('enter in layout area never exits layout area', () => {
+         </layout-area>
+       </layout>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -338,9 +316,7 @@ test('delete backward never deletes or exits in first layout area', () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <layout
+         layout={
+@@ -358,9 +334,7 @@ test('delete backward never deletes or exits in first layout area', () => {
+         </layout-area>
+       </layout>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -400,9 +374,7 @@ test('delete backward never deletes or exits in second layout area', () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <layout
+         layout={
+@@ -414,9 +386,7 @@ test('delete backward never deletes or exits in second layout area', () => {
+       >
+         <layout-area>
+           <paragraph>
+-            <text>
+-              
+-            </text>
++            <text />
+           </paragraph>
+         </layout-area>
+         <layout-area>
+@@ -428,9 +398,7 @@ test('delete backward never deletes or exits in second layout area', () => {
+         </layout-area>
+       </layout>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/lists.test.tsx b/packages/fields-document/src/DocumentEditor/lists.test.tsx
+index d1af230e9..e33fc2370 100644
+--- a/packages/fields-document/src/DocumentEditor/lists.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/lists.test.tsx
+@@ -29,9 +29,7 @@ test('ordered list shortcut', () => {
+         </list-item>
+       </ordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -62,9 +60,7 @@ test('unordered list shortcut - ', () => {
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -95,9 +91,7 @@ test('unordered list shortcut * ', () => {
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -214,9 +208,7 @@ test('inserting a break on end of list in empty list item exits list', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -278,9 +270,7 @@ test('inserting a break in empty list item in the middle of a list splits and ex
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -314,9 +304,7 @@ test('toggle list on empty line', () => {
+         </list-item>
+       </ordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -352,9 +340,7 @@ test('toggle list on line with text', () => {
+         </list-item>
+       </ordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -399,9 +385,7 @@ test('toggle list on line with text with marks', () => {
+         </list-item>
+       </ordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -447,9 +431,7 @@ test('toggle list on list with text with marks', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -485,9 +467,7 @@ test('toggle ordered-list inside of ordered-list', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -551,9 +531,7 @@ test('toggle ordered-list inside of multi-item ordered-list', () => {
+         </list-item>
+       </ordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -621,9 +599,7 @@ test('toggle unordered-list inside of single item in multi-item ordered-list', (
+         </list-item>
+       </ordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -691,9 +667,7 @@ test('toggle unordered-list for all items in multi-item ordered-list', () => {
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -755,9 +729,7 @@ test('backspace at start of list only unwraps the first item', () => {
+         </list-item>
+       </ordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -808,9 +780,7 @@ test('nested list as direct child of list is moved to last list-item', () => {
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -871,9 +841,7 @@ test('nest list', () => {
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -941,9 +909,7 @@ test('nest list when previous thing is nested', () => {
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -989,9 +955,7 @@ test('inserting a break on end of list non-empty list item adds a new list item'
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -1046,9 +1010,7 @@ test('changing the type of a nested list', () => {
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -1119,9 +1081,7 @@ test('changing the type of a nested list to something which it is nested inside'
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -1188,9 +1148,7 @@ test('nesting a list item in an ordered list into an unordered list makes the it
+         </list-item>
+       </unordered-list>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/markdown-link-shortcut.test.tsx b/packages/fields-document/src/DocumentEditor/markdown-link-shortcut.test.tsx
+index 6dafeb7e1..bef1aa0e2 100644
+--- a/packages/fields-document/src/DocumentEditor/markdown-link-shortcut.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/markdown-link-shortcut.test.tsx
+@@ -20,9 +20,7 @@ test('basic link shortcut', () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -112,9 +110,7 @@ test('shortcut with whitespace in the middle of the content works', () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -147,9 +143,7 @@ test('link shortcut then typing inserts text outside of the link', () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -184,9 +178,7 @@ test('link shortcut with bold in some of the content works', () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -296,9 +288,7 @@ test("link shortcut doesn't do anything when inside of a component block with li
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -346,9 +336,7 @@ test('link shortcut works when inside of a component block with links option inh
+             ]
+           }
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+           <link
+             @@isInline={true}
+             href="https://keystonejs.com"
+@@ -363,9 +351,7 @@ test('link shortcut works when inside of a component block with links option inh
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -386,9 +372,7 @@ test('an undo only reverts to the whole shortcut text', () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -431,9 +415,7 @@ test("text after the markdown shortcut isn't included in the link text", () => {
+   expect(editor).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+diff --git a/packages/fields-document/src/DocumentEditor/marks.test.tsx b/packages/fields-document/src/DocumentEditor/marks.test.tsx
+index b123447db..73e16b604 100644
+--- a/packages/fields-document/src/DocumentEditor/marks.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/marks.test.tsx
+@@ -540,9 +540,7 @@ test('inserting a break at the end of a block with a mark removes the mark', ()
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -589,9 +587,7 @@ test("inserting a break in the middle of text doesn't remove the mark", () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/pasting/html-from-other-editors.test.tsx b/packages/fields-document/src/DocumentEditor/pasting/html-from-other-editors.test.tsx
+index 76a517a85..21e86bd74 100644
+--- a/packages/fields-document/src/DocumentEditor/pasting/html-from-other-editors.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/pasting/html-from-other-editors.test.tsx
+@@ -137,9 +137,7 @@ test('confluence', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -148,16 +146,12 @@ test('confluence', () => {
+             A link
+           </text>
+         </link>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <divider
+         @@isVoid={true}
+       >
+-        <text>
+-          
+-        </text>
++        <text />
+       </divider>
+       <unordered-list>
+         <list-item>
+@@ -247,9 +241,7 @@ test('confluence', () => {
+         </text>
+       </heading>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -365,9 +357,7 @@ there is a break before this</p>
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com/"
+@@ -376,16 +366,12 @@ there is a break before this</p>
+             A link
+           </text>
+         </link>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <divider
+         @@isVoid={true}
+       >
+-        <text>
+-          
+-        </text>
++        <text />
+       </divider>
+       <unordered-list>
+         <list-item>
+@@ -535,9 +521,7 @@ test('dropbox paper', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -546,16 +530,12 @@ test('dropbox paper', () => {
+             A link
+           </text>
+         </link>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <divider
+         @@isVoid={true}
+       >
+-        <text>
+-          
+-        </text>
++        <text />
+       </divider>
+       <unordered-list>
+         <list-item>
+@@ -710,9 +690,7 @@ test('google docs', () => {
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -721,26 +699,18 @@ test('google docs', () => {
+             A link
+           </text>
+         </link>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <divider
+         @@isVoid={true}
+       >
+-        <text>
+-          
+-        </text>
++        <text />
+       </divider>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <unordered-list>
+         <list-item>
+@@ -826,9 +796,7 @@ test('google docs', () => {
+         </text>
+       </heading>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/packages/fields-document/src/DocumentEditor/pasting/markdown.test.tsx b/packages/fields-document/src/DocumentEditor/pasting/markdown.test.tsx
+index 60ce27a0d..c604e6bcd 100644
+--- a/packages/fields-document/src/DocumentEditor/pasting/markdown.test.tsx
++++ b/packages/fields-document/src/DocumentEditor/pasting/markdown.test.tsx
+@@ -1,6 +1,7 @@
+ /** @jest-environment jsdom */
+ /** @jsxRuntime classic */
+ /** @jsx jsx */
++import { Node } from 'slate';
+ import { makeEditor, jsx } from '../tests/utils';
+ import { MyDataTransfer } from './data-transfer';
+ 
+@@ -161,9 +162,7 @@ there is a break before this
+         </text>
+       </paragraph>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -172,9 +171,7 @@ there is a break before this
+             A link
+           </text>
+         </link>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+       <paragraph>
+         <text>
+@@ -184,9 +181,7 @@ there is a break before this
+       <divider
+         @@isVoid={true}
+       >
+-        <text>
+-          
+-        </text>
++        <text />
+       </divider>
+       <unordered-list>
+         <list-item>
+@@ -254,23 +249,22 @@ there is a break before this
+       </paragraph>
+       <paragraph>
+         <text>
+-          
++          [Link reference][1]
+         </text>
+-        <link
+-          @@isInline={true}
+-          href="http://keystonejs.com/link-reference"
+-        >
+-          <text>
+-            Link reference
+-          </text>
+-        </link>
++      </paragraph>
++      <paragraph>
++        <text>
++          ![Image reference][2]
++        </text>
++      </paragraph>
++      <paragraph>
+         <text>
+-          
++          [1]: http://keystonejs.com/link-reference
+         </text>
+       </paragraph>
+       <paragraph>
+         <text>
+-          ![Image reference](http://keystonejs.com/image-reference)
++          [2]: http://keystonejs.com/image-reference
+           <cursor />
+         </text>
+       </paragraph>
+@@ -303,9 +297,7 @@ test('a link stays in the same block', () => {
+   expect(deserializeMarkdown(`[link](https://keystonejs.com)`)).toMatchInlineSnapshot(`
+     <editor>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+         <link
+           @@isInline={true}
+           href="https://keystonejs.com"
+@@ -315,9 +307,7 @@ test('a link stays in the same block', () => {
+             <cursor />
+           </text>
+         </link>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+@@ -359,3 +349,92 @@ test('a link nested inside bold', () => {
+     </editor>
+   `);
+ });
++
++// this is written like this rather than a snapshot because the snapshot
++// formatting creates html escapes(which is nice for the formatting)
++// this test shows ensures that the snapshot formatting is not buggy
++// and we're not showing html escapes to users or something
++test('html in inline content is just written', () => {
++  const input = `a<code>blah</code>b`;
++  expect(Node.string(deserializeMarkdown(input))).toEqual(input);
++});
++
++test('html in complex inline content', () => {
++  expect(deserializeMarkdown(`__content [link<code>blah</code>](https://keystonejs.com) content__`))
++    .toMatchInlineSnapshot(`
++    <editor
++      marks={
++        Object {
++          "bold": true,
++        }
++      }
++    >
++      <paragraph>
++        <text
++          bold={true}
++        >
++          content 
++        </text>
++        <link
++          @@isInline={true}
++          href="https://keystonejs.com"
++        >
++          <text
++            bold={true}
++          >
++            link&lt;code&gt;blah&lt;/code&gt;
++          </text>
++        </link>
++        <text
++          bold={true}
++        >
++           content
++          <cursor />
++        </text>
++      </paragraph>
++    </editor>
++  `);
++});
++
++// the difference between a delightful "oh, nice! the editor did the formatting i wanted"
++// and "UGH!! the editor just removed some of the content i wanted" can be really subtle
++// and while we want the delightful experiences, avoiding the bad experiences is _more important_
++
++// so even though we could parse link references & definitions in some cases we don't because it feels a bit too magical
++// also note that so the workaround of "paste into some plain text place, copy it from there"
++// like html pasting doesn't exist here since this is parsing _from_ plain text
++// so erring on the side of "don't be too smart" is better
++test('link and image references and images are left alone', () => {
++  const input = `[Link reference][1]
++
++![Image reference][2]
++
++![Image](http://keystonejs.com/image)
++
++[1]: http://keystonejs.com/link-reference
++
++[2]: http://keystonejs.com/image-reference`;
++
++  expect(
++    deserializeMarkdown(input)
++      .children.map(node => Node.string(node))
++      .join('\n\n')
++  ).toEqual(input);
++});
++
++// ideally, we would probably convert the mark here, but like the comment on the previous test says,
++// it being not perfect is fine, as long as it doesn't make things _worse_
++test('marks in image tags are converted', () => {
++  const input = `![Image **blah**](https://keystonejs.com/image)`;
++
++  expect(deserializeMarkdown(input)).toMatchInlineSnapshot(`
++    <editor>
++      <paragraph>
++        <text>
++          ![Image **blah**](https://keystonejs.com/image)
++          <cursor />
++        </text>
++      </paragraph>
++    </editor>
++  `);
++});
+diff --git a/packages/fields-document/src/DocumentEditor/pasting/markdown.ts b/packages/fields-document/src/DocumentEditor/pasting/markdown.ts
+index 452027172..2a97da8dc 100644
+--- a/packages/fields-document/src/DocumentEditor/pasting/markdown.ts
++++ b/packages/fields-document/src/DocumentEditor/pasting/markdown.ts
+@@ -6,7 +6,6 @@ import autoLinkLiteralMarkdownSyntax from 'micromark-extension-gfm-autolink-lite
+ // @ts-ignore
+ import gfmStrikethroughFromMarkdownExtension from 'mdast-util-gfm-strikethrough/from-markdown';
+ import gfmStrikethroughMarkdownSyntax from 'micromark-extension-gfm-strikethrough';
+-import definitions from 'mdast-util-definitions';
+ import { Descendant } from 'slate';
+ import { getTextNodeForCurrentlyActiveMarks, addMarkToChildren } from './utils';
+ 
+@@ -17,22 +16,19 @@ const markdownConfig = {
+ 
+ export function deserializeMarkdown(markdown: string) {
+   const root = mdASTUtilFromMarkdown(markdown, markdownConfig);
+-  const getDefinition = definitions(root);
+   let nodes = root.children;
+   if (nodes.length === 1 && nodes[0].type === 'paragraph') {
+     nodes = nodes[0].children;
+   }
+-  return deserializeChildren(nodes, getDefinition);
++  return deserializeChildren(nodes, markdown);
+ }
+ 
+-type GetDefinition = ReturnType<typeof definitions>;
+-
+ type MDNode = ReturnType<typeof mdASTUtilFromMarkdown>['children'][number];
+ 
+-function deserializeChildren(nodes: MDNode[], getDefinition: GetDefinition) {
++function deserializeChildren(nodes: MDNode[], input: string) {
+   const outputNodes: Descendant[] = [];
+   for (const node of nodes) {
+-    const result = deserializeMarkdownNode(node, getDefinition);
++    const result = deserializeMarkdownNode(node, input);
+     if (result.length) {
+       outputNodes.push(...result);
+     }
+@@ -43,26 +39,17 @@ function deserializeChildren(nodes: MDNode[], getDefinition: GetDefinition) {
+   return outputNodes;
+ }
+ 
+-function deserializeMarkdownNode(node: MDNode, getDefinition: GetDefinition): Descendant[] {
++function deserializeMarkdownNode(node: MDNode, input: string): Descendant[] {
+   switch (node.type) {
+     case 'blockquote': {
+-      return [{ type: 'blockquote', children: deserializeChildren(node.children, getDefinition) }];
+-    }
+-    case 'linkReference': {
+-      return [
+-        {
+-          type: 'link',
+-          href: getDefinition(node.identifier)?.url || '',
+-          children: deserializeChildren(node.children, getDefinition),
+-        },
+-      ];
++      return [{ type: 'blockquote', children: deserializeChildren(node.children, input) }];
+     }
+     case 'link': {
+       return [
+         {
+           type: 'link',
+           href: node.url,
+-          children: deserializeChildren(node.children, getDefinition),
++          children: deserializeChildren(node.children, input),
+         },
+       ];
+     }
+@@ -70,14 +57,14 @@ function deserializeMarkdownNode(node: MDNode, getDefinition: GetDefinition): De
+       return [{ type: 'code', children: [{ text: node.value }] }];
+     }
+     case 'paragraph': {
+-      return [{ type: 'paragraph', children: deserializeChildren(node.children, getDefinition) }];
++      return [{ type: 'paragraph', children: deserializeChildren(node.children, input) }];
+     }
+     case 'heading': {
+       return [
+         {
+           type: 'heading',
+           level: node.depth,
+-          children: deserializeChildren(node.children, getDefinition),
++          children: deserializeChildren(node.children, input),
+         },
+       ];
+     }
+@@ -85,22 +72,12 @@ function deserializeMarkdownNode(node: MDNode, getDefinition: GetDefinition): De
+       return [
+         {
+           type: node.ordered ? 'ordered-list' : 'unordered-list',
+-          children: deserializeChildren(node.children, getDefinition),
++          children: deserializeChildren(node.children, input),
+         },
+       ];
+     }
+-    case 'imageReference': {
+-      return [
+-        getTextNodeForCurrentlyActiveMarks(
+-          `![${node.alt || ''}](${getDefinition(node.identifier)?.url || ''})`
+-        ),
+-      ];
+-    }
+-    case 'image': {
+-      return [getTextNodeForCurrentlyActiveMarks(`![${node.alt || ''}](${node.url})`)];
+-    }
+     case 'listItem': {
+-      return [{ type: 'list-item', children: deserializeChildren(node.children, getDefinition) }];
++      return [{ type: 'list-item', children: deserializeChildren(node.children, input) }];
+     }
+     case 'thematicBreak': {
+       return [{ type: 'divider', children: [{ text: '' }] }];
+@@ -109,28 +86,29 @@ function deserializeMarkdownNode(node: MDNode, getDefinition: GetDefinition): De
+       return [getTextNodeForCurrentlyActiveMarks('\n')];
+     }
+     case 'delete': {
+-      return addMarkToChildren('strikethrough', () =>
+-        deserializeChildren(node.children, getDefinition)
+-      );
++      return addMarkToChildren('strikethrough', () => deserializeChildren(node.children, input));
+     }
+     case 'strong': {
+-      return addMarkToChildren('bold', () => deserializeChildren(node.children, getDefinition));
++      return addMarkToChildren('bold', () => deserializeChildren(node.children, input));
+     }
+     case 'emphasis': {
+-      return addMarkToChildren('italic', () => deserializeChildren(node.children, getDefinition));
++      return addMarkToChildren('italic', () => deserializeChildren(node.children, input));
+     }
+     case 'inlineCode': {
+       return addMarkToChildren('code', () => [getTextNodeForCurrentlyActiveMarks(node.value)]);
+     }
+-    // while it would be nice if we parsed the html here
++    // while it might be nice if we parsed the html here
+     // it's a bit more complicated than just parsing the html
+     // because an html node might just be an opening/closing node
+     // but we just have an opening/closing node here
+     // not the opening and closing and children
+-    case 'html':
+     case 'text': {
+       return [getTextNodeForCurrentlyActiveMarks(node.value)];
+     }
+   }
+-  return [];
++  return [
++    getTextNodeForCurrentlyActiveMarks(
++      input.slice(node.position!.start.offset, node.position!.end.offset)
++    ),
++  ];
+ }
+diff --git a/packages/fields-document/src/DocumentEditor/tests/utils.tsx b/packages/fields-document/src/DocumentEditor/tests/utils.tsx
+index 82d5720b9..c950cc2c3 100644
+--- a/packages/fields-document/src/DocumentEditor/tests/utils.tsx
++++ b/packages/fields-document/src/DocumentEditor/tests/utils.tsx
+@@ -320,7 +320,11 @@ function nodeToReactElement(
+         });
+       }
+     }
+-    return createElement('text', { children: text, ...marks });
++    return createElement('text', {
++      // we want to show empty text nodes as <text />
++      children: text === '' ? undefined : text,
++      ...marks,
++    });
+   }
+   let children = node.children.map((x, i) =>
+     nodeToReactElement(editor, x, selection, path.concat(i))
+diff --git a/packages/fields-document/src/validation.test.tsx b/packages/fields-document/src/validation.test.tsx
+index b59aa0b9e..fb9675e21 100644
+--- a/packages/fields-document/src/validation.test.tsx
++++ b/packages/fields-document/src/validation.test.tsx
+@@ -205,9 +205,7 @@ test('label and data in inline relationships are stripped', () => {
+           }
+           relationship="inline"
+         >
+-          <text>
+-            
+-          </text>
++          <text />
+         </relationship>
+         <text>
+           something
+@@ -258,15 +256,11 @@ test('label and data in relationship props are stripped', () => {
+         }
+       >
+         <component-inline-prop>
+-          <text>
+-            
+-          </text>
++          <text />
+         </component-inline-prop>
+       </component-block>
+       <paragraph>
+-        <text>
+-          
+-        </text>
++        <text />
+       </paragraph>
+     </editor>
+   `);
+diff --git a/tests/sandbox/configs/all-the-things.ts b/tests/sandbox/configs/all-the-things.ts
+index 75432eb2b..2e5b2d9f9 100644
+--- a/tests/sandbox/configs/all-the-things.ts
++++ b/tests/sandbox/configs/all-the-things.ts
+@@ -14,7 +14,6 @@ import {
+   float,
+   bigInt,
+   calendarDay,
+-  multiselect,
+ } from '@keystone-6/core/fields';
+ import { document } from '@keystone-6/fields-document';
+ import { componentBlocks } from '../component-blocks';
+@@ -83,14 +82,6 @@ export const lists = {
+         ],
+         ui: { displayMode: 'segmented-control', description },
+       }),
+-      multiselect: multiselect({
+-        ui: { description },
+-        options: [
+-          { value: 'one', label: 'One' },
+-          { value: 'two', label: 'Two' },
+-          { value: 'three', label: 'Three' },
+-        ],
+-      }),
+       json: json({ ui: { description } }),
+       integer: integer({ ui: { description } }),
+       bigInt: bigInt({ ui: { description } }),
+diff --git a/tests/sandbox/schema.graphql b/tests/sandbox/schema.graphql
+index e975cce79..ebe355ca9 100644
+--- a/tests/sandbox/schema.graphql
++++ b/tests/sandbox/schema.graphql
+@@ -27,7 +27,6 @@ type Thing {
+   randomNumberVirtual: Float
+   select: String
+   selectSegmentedControl: String
+-  multiselect: [String!]
+   json: JSON
+   integer: Int
+   bigInt: BigInt
+@@ -267,7 +266,6 @@ input ThingUpdateInput {
+   calendarDay: CalendarDay
+   select: String
+   selectSegmentedControl: String
+-  multiselect: [String!]
+   json: JSON
+   integer: Int
+   bigInt: BigInt
+@@ -320,7 +318,6 @@ input ThingCreateInput {
+   calendarDay: CalendarDay
+   select: String
+   selectSegmentedControl: String
+-  multiselect: [String!]
+   json: JSON
+   integer: Int
+   bigInt: BigInt
+diff --git a/tests/sandbox/schema.prisma b/tests/sandbox/schema.prisma
+index 1b830ce22..115a23f65 100644
+--- a/tests/sandbox/schema.prisma
++++ b/tests/sandbox/schema.prisma
+@@ -27,7 +27,6 @@ model Thing {
+   calendarDay             String?
+   select                  String?
+   selectSegmentedControl  String?
+-  multiselect             String    @default("[]")
+   json                    String?
+   integer                 Int?
+   bigInt                  BigInt?
+diff --git a/yarn.lock b/yarn.lock
+index e57e765f8..f48b51e38 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -9750,13 +9750,6 @@ mdast-util-compact@^1.0.0:
+   dependencies:
+     unist-util-visit "^1.1.0"
+ 
+-mdast-util-definitions@^4.0.0:
+-  version "4.0.0"
+-  resolved "https://registry.yarnpkg.com/mdast-util-definitions/-/mdast-util-definitions-4.0.0.tgz#c5c1a84db799173b4dcf7643cda999e440c24db2"
+-  integrity sha512-k8AJ6aNnUkB7IE+5azR9h81O5EQ/cTDXtWdMq9Kk5KcEW/8ritU5CeLg/9HhOC++nALHBlaogJ5jz0Ybk3kPMQ==
+-  dependencies:
+-    unist-util-visit "^2.0.0"
+-
+ mdast-util-definitions@^5.0.0:
+   version "5.1.1"
+   resolved "https://registry.yarnpkg.com/mdast-util-definitions/-/mdast-util-definitions-5.1.1.tgz#2c1d684b28e53f84938bb06317944bee8efa79db"
+@@ -13915,15 +13908,6 @@ unist-util-visit@^1.0.0, unist-util-visit@^1.1.0:
+   dependencies:
+     unist-util-visit-parents "^2.0.0"
+ 
+-unist-util-visit@^2.0.0:
+-  version "2.0.3"
+-  resolved "https://registry.yarnpkg.com/unist-util-visit/-/unist-util-visit-2.0.3.tgz#c3703893146df47203bb8a9795af47d7b971208c"
+-  integrity sha512-iJ4/RczbJMkD0712mGktuGpm/U4By4FfDonL7N/9tATGIF4imikjOuagyMY53tnZq3NP6BcmlrHhEKAfGWjh7Q==
+-  dependencies:
+-    "@types/unist" "^2.0.0"
+-    unist-util-is "^4.0.0"
+-    unist-util-visit-parents "^3.0.0"
+-
+ unist-util-visit@^4.0.0:
+   version "4.1.0"
+   resolved "https://registry.yarnpkg.com/unist-util-visit/-/unist-util-visit-4.1.0.tgz#f41e407a9e94da31594e6b1c9811c51ab0b3d8f5"

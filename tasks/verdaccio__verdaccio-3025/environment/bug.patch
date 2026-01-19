@@ -1,0 +1,801 @@
+diff --git a/.changeset/swift-pumpkins-knock.md b/.changeset/swift-pumpkins-knock.md
+deleted file mode 100644
+index eca1d97df..000000000
+--- a/.changeset/swift-pumpkins-knock.md
++++ /dev/null
+@@ -1,6 +0,0 @@
+----
+-'@verdaccio/auth': patch
+-'verdaccio-htpasswd': patch
+----
+-
+-Refactor htpasswd plugin to use the bcryptjs 'compare' api call instead of 'comparSync'. Add a new configuration value named 'slow_verify_ms' to the htpasswd plugin that when exceeded during password verification will log a warning message.
+diff --git a/packages/auth/src/auth.ts b/packages/auth/src/auth.ts
+index 2ee660a71..9fb136c5c 100644
+--- a/packages/auth/src/auth.ts
++++ b/packages/auth/src/auth.ts
+@@ -111,7 +111,7 @@ class Auth implements IAuth {
+     };
+     let authPlugin;
+     try {
+-      authPlugin = new HTPasswd(plugingConf, pluginOptions as any as PluginOptions<HTPasswdConfig>);
++      authPlugin = new HTPasswd(plugingConf, pluginOptions);
+     } catch (error: any) {
+       debug('error on loading auth htpasswd plugin stack: %o', error);
+       return [];
+diff --git a/packages/plugins/htpasswd/README.md b/packages/plugins/htpasswd/README.md
+index c512b162c..7caff08f4 100644
+--- a/packages/plugins/htpasswd/README.md
++++ b/packages/plugins/htpasswd/README.md
+@@ -30,26 +30,7 @@ As simple as running:
+             # Hash algorithm, possible options are: "bcrypt", "md5", "sha1", "crypt".
+             #algorithm: bcrypt
+             # Rounds number for "bcrypt", will be ignored for other algorithms.
+-            # Setting this value higher will result in password verification taking longer.
+             #rounds: 10
+-            # Log a warning if the password takes more then this duration in milliseconds to verify.
+-            #slow_verify_ms: 200
+-
+-### Bcrypt rounds
+-
+-It is important to note that when using the default `bcrypt` algorithm and setting
+-the `rounds` configuration value to a higher number then the default of `10`, that
+-verification of a user password can cause significantly increased CPU usage and
+-additional latency in processing requests.
+-
+-If your Verdaccio instance handles a large number of authenticated requests using
+-username and password for authentication, the `rounds` configuration value may need
+-to be decreased to prevent excessive CPU usage and request latency.
+-
+-Also note that setting the `rounds` configuration value to a value that is too small
+-increases the risk of successful brute force attack. Auth0 has a
+-[blog article](https://auth0.com/blog/hashing-in-action-understanding-bcrypt)
+-that provides an overview of how `bcrypt` hashing works and some best practices.
+ 
+ ## Logging In
+ 
+diff --git a/packages/plugins/htpasswd/src/htpasswd.ts b/packages/plugins/htpasswd/src/htpasswd.ts
+index 6e7f6829d..ee7469453 100644
+--- a/packages/plugins/htpasswd/src/htpasswd.ts
++++ b/packages/plugins/htpasswd/src/htpasswd.ts
+@@ -19,12 +19,9 @@ export type HTPasswdConfig = {
+   file: string;
+   algorithm?: HtpasswdHashAlgorithm;
+   rounds?: number;
+-  max_users?: number;
+-  slow_verify_ms?: number;
+ } & Config;
+ 
+ export const DEFAULT_BCRYPT_ROUNDS = 10;
+-export const DEFAULT_SLOW_VERIFY_MS = 200;
+ 
+ /**
+  * HTPasswd - Verdaccio auth class
+@@ -33,21 +30,30 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+   /**
+    *
+    * @param {*} config htpasswd file
+-   * @param {object} options config.yaml in object from
++   * @param {object} stuff config.yaml in object from
+    */
+   private users: {};
++  private stuff: {};
++  private config: {};
++  private verdaccioConfig: Config;
+   private maxUsers: number;
+   private hashConfig: HtpasswdHashConfig;
+   private path: string;
+-  private slowVerifyMs: number;
+   private logger: Logger;
+   private lastTime: any;
+   // constructor
+-  public constructor(config: HTPasswdConfig, options: PluginOptions<HTPasswdConfig>) {
++  public constructor(config: HTPasswdConfig, stuff: PluginOptions<{}>) {
+     this.users = {};
+ 
++    // config for this module
++    this.config = config;
++    this.stuff = stuff;
++
+     // verdaccio logger
+-    this.logger = options.logger;
++    this.logger = stuff.logger;
++
++    // verdaccio main config object
++    this.verdaccioConfig = stuff.config;
+ 
+     // all this "verdaccio_config" stuff is for b/w compatibility only
+     this.maxUsers = config.max_users ? config.max_users : Infinity;
+@@ -82,41 +88,25 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+       throw new Error('should specify "file" in config');
+     }
+ 
+-    this.path = Path.resolve(Path.dirname(options.config.config_path), file);
+-    this.slowVerifyMs = config.slow_verify_ms || DEFAULT_SLOW_VERIFY_MS;
++    this.path = Path.resolve(Path.dirname(this.verdaccioConfig.config_path), file);
+   }
+ 
+   /**
+    * authenticate - Authenticate user.
+    * @param {string} user
+    * @param {string} password
+-   * @param {function} cb
+-   * @returns {void}
++   * @param {function} cd
++   * @returns {function}
+    */
+   public authenticate(user: string, password: string, cb: Callback): void {
+-    this.reload(async (err) => {
++    this.reload((err) => {
+       if (err) {
+         return cb(err.code === 'ENOENT' ? null : err);
+       }
+       if (!this.users[user]) {
+         return cb(null, false);
+       }
+-
+-      let passwordValid = false;
+-      try {
+-        const start = new Date();
+-        passwordValid = await verifyPassword(password, this.users[user]);
+-        const durationMs = new Date().getTime() - start.getTime();
+-        if (durationMs > this.slowVerifyMs) {
+-          this.logger.warn(
+-            { user, durationMs },
+-            'Password for user "@{user}" took @{durationMs}ms to verify'
+-          );
+-        }
+-      } catch ({ message }) {
+-        this.logger.error({ message }, 'Unable to verify user password: @{message}');
+-      }
+-      if (!passwordValid) {
++      if (!verifyPassword(password, this.users[user])) {
+         return cb(null, false);
+       }
+ 
+@@ -140,11 +130,11 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+    * @param {string} user
+    * @param {string} password
+    * @param {function} realCb
+-   * @returns {Promise<any>}
++   * @returns {function}
+    */
+-  public async adduser(user: string, password: string, realCb: Callback): Promise<any> {
++  public adduser(user: string, password: string, realCb: Callback): any {
+     const pathPass = this.path;
+-    let sanity = await sanityCheck(user, password, verifyPassword, this.users, this.maxUsers);
++    let sanity = sanityCheck(user, password, verifyPassword, this.users, this.maxUsers);
+ 
+     // preliminary checks, just to ensure that file won't be reloaded if it's
+     // not needed
+@@ -152,7 +142,7 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+       return realCb(sanity, false);
+     }
+ 
+-    lockAndRead(pathPass, async (err, res): Promise<void> => {
++    lockAndRead(pathPass, (err, res): void => {
+       let locked = false;
+ 
+       // callback that cleans up lock first
+@@ -180,7 +170,7 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+ 
+       // real checks, to prevent race conditions
+       // parsing users after reading file.
+-      sanity = await sanityCheck(user, password, verifyPassword, this.users, this.maxUsers);
++      sanity = sanityCheck(user, password, verifyPassword, this.users, this.maxUsers);
+ 
+       if (sanity) {
+         return cb(sanity);
+@@ -240,8 +230,7 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+    * changePassword - change password for existing user.
+    * @param {string} user
+    * @param {string} password
+-   * @param {string} newPassword
+-   * @param {function} realCb
++   * @param {function} cd
+    * @returns {function}
+    */
+   public changePassword(
+@@ -250,7 +239,7 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+     newPassword: string,
+     realCb: Callback
+   ): void {
+-    lockAndRead(this.path, async (err, res) => {
++    lockAndRead(this.path, (err, res) => {
+       let locked = false;
+       const pathPassFile = this.path;
+ 
+@@ -277,9 +266,13 @@ export default class HTPasswd implements IPluginAuth<HTPasswdConfig> {
+       const body = this._stringToUt8(res);
+       this.users = parseHTPasswd(body);
+ 
++      if (!this.users[user]) {
++        return cb(new Error('User not found'));
++      }
++
+       try {
+         this._writeFile(
+-          await changePasswordToHTPasswd(body, user, password, newPassword, this.hashConfig),
++          changePasswordToHTPasswd(body, user, password, newPassword, this.hashConfig),
+           cb
+         );
+       } catch (err: any) {
+diff --git a/packages/plugins/htpasswd/src/utils.ts b/packages/plugins/htpasswd/src/utils.ts
+index 4a78927fc..958b0c6e2 100644
+--- a/packages/plugins/htpasswd/src/utils.ts
++++ b/packages/plugins/htpasswd/src/utils.ts
+@@ -39,9 +39,8 @@ export function lockAndRead(name: string, cb: Callback): void {
+  * @returns {object}
+  */
+ export function parseHTPasswd(input: string): Record<string, any> {
+-  // The input is split on line ending styles that are both windows and unix compatible
+-  return input.split(/[\r]?[\n]/).reduce((result, line) => {
+-    const args = line.split(':', 3).map((str) => str.trim());
++  return input.split('\n').reduce((result, line) => {
++    const args = line.split(':', 3);
+     if (args.length > 1) {
+       result[args[0]] = args[1];
+     }
+@@ -53,13 +52,11 @@ export function parseHTPasswd(input: string): Record<string, any> {
+  * verifyPassword - matches password and it's hash.
+  * @param {string} passwd
+  * @param {string} hash
+- * @returns {Promise<boolean>}
++ * @returns {boolean}
+  */
+-export async function verifyPassword(passwd: string, hash: string): Promise<boolean> {
+-  if (hash.match(/^\$2([aby])\$/)) {
+-    return new Promise((resolve, reject) =>
+-      bcrypt.compare(passwd, hash, (error, result) => (error ? reject(error) : resolve(result)))
+-    );
++export function verifyPassword(passwd: string, hash: string): boolean {
++  if (hash.match(/^\$2(a|b|y)\$/)) {
++    return bcrypt.compareSync(passwd, hash);
+   } else if (hash.indexOf('{PLAIN}') === 0) {
+     return passwd === hash.substr(7);
+   } else if (hash.indexOf('{SHA}') === 0) {
+@@ -115,7 +112,6 @@ export function generateHtpasswdLine(
+  * @param {string} body
+  * @param {string} user
+  * @param {string} passwd
+- * @param {HtpasswdHashConfig} hashConfig
+  * @returns {string}
+  */
+ export function addUserToHTPasswd(
+@@ -143,18 +139,16 @@ export function addUserToHTPasswd(
+  * Sanity check for a user
+  * @param {string} user
+  * @param {object} users
+- * @param {string} password
+- * @param {Callback} verifyFn
+  * @param {number} maxUsers
+  * @returns {object}
+  */
+-export async function sanityCheck(
++export function sanityCheck(
+   user: string,
+   password: string,
+   verifyFn: Callback,
+   users: {},
+   maxUsers: number
+-): Promise<HttpError | null> {
++): HttpError | null {
+   let err;
+ 
+   // check for user or password
+@@ -173,7 +167,7 @@ export async function sanityCheck(
+   }
+ 
+   if (hash) {
+-    const auth = await verifyFn(password, users[user]);
++    const auth = verifyFn(password, users[user]);
+     if (auth) {
+       err = Error(API_ERROR.USERNAME_ALREADY_REGISTERED);
+       err.status = HTTP_STATUS.CONFLICT;
+@@ -197,27 +191,28 @@ export async function sanityCheck(
+  * @param {string} user
+  * @param {string} passwd
+  * @param {string} newPasswd
+- * @param {HtpasswdHashConfig} hashConfig
+  * @returns {string}
+  */
+-export async function changePasswordToHTPasswd(
++export function changePasswordToHTPasswd(
+   body: string,
+   user: string,
+   passwd: string,
+   newPasswd: string,
+   hashConfig: HtpasswdHashConfig
+-): Promise<string> {
++): string {
+   let lines = body.split('\n');
+-  const userLineIndex = lines.findIndex((line) => line.split(':', 1).shift() === user);
+-  if (userLineIndex === -1) {
+-    throw new Error(`Unable to change password for user '${user}': user does not currently exist`);
+-  }
+-  const [username, hash] = lines[userLineIndex].split(':', 2);
+-  const passwordValid = await verifyPassword(passwd, hash);
+-  if (!passwordValid) {
+-    throw new Error(`Unable to change password for user '${user}': invalid old password`);
+-  }
+-  const updatedUserLine = generateHtpasswdLine(username, newPasswd, hashConfig);
+-  lines.splice(userLineIndex, 1, updatedUserLine);
++  lines = lines.map((line) => {
++    const [username, hash] = line.split(':', 3);
++
++    if (username === user) {
++      if (verifyPassword(passwd, hash)) {
++        line = generateHtpasswdLine(user, newPasswd, hashConfig);
++      } else {
++        throw new Error('Invalid old Password');
++      }
++    }
++    return line;
++  });
++
+   return lines.join('\n');
+ }
+diff --git a/packages/plugins/htpasswd/tests/__fixtures__/htpasswd b/packages/plugins/htpasswd/tests/__fixtures__/htpasswd
+index 5c8a14a3f..dda54a931 100644
+--- a/packages/plugins/htpasswd/tests/__fixtures__/htpasswd
++++ b/packages/plugins/htpasswd/tests/__fixtures__/htpasswd
+@@ -1,3 +1,2 @@
+ test:$6FrCaT/v0dwE:autocreated 2018-01-17T03:40:22.958Z
+ username:$66to3JK5RgZM:autocreated 2018-01-17T03:40:46.315Z
+-bcrypt:$2y$04$K2Cn3StiXx4CnLmcTW/ymekOrj7WlycZZF9xgmoJ/U0zGPqSLPVBe
+diff --git a/packages/plugins/htpasswd/tests/__mocks__/Logger.ts b/packages/plugins/htpasswd/tests/__mocks__/Logger.ts
+new file mode 100644
+index 000000000..18e0b8c4a
+--- /dev/null
++++ b/packages/plugins/htpasswd/tests/__mocks__/Logger.ts
+@@ -0,0 +1 @@
++export default class Logger {}
+diff --git a/packages/plugins/htpasswd/tests/htpasswd.test.ts b/packages/plugins/htpasswd/tests/htpasswd.test.ts
+index 50203d7d5..6f34180ff 100644
+--- a/packages/plugins/htpasswd/tests/htpasswd.test.ts
++++ b/packages/plugins/htpasswd/tests/htpasswd.test.ts
+@@ -1,35 +1,36 @@
+ /* eslint-disable jest/no-mocks-import */
+-// @ts-ignore: Module has no default export
+-import bcrypt from 'bcryptjs';
+-// @ts-ignore: Module has no default export
+ import crypto from 'crypto';
+-// @ts-ignore: Module has no default export
++// @ts-ignore
+ import fs from 'fs';
+ import MockDate from 'mockdate';
+ 
+-import { PluginOptions } from '@verdaccio/types';
+-
+-import HTPasswd, { DEFAULT_SLOW_VERIFY_MS, HTPasswdConfig } from '../src/htpasswd';
++import HTPasswd, { VerdaccioConfigApp } from '../src/htpasswd';
+ import { HtpasswdHashAlgorithm } from '../src/utils';
+ import Config from './__mocks__/Config';
++// FIXME: remove this mocks imports
++import Logger from './__mocks__/Logger';
+ 
+-const options = {
+-  logger: { warn: jest.fn() },
++const stuff = {
++  logger: new Logger(),
+   config: new Config(),
+-} as any as PluginOptions<HTPasswdConfig>;
++};
+ 
+ const config = {
+   file: './htpasswd',
+   max_users: 1000,
+-} as HTPasswdConfig;
++};
++
++const getDefaultConfig = (): VerdaccioConfigApp => ({
++  file: './htpasswd',
++  max_users: 1000,
++});
+ 
+ describe('HTPasswd', () => {
+   let wrapper;
+ 
+   beforeEach(() => {
+-    wrapper = new HTPasswd(config, options);
++    wrapper = new HTPasswd(getDefaultConfig(), stuff as unknown as VerdaccioConfigApp);
+     jest.resetModules();
+-    jest.clearAllMocks();
+ 
+     crypto.randomBytes = jest.fn(() => {
+       return {
+@@ -39,71 +40,46 @@ describe('HTPasswd', () => {
+   });
+ 
+   describe('constructor()', () => {
+-    const emptyPluginOptions = { config: {} } as any as PluginOptions<HTPasswdConfig>;
++    const emptyPluginOptions = { config: {} } as VerdaccioConfigApp;
+ 
+-    test('should ensure file path configuration exists', () => {
++    test('should files whether file path does not exist', () => {
+       expect(function () {
+-        new HTPasswd({} as HTPasswdConfig, emptyPluginOptions);
++        new HTPasswd({}, emptyPluginOptions);
+       }).toThrow(/should specify "file" in config/);
+     });
+ 
+     test('should throw error about incorrect algorithm', () => {
+       expect(function () {
+-        let invalidConfig = { algorithm: 'invalid', ...config } as HTPasswdConfig;
+-        new HTPasswd(invalidConfig, emptyPluginOptions);
++        let config = getDefaultConfig();
++        config.algorithm = 'invalid' as any;
++        new HTPasswd(config, emptyPluginOptions);
+       }).toThrow(/Invalid algorithm "invalid"/);
+     });
+   });
+ 
+   describe('authenticate()', () => {
+     test('it should authenticate user with given credentials', (done) => {
+-      const users = [
+-        { username: 'test', password: 'test' },
+-        { username: 'username', password: 'password' },
+-        { username: 'bcrypt', password: 'password' },
+-      ];
+-      let usersAuthenticated = 0;
+-      const generateCallback = (username) => (error, userGroups) => {
+-        usersAuthenticated += 1;
+-        expect(error).toBeNull();
+-        expect(userGroups).toContain(username);
+-        usersAuthenticated === users.length && done();
++      const callbackTest = (a, b): void => {
++        expect(a).toBeNull();
++        expect(b).toContain('test');
++        done();
+       };
+-      users.forEach(({ username, password }) =>
+-        wrapper.authenticate(username, password, generateCallback(username))
+-      );
+-    });
+-
+-    test('it should not authenticate user with given credentials', (done) => {
+-      const users = ['test', 'username', 'bcrypt'];
+-      let usersAuthenticated = 0;
+-      const generateCallback = () => (error, userGroups) => {
+-        usersAuthenticated += 1;
+-        expect(error).toBeNull();
+-        expect(userGroups).toBeFalsy();
+-        usersAuthenticated === users.length && done();
++      const callbackUsername = (a, b): void => {
++        expect(a).toBeNull();
++        expect(b).toContain('username');
++        done();
+       };
+-      users.forEach((username) =>
+-        wrapper.authenticate(username, 'somerandompassword', generateCallback())
+-      );
++      wrapper.authenticate('test', 'test', callbackTest);
++      wrapper.authenticate('username', 'password', callbackUsername);
+     });
+ 
+-    test('it should warn on slow password verification', (done) => {
+-      bcrypt.compare = jest.fn((passwd, hash, callback) => {
+-        setTimeout(() => callback(null, true), DEFAULT_SLOW_VERIFY_MS + 1);
+-      });
++    test('it should not authenticate user with given credentials', (done) => {
+       const callback = (a, b): void => {
+         expect(a).toBeNull();
+-        expect(b).toContain('bcrypt');
+-        const mockWarn = options.logger.warn as jest.MockedFn<jest.MockableFunction>;
+-        expect(mockWarn.mock.calls.length).toBe(1);
+-        const [{ user, durationMs }, message] = mockWarn.mock.calls[0];
+-        expect(user).toEqual('bcrypt');
+-        expect(durationMs).toBeGreaterThan(DEFAULT_SLOW_VERIFY_MS);
+-        expect(message).toEqual('Password for user "@{user}" took @{durationMs}ms to verify');
++        expect(b).toBeFalsy();
+         done();
+       };
+-      wrapper.authenticate('bcrypt', 'password', callback);
++      wrapper.authenticate('test', 'somerandompassword', callback);
+     });
+   });
+ 
+@@ -146,7 +122,7 @@ describe('HTPasswd', () => {
+         });
+ 
+         const HTPasswd = require('../src/htpasswd.ts').default;
+-        const wrapper = new HTPasswd(config, options);
++        const wrapper = new HTPasswd(config, stuff);
+         wrapper.adduser('sanityCheck', 'test', (sanity) => {
+           expect(sanity.message).toBeDefined();
+           expect(sanity.message).toMatch('some error');
+@@ -164,7 +140,7 @@ describe('HTPasswd', () => {
+         });
+ 
+         const HTPasswd = require('../src/htpasswd.ts').default;
+-        const wrapper = new HTPasswd(config, options);
++        const wrapper = new HTPasswd(config, stuff);
+         wrapper.adduser('lockAndRead', 'test', (sanity) => {
+           expect(sanity.message).toBeDefined();
+           expect(sanity.message).toMatch('lock error');
+@@ -184,7 +160,7 @@ describe('HTPasswd', () => {
+         });
+ 
+         const HTPasswd = require('../src/htpasswd.ts').default;
+-        const wrapper = new HTPasswd(config, options);
++        const wrapper = new HTPasswd(config, stuff);
+         wrapper.adduser('addUserToHTPasswd', 'test', () => {
+           done();
+         });
+@@ -211,7 +187,7 @@ describe('HTPasswd', () => {
+         });
+ 
+         const HTPasswd = require('../src/htpasswd.ts').default;
+-        const wrapper = new HTPasswd(config, options);
++        const wrapper = new HTPasswd(config, stuff);
+         wrapper.adduser('addUserToHTPasswd', 'test', (err) => {
+           expect(err).not.toBeNull();
+           expect(err.message).toMatch('write error');
+@@ -222,11 +198,7 @@ describe('HTPasswd', () => {
+ 
+     describe('reload()', () => {
+       test('it should read the file and set the users', (done) => {
+-        const output = {
+-          test: '$6FrCaT/v0dwE',
+-          username: '$66to3JK5RgZM',
+-          bcrypt: '$2y$04$K2Cn3StiXx4CnLmcTW/ymekOrj7WlycZZF9xgmoJ/U0zGPqSLPVBe',
+-        };
++        const output = { test: '$6FrCaT/v0dwE', username: '$66to3JK5RgZM' };
+         const callback = (): void => {
+           expect(wrapper.users).toEqual(output);
+           done();
+@@ -252,7 +224,7 @@ describe('HTPasswd', () => {
+         };
+ 
+         const HTPasswd = require('../src/htpasswd.ts').default;
+-        const wrapper = new HTPasswd(config, options);
++        const wrapper = new HTPasswd(config, stuff);
+         wrapper.reload(callback);
+       });
+ 
+@@ -275,7 +247,7 @@ describe('HTPasswd', () => {
+         };
+ 
+         const HTPasswd = require('../src/htpasswd.ts').default;
+-        const wrapper = new HTPasswd(config, options);
++        const wrapper = new HTPasswd(config, stuff);
+         wrapper.reload(callback);
+       });
+ 
+@@ -295,7 +267,7 @@ describe('HTPasswd', () => {
+         };
+ 
+         const HTPasswd = require('../src/htpasswd.ts').default;
+-        const wrapper = new HTPasswd(config, options);
++        const wrapper = new HTPasswd(config, stuff);
+         wrapper.reload(callback);
+       });
+     });
+@@ -304,9 +276,7 @@ describe('HTPasswd', () => {
+   test('changePassword - it should throw an error for user not found', (done) => {
+     const callback = (error, isSuccess): void => {
+       expect(error).not.toBeNull();
+-      expect(error.message).toBe(
+-        `Unable to change password for user 'usernotpresent': user does not currently exist`
+-      );
++      expect(error.message).toBe('User not found');
+       expect(isSuccess).toBeFalsy();
+       done();
+     };
+@@ -316,9 +286,7 @@ describe('HTPasswd', () => {
+   test('changePassword - it should throw an error for wrong password', (done) => {
+     const callback = (error, isSuccess): void => {
+       expect(error).not.toBeNull();
+-      expect(error.message).toBe(
+-        `Unable to change password for user 'username': invalid old password`
+-      );
++      expect(error.message).toBe('Invalid old Password');
+       expect(isSuccess).toBeFalsy();
+       done();
+     };
+diff --git a/packages/plugins/htpasswd/tests/utils.test.ts b/packages/plugins/htpasswd/tests/utils.test.ts
+index d6cb0bb86..11752261f 100644
+--- a/packages/plugins/htpasswd/tests/utils.test.ts
++++ b/packages/plugins/htpasswd/tests/utils.test.ts
+@@ -1,4 +1,3 @@
+-// @ts-ignore: Module has no default export
+ import crypto from 'crypto';
+ import MockDate from 'mockdate';
+ 
+@@ -67,40 +66,40 @@ user4:$6FrCasdvppdwE:autocreated 2017-12-14T13:30:20.838Z`;
+ });
+ 
+ describe('verifyPassword', () => {
+-  it('should verify the MD5/Crypt3 password with true', async () => {
++  it('should verify the MD5/Crypt3 password with true', () => {
+     const input = ['test', '$apr1$sKXK9.lG$rZ4Iy63Vtn8jF9/USc4BV0'];
+-    expect(await verifyPassword(input[0], input[1])).toBeTruthy();
++    expect(verifyPassword(input[0], input[1])).toBeTruthy();
+   });
+-  it('should verify the MD5/Crypt3 password with false', async () => {
++  it('should verify the MD5/Crypt3 password with false', () => {
+     const input = ['testpasswordchanged', '$apr1$sKXK9.lG$rZ4Iy63Vtn8jF9/USc4BV0'];
+-    expect(await verifyPassword(input[0], input[1])).toBeFalsy();
++    expect(verifyPassword(input[0], input[1])).toBeFalsy();
+   });
+-  it('should verify the plain password with true', async () => {
++  it('should verify the plain password with true', () => {
+     const input = ['testpasswordchanged', '{PLAIN}testpasswordchanged'];
+-    expect(await verifyPassword(input[0], input[1])).toBeTruthy();
++    expect(verifyPassword(input[0], input[1])).toBeTruthy();
+   });
+-  it('should verify the plain password with false', async () => {
++  it('should verify the plain password with false', () => {
+     const input = ['testpassword', '{PLAIN}testpasswordchanged'];
+-    expect(await verifyPassword(input[0], input[1])).toBeFalsy();
++    expect(verifyPassword(input[0], input[1])).toBeFalsy();
+   });
+-  it('should verify the crypto SHA password with true', async () => {
++  it('should verify the crypto SHA password with true', () => {
+     const input = ['testpassword', '{SHA}i7YRj4/Wk1rQh2o740pxfTJwj/0='];
+-    expect(await verifyPassword(input[0], input[1])).toBeTruthy();
++    expect(verifyPassword(input[0], input[1])).toBeTruthy();
+   });
+-  it('should verify the crypto SHA password with false', async () => {
++  it('should verify the crypto SHA password with false', () => {
+     const input = ['testpasswordchanged', '{SHA}i7YRj4/Wk1rQh2o740pxfTJwj/0='];
+-    expect(await verifyPassword(input[0], input[1])).toBeFalsy();
++    expect(verifyPassword(input[0], input[1])).toBeFalsy();
+   });
+-  it('should verify the bcrypt password with true', async () => {
++  it('should verify the bcrypt password with true', () => {
+     const input = ['testpassword', '$2y$04$Wqed4yN0OktGbiUdxSTwtOva1xfESfkNIZfcS9/vmHLsn3.lkFxJO'];
+-    expect(await verifyPassword(input[0], input[1])).toBeTruthy();
++    expect(verifyPassword(input[0], input[1])).toBeTruthy();
+   });
+-  it('should verify the bcrypt password with false', async () => {
++  it('should verify the bcrypt password with false', () => {
+     const input = [
+       'testpasswordchanged',
+       '$2y$04$Wqed4yN0OktGbiUdxSTwtOva1xfESfkNIZfcS9/vmHLsn3.lkFxJO',
+     ];
+-    expect(await verifyPassword(input[0], input[1])).toBeFalsy();
++    expect(verifyPassword(input[0], input[1])).toBeFalsy();
+   });
+ });
+ 
+@@ -171,58 +170,58 @@ describe('sanityCheck', () => {
+     users = { test: '$6FrCaT/v0dwE' };
+   });
+ 
+-  test('should throw error for user already exists', async () => {
++  test('should throw error for user already exists', () => {
+     const verifyFn = jest.fn();
+-    const input = await sanityCheck('test', users.test, verifyFn, users, Infinity);
++    const input = sanityCheck('test', users.test, verifyFn, users, Infinity);
+     expect(input.status).toEqual(401);
+     expect(input.message).toEqual('unauthorized access');
+     expect(verifyFn).toHaveBeenCalled();
+   });
+ 
+-  test('should throw error for registration disabled of users', async () => {
++  test('should throw error for registration disabled of users', () => {
+     const verifyFn = (): void => {};
+-    const input = await sanityCheck('username', users.test, verifyFn, users, -1);
++    const input = sanityCheck('username', users.test, verifyFn, users, -1);
+     expect(input.status).toEqual(409);
+     expect(input.message).toEqual('user registration disabled');
+   });
+ 
+-  test('should throw error max number of users', async () => {
++  test('should throw error max number of users', () => {
+     const verifyFn = (): void => {};
+-    const input = await sanityCheck('username', users.test, verifyFn, users, 1);
++    const input = sanityCheck('username', users.test, verifyFn, users, 1);
+     expect(input.status).toEqual(403);
+     expect(input.message).toEqual('maximum amount of users reached');
+   });
+ 
+-  test('should not throw anything and sanity check', async () => {
++  test('should not throw anything and sanity check', () => {
+     const verifyFn = (): void => {};
+-    const input = await sanityCheck('username', users.test, verifyFn, users, 2);
++    const input = sanityCheck('username', users.test, verifyFn, users, 2);
+     expect(input).toBeNull();
+   });
+ 
+-  test('should throw error for required username field', async () => {
++  test('should throw error for required username field', () => {
+     const verifyFn = (): void => {};
+-    const input = await sanityCheck(undefined, users.test, verifyFn, users, 2);
++    const input = sanityCheck(undefined, users.test, verifyFn, users, 2);
+     expect(input.message).toEqual('username and password is required');
+     expect(input.status).toEqual(400);
+   });
+ 
+-  test('should throw error for required password field', async () => {
++  test('should throw error for required password field', () => {
+     const verifyFn = (): void => {};
+-    const input = await sanityCheck('username', undefined, verifyFn, users, 2);
++    const input = sanityCheck('username', undefined, verifyFn, users, 2);
+     expect(input.message).toEqual('username and password is required');
+     expect(input.status).toEqual(400);
+   });
+ 
+-  test('should throw error for required username & password fields', async () => {
++  test('should throw error for required username & password fields', () => {
+     const verifyFn = (): void => {};
+-    const input = await sanityCheck(undefined, undefined, verifyFn, users, 2);
++    const input = sanityCheck(undefined, undefined, verifyFn, users, 2);
+     expect(input.message).toEqual('username and password is required');
+     expect(input.status).toEqual(400);
+   });
+ 
+-  test('should throw error for existing username and password', async () => {
++  test('should throw error for existing username and password', () => {
+     const verifyFn = jest.fn(() => true);
+-    const input = await sanityCheck('test', users.test, verifyFn, users, 2);
++    const input = sanityCheck('test', users.test, verifyFn, users, 2);
+     expect(input.status).toEqual(409);
+     expect(input.message).toEqual('username is already registered');
+     expect(verifyFn).toHaveBeenCalledTimes(1);
+@@ -230,9 +229,9 @@ describe('sanityCheck', () => {
+ 
+   test(
+     'should throw error for existing username and password with max number ' + 'of users reached',
+-    async () => {
++    () => {
+       const verifyFn = jest.fn(() => true);
+-      const input = await sanityCheck('test', users.test, verifyFn, users, 1);
++      const input = sanityCheck('test', users.test, verifyFn, users, 1);
+       expect(input.status).toEqual(409);
+       expect(input.message).toEqual('username is already registered');
+       expect(verifyFn).toHaveBeenCalledTimes(1);
+@@ -241,11 +240,11 @@ describe('sanityCheck', () => {
+ });
+ 
+ describe('changePasswordToHTPasswd', () => {
+-  test('should throw error for wrong password', async () => {
++  test('should throw error for wrong password', () => {
+     const body = 'test:$6b9MlB3WUELU:autocreated 2017-11-06T18:17:21.957Z';
+ 
+     try {
+-      await changePasswordToHTPasswd(
++      changePasswordToHTPasswd(
+         body,
+         'test',
+         'somerandompassword',
+@@ -253,35 +252,15 @@ describe('changePasswordToHTPasswd', () => {
+         defaultHashConfig
+       );
+     } catch (error: any) {
+-      expect(error.message).toEqual(
+-        `Unable to change password for user 'test': invalid old password`
+-      );
+-    }
+-  });
+-
+-  test('should throw error when user does not exist', async () => {
+-    const body = 'test:$6b9MlB3WUELU:autocreated 2017-11-06T18:17:21.957Z';
+-
+-    try {
+-      await changePasswordToHTPasswd(
+-        body,
+-        'test2',
+-        'somerandompassword',
+-        'newPassword',
+-        defaultHashConfig
+-      );
+-    } catch (error: any) {
+-      expect(error.message).toEqual(
+-        `Unable to change password for user 'test2': user does not currently exist`
+-      );
++      expect(error.message).toEqual('Invalid old Password');
+     }
+   });
+ 
+-  test('should change the password', async () => {
++  test('should change the password', () => {
+     const body = 'root:$6qLTHoPfGLy2:autocreated 2018-08-20T13:38:12.164Z';
+ 
+     expect(
+-      await changePasswordToHTPasswd(body, 'root', 'demo123', 'newPassword', defaultHashConfig)
++      changePasswordToHTPasswd(body, 'root', 'demo123', 'newPassword', defaultHashConfig)
+     ).toMatchSnapshot();
+   });
+ });

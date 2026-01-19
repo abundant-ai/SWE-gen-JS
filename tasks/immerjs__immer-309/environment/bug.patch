@@ -1,0 +1,1399 @@
+diff --git a/.travis.yml b/.travis.yml
+index 1d3f0c4..6bc27a0 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -1,5 +1,6 @@
+ language: node_js
+ node_js:
++    - "6"
+     - "8"
+     - "10"
+     - "node"
+@@ -17,6 +18,7 @@ script:
+     - yarn coveralls
+     - yarn test:flow
+     - yarn test:dts
++    - yarn add typescript@3.3 -D && yarn test:dts
+ jobs:
+     include:
+         - stage: deploy
+diff --git a/__tests__/base.js b/__tests__/base.js
+index c490618..4485e89 100644
+--- a/__tests__/base.js
++++ b/__tests__/base.js
+@@ -771,30 +771,23 @@ function runBaseTest(name, useProxies, autoFreeze, useListener) {
+             })
+         })
+ 
+-        it("'this' should not be bound anymore - 1", () => {
++        it("'this' should work - 1", () => {
+             const base = {x: 3}
+             const next1 = produce(base, function() {
+-                expect(this).toBe(undefined)
++                this.x = 4
+             })
++            expect(next1).not.toBe(base)
++            expect(next1.x).toBe(4)
+         })
+ 
+-        it("'this' should not be bound anymore - 2", () => {
++        it("'this' should work - 2", () => {
++            const base = {x: 3}
+             const incrementor = produce(function() {
+-                expect(this).toBe(undefined)
++                this.x = 4
+             })
+-            incrementor()
+-        })
+-
+-        it("should be possible to use dynamic bound this", () => {
+-            const world = {
+-                counter: {count: 1},
+-                inc: produce(function(draft) {
+-                    expect(this).toBe(world)
+-                    draft.counter.count = this.counter.count + 1
+-                })
+-            }
+-
+-            expect(world.inc(world).counter.count).toBe(2)
++            const next1 = incrementor(base)
++            expect(next1).not.toBe(base)
++            expect(next1.x).toBe(4)
+         })
+ 
+         // See here: https://github.com/mweststrate/immer/issues/89
+@@ -899,13 +892,15 @@ function runBaseTest(name, useProxies, autoFreeze, useListener) {
+             })
+         })
+ 
++        // TODO: rewrite tests with async/await once node 6 support is dropped
+         describe("async recipe function", () => {
+             it("can modify the draft", () => {
+                 const base = {a: 0, b: 0}
+-                return produce(base, async d => {
++                return produce(base, d => {
+                     d.a = 1
+-                    await Promise.resolve()
+-                    d.b = 1
++                    return Promise.resolve().then(() => {
++                        d.b = 1
++                    })
+                 }).then(res => {
+                     expect(res).not.toBe(base)
+                     expect(res).toEqual({a: 1, b: 1})
+diff --git a/__tests__/curry.js b/__tests__/curry.js
+index 3ad7b90..897ff5e 100644
+--- a/__tests__/curry.js
++++ b/__tests__/curry.js
+@@ -54,7 +54,6 @@ function runTests(name, useProxies) {
+ 
+             expect(reducer(undefined, 3)).toEqual({hello: "world", index: 3})
+             expect(reducer({}, 3)).toEqual({index: 3})
+-            expect(reducer()).toEqual({hello: "world", index: undefined})
+         })
+ 
+         it("can has fun with change detection", () => {
+diff --git a/__tests__/draft.ts b/__tests__/draft.ts
+index 85a14e8..cc319c9 100644
+--- a/__tests__/draft.ts
++++ b/__tests__/draft.ts
+@@ -1,15 +1,29 @@
+-import {assert, _} from "spec.ts"
+-import {Draft} from "../dist/immer.js"
++import {Draft, DraftArray} from "../dist/immer.js"
+ 
+ // For checking if a type is assignable to its draft type (and vice versa)
+ declare const toDraft: <T>(value: T) => Draft<T>
+ declare const fromDraft: <T>(draft: Draft<T>) => T
+ 
++// prettier-ignore
++type Exact<A, B> = (<T>() => T extends A ? 1 : 0) extends (<T>() => T extends B ? 1 : 0)
++    ? (A extends B ? (B extends A ? unknown : never) : never)
++    : never
++
++/** Fails when `actual` and `expected` have different types. */
++declare const exactType: <Actual, Expected>(
++    actual: Actual & Exact<Actual, Expected>,
++    expected: Expected & Exact<Actual, Expected>
++) => Expected
++
++// To remove TS2454 errors.
++declare const _: any
++
+ // DraftArray<T>
+ {
+     // NOTE: As of 3.2.2, everything fails without "extends any"
+-    ;<Value extends any>(val: ReadonlyArray<Value>) => {
++    const $ = <Value extends any>(val: ReadonlyArray<Value>) => {
+         val = _ as Draft<typeof val>
++        val = _ as DraftArray<typeof val>
+         let elem: Value = _ as Draft<Value>
+     }
+ }
+@@ -17,30 +31,30 @@ declare const fromDraft: <T>(draft: Draft<T>) => T
+ // Tuple
+ {
+     let val: [1, 2] = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Tuple (nested in a tuple)
+ {
+     let val: [[1, 2]] = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Tuple (nested in two mutable arrays)
+ {
+     let val: [1, 2][][] = _
+     let draft: typeof val = _
+-    val = assert(toDraft(val), draft)
+-    assert(fromDraft(draft), val)
++    val = exactType(toDraft(val), draft)
++    exactType(fromDraft(draft), val)
+ }
+ 
+ // Tuple (nested in two readonly arrays)
+ {
+     let val: ReadonlyArray<ReadonlyArray<[1, 2]>> = _
+     let draft: [1, 2][][] = _
+-    val = assert(toDraft(val), draft)
++    val = exactType(toDraft(val), draft)
+ }
+ 
+ // Readonly tuple
+@@ -49,29 +63,29 @@ declare const fromDraft: <T>(draft: Draft<T>) => T
+     //       More info: https://stackoverflow.com/a/53822074/2228559
+     // let val: Readonly<[1, 2]> = _
+     // let draft: [1, 2] = _
+-    // draft = assert(toDraft(val), draft)
++    // draft = exactType(toDraft(val), draft)
+     // val = fromDraft(draft)
+ }
+ 
+ // Mutable array
+ {
+     let val: string[] = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Mutable array (nested in tuple)
+ {
+     let val: [string[]] = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Readonly array
+ {
+     let val: ReadonlyArray<string> = _
+     let draft: string[] = _
+-    val = assert(toDraft(val), draft)
++    val = exactType(toDraft(val), draft)
+     fromDraft(draft)
+ }
+ 
+@@ -79,22 +93,22 @@ declare const fromDraft: <T>(draft: Draft<T>) => T
+ {
+     let val: {readonly a: ReadonlyArray<string>} = _
+     let draft: {a: string[]} = _
+-    val = assert(toDraft(val), draft)
++    val = exactType(toDraft(val), draft)
+     fromDraft(draft)
+ }
+ 
+ // Mutable object
+ {
+     let val: {a: 1} = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Mutable object (nested in mutable object)
+ {
+     let val: {a: {b: 1}} = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Interface
+@@ -103,8 +117,8 @@ declare const fromDraft: <T>(draft: Draft<T>) => T
+         a: {b: number}
+     }
+     let val: Foo = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Interface (nested in interface)
+@@ -116,36 +130,36 @@ declare const fromDraft: <T>(draft: Draft<T>) => T
+         foo: Foo
+     }
+     let val: Bar = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Readonly object
+ {
+     let val: {readonly a: 1} = _
+     let draft: {a: 1} = _
+-    val = assert(toDraft(val), draft)
++    val = exactType(toDraft(val), draft)
+ }
+ 
+ // Readonly object (nested in tuple)
+ {
+     let val: [{readonly a: 1}] = _
+     let draft: [{a: 1}] = _
+-    val = assert(toDraft(val), draft)
++    val = exactType(toDraft(val), draft)
+ }
+ 
+ // Loose function
+ {
+     let val: Function = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Strict function
+ {
+     let val: () => void = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Class type (mutable)
+@@ -157,8 +171,8 @@ declare const fromDraft: <T>(draft: Draft<T>) => T
+     let val: Foo = _
+     // TODO: Uncomment this when plain object types can be distinguished from class types.
+     //       More info here: https://github.com/Microsoft/TypeScript/issues/29063
+-    // assert(toDraft(val), val)
+-    // assert(fromDraft(toDraft(val)), val)
++    // exactType(toDraft(val), val)
++    // exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Class type (readonly)
+@@ -170,109 +184,109 @@ declare const fromDraft: <T>(draft: Draft<T>) => T
+     let val: Foo = _
+     // TODO: Uncomment this when plain object types can be distinguished from class types.
+     //       More info here: https://github.com/Microsoft/TypeScript/issues/29063
+-    // assert(toDraft(val), val)
+-    // assert(fromDraft(toDraft(val)), val)
++    // exactType(toDraft(val), val)
++    // exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Map instance
+ {
+     let val: Map<any, any> = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ 
+     // Weak maps
+     let weak: WeakMap<any, any> = _
+-    assert(toDraft(weak), weak)
+-    assert(fromDraft(toDraft(weak)), weak)
++    exactType(toDraft(weak), weak)
++    exactType(fromDraft(toDraft(weak)), weak)
+ }
+ 
+ // Set instance
+ {
+     let val: Set<any> = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ 
+     // Weak sets
+     let weak: WeakSet<any> = _
+-    assert(toDraft(weak), weak)
+-    assert(fromDraft(toDraft(weak)), weak)
++    exactType(toDraft(weak), weak)
++    exactType(fromDraft(toDraft(weak)), weak)
+ }
+ 
+ // Promise object
+ {
+     let val: Promise<any> = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Date instance
+ {
+     let val: Date = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // RegExp instance
+ {
+     let val: RegExp = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Boxed primitive
+ {
+     let val: Boolean = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // String literal
+ {
+     let val: string = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Any
+ {
+     let val: any = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Never
+ {
+     let val: never = _ as never
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Unknown
+ {
+     let val: unknown = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Numeral
+ {
+     let val: 1 = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Union of numerals
+ {
+     let val: 1 | 2 | 3 = _
+-    assert(toDraft(val), val)
+-    assert(fromDraft(toDraft(val)), val)
++    exactType(toDraft(val), val)
++    exactType(fromDraft(toDraft(val)), val)
+ }
+ 
+ // Union of tuple, array, object
+ {
+     let val: [0] | ReadonlyArray<string> | Readonly<{a: 1}> = _
+     let draft: [0] | string[] | {a: 1} = _
+-    val = assert(toDraft(val), draft)
++    val = exactType(toDraft(val), draft)
+ }
+ 
+ // Generic type
+@@ -280,8 +294,8 @@ declare const fromDraft: <T>(draft: Draft<T>) => T
+     // NOTE: "extends any" only helps a little.
+     const $ = <T extends any>(val: ReadonlyArray<T>) => {
+         let draft: Draft<typeof val> = _
+-        val = assert(toDraft(val), draft)
++        val = exactType(toDraft(val), draft)
+         // $ExpectError: [ts] Argument of type 'DraftArray<T>' is not assignable to parameter of type 'Draft<T>'. [2345]
+-        // assert(fromDraft(draft), draft)
++        // exactType(fromDraft(draft), draft)
+     }
+ }
+diff --git a/__tests__/immutable.ts b/__tests__/immutable.ts
+index 8df0982..b580a63 100644
+--- a/__tests__/immutable.ts
++++ b/__tests__/immutable.ts
+@@ -1,56 +1,66 @@
+-import {assert, _} from "spec.ts"
+ import {Immutable} from "../dist/immer.js"
+ 
++// prettier-ignore
++type Exact<A, B> = (<T>() => T extends A ? 1 : 0) extends (<T>() => T extends B ? 1 : 0)
++    ? (A extends B ? (B extends A ? unknown : never) : never)
++    : never
++
++/** Fails when `actual` and `expected` have different types. */
++declare const exactType: <Actual, Expected>(
++    actual: Actual & Exact<Actual, Expected>,
++    expected: Expected & Exact<Actual, Expected>
++) => Expected
++
+ // array in tuple
+ {
+-    let val = _ as Immutable<[string[], 1]>
+-    assert(val, _ as readonly [ReadonlyArray<string>, 1])
++    let val = {} as Immutable<[string[], 1]>
++    exactType(val, {} as [ReadonlyArray<string>, 1])
+ }
+ 
+ // tuple in array
+ {
+-    let val = _ as Immutable<[string, 1][]>
+-    assert(val, _ as ReadonlyArray<readonly [string, 1]>)
++    let val = {} as Immutable<[string, 1][]>
++    exactType(val, {} as ReadonlyArray<[string, 1]>)
+ }
+ 
+ // tuple in tuple
+ {
+-    let val = _ as Immutable<[[string, 1], 1]>
+-    assert(val, _ as readonly [readonly [string, 1], 1])
++    let val = {} as Immutable<[[string, 1], 1]>
++    exactType(val, {} as [[string, 1], 1])
+ }
+ 
+ // array in array
+ {
+-    let val = _ as Immutable<string[][]>
+-    assert(val, _ as ReadonlyArray<ReadonlyArray<string>>)
++    let val = {} as Immutable<string[][]>
++    exactType(val, {} as ReadonlyArray<ReadonlyArray<string>>)
+ }
+ 
+ // tuple in object
+ {
+-    let val = _ as Immutable<{a: [string, 1]}>
+-    assert(val, _ as {readonly a: readonly [string, 1]})
++    let val = {} as Immutable<{a: [string, 1]}>
++    exactType(val, {} as {readonly a: [string, 1]})
+ }
+ 
+ // object in tuple
+ {
+-    let val = _ as Immutable<[{a: string}, 1]>
+-    assert(val, _ as readonly [{readonly a: string}, 1])
++    let val = {} as Immutable<[{a: string}, 1]>
++    exactType(val, {} as [{readonly a: string}, 1])
+ }
+ 
+ // array in object
+ {
+-    let val = _ as Immutable<{a: string[]}>
+-    assert(val, _ as {readonly a: ReadonlyArray<string>})
++    let val = {} as Immutable<{a: string[]}>
++    exactType(val, {} as {readonly a: ReadonlyArray<string>})
+ }
+ 
+ // object in array
+ {
+-    let val = _ as Immutable<Array<{a: string}>>
+-    assert(val, _ as ReadonlyArray<{readonly a: string}>)
++    let val = {} as Immutable<Array<{a: string}>>
++    exactType(val, {} as ReadonlyArray<{readonly a: string}>)
+ }
+ 
+ // object in object
+ {
+-    let val = _ as Immutable<{a: {b: string}}>
+-    assert(val, _ as {readonly a: {readonly b: string}})
++    let val = {} as Immutable<{a: {b: string}}>
++    exactType(val, {} as {readonly a: {readonly b: string}})
+ }
+diff --git a/__tests__/produce.ts b/__tests__/produce.ts
+index 363da6a..4b31cdb 100644
+--- a/__tests__/produce.ts
++++ b/__tests__/produce.ts
+@@ -1,13 +1,21 @@
+-import {assert, _} from "spec.ts"
+ import produce, {
+     produce as produce2,
+     applyPatches,
+     Patch,
+-    nothing,
+-    Draft,
+-    Immutable
++    nothing
+ } from "../dist/immer.js"
+ 
++// prettier-ignore
++type Exact<A, B> = (<T>() => T extends A ? 1 : 0) extends (<T>() => T extends B ? 1 : 0)
++    ? (A extends B ? (B extends A ? unknown : never) : never)
++    : never
++
++/** Fails when `actual` and `expected` have different types. */
++declare const exactType: <Actual, Expected>(
++    actual: Actual & Exact<Actual, Expected>,
++    expected: Expected & Exact<Actual, Expected>
++) => Expected
++
+ interface State {
+     readonly num: number
+     readonly foo?: string
+@@ -55,50 +63,32 @@ it("can update readonly state via standard api", () => {
+         draft.arr2[0].value = "foo"
+         draft.arr2.push({value: "asf"})
+     })
+-    assert(newState, state)
++    exactType(newState, state)
+ })
+ 
+ // NOTE: only when the function type is inferred
+ it("can infer state type from default state", () => {
+-    type State = {readonly a: number}
+-    type Recipe = <S extends State>(state?: S | undefined) => S
+-
+-    let foo = produce((_: any) => {}, _ as State)
+-    assert(foo, _ as Recipe)
++    type Producer = (base: number | undefined) => number
++    let foo = produce(_ => {}, 1)
++    exactType(foo, {} as Producer)
++    exactType(foo(2), 0 as number)
+ })
+ 
+ it("can infer state type from recipe function", () => {
+-    type State = {readonly a: string} | {readonly b: string}
+-    type Recipe = <S extends State>(state: S) => S
+-
+-    let foo = produce((_: Draft<State>) => {})
+-    assert(foo, _ as Recipe)
+-})
+-
+-it("can infer state type from recipe function with arguments", () => {
+-    type State = {readonly a: string} | {readonly b: string}
+-    type Recipe = <S extends State>(state: S, x: number) => S
++    type T = string | number
++    type Producer = (base: T | undefined, _2: number) => T
+ 
+-    let foo = produce((draft: Draft<State>, x: number) => {})
+-    assert(foo, _ as Recipe)
+-})
+-
+-it("can infer state type from recipe function with arguments and initial state", () => {
+-    type State = {readonly a: string} | {readonly b: string}
+-    type Recipe = <S extends State>(state: S | undefined, x: number) => S
+-
+-    let foo = produce((draft: Draft<State>, x: number) => {}, _ as State)
+-    assert(foo, _ as Recipe)
++    let foo = produce((_: string | number, _2: number) => {}, 1)
++    exactType(foo, {} as Producer)
++    exactType(foo("", 0), {} as string | number)
+ })
+ 
+ it("cannot infer state type when the function type and default state are missing", () => {
+-    type Recipe = <S extends any>(state: S) => S
+-    const foo = produce((_: any) => {})
+-    assert(foo, _ as Recipe)
++    exactType(produce(_ => {}), {} as (base: any) => any)
+ })
+ 
+ it("can update readonly state via curried api", () => {
+-    const newState = produce((draft: Draft<State>) => {
++    const newState = produce<State>(draft => {
+         draft.num++
+         draft.foo = "bar"
+         draft.bar = "foo"
+@@ -114,7 +104,7 @@ it("can update readonly state via curried api", () => {
+ })
+ 
+ it("can update use the non-default export", () => {
+-    const newState = produce2((draft: Draft<State>) => {
++    const newState = produce2<State>(draft => {
+         draft.num++
+         draft.foo = "bar"
+         draft.bar = "foo"
+@@ -146,164 +136,117 @@ it("can apply patches", () => {
+ 
+ describe("curried producer", () => {
+     it("supports rest parameters", () => {
+-        type State = {readonly a: 1}
+-
+-        // No initial state:
+-        {
+-            type Recipe = <S extends State>(state: S, a: number, b: number) => S
+-            let foo = produce((s: State, a: number, b: number) => {})
+-            assert(foo, _ as Recipe)
+-            foo(_ as State, 1, 2)
+-        }
+-
+-        // Using argument parameters:
+-        {
+-            type Recipe = <S extends State>(state: S, ...rest: number[]) => S
+-            let woo = produce((state: Draft<State>, ...args: number[]) => {})
+-            assert(woo, _ as Recipe)
+-            woo(_ as State, 1, 2)
+-        }
++        type Foo = (base: {}, _2: number, _3: number) => {}
++        let foo = produce((_1: {}, _2: number, _3: number) => {})
++        exactType(foo, {} as Foo)
++        foo({}, 1, 2)
+ 
+         // With initial state:
+-        {
+-            type Recipe = <S extends State>(
+-                state?: S | undefined,
+-                ...rest: number[]
+-            ) => S
+-            let bar = produce(
+-                (state: Draft<State>, ...args: number[]) => {},
+-                _ as State
+-            )
+-            assert(bar, _ as Recipe)
+-            bar(_ as State, 1, 2)
+-            bar(_ as State)
+-            bar()
+-        }
+-
+-        // When args is a tuple:
+-        {
+-            type Recipe = <S extends State>(
+-                state: S | undefined,
+-                first: string,
+-                ...rest: number[]
+-            ) => S
+-            let tup = produce(
+-                (state: Draft<State>, ...args: [string, ...number[]]) => {},
+-                _ as State
+-            )
+-            assert(tup, _ as Recipe)
+-            tup({a: 1}, "", 2)
+-            tup(undefined, "", 2)
+-        }
++        type Bar = (base: {} | undefined, _2: number, _3: number) => {}
++        let bar = produce((_1: {}, _2: number, _3: number) => {}, {})
++        exactType(bar, {} as Bar)
++        bar(undefined, 1, 2)
+     })
+ 
+     it("can be passed a readonly array", () => {
+-        // No initial state:
+-        {
+-            let foo = produce((state: string[]) => {})
+-            assert(foo, _ as <S extends readonly string[]>(state: S) => S)
+-            foo([] as ReadonlyArray<string>)
+-        }
++        let foo = produce((_: any[]) => {})
++        foo([] as ReadonlyArray<any>)
+ 
+         // With initial state:
+-        {
+-            let bar = produce(() => {}, [] as ReadonlyArray<string>)
+-            assert(bar, _ as <S extends readonly string[]>(
+-                state?: S | undefined
+-            ) => S)
+-            bar([] as ReadonlyArray<string>)
+-            bar(undefined)
+-            bar()
+-        }
++        let bar = produce((_: any[]) => {}, [])
++        bar([] as ReadonlyArray<any>)
+     })
+ })
+ 
+ it("works with return type of: number", () => {
+-    let base = _ as {a: number}
++    let base = {} as {a: number}
+     let result = produce(base, () => 1)
+-    assert(result, _ as number)
++    exactType(result, {} as number)
+ })
+ 
+ it("works with return type of: number | undefined", () => {
+-    let base = _ as {a: number}
++    let base = {} as {a: number}
+     let result = produce(base, draft => {
+         return draft.a < 0 ? 0 : undefined
+     })
+-    assert(result, _ as {a: number} | number)
++    exactType(result, {} as {a: number} | number)
+ })
+ 
+ it("can return an object type that is identical to the base type", () => {
+-    let base = _ as {a: number}
++    let base = {} as {a: number}
+     let result = produce(base, draft => {
+         return draft.a < 0 ? {a: 0} : undefined
+     })
+     // TODO: Can we resolve the weird union of identical object types?
+-    assert(result, _ as {a: number} | {a: number})
++    exactType(result, {} as {a: number} | {a: number})
+ })
+ 
+ it("can return an object type that is _not_ assignable to the base type", () => {
+-    let base = _ as {a: number}
++    let base = {} as {a: number}
+     let result = produce(base, draft => {
+         return draft.a < 0 ? {a: true} : undefined
+     })
+-    assert(result, _ as {a: number} | {a: boolean})
++    exactType(result, {} as {a: number} | {a: boolean})
+ })
+ 
+ it("does not enforce immutability at the type level", () => {
+     let result = produce([] as any[], draft => {
+         draft.push(1)
+     })
+-    assert(result, _ as any[])
++    exactType(result, {} as any[])
+ })
+ 
+ it("can produce an undefined value", () => {
+-    let base = _ as {readonly a: number}
++    let base = {} as {readonly a: number}
+ 
+     // Return only nothing.
+     let result = produce(base, _ => nothing)
+-    assert(result, undefined)
++    exactType(result, undefined)
+ 
+     // Return maybe nothing.
+     let result2 = produce(base, draft => {
+         if (draft.a > 0) return nothing
+     })
+-    assert(result2, _ as typeof base | undefined)
++    exactType(result2, {} as typeof base | undefined)
+ })
+ 
+ it("can return the draft itself", () => {
+-    let base = _ as {readonly a: number}
++    let base = {} as {readonly a: number}
+     let result = produce(base, draft => draft)
+ 
+     // Currently, the `readonly` modifier is lost.
+-    assert(result, _ as {a: number})
++    exactType(result, {} as {a: number} | undefined)
+ })
+ 
+ it("can return a promise", () => {
+-    type Base = {readonly a: number}
+-    let base = _ as Base
++    let base = {} as {readonly a: number}
+ 
+     // Return a promise only.
+-    let res1 = produce(base, draft => {
+-        return Promise.resolve(draft.a > 0 ? null : undefined)
+-    })
+-    assert(res1, _ as Promise<Base | null>)
++    exactType(
++        produce(base, draft => {
++            return Promise.resolve(draft.a > 0 ? null : undefined)
++        }),
++        {} as Promise<{readonly a: number} | null>
++    )
+ 
+     // Return a promise or undefined.
+-    let res2 = produce(base, draft => {
+-        if (draft.a > 0) return Promise.resolve()
+-    })
+-    assert(res2, _ as Base | Promise<Base>)
++    exactType(
++        produce(base, draft => {
++            if (draft.a > 0) return Promise.resolve()
++        }),
++        {} as (Promise<{readonly a: number}> | {readonly a: number})
++    )
+ })
+ 
+ it("works with `void` hack", () => {
+-    let base = _ as {readonly a: number}
++    let base = {} as {readonly a: number}
+     let copy = produce(base, s => void s.a++)
+-    assert(copy, base)
++    exactType(copy, base)
+ })
+ 
+ it("works with generic parameters", () => {
+-    let insert = <T>(array: readonly T[], index: number, elem: T) => {
+-        // Need explicit cast on draft as T[] is wider than readonly T[]
++    let insert = <T>(array: ReadonlyArray<T>, index: number, elem: T) => {
++        // NOTE: As of 3.2.2, the explicit argument type is required.
+         return produce(array, (draft: T[]) => {
+             draft.push(elem)
+             draft.splice(index, 0, elem)
+@@ -314,90 +257,3 @@ it("works with generic parameters", () => {
+     let arr: ReadonlyArray<typeof val> = 0 as any
+     insert(arr, 0, val)
+ })
+-
+-it("can work with non-readonly base types", () => {
+-    const state = {
+-        price: 10,
+-        todos: [
+-            {
+-                title: "test",
+-                done: false
+-            }
+-        ]
+-    }
+-    type State = typeof state
+-
+-    const newState: State = produce(state, draft => {
+-        draft.price += 5
+-        draft.todos.push({
+-            title: "hi",
+-            done: true
+-        })
+-    })
+-
+-    const reducer = (draft: State) => {
+-        draft.price += 5
+-        draft.todos.push({
+-            title: "hi",
+-            done: true
+-        })
+-    }
+-
+-    // base case for with-initial-state
+-    const newState4 = produce(reducer, state)(state)
+-    assert(newState4, _ as State)
+-    // no argument case, in that case, immutable version recipe first arg will be inferred
+-    const newState5 = produce(reducer, state)()
+-    assert(newState5, _ as Immutable<State>)
+-    // we can force the return type of the reducer by passing the generic argument
+-    const newState3 = produce(reducer, state)<State>()
+-    assert(newState3, _ as State)
+-})
+-
+-it("can work with readonly base types", () => {
+-    type State = {
+-        readonly price: number
+-        readonly todos: readonly {
+-            readonly title: string
+-            readonly done: boolean
+-        }[]
+-    }
+-
+-    const state: State = {
+-        price: 10,
+-        todos: [
+-            {
+-                title: "test",
+-                done: false
+-            }
+-        ]
+-    }
+-
+-    const newState: State = produce(state, draft => {
+-        draft.price + 5
+-        draft.todos.push({
+-            title: "hi",
+-            done: true
+-        })
+-    })
+-
+-    const reducer = (draft: Draft<State>) => {
+-        draft.price += 5
+-        draft.todos.push({
+-            title: "hi",
+-            done: true
+-        })
+-    }
+-    const newState2: State = produce(reducer)(state)
+-    assert(newState2, _ as State)
+-
+-    // base case for with-initial-state
+-    const newState4 = produce(reducer, state)(state)
+-    assert(newState4, _ as State)
+-    // no argument case, in that case, immutable version recipe first arg will be inferred
+-    const newState5 = produce(reducer, state)()
+-    assert(newState5, _ as Immutable<State>)
+-    // we can force the return type of the reducer by passing the generic argument
+-    const newState3 = produce(reducer, state)<State>()
+-    assert(newState3, _ as State)
+-})
+diff --git a/__tests__/readme.js b/__tests__/readme.js
+index 31306fa..ef1c9c8 100644
+--- a/__tests__/readme.js
++++ b/__tests__/readme.js
+@@ -1,5 +1,5 @@
+ "use strict"
+-import produce, {applyPatches, immerable} from "../src/index"
++import produce, {applyPatches} from "../src/index"
+ 
+ describe("readme example", () => {
+     it("works", () => {
+@@ -34,6 +34,21 @@ describe("readme example", () => {
+         expect(nextState[1]).not.toBe(baseState[1])
+     })
+ 
++    it("it can use this", () => {
++        const base = {counter: 0}
++
++        const next = produce(base, function() {
++            this.counter++
++        })
++        expect(next.counter).toBe(1)
++
++        // OR
++        const increment = produce(function() {
++            this.counter++
++        })
++        expect(increment(base).counter).toBe(1)
++    })
++
+     it("patches", () => {
+         let state = {
+             name: "Micheal",
+@@ -131,41 +146,4 @@ describe("readme example", () => {
+             users: new Map([["michel", {name: "michel"}]])
+         })
+     })
+-
+-    it("supports immerable", () => {
+-        class Clock {
+-            constructor(hours = 0, minutes = 0) {
+-                this.hours = hours
+-                this.minutes = minutes
+-            }
+-
+-            increment(hours, minutes = 0) {
+-                return produce(this, d => {
+-                    d.hours += hours
+-                    d.minutes += minutes
+-                })
+-            }
+-
+-            toString() {
+-                return `${("" + this.hours).padStart(2, 0)}:${(
+-                    "" + this.minutes
+-                ).padStart(2, 0)}`
+-            }
+-        }
+-        Clock[immerable] = true
+-
+-        const midnight = new Clock()
+-        const lunch = midnight.increment(12, 30)
+-
+-        expect(midnight).not.toBe(lunch)
+-        expect(lunch).toBeInstanceOf(Clock)
+-        expect(midnight.toString()).toBe("00:00")
+-        expect(lunch.toString()).toBe("12:30")
+-
+-        const diner = lunch.increment(6)
+-
+-        expect(diner).not.toBe(lunch)
+-        expect(lunch).toBeInstanceOf(Clock)
+-        expect(diner.toString()).toBe("18:30")
+-    })
+ })
+diff --git a/package.json b/package.json
+index acc7b80..6b41852 100644
+--- a/package.json
++++ b/package.json
+@@ -24,7 +24,7 @@
+   },
+   "repository": {
+     "type": "git",
+-    "url": "https://github.com/immerjs/immer.git"
++    "url": "https://github.com/mweststrate/immer.git"
+   },
+   "keywords": [
+     "immutable",
+@@ -34,9 +34,9 @@
+   "author": "Michel Weststrate",
+   "license": "MIT",
+   "bugs": {
+-    "url": "https://github.com/immerjs/immer/issues"
++    "url": "https://github.com/mweststrate/immer/issues"
+   },
+-  "homepage": "https://github.com/immerjs/immer#readme",
++  "homepage": "https://github.com/mweststrate/immer#readme",
+   "files": [
+     "dist",
+     "src"
+@@ -62,13 +62,12 @@
+     "jest": "^24.7.1",
+     "lodash": "^4.17.4",
+     "lodash.clonedeep": "^4.5.0",
+-    "prettier": "1.17.0",
++    "prettier": "^1.9.2",
+     "pretty-quick": "^1.8.0",
+     "regenerator-runtime": "^0.11.1",
+     "rimraf": "^2.6.2",
+     "seamless-immutable": "^7.1.3",
+-    "spec.ts": "^1.1.0",
+-    "typescript": "3.4.3",
++    "typescript": "3.1.1",
+     "yarn-or-npm": "^2.0.4"
+   },
+   "jest": {
+diff --git a/readme.md b/readme.md
+index fc00d47..5586df7 100644
+--- a/readme.md
++++ b/readme.md
+@@ -2,13 +2,13 @@
+ 
+ # Immer
+ 
+-[![npm](https://img.shields.io/npm/v/immer.svg)](https://www.npmjs.com/package/immer) [![size](http://img.badgesize.io/https://cdn.jsdelivr.net/npm/immer/dist/immer.umd.js?compression=gzip)](http://img.badgesize.io/https://cdn.jsdelivr.net/npm/immer/dist/immer.umd.js) [![Build Status](https://travis-ci.org/mweststrate/immer.svg?branch=master)](https://travis-ci.org/mweststrate/immer) [![Coverage Status](https://coveralls.io/repos/github/mweststrate/immer/badge.svg?branch=master)](https://coveralls.io/github/mweststrate/immer?branch=master) [![code style: prettier](https://img.shields.io/badge/code_style-prettier-ff69b4.svg)](https://github.com/prettier/prettier) [![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg)](https://www.paypal.me/michelweststrate)
++[![npm](https://img.shields.io/npm/v/immer.svg)](https://www.npmjs.com/package/immer) [![size](http://img.badgesize.io/https://cdn.jsdelivr.net/npm/immer/dist/immer.umd.js?compression=gzip)](http://img.badgesize.io/https://cdn.jsdelivr.net/npm/immer/dist/immer.umd.js) [![install size](https://packagephobia.now.sh/badge?p=immer)](https://packagephobia.now.sh/result?p=immer) [![Build Status](https://travis-ci.org/mweststrate/immer.svg?branch=master)](https://travis-ci.org/mweststrate/immer) [![Coverage Status](https://coveralls.io/repos/github/mweststrate/immer/badge.svg?branch=master)](https://coveralls.io/github/mweststrate/immer?branch=master) [![code style: prettier](https://img.shields.io/badge/code_style-prettier-ff69b4.svg)](https://github.com/prettier/prettier) [![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg)](https://www.paypal.me/michelweststrate)
+ 
+ _Create the next immutable state tree by simply modifying the current tree_
+ 
+ Winner of the "breakthrough of the year" [open source award](https://osawards.com/react/) in 2019
+ 
+-### [Release notes](https://github.com/immerjs/immer/releases)
++### [Release notes](https://github.com/mweststrate/immer/releases)
+ 
+ Did Immer make a difference to your project? Consider buying me a coffee!<br/><a href="https://www.buymeacoffee.com/mweststrate" target="_blank"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffee" style="height: auto !important;width: auto !important;" ></a>
+ 
+@@ -602,7 +602,7 @@ const state: State = {
+     x: 0
+ }
+ 
+-const newState = produce(state, draft => {
++const newState = produce<State>(state, draft => {
+     // `x` can be modified here
+     draft.x++
+ })
+@@ -612,38 +612,37 @@ const newState = produce(state, draft => {
+ 
+ This ensures that the only place you can modify your state is in your produce callbacks. It even works recursively and with `ReadonlyArray`s!
+ 
+-For curried reducers, the type is inferred from the first argument of recipe function, so make sure to type it. The `Draft` utility type can be used if the state argument type is immutable:
++**Note:** Immer v1.9+ supports Typescript v3.1+ only.
+ 
+-```ts
+-import produce, {Draft} from "immer"
++## Using `this`
+ 
+-interface State {
+-    readonly x: number
+-}
++_Deprecated, this will probably be removed in a next major version, see [#308](https://github.com/mweststrate/immer/issues/308)_
+ 
+-// `x` cannot be modified here
+-const state: State = {
+-    x: 0
+-}
++The recipe will be always invoked with the `draft` as `this` context.
+ 
+-const increment = produce((draft: Draft<State>, inc: number) => {
+-    // `x` can be modified here
+-    draft.x += inc
+-})
++This means that the following constructions are also valid:
+ 
+-const newState = increment(state, 2)
+-// `newState.x` cannot be modified here
+-```
++```javascript
++const base = {counter: 0}
+ 
+-**Note:** Immer v1.9+ supports TypeScript v3.1+ only.
++const next = produce(base, function() {
++    this.counter++
++})
++console.log(next.counter) // 1
+ 
+-**Note:** Immer v3.0+ supports TypeScript v3.4+ only.
++// OR
++const increment = produce(function() {
++    this.counter++
++})
++console.log(increment(base).counter) // 1
++```
+ 
+ # Pitfalls
+ 
+ 1. Don't redefine draft like, `draft = myCoolNewState`. Instead, either modify the `draft` or return a new state. See [Returning data from producers](#returning-data-from-producers).
+ 1. Immer assumes your state to be a unidirectional tree. That is, no object should appear twice in the tree, and there should be no circular references.
+ 1. Since Immer uses proxies, reading huge amounts of data from state comes with an overhead (especially in the ES5 implementation). If this ever becomes an issue (measure before you optimize!), do the current state analysis before entering the producer function or read from the `currentState` rather than the `draftState`. Also, realize that immer is opt-in everywhere, so it is perfectly fine to manually write super performance critical reducers, and use immer for all the normal ones. Also note that `original` can be used to get the original state of an object, which is cheaper to read.
++1. Some debuggers (at least Node 6 is known) have trouble debugging when Proxies are in play. Node 8 is known to work correctly.
+ 1. Always try to pull `produce` 'up', for example `for (let x of y) produce(base, d => d.push(x))` is exponentially slower than `produce(base, d => { for (let x of y) d.push(x)})`
+ 1. It is possible to return values from producers, except, it is not possible to return `undefined` that way, as it is indistinguishable from not updating the draft at all! If you want to replace the draft with `undefined`, just return `nothing` from the producer.
+ 
+@@ -735,18 +734,10 @@ Most important observation:
+ 
+ ## Migration
+ 
+-**Immer 2.\* -> 3.0**
+-
+-TODO
+-
+ **Immer 1.\* -> 2.0**
+ 
+ Make sure you don't return any promises as state, because `produce` will actually invoke the promise and wait until it settles.
+ 
+-**Immer 2.1 -> 2.2**
+-
+-When using TypeScript, for curried reducers that are typed in the form `produce<Type>((arg) => { })`, rewrite this to `produce((arg: Type) => { })` or `produce((arg: Draft<Type>) => { })` for correct inference.
+-
+ ## FAQ
+ 
+ _(for those who skimmed the above instead of actually reading)_
+diff --git a/src/immer.d.ts b/src/immer.d.ts
+index 4940449..d2b30a9 100644
+--- a/src/immer.d.ts
++++ b/src/immer.d.ts
+@@ -1,10 +1,3 @@
+-type Tail<T extends any[]> = ((...t: T) => any) extends ((
+-    _: any,
+-    ...tail: infer TT
+-) => any)
+-    ? TT
+-    : []
+-
+ /** Object types that should never be mapped */
+ type AtomicObject =
+     | Function
+@@ -19,17 +12,27 @@ type AtomicObject =
+     | Number
+     | String
+ 
+-export type Draft<T> = T extends AtomicObject
+-    ? T
+-    : T extends object
+-    ? {-readonly [K in keyof T]: Draft<T[K]>}
+-    : T
++type ArrayMethod = Exclude<keyof [], number>
++type Indices<T> = Exclude<keyof T, ArrayMethod>
+ 
+-/** Convert a mutable type into a readonly type */
+-export type Immutable<T> = T extends AtomicObject
++export type DraftArray<T extends ReadonlyArray<any>> = Array<
++    {[P in Indices<T>]: Draft<T[P]>}[Indices<T>]
++>
++
++export type DraftTuple<T extends ReadonlyArray<any>> = {
++    [P in keyof T]: P extends Indices<T> ? Draft<T[P]> : never
++}
++
++export type Draft<T> = T extends never[]
++    ? T
++    : T extends ReadonlyArray<any>
++    ? T[number][] extends T
++        ? DraftArray<T>
++        : DraftTuple<T>
++    : T extends AtomicObject
+     ? T
+     : T extends object
+-    ? {readonly [K in keyof T]: Immutable<T[K]>}
++    ? {-readonly [P in keyof T]: Draft<T[P]>}
+     : T
+ 
+ export interface Patch {
+@@ -50,60 +53,57 @@ export type Produced<Base, Return> = Return extends void
+     ? Promise<Result extends void ? Base : FromNothing<Result>>
+     : FromNothing<Return>
+ 
+-/**
+- * The `produce` function takes a value and a "recipe function" (whose
+- * return value often depends on the base state). The recipe function is
+- * free to mutate its first argument however it wants. All mutations are
+- * only ever applied to a __copy__ of the base state.
+- *
+- * Pass only a function to create a "curried producer" which relieves you
+- * from passing the recipe function every time.
+- *
+- * Only plain objects and arrays are made mutable. All other objects are
+- * considered uncopyable.
+- *
+- * Note: This function is __bound__ to its `Immer` instance.
+- *
+- * @param {any} base - the initial state
+- * @param {Function} producer - function that receives a proxy of the base state as first argument and which can be freely modified
+- * @param {Function} patchListener - optional function that will be called with all the patches produced here
+- * @returns {any} a new state, or the initial state if nothing was modified
+- */
++type ImmutableTuple<T extends ReadonlyArray<any>> = {
++    readonly [P in keyof T]: Immutable<T[P]>
++}
++
++/** Convert a mutable type into a readonly type */
++export type Immutable<T> = T extends object
++    ? T extends AtomicObject
++        ? T
++        : T extends ReadonlyArray<any>
++        ? Array<T[number]> extends T
++            ? {[P in keyof T]: ReadonlyArray<Immutable<T[number]>>}[keyof T]
++            : ImmutableTuple<T>
++        : {readonly [P in keyof T]: Immutable<T[P]>}
++    : T
++
+ export interface IProduce {
+-    /** Curried producer */
+-    <
+-        Recipe extends (...args: any[]) => any,
+-        Params extends any[] = Parameters<Recipe>,
+-        T = Params[0]
+-    >(
+-        recipe: Recipe
+-    ): <Base extends Immutable<T>>(
+-        base: Base,
+-        ...rest: Tail<Params>
+-    ) => Produced<Base, ReturnType<Recipe>>
+-    //   ^ by making the returned type generic, the actual type of the passed in object is preferred
+-    //     over the type used in the recipe. However, it does have to satisfy the immutable version used in the recipe
+-    //     Note: the type of S is the widened version of T, so it can have more props than T, but that is technically actually correct!
+-
+-    /** Curried producer with initial state */
+-    <
+-        Recipe extends (...args: any[]) => any,
+-        Params extends any[] = Parameters<Recipe>,
+-        T = Params[0]
+-    >(
+-        recipe: Recipe,
+-        initialState: Immutable<T>
+-    ): <Base extends Immutable<T>>(
+-        base?: Base,
+-        ...rest: Tail<Params>
+-    ) => Produced<Base, ReturnType<Recipe>>
+-
+-    /** Normal producer */
+-    <Base, D = Draft<Base>, Return = void>(
+-        base: Base,
+-        recipe: (draft: D) => Return,
++    /**
++     * The `produce` function takes a value and a "recipe function" (whose
++     * return value often depends on the base state). The recipe function is
++     * free to mutate its first argument however it wants. All mutations are
++     * only ever applied to a __copy__ of the base state.
++     *
++     * Pass only a function to create a "curried producer" which relieves you
++     * from passing the recipe function every time.
++     *
++     * Only plain objects and arrays are made mutable. All other objects are
++     * considered uncopyable.
++     *
++     * Note: This function is __bound__ to its `Immer` instance.
++     *
++     * @param {any} base - the initial state
++     * @param {Function} producer - function that receives a proxy of the base state as first argument and which can be freely modified
++     * @param {Function} patchListener - optional function that will be called with all the patches produced here
++     * @returns {any} a new state, or the initial state if nothing was modified
++     */
++    <T = any, Return = void, D = Draft<T>>(
++        base: T,
++        recipe: (this: D, draft: D) => Return,
+         listener?: PatchListener
+-    ): Produced<Base, Return>
++    ): Produced<T, Return>
++
++    /** Curried producer with a default value */
++    <T = any, Rest extends any[] = [], Return = void, D = Draft<T>>(
++        recipe: (this: D, draft: D, ...rest: Rest) => Return,
++        defaultBase: T
++    ): (base: Immutable<D> | undefined, ...rest: Rest) => Produced<D, Return>
++
++    /** Curried producer with no default value */
++    <T = any, Rest extends any[] = [], Return = void>(
++        recipe: (this: Draft<T>, draft: Draft<T>, ...rest: Rest) => Return
++    ): (base: Immutable<T>, ...rest: Rest) => Produced<T, Return>
+ }
+ 
+ export const produce: IProduce
+diff --git a/src/immer.js b/src/immer.js
+index 37eb140..7f300b6 100644
+--- a/src/immer.js
++++ b/src/immer.js
+@@ -40,10 +40,9 @@ export class Immer {
+             const defaultBase = recipe
+             recipe = base
+ 
+-            const self = this
+-            return function curriedProduce(base = defaultBase, ...args) {
+-                return self.produce(base, draft => recipe.call(this, draft, ...args)) // prettier-ignore
+-            }
++            // prettier-ignore
++            return (base = defaultBase, ...args) =>
++                this.produce(base, draft => recipe.call(draft, draft, ...args))
+         }
+ 
+         // prettier-ignore
+@@ -64,7 +63,7 @@ export class Immer {
+             const proxy = this.createProxy(base)
+             let hasError = true
+             try {
+-                result = recipe(proxy)
++                result = recipe.call(proxy, proxy)
+                 hasError = false
+             } finally {
+                 // finally instead of catch + rethrow better preserves original stack
+diff --git a/yarn.lock b/yarn.lock
+index a34351a..02e59d3 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -4993,10 +4993,10 @@ preserve@^0.2.0:
+   resolved "https://registry.yarnpkg.com/preserve/-/preserve-0.2.0.tgz#815ed1f6ebc65926f865b310c0713bcb3315ce4b"
+   integrity sha1-gV7R9uvGWSb4ZbMQwHE7yzMVzks=
+ 
+-prettier@1.17.0:
+-  version "1.17.0"
+-  resolved "https://registry.yarnpkg.com/prettier/-/prettier-1.17.0.tgz#53b303676eed22cc14a9f0cec09b477b3026c008"
+-  integrity sha512-sXe5lSt2WQlCbydGETgfm1YBShgOX4HxQkFPvbxkcwgDvGDeqVau8h+12+lmSVlP3rHPz0oavfddSZg/q+Szjw==
++prettier@^1.9.2:
++  version "1.16.4"
++  resolved "https://registry.yarnpkg.com/prettier/-/prettier-1.16.4.tgz#73e37e73e018ad2db9c76742e2647e21790c9717"
++  integrity sha512-ZzWuos7TI5CKUeQAtFd6Zhm2s6EpAD/ZLApIhsF9pRvRtM1RFo61dM/4MSRUA0SuLugA/zgrZD8m0BaY46Og7g==
+ 
+ pretty-format@^24.7.0:
+   version "24.7.0"
+@@ -5730,11 +5730,6 @@ spdx-license-ids@^3.0.0:
+   resolved "https://registry.yarnpkg.com/spdx-license-ids/-/spdx-license-ids-3.0.3.tgz#81c0ce8f21474756148bbb5f3bfc0f36bf15d76e"
+   integrity sha512-uBIcIl3Ih6Phe3XHK1NqboJLdGfwr1UN3k6wSD1dZpmPsIkb8AGNbZYJ1fOBk834+Gxy8rpfDxrS6XLEMZMY2g==
+ 
+-spec.ts@^1.1.0:
+-  version "1.1.0"
+-  resolved "https://registry.yarnpkg.com/spec.ts/-/spec.ts-1.1.0.tgz#a8cee5d1f3e14efbf7c5af175b58b644775118eb"
+-  integrity sha512-gO7n/i6EMgMxUm6Ba8XdNkuHY80eXUFrYSgLSPYMjs1oBRKmzmB/fnX7rq/X5PY73ehFEC6S7jJpXq/I/651tQ==
+-
+ split-string@^3.0.1, split-string@^3.0.2:
+   version "3.1.0"
+   resolved "https://registry.yarnpkg.com/split-string/-/split-string-3.1.0.tgz#7cb09dda3a86585705c64b39a6466038682e8fe2"
+@@ -6054,10 +6049,10 @@ type-check@~0.3.2:
+   dependencies:
+     prelude-ls "~1.1.2"
+ 
+-typescript@3.4.3:
+-  version "3.4.3"
+-  resolved "https://registry.yarnpkg.com/typescript/-/typescript-3.4.3.tgz#0eb320e4ace9b10eadf5bc6103286b0f8b7c224f"
+-  integrity sha512-FFgHdPt4T/duxx6Ndf7hwgMZZjZpB+U0nMNGVCYPq0rEzWKjEDobm4J6yb3CS7naZ0yURFqdw9Gwc7UOh/P9oQ==
++typescript@3.1.1:
++  version "3.1.1"
++  resolved "https://registry.yarnpkg.com/typescript/-/typescript-3.1.1.tgz#3362ba9dd1e482ebb2355b02dfe8bcd19a2c7c96"
++  integrity sha512-Veu0w4dTc/9wlWNf2jeRInNodKlcdLgemvPsrNpfu5Pq39sgfFjvIIgTsvUHCoLBnMhPoUA+tFxsXjU6VexVRQ==
+ 
+ uglify-js@^3.1.4:
+   version "3.5.3"

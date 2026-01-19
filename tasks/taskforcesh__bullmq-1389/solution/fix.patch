@@ -1,0 +1,168 @@
+diff --git a/package.json b/package.json
+index ab17bb791a..f3df2f142d 100644
+--- a/package.json
++++ b/package.json
+@@ -68,7 +68,6 @@
+     "@types/chai": "^4.3.1",
+     "@types/chai-as-promised": "^7.1.5",
+     "@types/glob": "^7.2.0",
+-    "@types/ioredis": "^4.28.2",
+     "@types/lodash.defaults": "^4.2.7",
+     "@types/lodash.isarguments": "^3.1.7",
+     "@types/mocha": "^5.2.7",
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index c894d30d36..61cab25303 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -174,7 +174,14 @@ export class Job<
+       : undefined;
+ 
+     this.toKey = queue.toKey.bind(queue);
+-    this.scripts = new Scripts(queue);
++    this.scripts = this.buildScripts(queue);
++  }
++
++  /**
++   * Helper to easily extend Scripts class calls.
++   */
++  protected buildScripts(queue: MinimalQueue): Scripts {
++    return new Scripts(queue);
+   }
+ 
+   /**
+@@ -633,8 +640,9 @@ export class Job<
+    * @param delay - milliseconds to be added to current time.
+    * @returns void
+    */
+-  changeDelay(delay: number): Promise<void> {
+-    return this.scripts.changeDelay(this.id, delay);
++  async changeDelay(delay: number): Promise<void> {
++    await this.scripts.changeDelay(this.id, delay);
++    this.delay = delay;
+   }
+ 
+   /**
+diff --git a/src/classes/queue-base.ts b/src/classes/queue-base.ts
+index 08326e11c9..8c2f51fb0a 100644
+--- a/src/classes/queue-base.ts
++++ b/src/classes/queue-base.ts
+@@ -67,7 +67,7 @@ export class QueueBase extends EventEmitter {
+     const queueKeys = new QueueKeys(opts.prefix);
+     this.keys = queueKeys.getKeys(name);
+     this.toKey = (type: string) => queueKeys.toKey(name, type);
+-    this.scripts = new Scripts(this);
++    this.scripts = this.buildScripts();
+   }
+ 
+   /**
+@@ -91,6 +91,13 @@ export class QueueBase extends EventEmitter {
+     return Job;
+   }
+ 
++  /**
++   * Helper to easily extend Scripts class calls.
++   */
++  protected buildScripts(): Scripts {
++    return new Scripts(this);
++  }
++
+   /**
+    * Emits an event. Normally used by subclasses to emit events.
+    *
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 1c013e30c3..bf6a5845b1 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -457,15 +457,14 @@ export class Scripts {
+   async changeDelay(jobId: string, delay: number): Promise<void> {
+     const client = await this.queue.client;
+ 
+-    const delayTimestamp = Date.now() + delay;
+-    const args = this.changeDelayArgs(jobId, delayTimestamp);
++    const args = this.changeDelayArgs(jobId, delay);
+     const result = await (<any>client).changeDelay(args);
+     if (result < 0) {
+       throw this.finishedErrors(result, jobId, 'changeDelay', 'delayed');
+     }
+   }
+ 
+-  private changeDelayArgs(jobId: string, timestamp: number): string[] {
++  private changeDelayArgs(jobId: string, delay: number): (string | number)[] {
+     //
+     // Bake in the job id first 12 bits into the timestamp
+     // to guarantee correct execution order of delayed jobs
+@@ -473,18 +472,18 @@ export class Scripts {
+     //
+     // WARNING: Jobs that are so far apart that they wrap around will cause FIFO to fail
+     //
+-    timestamp = Math.max(0, timestamp);
++    let timestamp = Date.now() + delay;
+ 
+     if (timestamp > 0) {
+       timestamp = timestamp * 0x1000 + (+jobId & 0xfff);
+     }
+ 
+-    const keys = ['delayed', jobId].map(name => {
++    const keys: (string | number)[] = ['delayed', jobId].map(name => {
+       return this.queue.toKey(name);
+     });
+     keys.push.apply(keys, [this.queue.keys.events, this.queue.keys.delay]);
+ 
+-    return keys.concat([JSON.stringify(timestamp), jobId]);
++    return keys.concat([delay, JSON.stringify(timestamp), jobId]);
+   }
+ 
+   // Note: We have an issue here with jobs using custom job ids
+diff --git a/src/commands/changeDelay-4.lua b/src/commands/changeDelay-4.lua
+index db76933128..28eb84518c 100644
+--- a/src/commands/changeDelay-4.lua
++++ b/src/commands/changeDelay-4.lua
+@@ -6,8 +6,9 @@
+     KEYS[3] events stream
+     KEYS[4] delayed stream
+ 
+-    ARGV[1] delayedTimestamp
+-    ARGV[2] the id of the job
++    ARGV[1] delay
++    ARGV[2] delayedTimestamp
++    ARGV[3] the id of the job
+   Output:
+     0 - OK
+    -1 - Missing job.
+@@ -20,8 +21,8 @@ local rcall = redis.call
+ 
+ if rcall("EXISTS", KEYS[2]) == 1 then
+ 
+-  local jobId = ARGV[2]
+-  local score = tonumber(ARGV[1])
++  local jobId = ARGV[3]
++  local score = tonumber(ARGV[2])
+   local delayedTimestamp = (score / 0x1000)
+ 
+   local numRemovedElements = rcall("ZREM", KEYS[1], jobId)
+@@ -30,6 +31,7 @@ if rcall("EXISTS", KEYS[2]) == 1 then
+     return -3
+   end
+ 
++  rcall("HSET", KEYS[2], "delay", tonumber(ARGV[1]))
+   rcall("ZADD", KEYS[1], score, jobId)
+ 
+   rcall("XADD", KEYS[3], "*", "event", "delayed", "jobId", jobId, "delay", delayedTimestamp);
+diff --git a/yarn.lock b/yarn.lock
+index 16f8bc08de..27c1df4bbd 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -990,13 +990,6 @@
+     "@types/minimatch" "*"
+     "@types/node" "*"
+ 
+-"@types/ioredis@^4.28.2":
+-  version "4.28.8"
+-  resolved "https://registry.yarnpkg.com/@types/ioredis/-/ioredis-4.28.8.tgz#a181d6eb70e402a6db670fe54b9c5bb66c0fac17"
+-  integrity sha512-mULOyO2smtvkE1zmzRRA4P0+1UjEqusi014kXOL1q3CY0RgqkR5/wKvv+vAJbPw2Q66wPyylKeevUy+m/FaRMg==
+-  dependencies:
+-    "@types/node" "*"
+-
+ "@types/json-schema@^7.0.7":
+   version "7.0.11"
+   resolved "https://registry.yarnpkg.com/@types/json-schema/-/json-schema-7.0.11.tgz#d421b6c527a3037f7c84433fd2c4229e016863d3"

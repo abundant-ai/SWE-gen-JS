@@ -1,0 +1,141 @@
+diff --git a/docs/gitbook/patterns/process-step-jobs.md b/docs/gitbook/patterns/process-step-jobs.md
+index 59eb749b3d..db09a7827c 100644
+--- a/docs/gitbook/patterns/process-step-jobs.md
++++ b/docs/gitbook/patterns/process-step-jobs.md
+@@ -55,6 +55,7 @@ enum Step {
+   Second,
+   Finish,
+ }
++
+ const worker = new Worker(
+   queueName,
+   async job => {
+@@ -75,8 +76,7 @@ const worker = new Worker(
+           await job.update({
+             step: Step.Finish,
+           });
+-          step = Step.Finish;
+-          return Step.Finish;
++          throw new DelayedError();
+         }
+         default: {
+           throw new Error('invalid step');
+@@ -153,7 +153,7 @@ const worker = new Worker(
+             step = Step.Finish;
+             return Step.Finish;
+           } else {
+-            return;
++            throw new WaitingChildrenError();
+           }
+         }
+         default: {
+@@ -240,7 +240,7 @@ const worker = new Worker(
+             step = Step.Finish;
+             return Step.Finish;
+           } else {
+-            return;
++            throw new WaitingChildrenError();
+           }
+         }
+         default: {
+diff --git a/src/classes/delayed-error.ts b/src/classes/delayed-error.ts
+new file mode 100644
+index 0000000000..7e04fad7c2
+--- /dev/null
++++ b/src/classes/delayed-error.ts
+@@ -0,0 +1,14 @@
++/**
++ * DelayedError
++ *
++ * Error to be thrown when job is moved to delayed state
++ * from job in active state.
++ *
++ */
++export class DelayedError extends Error {
++  constructor(message?: string) {
++    super(message);
++    this.name = this.constructor.name;
++    Object.setPrototypeOf(this, new.target.prototype);
++  }
++}
+diff --git a/src/classes/index.ts b/src/classes/index.ts
+index 3197489b59..cb4026826c 100644
+--- a/src/classes/index.ts
++++ b/src/classes/index.ts
+@@ -1,6 +1,7 @@
+ export * from './backoffs';
+ export * from './child-pool';
+ export * from './child-processor';
++export * from './delayed-error';
+ export * from './flow-producer';
+ export * from './job';
+ // export * from './master'; this file must not be exported
+@@ -15,4 +16,5 @@ export * from './repeat';
+ export * from './sandbox';
+ export * from './scripts';
+ export * from './unrecoverable-error';
++export * from './waiting-children-error';
+ export * from './worker';
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index 75c340da8f..b69673b613 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -1009,7 +1009,7 @@ export class Job<
+    * otherwise the operation was not a success and throw the corresponding error. If the promise
+    * rejects, it indicates that the script failed to execute
+    */
+-  async retry(state: FinishedStatus = 'failed'): Promise<void> {
++  retry(state: FinishedStatus = 'failed'): Promise<void> {
+     this.failedReason = null;
+     this.finishedOn = null;
+     this.processedOn = null;
+diff --git a/src/classes/waiting-children-error.ts b/src/classes/waiting-children-error.ts
+new file mode 100644
+index 0000000000..a9859fbd59
+--- /dev/null
++++ b/src/classes/waiting-children-error.ts
+@@ -0,0 +1,14 @@
++/**
++ * WaitingChildrenError
++ *
++ * Error to be thrown when job is moved to waiting-children state
++ * from job in active state.
++ *
++ */
++export class WaitingChildrenError extends Error {
++  constructor(message?: string) {
++    super(message);
++    this.name = this.constructor.name;
++    Object.setPrototypeOf(this, new.target.prototype);
++  }
++}
+diff --git a/src/classes/worker.ts b/src/classes/worker.ts
+index bef459d1b5..df58fb9fbe 100644
+--- a/src/classes/worker.ts
++++ b/src/classes/worker.ts
+@@ -26,6 +26,8 @@ import { Job } from './job';
+ import { RedisConnection } from './redis-connection';
+ import sandbox from './sandbox';
+ import { AsyncFifoQueue } from './async-fifo-queue';
++import { DelayedError } from './delayed-error';
++import { WaitingChildrenError } from './waiting-children-error';
+ 
+ // 10 seconds is the maximum time a BRPOPLPUSH can block.
+ const maximumBlockTimeout = 10;
+@@ -635,6 +637,16 @@ export class Worker<
+             return;
+           }
+ 
++          if (
++            (err instanceof DelayedError || err.name == 'DelayedError') ||
++            (
++              err instanceof WaitingChildrenError ||
++              err.name == 'WaitingChildrenError'
++            )
++          ) {
++            return;
++          }
++
+           await job.moveToFailed(err, token);
+           this.emit('failed', job, err, 'active');
+         } catch (err) {

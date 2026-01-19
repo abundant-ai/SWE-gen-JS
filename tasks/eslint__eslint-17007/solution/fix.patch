@@ -1,0 +1,234 @@
+diff --git a/lib/rules/no-misleading-character-class.js b/lib/rules/no-misleading-character-class.js
+index ef6e14180..ddbcaefd5 100644
+--- a/lib/rules/no-misleading-character-class.js
++++ b/lib/rules/no-misleading-character-class.js
+@@ -4,16 +4,15 @@
+ "use strict";
+ 
+ const { CALL, CONSTRUCT, ReferenceTracker, getStringIfConstant } = require("@eslint-community/eslint-utils");
+-const { RegExpValidator, RegExpParser, visitRegExpAST } = require("@eslint-community/regexpp");
++const { RegExpParser, visitRegExpAST } = require("@eslint-community/regexpp");
+ const { isCombiningCharacter, isEmojiModifier, isRegionalIndicatorSymbol, isSurrogatePair } = require("./utils/unicode");
+ const astUtils = require("./utils/ast-utils.js");
++const { isValidWithUnicodeFlag } = require("./utils/regular-expressions");
+ 
+ //------------------------------------------------------------------------------
+ // Helpers
+ //------------------------------------------------------------------------------
+ 
+-const REGEXPP_LATEST_ECMA_VERSION = 2022;
+-
+ /**
+  * Iterate character sequences of a given nodes.
+  *
+@@ -185,38 +184,10 @@ module.exports = {
+             }
+         }
+ 
+-        /**
+-         * Checks if the given regular expression pattern would be valid with the `u` flag.
+-         * @param {string} pattern The regular expression pattern to verify.
+-         * @returns {boolean} `true` if the pattern would be valid with the `u` flag.
+-         * `false` if the pattern would be invalid with the `u` flag or the configured
+-         * ecmaVersion doesn't support the `u` flag.
+-         */
+-        function isValidWithUnicodeFlag(pattern) {
+-            const { ecmaVersion } = context.languageOptions;
+-
+-            // ecmaVersion <= 5 doesn't support the 'u' flag
+-            if (ecmaVersion <= 5) {
+-                return false;
+-            }
+-
+-            const validator = new RegExpValidator({
+-                ecmaVersion: Math.min(ecmaVersion, REGEXPP_LATEST_ECMA_VERSION)
+-            });
+-
+-            try {
+-                validator.validatePattern(pattern, void 0, void 0, /* uFlag = */ true);
+-            } catch {
+-                return false;
+-            }
+-
+-            return true;
+-        }
+-
+         return {
+             "Literal[regex]"(node) {
+                 verify(node, node.regex.pattern, node.regex.flags, fixer => {
+-                    if (!isValidWithUnicodeFlag(node.regex.pattern)) {
++                    if (!isValidWithUnicodeFlag(context.languageOptions.ecmaVersion, node.regex.pattern)) {
+                         return null;
+                     }
+ 
+@@ -242,7 +213,7 @@ module.exports = {
+                     if (typeof pattern === "string") {
+                         verify(refNode, pattern, flags || "", fixer => {
+ 
+-                            if (!isValidWithUnicodeFlag(pattern)) {
++                            if (!isValidWithUnicodeFlag(context.languageOptions.ecmaVersion, pattern)) {
+                                 return null;
+                             }
+ 
+diff --git a/lib/rules/prefer-regex-literals.js b/lib/rules/prefer-regex-literals.js
+index b26405061..94b52155e 100644
+--- a/lib/rules/prefer-regex-literals.js
++++ b/lib/rules/prefer-regex-literals.js
+@@ -13,13 +13,12 @@ const astUtils = require("./utils/ast-utils");
+ const { CALL, CONSTRUCT, ReferenceTracker, findVariable } = require("@eslint-community/eslint-utils");
+ const { RegExpValidator, visitRegExpAST, RegExpParser } = require("@eslint-community/regexpp");
+ const { canTokensBeAdjacent } = require("./utils/ast-utils");
++const { REGEXPP_LATEST_ECMA_VERSION } = require("./utils/regular-expressions");
+ 
+ //------------------------------------------------------------------------------
+ // Helpers
+ //------------------------------------------------------------------------------
+ 
+-const REGEXPP_LATEST_ECMA_VERSION = 2022;
+-
+ /**
+  * Determines whether the given node is a string literal.
+  * @param {ASTNode} node Node to check.
+diff --git a/lib/rules/require-unicode-regexp.js b/lib/rules/require-unicode-regexp.js
+index acedb956e..2fe1539cf 100644
+--- a/lib/rules/require-unicode-regexp.js
++++ b/lib/rules/require-unicode-regexp.js
+@@ -15,6 +15,8 @@ const {
+     ReferenceTracker,
+     getStringIfConstant
+ } = require("@eslint-community/eslint-utils");
++const astUtils = require("./utils/ast-utils.js");
++const { isValidWithUnicodeFlag } = require("./utils/regular-expressions");
+ 
+ //------------------------------------------------------------------------------
+ // Rule Definition
+@@ -31,7 +33,10 @@ module.exports = {
+             url: "https://eslint.org/docs/rules/require-unicode-regexp"
+         },
+ 
++        hasSuggestions: true,
++
+         messages: {
++            addUFlag: "Add the 'u' flag.",
+             requireUFlag: "Use the 'u' flag."
+         },
+ 
+@@ -47,7 +52,20 @@ module.exports = {
+                 const flags = node.regex.flags || "";
+ 
+                 if (!flags.includes("u")) {
+-                    context.report({ node, messageId: "requireUFlag" });
++                    context.report({
++                        messageId: "requireUFlag",
++                        node,
++                        suggest: isValidWithUnicodeFlag(context.languageOptions.ecmaVersion, node.regex.pattern)
++                            ? [
++                                {
++                                    fix(fixer) {
++                                        return fixer.insertTextAfter(node, "u");
++                                    },
++                                    messageId: "addUFlag"
++                                }
++                            ]
++                            : null
++                    });
+                 }
+             },
+ 
+@@ -59,11 +77,46 @@ module.exports = {
+                 };
+ 
+                 for (const { node: refNode } of tracker.iterateGlobalReferences(trackMap)) {
+-                    const flagsNode = refNode.arguments[1];
++                    const [patternNode, flagsNode] = refNode.arguments;
++                    const pattern = getStringIfConstant(patternNode, scope);
+                     const flags = getStringIfConstant(flagsNode, scope);
+ 
+                     if (!flagsNode || (typeof flags === "string" && !flags.includes("u"))) {
+-                        context.report({ node: refNode, messageId: "requireUFlag" });
++                        context.report({
++                            messageId: "requireUFlag",
++                            node: refNode,
++                            suggest: typeof pattern === "string" && isValidWithUnicodeFlag(context.languageOptions.ecmaVersion, pattern)
++                                ? [
++                                    {
++                                        fix(fixer) {
++                                            if (flagsNode) {
++                                                if ((flagsNode.type === "Literal" && typeof flagsNode.value === "string") || flagsNode.type === "TemplateLiteral") {
++                                                    const flagsNodeText = sourceCode.getText(flagsNode);
++
++                                                    return fixer.replaceText(flagsNode, [
++                                                        flagsNodeText.slice(0, flagsNodeText.length - 1),
++                                                        flagsNodeText.slice(flagsNodeText.length - 1)
++                                                    ].join("u"));
++                                                }
++
++                                                // We intentionally don't suggest concatenating + "u" to non-literals
++                                                return null;
++                                            }
++
++                                            const penultimateToken = sourceCode.getLastToken(refNode, { skip: 1 }); // skip closing parenthesis
++
++                                            return fixer.insertTextAfter(
++                                                penultimateToken,
++                                                astUtils.isCommaToken(penultimateToken)
++                                                    ? ' "u",'
++                                                    : ', "u"'
++                                            );
++                                        },
++                                        messageId: "addUFlag"
++                                    }
++                                ]
++                                : null
++                        });
+                     }
+                 }
+             }
+diff --git a/lib/rules/utils/regular-expressions.js b/lib/rules/utils/regular-expressions.js
+new file mode 100644
+index 000000000..234a1cb8b
+--- /dev/null
++++ b/lib/rules/utils/regular-expressions.js
+@@ -0,0 +1,42 @@
++/**
++ * @fileoverview Common utils for regular expressions.
++ * @author Josh Goldberg
++ * @author Toru Nagashima
++ */
++
++"use strict";
++
++const { RegExpValidator } = require("@eslint-community/regexpp");
++
++const REGEXPP_LATEST_ECMA_VERSION = 2022;
++
++/**
++ * Checks if the given regular expression pattern would be valid with the `u` flag.
++ * @param {number} ecmaVersion ECMAScript version to parse in.
++ * @param {string} pattern The regular expression pattern to verify.
++ * @returns {boolean} `true` if the pattern would be valid with the `u` flag.
++ * `false` if the pattern would be invalid with the `u` flag or the configured
++ * ecmaVersion doesn't support the `u` flag.
++ */
++function isValidWithUnicodeFlag(ecmaVersion, pattern) {
++    if (ecmaVersion <= 5) { // ecmaVersion <= 5 doesn't support the 'u' flag
++        return false;
++    }
++
++    const validator = new RegExpValidator({
++        ecmaVersion: Math.min(ecmaVersion, REGEXPP_LATEST_ECMA_VERSION)
++    });
++
++    try {
++        validator.validatePattern(pattern, void 0, void 0, /* uFlag = */ true);
++    } catch {
++        return false;
++    }
++
++    return true;
++}
++
++module.exports = {
++    isValidWithUnicodeFlag,
++    REGEXPP_LATEST_ECMA_VERSION
++};

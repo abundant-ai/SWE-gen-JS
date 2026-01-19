@@ -1,0 +1,187 @@
+diff --git a/docs/gitbook/patterns/process-step-jobs.md b/docs/gitbook/patterns/process-step-jobs.md
+index b19e0dfaad..359eac61be 100644
+--- a/docs/gitbook/patterns/process-step-jobs.md
++++ b/docs/gitbook/patterns/process-step-jobs.md
+@@ -71,7 +71,7 @@ const worker = new Worker(
+             {
+               parent: {
+                 id: job.id,
+-                queue: `bull:${parentQueueName}`,
++                queue: job.queueQualifiedName,
+               },
+             },
+           );
+@@ -89,7 +89,7 @@ const worker = new Worker(
+             {
+               parent: {
+                 id: job.id,
+-                queue: `${job.prefix}:${job.queueName}`,
++                queue: job.queueQualifiedName,
+               },
+             },
+           );
+@@ -124,3 +124,86 @@ const worker = new Worker(
+ {% hint style="info" %}
+ Bullmq-Pro: this pattern could be handled by using observables; in that case, we do not need to save next step.
+ {% endhint %}
++
++# Chaining Flows
++
++Another use case is to add flows at runtime and then wait for the children to complete.
++
++For example, we can add children dynamically in the processor function of a worker. This could be handled in this way:
++
++```typescript
++enum Step {
++  Initial,
++  Second,
++  Third,
++  Finish,
++}
++
++const flow = new FlowProducer({ connection });
++const worker = new Worker(
++  parentQueueName,
++  async (job, token) => {
++    let step = job.data.step;
++    while (step !== Step.Finish) {
++      switch (step) {
++        case Step.Initial: {
++          await doInitialStepStuff();
++          await flow.add({
++            name: 'child-job',
++            queueName: 'childrenQueueName',
++            data: {},
++            children: [
++              {
++                name,
++                data: { idx: 0, foo: 'bar' },
++                queueName: 'grandchildrenQueueName',
++              },
++              {
++                name,
++                data: { idx: 1, foo: 'baz' },
++                queueName: 'grandchildrenQueueName',
++              },
++            ],
++            opts: {
++              parent: {
++                id: job.id,
++                queue: job.queueQualifiedName,
++              },
++            },
++          });
++
++          await job.update({
++            step: Step.Second,
++          });
++          step = Step.Second;
++          break;
++        }
++        case Step.Second: {
++          await doSecondStepStuff();
++          await job.update({
++            step: Step.Third,
++          });
++          step = Step.Third;
++          break;
++        }
++        case Step.Third: {
++          const shouldWait = await job.moveToWaitingChildren(token);
++          if (!shouldWait) {
++            await job.update({
++              step: Step.Finish,
++            });
++            step = Step.Finish;
++            return Step.Finish;
++          } else {
++            return;
++          }
++        }
++        default: {
++          throw new Error('invalid step');
++        }
++      }
++    }
++  },
++  { connection },
++);
++```
+diff --git a/src/classes/flow-producer.ts b/src/classes/flow-producer.ts
+index 3618d3c13c..a028d7d039 100644
+--- a/src/classes/flow-producer.ts
++++ b/src/classes/flow-producer.ts
+@@ -163,10 +163,20 @@ export class FlowProducer extends EventEmitter {
+     const client = await this.connection.client;
+     const multi = client.multi();
+ 
++    const parentOpts = flow?.opts?.parent;
++    const parentKey = getParentKey(parentOpts);
++    const parentDependenciesKey = parentKey
++      ? `${parentKey}:dependencies`
++      : undefined;
++
+     const jobsTree = this.addNode({
+       multi,
+       node: flow,
+       queuesOpts: opts?.queuesOptions,
++      parent: {
++        parentOpts,
++        parentDependenciesKey,
++      },
+     });
+ 
+     await multi.exec();
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index d5dcbdf7b8..eb150975d8 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -664,10 +664,21 @@ export class Job<
+     return this.queue.name;
+   }
+ 
++  /**
++   * @returns the prefix that is used.
++   */
+   get prefix(): string {
+     return this.queue.opts.prefix;
+   }
+ 
++  /**
++   * @returns it includes the prefix, the namespace separator :, and queue name.
++   * @see https://www.gnu.org/software/gawk/manual/html_node/Qualified-Names.html
++   */
++  get queueQualifiedName(): string {
++    return `${this.prefix}:${this.queueName}`;
++  }
++
+   /**
+    * Get current state.
+    *
+diff --git a/src/interfaces/flow-job.ts b/src/interfaces/flow-job.ts
+index fda8833092..61176f4d3a 100644
+--- a/src/interfaces/flow-job.ts
++++ b/src/interfaces/flow-job.ts
+@@ -1,15 +1,19 @@
+ import { JobsOptions } from '../types';
+ import { QueueOptions } from './queue-options';
+ 
+-export interface FlowJob {
++interface FlowJobBase<T> {
+   name: string;
+   queueName: string;
+   data?: any;
+   prefix?: string;
+-  opts?: Omit<JobsOptions, 'parent' | 'repeat'>;
+-  children?: FlowJob[];
++  opts?: Omit<T, 'repeat'>;
++  children?: FlowChildJob[];
+ }
+ 
++export type FlowChildJob = FlowJobBase<Omit<JobsOptions, 'parent'>>;
++
++export type FlowJob = FlowJobBase<JobsOptions>;
++
+ export type FlowQueuesOpts = Record<
+   string,
+   Omit<QueueOptions, 'connection' | 'prefix'>

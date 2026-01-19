@@ -1,0 +1,105 @@
+diff --git a/index.d.ts b/index.d.ts
+index 6d940fe..a854119 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -538,9 +538,11 @@ type CommonOptions<IsSync extends boolean = boolean> = {
+ 	readonly cleanup?: IfAsync<IsSync, boolean>;
+ 
+ 	/**
+-	Buffer the output from the spawned process. When set to `false`, you must read the output of `stdout` and `stderr` (or `all` if the `all` option is `true`). Otherwise the returned promise will not be resolved/rejected.
++	Whether to return the child process' output using the `result.stdout`, `result.stderr`, `result.all` and `result.stdio` properties.
+ 
+-	If the spawned process fails, `error.stdout`, `error.stderr`, and `error.all` will contain the buffered data.
++	On failure, the `error.stdout`, `error.stderr`, `error.all` and `error.stdio` properties are used instead.
++
++	When `buffer` is `false`, the output can still be read using the `childProcess.stdout`, `childProcess.stderr`, `childProcess.stdio` and `childProcess.all` streams. If the output is read, this should be done right away to avoid missing any data.
+ 
+ 	@default true
+ 	*/
+diff --git a/lib/stream.js b/lib/stream.js
+index ebef5a5..ff0d449 100644
+--- a/lib/stream.js
++++ b/lib/stream.js
+@@ -1,5 +1,6 @@
+ import {once} from 'node:events';
+ import {finished} from 'node:stream/promises';
++import {setImmediate} from 'node:timers/promises';
+ import getStream, {getStreamAsArrayBuffer, getStreamAsArray} from 'get-stream';
+ import mergeStreams from '@sindresorhus/merge-streams';
+ import {throwOnTimeout, cleanupOnExit} from './kill.js';
+@@ -11,23 +12,6 @@ export const makeAllStream = ({stdout, stderr}, {all}) => all && (stdout || stde
+ 	? mergeStreams([stdout, stderr].filter(Boolean))
+ 	: undefined;
+ 
+-// `childProcess.stdout|stderr` do not end until they have been consumed by `childProcess.all`.
+-// `childProcess.all` does not end until `childProcess.stdout|stderr` have ended.
+-// That's a good thing, since it ensures those streams are fully read and destroyed, even on errors.
+-// However, this creates a deadlock if `childProcess.all` is not being read.
+-// Doing so prevents the process from exiting, even when it failed.
+-// It also prevents those streams from being properly destroyed.
+-// This can only happen when:
+-//  - `all` is `true`
+-//  - `buffer` is `false`
+-//  - `childProcess.all` is not read by the user
+-// Therefore, we forcefully resume `childProcess.all` flow on errors.
+-const resumeAll = all => {
+-	if (all?.readableFlowing === null) {
+-		all.resume();
+-	}
+-};
+-
+ // On failure, `result.stdout|stderr|all` should contain the currently buffered stream
+ // They are automatically closed and flushed by Node.js when the child process exits
+ // We guarantee this by calling `childProcess.kill()`
+@@ -71,7 +55,8 @@ const getStreamPromise = async ({stream, encoding, buffer, maxBuffer}) => {
+ 	}
+ 
+ 	if (!buffer) {
+-		return finished(stream);
++		await Promise.all([finished(stream), resumeStream(stream)]);
++		return;
+ 	}
+ 
+ 	if (stream.readableObjectMode) {
+@@ -84,6 +69,15 @@ const getStreamPromise = async ({stream, encoding, buffer, maxBuffer}) => {
+ 	return applyEncoding(contents, encoding);
+ };
+ 
++// When using `buffer: false`, users need to read `childProcess.stdout|stderr|all` right away
++// See https://github.com/sindresorhus/execa/issues/730 and https://github.com/sindresorhus/execa/pull/729#discussion_r1465496310
++const resumeStream = async stream => {
++	await setImmediate();
++	if (stream.readableFlowing === null) {
++		stream.resume();
++	}
++};
++
+ const applyEncoding = (contents, encoding) => encoding === 'buffer' ? new Uint8Array(contents) : contents;
+ 
+ // Retrieve streams created by the `std*` options
+@@ -173,7 +167,6 @@ export const getSpawnedResult = async ({
+ 		]);
+ 	} catch (error) {
+ 		spawned.kill();
+-		resumeAll(spawned.all);
+ 		const results = await Promise.all([
+ 			error,
+ 			waitForFailedProcess(processSpawnPromise, processErrorPromise, processExitPromise),
+diff --git a/readme.md b/readme.md
+index cddd189..9d4c34a 100644
+--- a/readme.md
++++ b/readme.md
+@@ -534,9 +534,11 @@ For example, this can be used together with [`get-node`](https://github.com/ehmi
+ Type: `boolean`\
+ Default: `true`
+ 
+-Buffer the output from the spawned process. When set to `false`, you must read the output of [`stdout`](#stdout-1) and [`stderr`](#stderr-1) (or [`all`](#all) if the [`all`](#all-2) option is `true`). Otherwise the returned promise will not be resolved/rejected.
++Whether to return the child process' output using the [`result.stdout`](#stdout), [`result.stderr`](#stderr), [`result.all`](#all-1) and [`result.stdio`](#stdio) properties.
+ 
+-If the spawned process fails, [`error.stdout`](#stdout), [`error.stderr`](#stderr), [`error.all`](#all) and [`error.stdio`](#stdio) will contain the buffered data.
++On failure, the [`error.stdout`](#stdout), [`error.stderr`](#stderr), [`error.all`](#all-1) and [`error.stdio`](#stdio) properties are used instead.
++
++When `buffer` is `false`, the output can still be read using the [`childProcess.stdout`](#stdout-1), [`childProcess.stderr`](#stderr-1), [`childProcess.stdio`](https://nodejs.org/api/child_process.html#subprocessstdio) and [`childProcess.all`](#all) streams. If the output is read, this should be done right away to avoid missing any data.
+ 
+ #### input
+ 

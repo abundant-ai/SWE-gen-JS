@@ -1,0 +1,236 @@
+diff --git a/changelog_unreleased/javascript/17491.md b/changelog_unreleased/javascript/17491.md
+new file mode 100644
+index 000000000..5bddab05a
+--- /dev/null
++++ b/changelog_unreleased/javascript/17491.md
+@@ -0,0 +1,15 @@
++#### Support type cast comments for acorn parser (#17491 by @ArnaudBarre)
++
++This was previously only supported by the Babel parser.
++
++<!-- prettier-ignore -->
++```js
++// Input
++/** @type {MyType} */ (x).foo;
++
++// Prettier stable (--parser=acorn)
++/** @type {MyType} */ x.foo;
++
++// Prettier main (--parser=acorn)
++/** @type {MyType} */ (x).foo;
++```
+diff --git a/src/language-js/clean.js b/src/language-js/clean.js
+index 690fbda35..aa209a344 100644
+--- a/src/language-js/clean.js
++++ b/src/language-js/clean.js
+@@ -3,7 +3,6 @@ import {
+   isNumericLiteral,
+   isStringLiteral,
+ } from "./utils/index.js";
+-import isBlockComment from "./utils/is-block-comment.js";
+ 
+ const ignoredProperties = new Set([
+   "range",
+@@ -27,7 +26,7 @@ const removeTemplateElementsValue = (node) => {
+   }
+ };
+ 
+-function clean(original, cloned, parent) {
++function clean(original, cloned) {
+   if (original.type === "Program") {
+     delete cloned.sourceType;
+   }
+@@ -173,28 +172,12 @@ function clean(original, cloned, parent) {
+   ) {
+     removeTemplateElementsValue(cloned.quasi);
+   }
++
++  // TODO: Only delete value when there is leading comment which is exactly
++  // `/* GraphQL */` or `/* HTML */`
++  // Also see ./embed.js
+   if (original.type === "TemplateLiteral") {
+-    // This checks for a leading comment that is exactly `/* GraphQL */`
+-    // In order to be in line with other implementations of this comment tag
+-    // we will not trim the comment value and we will expect exactly one space on
+-    // either side of the GraphQL string
+-    // Also see ./embed.js
+-    const hasLanguageComment = original.leadingComments?.some(
+-      (comment) =>
+-        isBlockComment(comment) &&
+-        ["GraphQL", "HTML"].some(
+-          (languageName) => comment.value === ` ${languageName} `,
+-        ),
+-    );
+-    if (
+-      hasLanguageComment ||
+-      (parent.type === "CallExpression" && parent.callee.name === "graphql") ||
+-      // TODO: check parser
+-      // `flow` and `typescript` don't have `leadingComments`
+-      !original.leadingComments
+-    ) {
+-      removeTemplateElementsValue(cloned);
+-    }
++    removeTemplateElementsValue(cloned);
+   }
+ 
+   // We print `(a?.b!).c` as `(a?.b)!.c`, but `typescript` parse them differently
+diff --git a/src/language-js/parse/acorn.js b/src/language-js/parse/acorn.js
+index 68f260d37..654fa67dc 100644
+--- a/src/language-js/parse/acorn.js
++++ b/src/language-js/parse/acorn.js
+@@ -17,6 +17,7 @@ const parseOptions = {
+   allowSuperOutsideMethod: true,
+   locations: true,
+   ranges: true,
++  preserveParens: true,
+ };
+ 
+ function createParseError(error) {
+diff --git a/src/language-js/parse/babel.js b/src/language-js/parse/babel.js
+index f7e15bc65..d9a68e157 100644
+--- a/src/language-js/parse/babel.js
++++ b/src/language-js/parse/babel.js
+@@ -27,6 +27,7 @@ const parseOptions = {
+   errorRecovery: true,
+   createParenthesizedExpressions: true,
+   createImportExpressions: true,
++  attachComment: false,
+   plugins: [
+     // When adding a plugin, please add a test in `tests/format/js/babel-plugins`,
+     // To remove plugins, remove it here and run `yarn test tests/format/js/babel-plugins` to verify
+@@ -151,7 +152,7 @@ function createParse({ isExpression = false, optionsCombinations }) {
+       ast = wrapBabelExpression(ast, { text, rootMarker: options.rootMarker });
+     }
+ 
+-    return postprocess(ast, { parser: "babel", text });
++    return postprocess(ast, { text });
+   };
+ }
+ 
+diff --git a/src/language-js/parse/postprocess/index.js b/src/language-js/parse/postprocess/index.js
+index d00896f69..02d593856 100644
+--- a/src/language-js/parse/postprocess/index.js
++++ b/src/language-js/parse/postprocess/index.js
+@@ -51,22 +51,41 @@ function postprocess(ast, options) {
+     comments.unshift(interpreter);
+   }
+ 
+-  // Keep Babel's non-standard ParenthesizedExpression nodes only if they have Closure-style type cast comments.
+-  if (parser === "babel") {
+-    const startOffsetsOfTypeCastedNodes = new Set();
++  if (isNonEmptyArray(ast.comments)) {
++    let followingComment;
++    for (let i = ast.comments.length - 1; i >= 0; i--) {
++      const comment = ast.comments[i];
+ 
+-    // Comments might be attached not directly to ParenthesizedExpression but to its ancestor.
+-    // E.g.: /** @type {Foo} */ (foo).bar();
+-    // Let's use the fact that those ancestors and ParenthesizedExpression have the same start offset.
++      if (
++        followingComment &&
++        locEnd(comment) === locStart(followingComment) &&
++        isBlockComment(comment) &&
++        isBlockComment(followingComment) &&
++        isIndentableBlockComment(comment) &&
++        isIndentableBlockComment(followingComment)
++      ) {
++        ast.comments.splice(i + 1, 1);
++        comment.value += "*//*" + followingComment.value;
++        comment.range = [locStart(comment), locEnd(followingComment)];
++      }
+ 
+-    ast = visitNode(ast, (node) => {
+-      if (node.leadingComments?.some(isTypeCastComment)) {
+-        startOffsetsOfTypeCastedNodes.add(locStart(node));
++      /* c8 ignore next 3 */
++      if (!isLineComment(comment) && !isBlockComment(comment)) {
++        throw new TypeError(`Unknown comment type: "${comment.type}".`);
++      }
++
++      /* c8 ignore next 3 */
++      if (process.env.NODE_ENV !== "production") {
++        assertComment(comment, text);
+       }
+-    });
+ 
+-    ast = visitNode(ast, (node) => {
+-      if (node.type === "ParenthesizedExpression") {
++      followingComment = comment;
++    }
++  }
++
++  ast = visitNode(ast, (node) => {
++    switch (node.type) {
++      case "ParenthesizedExpression": {
+         const { expression } = node;
+ 
+         // Align range with `flow`
+@@ -75,17 +94,24 @@ function postprocess(ast, options) {
+           return expression;
+         }
+ 
+-        const start = locStart(node);
+-        if (!startOffsetsOfTypeCastedNodes.has(start)) {
++        // Keep ParenthesizedExpression nodes only if they have Closure-style type cast comments.
++        const nodeStart = locStart(node);
++        const previousComment = ast.comments.findLast(
++          (comment) => locEnd(comment) <= nodeStart,
++        );
++        const keepTypeCast =
++          previousComment &&
++          isTypeCastComment(previousComment) &&
++          // check that there are only white spaces between the comment and the parenthesis
++          text.slice(locEnd(previousComment), nodeStart).trim().length === 0;
++
++        if (!keepTypeCast) {
+           expression.extra = { ...expression.extra, parenthesized: true };
+           return expression;
+         }
++        break;
+       }
+-    });
+-  }
+ 
+-  ast = visitNode(ast, (node) => {
+-    switch (node.type) {
+       case "LogicalExpression":
+         // We remove unneeded parens around same-operator LogicalExpressions
+         if (isUnbalancedLogicalTree(node)) {
+@@ -152,37 +178,6 @@ function postprocess(ast, options) {
+     }
+   });
+ 
+-  if (isNonEmptyArray(ast.comments)) {
+-    let followingComment;
+-    for (let i = ast.comments.length - 1; i >= 0; i--) {
+-      const comment = ast.comments[i];
+-
+-      if (
+-        followingComment &&
+-        locEnd(comment) === locStart(followingComment) &&
+-        isBlockComment(comment) &&
+-        isBlockComment(followingComment) &&
+-        isIndentableBlockComment(comment) &&
+-        isIndentableBlockComment(followingComment)
+-      ) {
+-        ast.comments.splice(i + 1, 1);
+-        comment.value += "*//*" + followingComment.value;
+-        comment.range = [locStart(comment), locEnd(followingComment)];
+-      }
+-
+-      if (!isLineComment(comment) && !isBlockComment(comment)) {
+-        throw new TypeError(`Unknown comment type: "${comment.type}".`);
+-      }
+-
+-      /* c8 ignore next 3 */
+-      if (process.env.NODE_ENV !== "production") {
+-        assertComment(comment, text);
+-      }
+-
+-      followingComment = comment;
+-    }
+-  }
+-
+   // In `typescript`/`espree`/`flow`, `Program` doesn't count whitespace and comments
+   // See https://github.com/eslint/espree/issues/488
+   if (ast.type === "Program") {

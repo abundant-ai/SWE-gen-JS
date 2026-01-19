@@ -1,0 +1,283 @@
+diff --git a/index.d.ts b/index.d.ts
+index c8f1136..9e79c0f 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -615,7 +615,9 @@ type ExecaCommonReturnValue<IsSync extends boolean = boolean, OptionsType extend
+ 	cwd: string;
+ 
+ 	/**
+-	Whether the process was canceled using the [`signal`](https://github.com/sindresorhus/execa#signal-1) option.
++	Whether the process was canceled.
++
++	You can cancel the spawned process using the [`signal`](https://github.com/sindresorhus/execa#signal-1) option.
+ 	*/
+ 	isCanceled: boolean;
+ 
+@@ -724,6 +726,11 @@ export type ExecaChildPromise<OptionsType extends Options = Options> = {
+ 	*/
+ 	kill(signal?: string, options?: KillOptions): void;
+ 
++	/**
++	Similar to [`childProcess.kill()`](https://nodejs.org/api/child_process.html#child_process_subprocess_kill_signal). This used to be preferred when cancelling the child process execution as the error is more descriptive and [`childProcessResult.isCanceled`](#iscanceled) is set to `true`. But now this is deprecated and you should either use `.kill()` or the `signal` option when creating the child process.
++	*/
++	cancel(): void;
++
+ 	/**
+ 	[Pipe](https://nodejs.org/api/stream.html#readablepipedestination-options) the child process's `stdout` to `target`, which can be:
+ 	- Another `execa()` return value
+diff --git a/index.js b/index.js
+index 57734c0..1ff8d7a 100644
+--- a/index.js
++++ b/index.js
+@@ -10,7 +10,7 @@ import {makeError} from './lib/error.js';
+ import {handleInputAsync, pipeOutputAsync} from './lib/stdio/async.js';
+ import {handleInputSync, pipeOutputSync} from './lib/stdio/sync.js';
+ import {normalizeStdioNode} from './lib/stdio/normalize.js';
+-import {spawnedKill, validateTimeout} from './lib/kill.js';
++import {spawnedKill, spawnedCancel, validateTimeout} from './lib/kill.js';
+ import {addPipeMethods} from './lib/pipe.js';
+ import {getSpawnedResult, makeAllStream} from './lib/stream.js';
+ import {mergePromise} from './lib/promise.js';
+@@ -119,19 +119,20 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 
+ 	pipeOutputAsync(spawned, stdioStreamsGroups);
+ 
++	const context = {isCanceled: false, timedOut: false};
++
+ 	spawned.kill = spawnedKill.bind(null, spawned.kill.bind(spawned));
++	spawned.cancel = spawnedCancel.bind(null, spawned, context);
+ 	spawned.all = makeAllStream(spawned, options);
+ 
+ 	addPipeMethods(spawned);
+ 
+-	const promise = handlePromise({spawned, options, stdioStreamsGroups, command, escapedCommand});
++	const promise = handlePromise({spawned, options, context, stdioStreamsGroups, command, escapedCommand});
+ 	mergePromise(spawned, promise);
+ 	return spawned;
+ }
+ 
+-const handlePromise = async ({spawned, options, stdioStreamsGroups, command, escapedCommand}) => {
+-	const context = {timedOut: false};
+-
++const handlePromise = async ({spawned, options, context, stdioStreamsGroups, command, escapedCommand}) => {
+ 	const [
+ 		[exitCode, signal, error],
+ 		stdioResults,
+@@ -141,7 +142,7 @@ const handlePromise = async ({spawned, options, stdioStreamsGroups, command, esc
+ 	const all = handleOutput(options, allResult);
+ 
+ 	if (error || exitCode !== 0 || signal !== null) {
+-		const isCanceled = options.signal?.aborted === true;
++		const isCanceled = context.isCanceled || Boolean(options.signal?.aborted);
+ 		const returnedError = makeError({
+ 			error,
+ 			exitCode,
+diff --git a/index.test-d.ts b/index.test-d.ts
+index a23b1cf..238070d 100644
+--- a/index.test-d.ts
++++ b/index.test-d.ts
+@@ -34,6 +34,7 @@ expectType<[undefined, string | Uint8Array | undefined, string | Uint8Array | un
+ 
+ try {
+ 	const execaPromise = execa('unicorns', {all: true});
++	execaPromise.cancel();
+ 
+ 	const execaBufferPromise = execa('unicorns', {encoding: 'buffer', all: true});
+ 	const writeStream = createWriteStream('output.txt');
+diff --git a/lib/kill.js b/lib/kill.js
+index 7cc6836..3cf4c6a 100644
+--- a/lib/kill.js
++++ b/lib/kill.js
+@@ -42,6 +42,15 @@ const getForceKillAfterTimeout = (signal, forceKillAfterTimeout, killResult) =>
+ 	return forceKillAfterTimeout;
+ };
+ 
++// `childProcess.cancel()`
++export const spawnedCancel = (spawned, context) => {
++	const killResult = spawned.kill();
++
++	if (killResult) {
++		context.isCanceled = true;
++	}
++};
++
+ const killAfterTimeout = async ({spawned, timeout, killSignal, context, controller}) => {
+ 	await pSetTimeout(timeout, undefined, {ref: false, signal: controller.signal});
+ 	spawned.kill(killSignal);
+diff --git a/readme.md b/readme.md
+index d1e379a..518a79b 100644
+--- a/readme.md
++++ b/readme.md
+@@ -459,7 +459,9 @@ Whether the process timed out.
+ 
+ Type: `boolean`
+ 
+-Whether the process was canceled using the [`signal`](#signal-1) option.
++Whether the process was canceled.
++
++You can cancel the spawned process using the [`signal`](#signal-1) option.
+ 
+ #### isTerminated
+ 
+diff --git a/test/kill.js b/test/kill.js
+index 3a57353..7389e4b 100644
+--- a/test/kill.js
++++ b/test/kill.js
+@@ -182,73 +182,122 @@ test('removes exit handler on exit', async t => {
+ 	t.false(exitListeners.includes(listener));
+ });
+ 
+-test('result.isCanceled is false when abort isn\'t called (success)', async t => {
++test('cancel method kills the subprocess', async t => {
++	const subprocess = execa('node');
++	subprocess.cancel();
++	t.true(subprocess.killed);
++	const {isTerminated} = await t.throwsAsync(subprocess);
++	t.true(isTerminated);
++});
++
++test('result.isCanceled is false when spawned.cancel() isn\'t called (success)', async t => {
+ 	const {isCanceled} = await execa('noop.js');
+ 	t.false(isCanceled);
+ });
+ 
+-test('result.isCanceled is false when abort isn\'t called (failure)', async t => {
++test('result.isCanceled is false when spawned.cancel() isn\'t called (failure)', async t => {
+ 	const {isCanceled} = await t.throwsAsync(execa('fail.js'));
+ 	t.false(isCanceled);
+ });
+ 
+-test('result.isCanceled is false when abort isn\'t called in sync mode (success)', t => {
++test('result.isCanceled is false when spawned.cancel() isn\'t called in sync mode (success)', t => {
+ 	const {isCanceled} = execaSync('noop.js');
+ 	t.false(isCanceled);
+ });
+ 
+-test('result.isCanceled is false when abort isn\'t called in sync mode (failure)', t => {
++test('result.isCanceled is false when spawned.cancel() isn\'t called in sync mode (failure)', t => {
+ 	const {isCanceled} = t.throws(() => {
+ 		execaSync('fail.js');
+ 	});
+ 	t.false(isCanceled);
+ });
+ 
+-test('calling abort is not considered a signal termination', async t => {
+-	const abortController = new AbortController();
+-	const subprocess = execa('noop.js', {signal: abortController.signal});
+-	abortController.abort();
+-	const {isTerminated, signal} = await t.throwsAsync(subprocess);
+-	t.false(isTerminated);
+-	t.is(signal, undefined);
++test('calling cancel method throws an error with message "Command was canceled"', async t => {
++	const subprocess = execa('noop.js');
++	subprocess.cancel();
++	await t.throwsAsync(subprocess, {message: /Command was canceled/});
+ });
+ 
+-test('error.isCanceled is true when abort is used', async t => {
+-	const abortController = new AbortController();
+-	const subprocess = execa('noop.js', {signal: abortController.signal});
+-	abortController.abort();
++test('error.isCanceled is true when cancel method is used', async t => {
++	const subprocess = execa('noop.js');
++	subprocess.cancel();
+ 	const {isCanceled} = await t.throwsAsync(subprocess);
+ 	t.true(isCanceled);
+ });
+ 
+ test('error.isCanceled is false when kill method is used', async t => {
+-	const abortController = new AbortController();
+-	const subprocess = execa('noop.js', {signal: abortController.signal});
++	const subprocess = execa('noop.js');
+ 	subprocess.kill();
+ 	const {isCanceled} = await t.throwsAsync(subprocess);
+ 	t.false(isCanceled);
+ });
+ 
+-test('calling abort throws an error with message "Command was canceled"', async t => {
+-	const abortController = new AbortController();
+-	const subprocess = execa('noop.js', {signal: abortController.signal});
+-	abortController.abort();
+-	await t.throwsAsync(subprocess, {message: /Command was canceled/});
+-});
+-
+-test('calling abort twice should show the same behaviour as calling it once', async t => {
+-	const abortController = new AbortController();
+-	const subprocess = execa('noop.js', {signal: abortController.signal});
+-	abortController.abort();
+-	abortController.abort();
++test('calling cancel method twice should show the same behaviour as calling it once', async t => {
++	const subprocess = execa('noop.js');
++	subprocess.cancel();
++	subprocess.cancel();
+ 	const {isCanceled} = await t.throwsAsync(subprocess);
+ 	t.true(isCanceled);
++	t.true(subprocess.killed);
++});
++
++test('calling cancel method on a successfully completed process does not make result.isCanceled true', async t => {
++	const subprocess = execa('noop.js');
++	const {isCanceled} = await subprocess;
++	subprocess.cancel();
++	t.false(isCanceled);
+ });
+ 
+-test('calling abort on a successfully completed process does not make result.isCanceled true', async t => {
+-	const abortController = new AbortController();
+-	const subprocess = execa('noop.js', {signal: abortController.signal});
+-	const result = await subprocess;
+-	abortController.abort();
+-	t.false(result.isCanceled);
++test('calling cancel method on a process which has been killed does not make error.isCanceled true', async t => {
++	const subprocess = execa('noop.js');
++	subprocess.kill();
++	const {isCanceled} = await t.throwsAsync(subprocess);
++	t.false(isCanceled);
+ });
++
++if (globalThis.AbortController !== undefined) {
++	test('calling abort throws an error with message "Command was canceled"', async t => {
++		const abortController = new AbortController();
++		const subprocess = execa('noop.js', [], {signal: abortController.signal});
++		abortController.abort();
++		await t.throwsAsync(subprocess, {message: /Command was canceled/});
++	});
++
++	test('calling abort twice should show the same behaviour as calling it once', async t => {
++		const abortController = new AbortController();
++		const subprocess = execa('noop.js', [], {signal: abortController.signal});
++		abortController.abort();
++		abortController.abort();
++		const {isCanceled} = await t.throwsAsync(subprocess);
++		t.true(isCanceled);
++		t.true(subprocess.killed);
++	});
++
++	test('calling abort on a successfully completed process does not make result.isCanceled true', async t => {
++		const abortController = new AbortController();
++		const subprocess = execa('noop.js', [], {signal: abortController.signal});
++		const {isCanceled} = await subprocess;
++		abortController.abort();
++		t.false(isCanceled);
++	});
++
++	test('calling cancel after abort should show the same behaviour as only calling cancel', async t => {
++		const abortController = new AbortController();
++		const subprocess = execa('noop.js', [], {signal: abortController.signal});
++		abortController.abort();
++		subprocess.cancel();
++		const {isCanceled} = await t.throwsAsync(subprocess);
++		t.true(isCanceled);
++		t.true(subprocess.killed);
++	});
++
++	test('calling abort after cancel should show the same behaviour as only calling cancel', async t => {
++		const abortController = new AbortController();
++		const subprocess = execa('noop.js', [], {signal: abortController.signal});
++		subprocess.cancel();
++		abortController.abort();
++		const {isCanceled} = await t.throwsAsync(subprocess);
++		t.true(isCanceled);
++		t.true(subprocess.killed);
++	});
++}

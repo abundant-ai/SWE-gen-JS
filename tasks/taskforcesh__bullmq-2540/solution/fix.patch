@@ -1,0 +1,67 @@
+diff --git a/python/bullmq/job.py b/python/bullmq/job.py
+index 5728388a60..bb7bbe78ad 100644
+--- a/python/bullmq/job.py
++++ b/python/bullmq/job.py
+@@ -14,6 +14,7 @@ import traceback
+ 
+ optsDecodeMap = {
+     'fpof': 'failParentOnFailure',
++    'idof': 'ignoreDependencyOnFailure',
+     'kl': 'keepLogs',
+ }
+ 
+diff --git a/python/bullmq/scripts.py b/python/bullmq/scripts.py
+index 0333f89961..9dd1af7e47 100644
+--- a/python/bullmq/scripts.py
++++ b/python/bullmq/scripts.py
+@@ -512,11 +512,6 @@ class Scripts:
+                 return metrics.get("maxDataPoints", "")
+             return ""
+ 
+-        def getFailParentOnFailure(job: Job):
+-            opts = job.opts
+-            if opts is not None:
+-                return opts.get("failParentOnFailure", False)
+-
+         keepJobs = getKeepJobs(shouldRemove)
+ 
+         packedOpts = msgpack.packb({
+@@ -527,7 +522,8 @@ class Scripts:
+             "attempts": job.attempts,
+             "attemptsMade": job.attemptsMade,
+             "maxMetricsSize": getMetricsSize(opts),
+-            "fpof": getFailParentOnFailure(job),
++            "fpof": opts.get("failParentOnFailure", False),
++            "idof": opts.get("ignoreDependencyOnFailure", False)
+         }, use_bin_type=True)
+ 
+         args = [job.id, timestamp, propVal, transformed_value or "", target,
+diff --git a/src/commands/moveStalledJobsToWait-9.lua b/src/commands/moveStalledJobsToWait-9.lua
+index 6e25a752ce..df87ca5820 100644
+--- a/src/commands/moveStalledJobsToWait-9.lua
++++ b/src/commands/moveStalledJobsToWait-9.lua
+@@ -28,6 +28,7 @@ local rcall = redis.call
+ --- @include "includes/batches"
+ --- @include "includes/getTargetQueueList"
+ --- @include "includes/moveParentFromWaitingChildrenToFailed"
++--- @include "includes/moveParentToWaitIfNeeded"
+ --- @include "includes/removeJob"
+ --- @include "includes/removeJobsByMaxAge"
+ --- @include "includes/removeJobsByMaxCount"
+@@ -105,6 +106,16 @@ if (#stalling > 0) then
+                                 jobKey,
+                                 timestamp
+                             )
++                        elseif opts['idof'] then
++                            local parentData = cjson.decode(rawParentData)
++                            local parentKey = parentData['queueKey'] .. ':' .. parentData['id']
++                            local dependenciesSet = parentKey .. ":dependencies"
++                            if rcall("SREM", dependenciesSet, jobKey) == 1 then
++                                moveParentToWaitIfNeeded(parentData['queueKey'], dependenciesSet,
++                                                         parentKey, parentData['id'], timestamp)
++                                local failedSet = parentKey .. ":failed"
++                                rcall("HSET", failedSet, jobKey, failedReason)
++                            end
+                         end
+                         if removeOnFailType == "number" then
+                             removeJobsByMaxCount(opts["removeOnFail"],

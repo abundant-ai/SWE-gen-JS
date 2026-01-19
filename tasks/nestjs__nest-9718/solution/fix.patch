@@ -1,0 +1,340 @@
+diff --git a/packages/common/pipes/file/file-type.validator.ts b/packages/common/pipes/file/file-type.validator.ts
+new file mode 100644
+index 000000000..334049149
+--- /dev/null
++++ b/packages/common/pipes/file/file-type.validator.ts
+@@ -0,0 +1,30 @@
++import { FileValidator } from './file-validator.interface';
++
++export type FileTypeValidatorOptions = {
++  fileType: string;
++};
++
++/**
++ * Defines the built-in FileType File Validator
++ *
++ * @see [File Validators](https://docs.nestjs.com/techniques/file-upload#validators)
++ *
++ * @publicApi
++ */
++export class FileTypeValidator extends FileValidator<FileTypeValidatorOptions> {
++  buildErrorMessage(): string {
++    return `Validation failed (expected type is ${this.validationOptions.fileType})`;
++  }
++
++  isValid(file: any): boolean {
++    if (!this.validationOptions) {
++      return true;
++    }
++
++    if (!file.mimetype) {
++      return false;
++    }
++
++    return (file.mimetype as string).endsWith(this.validationOptions.fileType);
++  }
++}
+diff --git a/packages/common/pipes/file/file-validator.interface.ts b/packages/common/pipes/file/file-validator.interface.ts
+new file mode 100644
+index 000000000..ad453cdae
+--- /dev/null
++++ b/packages/common/pipes/file/file-validator.interface.ts
+@@ -0,0 +1,18 @@
++/**
++ * Interface describing FileValidators, which can be added to a {@link ParseFilePipe}.
++ */
++export abstract class FileValidator<TValidationOptions = Record<string, any>> {
++  constructor(protected readonly validationOptions: TValidationOptions) {}
++
++  /**
++   * Indicates if this file should be considered valid, according to the options passed in the constructor.
++   * @param file the file from the request object
++   */
++  abstract isValid(file?: any): boolean | Promise<boolean>;
++
++  /**
++   * Builds an error message in case the validation fails.
++   * @param file the file from the request object
++   */
++  abstract buildErrorMessage(file: any): string;
++}
+diff --git a/packages/common/pipes/file/index.ts b/packages/common/pipes/file/index.ts
+new file mode 100644
+index 000000000..11d19e318
+--- /dev/null
++++ b/packages/common/pipes/file/index.ts
+@@ -0,0 +1,6 @@
++export * from './file-type.validator';
++export * from './file-validator.interface';
++export * from './max-file-size.validator';
++export * from './parse-file-options.interface';
++export * from './parse-file.pipe';
++export * from './parse-file-pipe.builder';
+diff --git a/packages/common/pipes/file/max-file-size.validator.ts b/packages/common/pipes/file/max-file-size.validator.ts
+new file mode 100644
+index 000000000..847ee19f0
+--- /dev/null
++++ b/packages/common/pipes/file/max-file-size.validator.ts
+@@ -0,0 +1,26 @@
++import { FileValidator } from './file-validator.interface';
++
++export type MaxFileSizeValidatorOptions = {
++  maxSize: number;
++};
++
++/**
++ * Defines the built-in MaxSize File Validator
++ *
++ * @see [File Validators](https://docs.nestjs.com/techniques/file-upload#validators)
++ *
++ * @publicApi
++ */
++export class MaxFileSizeValidator extends FileValidator<MaxFileSizeValidatorOptions> {
++  buildErrorMessage(): string {
++    return `Validation failed (expected size is less than ${this.validationOptions.maxSize})`;
++  }
++
++  public isValid(file: any): boolean {
++    if (!this.validationOptions) {
++      return true;
++    }
++
++    return file.size < this.validationOptions.maxSize;
++  }
++}
+diff --git a/packages/common/pipes/file/parse-file-options.interface.ts b/packages/common/pipes/file/parse-file-options.interface.ts
+new file mode 100644
+index 000000000..e74630999
+--- /dev/null
++++ b/packages/common/pipes/file/parse-file-options.interface.ts
+@@ -0,0 +1,8 @@
++import { ErrorHttpStatusCode } from '../../utils/http-error-by-code.util';
++import { FileValidator } from './file-validator.interface';
++
++export interface ParseFileOptions {
++  validators?: FileValidator[];
++  errorHttpStatusCode?: ErrorHttpStatusCode;
++  exceptionFactory?: (error: string) => any;
++}
+diff --git a/packages/common/pipes/file/parse-file-pipe.builder.ts b/packages/common/pipes/file/parse-file-pipe.builder.ts
+new file mode 100644
+index 000000000..7835322d9
+--- /dev/null
++++ b/packages/common/pipes/file/parse-file-pipe.builder.ts
+@@ -0,0 +1,37 @@
++import {
++  FileTypeValidator,
++  FileTypeValidatorOptions,
++} from './file-type.validator';
++import { FileValidator } from './file-validator.interface';
++import {
++  MaxFileSizeValidator,
++  MaxFileSizeValidatorOptions,
++} from './max-file-size.validator';
++import { ParseFileOptions } from './parse-file-options.interface';
++import { ParseFilePipe } from './parse-file.pipe';
++
++export class ParseFilePipeBuilder {
++  private validators: FileValidator[] = [];
++
++  addMaxSizeValidator(options: MaxFileSizeValidatorOptions) {
++    this.validators.push(new MaxFileSizeValidator(options));
++    return this;
++  }
++
++  addFileTypeValidator(options: FileTypeValidatorOptions) {
++    this.validators.push(new FileTypeValidator(options));
++    return this;
++  }
++
++  build(
++    additionalOptions?: Omit<ParseFileOptions, 'validators'>,
++  ): ParseFilePipe {
++    const parseFilePipe = new ParseFilePipe({
++      ...additionalOptions,
++      validators: this.validators,
++    });
++
++    this.validators = [];
++    return parseFilePipe;
++  }
++}
+diff --git a/packages/common/pipes/file/parse-file.pipe.ts b/packages/common/pipes/file/parse-file.pipe.ts
+new file mode 100644
+index 000000000..e952c38f5
+--- /dev/null
++++ b/packages/common/pipes/file/parse-file.pipe.ts
+@@ -0,0 +1,68 @@
++import { Injectable, Optional } from '../../decorators/core';
++import { HttpStatus } from '../../enums';
++import { HttpErrorByCode } from '../../utils/http-error-by-code.util';
++import { PipeTransform } from '../../interfaces/features/pipe-transform.interface';
++import { ParseFileOptions } from './parse-file-options.interface';
++import { FileValidator } from './file-validator.interface';
++import { throws } from 'assert';
++
++/**
++ * Defines the built-in ParseFile Pipe. This pipe can be used to validate incoming files
++ * with `@UploadedFile()` decorator. You can use either other specific built-in validators
++ * or provide one of your own, simply implementing it through {@link FileValidator}
++ * interface and adding it to ParseFilePipe's constructor.
++ *
++ * @see [Built-in Pipes](https://docs.nestjs.com/pipes#built-in-pipes)
++ *
++ * @publicApi
++ */
++@Injectable()
++export class ParseFilePipe implements PipeTransform<any> {
++  protected exceptionFactory: (error: string) => any;
++  private readonly validators: FileValidator[];
++
++  constructor(@Optional() options: ParseFileOptions = {}) {
++    const {
++      exceptionFactory,
++      errorHttpStatusCode = HttpStatus.BAD_REQUEST,
++      validators = [],
++    } = options;
++
++    this.exceptionFactory =
++      exceptionFactory ||
++      (error => new HttpErrorByCode[errorHttpStatusCode](error));
++
++    this.validators = validators;
++  }
++
++  async transform(value: any): Promise<any> {
++    if (this.validators.length) {
++      await this.validate(value);
++    }
++    return value;
++  }
++
++  protected async validate(file: any): Promise<any> {
++    for (const validator of this.validators) {
++      await this.validateOrThrow(file, validator);
++    }
++
++    return file;
++  }
++
++  private async validateOrThrow(file: any, validator: FileValidator) {
++    const isValid = await validator.isValid(file);
++
++    if (!isValid) {
++      const errorMessage = validator.buildErrorMessage(file);
++      throw this.exceptionFactory(errorMessage);
++    }
++  }
++
++  /**
++   * @returns list of validators used in this pipe.
++   */
++  getValidators() {
++    return this.validators;
++  }
++}
+diff --git a/packages/common/pipes/index.ts b/packages/common/pipes/index.ts
+index a69365493..ebbc55f27 100644
+--- a/packages/common/pipes/index.ts
++++ b/packages/common/pipes/index.ts
+@@ -6,3 +6,4 @@ export * from './parse-float.pipe';
+ export * from './parse-enum.pipe';
+ export * from './parse-uuid.pipe';
+ export * from './validation.pipe';
++export * from './file';
+diff --git a/sample/29-file-upload/e2e/app/app.e2e-spec.ts b/sample/29-file-upload/e2e/app/app.e2e-spec.ts
+index 826b5ba8d..4107251ff 100644
+--- a/sample/29-file-upload/e2e/app/app.e2e-spec.ts
++++ b/sample/29-file-upload/e2e/app/app.e2e-spec.ts
+@@ -1,7 +1,6 @@
+ import { INestApplication } from '@nestjs/common';
+ import { Test } from '@nestjs/testing';
+ import { readFileSync } from 'fs';
+-import { join } from 'path';
+ import * as request from 'supertest';
+ import { AppModule } from '../../src/app.module';
+ 
+@@ -30,6 +29,28 @@ describe('E2E FileTest', () => {
+       });
+   });
+ 
++  it('should allow for file uploads that pass validation', async () => {
++    return request(app.getHttpServer())
++      .post('/file/pass-validation')
++      .attach('file', './package.json')
++      .field('name', 'test')
++      .expect(201)
++      .expect({
++        body: {
++          name: 'test',
++        },
++        file: readFileSync('./package.json').toString(),
++      });
++  });
++
++  it('should throw for file uploads that do not pass validation', async () => {
++    return request(app.getHttpServer())
++      .post('/file/fail-validation')
++      .attach('file', './package.json')
++      .field('name', 'test')
++      .expect(400);
++  });
++
+   afterAll(async () => {
+     await app.close();
+   });
+diff --git a/sample/29-file-upload/src/app.controller.ts b/sample/29-file-upload/src/app.controller.ts
+index dc59cd260..39d3af1fb 100644
+--- a/sample/29-file-upload/src/app.controller.ts
++++ b/sample/29-file-upload/src/app.controller.ts
+@@ -2,6 +2,7 @@ import {
+   Body,
+   Controller,
+   Get,
++  ParseFilePipeBuilder,
+   Post,
+   UploadedFile,
+   UseInterceptors,
+@@ -31,4 +32,42 @@ export class AppController {
+       file: file.buffer.toString(),
+     };
+   }
++
++  @UseInterceptors(FileInterceptor('file'))
++  @Post('file/pass-validation')
++  uploadFileAndPassValidation(
++    @Body() body: SampleDto,
++    @UploadedFile(
++      new ParseFilePipeBuilder()
++        .addFileTypeValidator({
++          fileType: 'json',
++        })
++        .build(),
++    )
++    file: Express.Multer.File,
++  ) {
++    return {
++      body,
++      file: file.buffer.toString(),
++    };
++  }
++
++  @UseInterceptors(FileInterceptor('file'))
++  @Post('file/fail-validation')
++  uploadFileAndFailValidation(
++    @Body() body: SampleDto,
++    @UploadedFile(
++      new ParseFilePipeBuilder()
++        .addFileTypeValidator({
++          fileType: 'jpg',
++        })
++        .build(),
++    )
++    file: Express.Multer.File,
++  ) {
++    return {
++      body,
++      file: file.buffer.toString(),
++    };
++  }
+ }

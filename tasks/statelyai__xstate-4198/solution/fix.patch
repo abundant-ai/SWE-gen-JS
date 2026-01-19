@@ -1,0 +1,146 @@
+diff --git a/.changeset/calm-nails-heal.md b/.changeset/calm-nails-heal.md
+new file mode 100644
+index 0000000000..0ddce60d19
+--- /dev/null
++++ b/.changeset/calm-nails-heal.md
+@@ -0,0 +1,26 @@
++---
++'xstate': minor
++---
++
++Introduce `toPromise(actor)`, which creates a promise from an `actor` that resolves with the actor snapshot's `output` when done, or rejects with the actor snapshot's `error` when it fails.
++
++```ts
++import { createMachine, createActor, toPromise } from 'xstate';
++
++const machine = createMachine({
++  // ...
++  states: {
++    // ...
++    done: { type: 'final', output: 42 }
++  }
++});
++
++const actor = createActor(machine);
++
++actor.start();
++
++const output = await toPromise(actor);
++
++console.log(output);
++// => 42
++```
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 2888688982..31519b80c2 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -2,21 +2,31 @@ export * from './actions.ts';
+ export * from './actors/index.ts';
+ export { SimulatedClock } from './SimulatedClock.ts';
+ export { type Spawner } from './spawn.ts';
++export { isMachineSnapshot, type MachineSnapshot } from './State.ts';
+ export { StateMachine } from './StateMachine.ts';
+ export { getStateNodes } from './stateUtils.ts';
+ export * from './typegenTypes.ts';
+ export * from './types.ts';
+ export { waitFor } from './waitFor.ts';
+-import { Actor, createActor, interpret, Interpreter } from './interpreter.ts';
+ import { createMachine } from './createMachine.ts';
+-export { type MachineSnapshot, isMachineSnapshot } from './State.ts';
++import { Actor, createActor, interpret, Interpreter } from './interpreter.ts';
+ import { StateNode } from './StateNode.ts';
+ // TODO: decide from where those should be exported
++export { and, not, or, stateIn } from './guards.ts';
++export { setup } from './setup.ts';
++export type {
++  ActorSystem,
++  InspectedActorEvent,
++  InspectedEventEvent,
++  InspectedSnapshotEvent,
++  InspectionEvent
++} from './system.ts';
++export { toPromise } from './toPromise.ts';
+ export {
++  getAllOwnEventDescriptors as __unsafe_getAllOwnEventDescriptors,
+   matchesState,
+   pathToStateValue,
+-  toObserver,
+-  getAllOwnEventDescriptors as __unsafe_getAllOwnEventDescriptors
++  toObserver
+ } from './utils.ts';
+ export {
+   Actor,
+@@ -26,16 +36,6 @@ export {
+   StateNode,
+   type Interpreter
+ };
+-export type {
+-  InspectedActorEvent,
+-  InspectedEventEvent,
+-  InspectedSnapshotEvent,
+-  InspectionEvent,
+-  ActorSystem
+-} from './system.ts';
+-
+-export { and, not, or, stateIn } from './guards.ts';
+-export { setup } from './setup.ts';
+ 
+ declare global {
+   interface SymbolConstructor {
+diff --git a/packages/core/src/toPromise.ts b/packages/core/src/toPromise.ts
+new file mode 100644
+index 0000000000..cf8f1c27f8
+--- /dev/null
++++ b/packages/core/src/toPromise.ts
+@@ -0,0 +1,36 @@
++import { AnyActorRef, OutputFrom } from './types.ts';
++
++/**
++ * Returns a promise that resolves to the `output` of the actor when it is done.
++ *
++ * @example
++ * ```ts
++ * const machine = createMachine({
++ *   // ...
++ *   output: {
++ *     count: 42
++ *   }
++ * });
++ *
++ * const actor = createActor(machine);
++ *
++ * actor.start();
++ *
++ * const output = await toPromise(actor);
++ *
++ * console.log(output);
++ * // logs { count: 42 }
++ * ```
++ */
++export function toPromise<T extends AnyActorRef>(
++  actor: T
++): Promise<OutputFrom<T>> {
++  return new Promise((resolve, reject) => {
++    actor.subscribe({
++      complete: () => {
++        resolve(actor.getSnapshot().output);
++      },
++      error: reject
++    });
++  });
++}
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 35b3243512..7b929990a7 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -159,7 +159,9 @@ export type OutputFrom<T> = T extends ActorLogic<
+   infer _TSystem
+ >
+   ? (TSnapshot & { status: 'done' })['output']
+-  : never;
++  : T extends ActorRef<infer TSnapshot, infer _TEvent>
++    ? (TSnapshot & { status: 'done' })['output']
++    : never;
+ 
+ export type ActionFunction<
+   TContext extends MachineContext,

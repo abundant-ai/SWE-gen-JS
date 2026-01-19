@@ -1,0 +1,257 @@
+diff --git a/lib/stdio/duplex.js b/lib/stdio/duplex.js
+new file mode 100644
+index 0000000..550751e
+--- /dev/null
++++ b/lib/stdio/duplex.js
+@@ -0,0 +1,59 @@
++import {Duplex, Readable, PassThrough, getDefaultHighWaterMark} from 'node:stream';
++
++/*
++Transform an array of generator functions into a `Duplex`.
++
++The `Duplex` is created by `Duplex.from()` made of a writable stream and a readable stream, piped to each other.
++- The writable stream is a simple `PassThrough`, so it only forwards data to the readable part.
++- The `PassThrough` is read as an iterable using `passThrough.iterator()`.
++- This iterable is transformed to another iterable, by applying the encoding generators.
++	Those convert the chunk type from `Buffer` to `string | Uint8Array` depending on the encoding option.
++- This new iterable is transformed again to another one, this time by applying the user-supplied generator.
++- Finally, `Readable.from()` is used to convert this final iterable to a `Readable` stream.
++*/
++export const generatorsToDuplex = (generators, {writableObjectMode, readableObjectMode}) => {
++	const passThrough = new PassThrough({
++		objectMode: writableObjectMode,
++		highWaterMark: getDefaultHighWaterMark(writableObjectMode),
++		destroy: destroyPassThrough,
++	});
++	let iterable = passThrough.iterator();
++
++	for (const generator of generators) {
++		iterable = applyGenerator(generator, iterable);
++	}
++
++	const readableStream = Readable.from(iterable, {
++		objectMode: readableObjectMode,
++		highWaterMark: getDefaultHighWaterMark(readableObjectMode),
++	});
++	const duplexStream = Duplex.from({writable: passThrough, readable: readableStream});
++	return duplexStream;
++};
++
++const applyGenerator = async function * ({transform, final}, chunks) {
++	for await (const chunk of chunks) {
++		yield * transform(chunk);
++	}
++
++	if (final !== undefined) {
++		yield * final();
++	}
++};
++
++/*
++When an error is thrown in a generator, the PassThrough is aborted.
++
++This creates a race condition for which error is propagated, due to the Duplex throwing twice:
++- The writable side is aborted (PassThrough)
++- The readable side propagate the generator's error
++
++In order for the later to win that race, we need to wait one microtask.
++- However we wait one macrotask instead to be on the safe side
++- See https://github.com/sindresorhus/execa/pull/693#discussion_r1453809450
++*/
++const destroyPassThrough = (error, done) => {
++	setImmediate(() => {
++		done(error);
++	});
++};
+diff --git a/lib/stdio/generator.js b/lib/stdio/generator.js
+index aa8b2a8..4d04704 100644
+--- a/lib/stdio/generator.js
++++ b/lib/stdio/generator.js
+@@ -1,4 +1,4 @@
+-import {generatorsToTransform} from './transform.js';
++import {generatorsToDuplex} from './duplex.js';
+ import {getEncodingStartGenerator} from './encoding.js';
+ import {getLinesGenerator} from './lines.js';
+ import {isGeneratorOptions} from './type.js';
+@@ -77,7 +77,7 @@ export const generatorToDuplexStream = ({
+ 		{transform, final},
+ 		{transform: getValidateTransformReturn(readableObjectMode, optionName)},
+ 	].filter(Boolean);
+-	const duplexStream = generatorsToTransform(generators, {writableObjectMode, readableObjectMode});
++	const duplexStream = generatorsToDuplex(generators, {writableObjectMode, readableObjectMode});
+ 	return {value: duplexStream};
+ };
+ 
+diff --git a/lib/stdio/transform.js b/lib/stdio/transform.js
+deleted file mode 100644
+index 67439a2..0000000
+--- a/lib/stdio/transform.js
++++ /dev/null
+@@ -1,53 +0,0 @@
+-import {Transform, getDefaultHighWaterMark} from 'node:stream';
+-import {callbackify} from 'node:util';
+-
+-// Transform an array of generator functions into a `Transform` stream.
+-// `Duplex.from(generator)` cannot be used because it does not allow setting the `objectMode` and `highWaterMark`.
+-export const generatorsToTransform = (generators, {writableObjectMode, readableObjectMode}) => new Transform({
+-	writableObjectMode,
+-	writableHighWaterMark: getDefaultHighWaterMark(writableObjectMode),
+-	readableObjectMode,
+-	readableHighWaterMark: getDefaultHighWaterMark(readableObjectMode),
+-	transform(chunk, encoding, done) {
+-		pushChunks(transformChunk.bind(undefined, chunk, generators, 0), this, done);
+-	},
+-	flush(done) {
+-		pushChunks(finalChunks.bind(undefined, generators), this, done);
+-	},
+-});
+-
+-const pushChunks = callbackify(async (getChunks, transformStream) => {
+-	for await (const chunk of getChunks()) {
+-		transformStream.push(chunk);
+-	}
+-});
+-
+-// For each new chunk, apply each `transform()` method
+-const transformChunk = async function * (chunk, generators, index) {
+-	if (index === generators.length) {
+-		yield chunk;
+-		return;
+-	}
+-
+-	const {transform} = generators[index];
+-	for await (const transformedChunk of transform(chunk)) {
+-		yield * transformChunk(transformedChunk, generators, index + 1);
+-	}
+-};
+-
+-// At the end, apply each `final()` method, followed by the `transform()` method of the next transforms
+-const finalChunks = async function * (generators) {
+-	for (const [index, {final}] of Object.entries(generators)) {
+-		yield * generatorFinalChunks(final, Number(index), generators);
+-	}
+-};
+-
+-const generatorFinalChunks = async function * (final, index, generators) {
+-	if (final === undefined) {
+-		return;
+-	}
+-
+-	for await (const finalChunk of final()) {
+-		yield * transformChunk(finalChunk, generators, index + 1);
+-	}
+-};
+diff --git a/test/stdio/generator.js b/test/stdio/generator.js
+index 26a557e..7cbade3 100644
+--- a/test/stdio/generator.js
++++ b/test/stdio/generator.js
+@@ -1,7 +1,7 @@
+ import {Buffer} from 'node:buffer';
+ import {readFile, writeFile, rm} from 'node:fs/promises';
+ import {getDefaultHighWaterMark, PassThrough} from 'node:stream';
+-import {setTimeout, scheduler} from 'node:timers/promises';
++import {setTimeout, setImmediate} from 'node:timers/promises';
+ import test from 'ava';
+ import getStream, {getStreamAsArray} from 'get-stream';
+ import tempfile from 'tempfile';
+@@ -292,17 +292,16 @@ test('Cannot use generators with sync methods and stdout', testSyncMethods, 1);
+ test('Cannot use generators with sync methods and stderr', testSyncMethods, 2);
+ test('Cannot use generators with sync methods and stdio[*]', testSyncMethods, 3);
+ 
+-const repeatCount = getDefaultHighWaterMark() * 3;
++const repeatHighWaterMark = 10;
+ 
+ const writerGenerator = function * () {
+-	for (let index = 0; index < repeatCount; index += 1) {
++	for (let index = 0; index < getDefaultHighWaterMark() * repeatHighWaterMark; index += 1) {
+ 		yield '\n';
+ 	}
+ };
+ 
+-const getLengthGenerator = function * (t, chunk) {
+-	t.is(chunk.length, 1);
+-	yield chunk;
++const getLengthGenerator = function * (chunk) {
++	yield `${chunk.length}`;
+ };
+ 
+ const testHighWaterMark = async (t, passThrough, binary, objectMode) => {
+@@ -311,17 +310,16 @@ const testHighWaterMark = async (t, passThrough, binary, objectMode) => {
+ 			...(objectMode ? [outputObjectGenerator] : []),
+ 			writerGenerator,
+ 			...(passThrough ? [noopGenerator(false, binary)] : []),
+-			{transform: getLengthGenerator.bind(undefined, t), binary: true, objectMode: true},
++			{transform: getLengthGenerator, binary: true},
+ 		],
+ 	});
+-	t.is(stdout.length, repeatCount);
+-	t.true(stdout.every(chunk => chunk.toString() === '\n'));
++	t.is(stdout, `${getDefaultHighWaterMark()}`.repeat(repeatHighWaterMark));
+ };
+ 
+-test('Synchronous yields are not buffered, no passThrough', testHighWaterMark, false, false, false);
+-test('Synchronous yields are not buffered, line-wise passThrough', testHighWaterMark, true, false, false);
+-test('Synchronous yields are not buffered, binary passThrough', testHighWaterMark, true, true, false);
+-test('Synchronous yields are not buffered, objectMode as input but not output', testHighWaterMark, false, false, true);
++test('Stream respects highWaterMark, no passThrough', testHighWaterMark, false, false, false);
++test('Stream respects highWaterMark, line-wise passThrough', testHighWaterMark, true, false, false);
++test('Stream respects highWaterMark, binary passThrough', testHighWaterMark, true, true, false);
++test('Stream respects highWaterMark, objectMode as input but not output', testHighWaterMark, false, false, true);
+ 
+ const getTypeofGenerator = objectMode => ({
+ 	* transform(line) {
+@@ -482,7 +480,7 @@ const brokenSymbol = '\uFFFD';
+ const testMultibyte = async (t, objectMode) => {
+ 	const childProcess = execa('stdin.js', {stdin: noopGenerator(objectMode)});
+ 	childProcess.stdin.write(multibyteUint8Array.slice(0, breakingLength));
+-	await scheduler.yield();
++	await setImmediate();
+ 	childProcess.stdin.end(multibyteUint8Array.slice(breakingLength));
+ 	const {stdout} = await childProcess;
+ 	t.is(stdout, multibyteString);
+@@ -514,9 +512,9 @@ const suffix = ' <';
+ 
+ const multipleYieldGenerator = async function * (line = foobarString) {
+ 	yield prefix;
+-	await scheduler.yield();
++	await setImmediate();
+ 	yield line;
+-	await scheduler.yield();
++	await setImmediate();
+ 	yield suffix;
+ };
+ 
+@@ -528,33 +526,6 @@ const testMultipleYields = async (t, final) => {
+ test('Generator can yield "transform" multiple times at different moments', testMultipleYields, false);
+ test('Generator can yield "final" multiple times at different moments', testMultipleYields, true);
+ 
+-const partsPerChunk = 4;
+-const chunksPerCall = 10;
+-const callCount = 5;
+-const fullString = '\n'.repeat(getDefaultHighWaterMark(false) / partsPerChunk);
+-
+-const yieldFullStrings = function * () {
+-	yield * Array.from({length: partsPerChunk * chunksPerCall}).fill(fullString);
+-};
+-
+-const manyYieldGenerator = async function * () {
+-	for (let index = 0; index < callCount; index += 1) {
+-		yield * yieldFullStrings();
+-		// eslint-disable-next-line no-await-in-loop
+-		await scheduler.yield();
+-	}
+-};
+-
+-const testManyYields = async (t, final) => {
+-	const childProcess = execa('noop.js', {stdout: convertTransformToFinal(manyYieldGenerator, final), buffer: false});
+-	const [chunks] = await Promise.all([getStreamAsArray(childProcess.stdout), childProcess]);
+-	const expectedChunk = Buffer.alloc(getDefaultHighWaterMark(false) * chunksPerCall).fill('\n');
+-	t.deepEqual(chunks, Array.from({length: callCount}).fill(expectedChunk));
+-};
+-
+-test('Generator "transform" yields are sent right away', testManyYields, false);
+-test('Generator "final" yields are sent right away', testManyYields, true);
+-
+ const testInputFile = async (t, getOptions, reversed) => {
+ 	const filePath = tempfile();
+ 	await writeFile(filePath, foobarString);

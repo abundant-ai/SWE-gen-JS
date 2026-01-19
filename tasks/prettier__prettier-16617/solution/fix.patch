@@ -1,0 +1,126 @@
+diff --git a/changelog_unreleased/scss/16617.md b/changelog_unreleased/scss/16617.md
+new file mode 100644
+index 000000000..f95cde238
+--- /dev/null
++++ b/changelog_unreleased/scss/16617.md
+@@ -0,0 +1,22 @@
++#### Fixed wrong trailing comma position after comment in SCSS (#16617 by @Ma-hawaj, @fisker)
++
++<!-- prettier-ignore -->
++```css
++/* Input */
++$z-indexes: (
++    header: 1035,
++    overlay: 1202 // TODO: change to 1050 after bootstrap modals will be removed
++);
++
++/* Prettier stable */
++$z-indexes: (
++    header: 1035,
++    overlay: 1202 // TODO: change to 1050 after bootstrap modals will be removed,
++);
++
++/* Prettier main */
++$z-indexes: (
++    header: 1035,
++    overlay: 1202, // TODO: change to 1050 after bootstrap modals will be removed
++);
++```
+diff --git a/src/language-css/parse/parse-value.js b/src/language-css/parse/parse-value.js
+index fa3cc4b35..ea628fe53 100644
+--- a/src/language-css/parse/parse-value.js
++++ b/src/language-css/parse/parse-value.js
+@@ -7,6 +7,9 @@ import isSCSSVariable from "../utils/is-scss-variable.js";
+ import parseSelector from "./parse-selector.js";
+ import { addTypePrefix } from "./utils.js";
+ 
++const isClosingParenthesis = (node) =>
++  node.type === "paren" && node.value === ")";
++
+ function parseValueNode(valueNode, options) {
+   const { nodes } = valueNode;
+   let parenGroup = {
+@@ -87,7 +90,7 @@ function parseValueNode(valueNode, options) {
+         type: "comma_group",
+       };
+       commaGroupStack.push(commaGroup);
+-    } else if (node.type === "paren" && node.value === ")") {
++    } else if (isClosingParenthesis(node)) {
+       if (commaGroup.groups.length > 0) {
+         parenGroup.groups.push(commaGroup);
+       }
+@@ -105,6 +108,15 @@ function parseValueNode(valueNode, options) {
+       parenGroupStack.pop();
+       parenGroup = parenGroupStack.at(-1);
+     } else if (node.type === "comma") {
++      // Trialing comma
++      if (
++        i === nodes.length - 3 &&
++        nodes[i + 1].type === "comment" &&
++        isClosingParenthesis(nodes[i + 2])
++      ) {
++        continue;
++      }
++
+       parenGroup.groups.push(commaGroup);
+       commaGroup = {
+         groups: [],
+@@ -118,6 +130,7 @@ function parseValueNode(valueNode, options) {
+   if (commaGroup.groups.length > 0) {
+     parenGroup.groups.push(commaGroup);
+   }
++
+   return rootParenGroup;
+ }
+ 
+diff --git a/src/language-css/print/comma-separated-value-group.js b/src/language-css/print/comma-separated-value-group.js
+index f13929014..8f6e2197f 100644
+--- a/src/language-css/print/comma-separated-value-group.js
++++ b/src/language-css/print/comma-separated-value-group.js
+@@ -6,6 +6,7 @@ import {
+   hardline,
+   indent,
+   line,
++  lineSuffix,
+   softline,
+ } from "../../document/builders.js";
+ import { locEnd, locStart } from "../loc.js";
+@@ -79,13 +80,23 @@ function printCommaSeparatedValueGroup(path, options, print) {
+   let didBreak = false;
+ 
+   for (let i = 0; i < node.groups.length; ++i) {
+-    parts.push([parts.pop(), printed[i]]);
+-
+     const iPrevNode = node.groups[i - 1];
+     const iNode = node.groups[i];
+     const iNextNode = node.groups[i + 1];
+     const iNextNextNode = node.groups[i + 2];
+ 
++    // If the node is comment and last node print it in a line suffix
++    if (isInlineValueCommentNode(iNode) && !iNextNode) {
++      // TODO: Improve this part
++      // This `lineSuffix` should be done in `value-comment` print
++      // But since we add `line` to groups in `value-paren_group`,
++      // The format result looks bad for now
++      parts.push([parts.pop(), lineSuffix([" ", printed[i]])]);
++      continue;
++    }
++
++    parts.push([parts.pop(), printed[i]]);
++
+     if (insideURLFunction) {
+       if ((iNextNode && isAdditionNode(iNextNode)) || isAdditionNode(iNode)) {
+         parts.push([parts.pop(), " "]);
+@@ -426,6 +437,12 @@ function printCommaSeparatedValueGroup(path, options, print) {
+       continue;
+     }
+ 
++    // don't print line when the next node is a comment and last node
++    // it will be printed with the comment in a line suffix
++    if (isInlineValueCommentNode(iNextNode) && !iNextNextNode) {
++      continue;
++    }
++
+     // Be default all values go through `line`
+     parts.push(line, "");
+   }

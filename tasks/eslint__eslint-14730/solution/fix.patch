@@ -1,0 +1,139 @@
+diff --git a/docs/developer-guide/nodejs-api.md b/docs/developer-guide/nodejs-api.md
+index daa56e764..449d1ec08 100644
+--- a/docs/developer-guide/nodejs-api.md
++++ b/docs/developer-guide/nodejs-api.md
+@@ -355,7 +355,9 @@ The `LintResult` value is the information of the linting result of each file. Th
+ * `fixableWarningCount` (`number`)<br>
+   The number of warnings that can be fixed automatically by the `fix` constructor option.
+ * `errorCount` (`number`)<br>
+-  The number of errors. This includes fixable errors.
++  The number of errors. This includes fixable errors and fatal errors.
++* `fatalErrorCount` (`number`)<br>
++  The number of fatal errors.
+ * `warningCount` (`number`)<br>
+   The number of warnings. This includes fixable warnings.
+ * `output` (`string | undefined`)<br>
+diff --git a/docs/user-guide/command-line-interface.md b/docs/user-guide/command-line-interface.md
+index 99fd61eb9..4500e6ff6 100644
+--- a/docs/user-guide/command-line-interface.md
++++ b/docs/user-guide/command-line-interface.md
+@@ -81,6 +81,7 @@ Miscellaneous:
+   --init                         Run config initialization wizard - default: false
+   --env-info                     Output execution environment information - default: false
+   --no-error-on-unmatched-pattern  Prevent errors when pattern is unmatched - default: false
++  --exit-on-fatal-error          Exit with exit code 2 in case of fatal error - default: false
+   --debug                        Output debugging information
+   -h, --help                     Show help
+   -v, --version                  Output the version number
+@@ -467,6 +468,10 @@ This option outputs information about the execution environment, including the v
+ 
+ This option prevents errors when a quoted glob pattern or `--ext` is unmatched. This will not prevent errors when your shell can't match a glob.
+ 
++#### `--exit-on-fatal-error`
++
++This option causes ESLint to exit with exit code 2 if one or more fatal parsing errors occur. Without this option, fatal parsing errors are reported as rule violations.
++
+ #### `--debug`
+ 
+ This option outputs debugging information to the console. This information is useful when you're seeing a problem and having a hard time pinpointing it. The ESLint team may ask for this debugging information to help solve bugs.
+diff --git a/lib/cli-engine/cli-engine.js b/lib/cli-engine/cli-engine.js
+index ca298f9c3..24f6a10d1 100644
+--- a/lib/cli-engine/cli-engine.js
++++ b/lib/cli-engine/cli-engine.js
+@@ -156,6 +156,9 @@ function calculateStatsPerFile(messages) {
+     return messages.reduce((stat, message) => {
+         if (message.fatal || message.severity === 2) {
+             stat.errorCount++;
++            if (message.fatal) {
++                stat.fatalErrorCount++;
++            }
+             if (message.fix) {
+                 stat.fixableErrorCount++;
+             }
+@@ -168,6 +171,7 @@ function calculateStatsPerFile(messages) {
+         return stat;
+     }, {
+         errorCount: 0,
++        fatalErrorCount: 0,
+         warningCount: 0,
+         fixableErrorCount: 0,
+         fixableWarningCount: 0
+@@ -183,12 +187,14 @@ function calculateStatsPerFile(messages) {
+ function calculateStatsPerRun(results) {
+     return results.reduce((stat, result) => {
+         stat.errorCount += result.errorCount;
++        stat.fatalErrorCount += result.fatalErrorCount;
+         stat.warningCount += result.warningCount;
+         stat.fixableErrorCount += result.fixableErrorCount;
+         stat.fixableWarningCount += result.fixableWarningCount;
+         return stat;
+     }, {
+         errorCount: 0,
++        fatalErrorCount: 0,
+         warningCount: 0,
+         fixableErrorCount: 0,
+         fixableWarningCount: 0
+diff --git a/lib/cli.js b/lib/cli.js
+index f76676454..477310da5 100644
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -131,14 +131,16 @@ function translateOptions({
+  */
+ function countErrors(results) {
+     let errorCount = 0;
++    let fatalErrorCount = 0;
+     let warningCount = 0;
+ 
+     for (const result of results) {
+         errorCount += result.errorCount;
++        fatalErrorCount += result.fatalErrorCount;
+         warningCount += result.warningCount;
+     }
+ 
+-    return { errorCount, warningCount };
++    return { errorCount, fatalErrorCount, warningCount };
+ }
+ 
+ /**
+@@ -314,9 +316,12 @@ const cli = {
+         if (await printResults(engine, resultsToPrint, options.format, options.outputFile)) {
+ 
+             // Errors and warnings from the original unfiltered results should determine the exit code
+-            const { errorCount, warningCount } = countErrors(results);
++            const { errorCount, fatalErrorCount, warningCount } = countErrors(results);
++
+             const tooManyWarnings =
+                 options.maxWarnings >= 0 && warningCount > options.maxWarnings;
++            const shouldExitForFatalErrors =
++                options.exitOnFatalError && fatalErrorCount > 0;
+ 
+             if (!errorCount && tooManyWarnings) {
+                 log.error(
+@@ -325,6 +330,10 @@ const cli = {
+                 );
+             }
+ 
++            if (shouldExitForFatalErrors) {
++                return 2;
++            }
++
+             return (errorCount || tooManyWarnings) ? 1 : 0;
+         }
+ 
+diff --git a/lib/options.js b/lib/options.js
+index 92c140bd3..e3661ec81 100644
+--- a/lib/options.js
++++ b/lib/options.js
+@@ -290,6 +290,12 @@ module.exports = optionator({
+             default: "true",
+             description: "Prevent errors when pattern is unmatched"
+         },
++        {
++            option: "exit-on-fatal-error",
++            type: "Boolean",
++            default: "false",
++            description: "Exit with exit code 2 in case of fatal error"
++        },
+         {
+             option: "debug",
+             type: "Boolean",

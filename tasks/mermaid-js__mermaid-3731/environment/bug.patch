@@ -1,0 +1,225 @@
+diff --git a/cypress/platform/knsv2.html b/cypress/platform/knsv2.html
+index de9780185..968d04f72 100644
+--- a/cypress/platform/knsv2.html
++++ b/cypress/platform/knsv2.html
+@@ -72,7 +72,7 @@ classDiagram
+         Student "1" --o "1" IdCard : carries
+         Student "1" --o "1" Bike : rides
+     </pre>
+-    <pre id="diagram" class="mermaid2">
++    <pre id="diagram" class="mermaid">
+ mindmap
+   root
+     child1((Circle))
+diff --git a/packages/mermaid/src/__mocks__/mermaidAPI.ts b/packages/mermaid/src/__mocks__/mermaidAPI.ts
+index 6eccaac48..08c5b7eea 100644
+--- a/packages/mermaid/src/__mocks__/mermaidAPI.ts
++++ b/packages/mermaid/src/__mocks__/mermaidAPI.ts
+@@ -25,7 +25,6 @@ function parse(text: string, parseError?: Function): boolean {
+ // original version cannot be modified since it was frozen with `Object.freeze()`
+ export const mermaidAPI = {
+   render: vi.fn(),
+-  renderAsync: vi.fn(),
+   parse,
+   parseDirective: vi.fn(),
+   initialize: vi.fn(),
+diff --git a/packages/mermaid/src/mermaid.spec.ts b/packages/mermaid/src/mermaid.spec.ts
+index 534b3e964..e3bc69448 100644
+--- a/packages/mermaid/src/mermaid.spec.ts
++++ b/packages/mermaid/src/mermaid.spec.ts
+@@ -48,13 +48,11 @@ describe('when using mermaid and ', function () {
+       const node = document.createElement('div');
+       node.appendChild(document.createTextNode('graph TD;\na;'));
+ 
+-      mermaid.initThrowsErrors(undefined, node);
++      await mermaid.initThrowsErrors(undefined, node);
+       // mermaidAPI.render function has been mocked, since it doesn't yet work
+       // in Node.JS (only works in browser)
+       expect(mermaidAPI.render).toHaveBeenCalled();
+     });
+-  });
+-  describe('when using #initThrowsErrorsAsync', function () {
+     it('should throw error (but still render) if lazyLoadedDiagram fails', async () => {
+       const node = document.createElement('div');
+       node.appendChild(document.createTextNode('graph TD;\na;'));
+@@ -62,14 +60,14 @@ describe('when using mermaid and ', function () {
+       mermaidAPI.setConfig({
+         lazyLoadedDiagrams: ['this-file-does-not-exist.mjs'],
+       });
+-      await expect(mermaid.initThrowsErrorsAsync(undefined, node)).rejects.toThrowError(
++      await expect(mermaid.initThrowsErrors(undefined, node)).rejects.toThrowError(
+         // this error message is probably different on every platform
+         // this one is just for vite-note (node/jest/browser may be different)
+         'Failed to load this-file-does-not-exist.mjs'
+       );
+ 
+       // should still render, even if lazyLoadedDiagrams fails
+-      expect(mermaidAPI.renderAsync).toHaveBeenCalled();
++      expect(mermaidAPI.render).toHaveBeenCalled();
+     });
+ 
+     afterEach(() => {
+diff --git a/packages/mermaid/src/mermaid.ts b/packages/mermaid/src/mermaid.ts
+index 2a11088e6..5867dc3b2 100644
+--- a/packages/mermaid/src/mermaid.ts
++++ b/packages/mermaid/src/mermaid.ts
+@@ -47,12 +47,7 @@ const init = async function (
+   callback?: Function
+ ) {
+   try {
+-    const conf = mermaidAPI.getConfig();
+-    if (conf?.lazyLoadedDiagrams && conf.lazyLoadedDiagrams.length > 0) {
+-      await initThrowsErrorsAsync(config, nodes, callback);
+-    } else {
+-      initThrowsErrors(config, nodes, callback);
+-    }
++    await initThrowsErrors(config, nodes, callback);
+   } catch (e) {
+     log.warn('Syntax Error rendering');
+     if (isDetailedError(e)) {
+@@ -89,7 +84,19 @@ const handleError = (error: unknown, errors: DetailedError[], parseError?: Funct
+     }
+   }
+ };
+-const initThrowsErrors = function (
++/**
++ * Equivalent to {@link init()}, except an error will be thrown on error.
++ *
++ * @param config - **Deprecated** Mermaid sequenceConfig.
++ * @param nodes - One of:
++ * - A DOM Node
++ * - An array of DOM nodes (as would come from a jQuery selector)
++ * - A W3C selector, a la `.mermaid` (default)
++ * @param callback - Function that is called with the id of each generated mermaid diagram.
++ *
++ * @returns Resolves on success, otherwise the {@link Promise} will be rejected with an Error.
++ */
++const initThrowsErrors = async function (
+   config?: MermaidConfig,
+   // eslint-disable-next-line no-undef
+   nodes?: string | HTMLElement | NodeListOf<HTMLElement>,
+@@ -103,6 +110,24 @@ const initThrowsErrors = function (
+     mermaid.sequenceConfig = config;
+   }
+ 
++  const errors = [];
++
++  if (conf?.lazyLoadedDiagrams && conf.lazyLoadedDiagrams.length > 0) {
++    // Load all lazy loaded diagrams in parallel
++    const results = await Promise.allSettled(
++      conf.lazyLoadedDiagrams.map(async (diagram: string) => {
++        const { id, detector, loadDiagram } = await import(diagram);
++        addDetector(id, detector, loadDiagram);
++      })
++    );
++    for (const result of results) {
++      if (result.status == 'rejected') {
++        log.warn(`Failed to lazyLoadedDiagram due to `, result.reason);
++        errors.push(result.reason);
++      }
++    }
++  }
++
+   // if last argument is a function this is the callback function
+   log.debug(`${!callback ? 'No ' : ''}Callback function found`);
+   let nodesToProcess: ArrayLike<HTMLElement>;
+@@ -128,7 +153,6 @@ const initThrowsErrors = function (
+   const idGenerator = new utils.initIdGenerator(conf.deterministicIds, conf.deterministicIDSeed);
+ 
+   let txt: string;
+-  const errors: DetailedError[] = [];
+ 
+   // element is the current div with mermaid class
+   for (const element of Array.from(nodesToProcess)) {
+@@ -177,12 +201,10 @@ const initThrowsErrors = function (
+   }
+ };
+ 
+-let lazyLoadingPromise: Promise<PromiseSettledResult<void>[]> | undefined = undefined;
++let lazyLoadingPromise: Promise<unknown> | undefined = undefined;
+ /**
+- * This is an internal function and should not be made public, as it will likely change.
+- * @internal
+- * @param conf - Mermaid config.
+- * @returns An array of {@link PromiseSettledResult}, showing the status of imports.
++ * @param conf
++ * @deprecated This is an internal function and should not be used. Will be removed in v10.
+  */
+ const registerLazyLoadedDiagrams = async (conf: MermaidConfig) => {
+   // Only lazy load once
+@@ -196,7 +218,7 @@ const registerLazyLoadedDiagrams = async (conf: MermaidConfig) => {
+       })
+     );
+   }
+-  return await lazyLoadingPromise;
++  await lazyLoadingPromise;
+ };
+ 
+ let loadingPromise: Promise<unknown> | undefined = undefined;
+@@ -219,20 +241,9 @@ const loadExternalDiagrams = async (conf: MermaidConfig) => {
+ };
+ 
+ /**
+- * Equivalent to {@link init()}, except an error will be thrown on error.
+- *
+- * @alpha
+- * @deprecated This is an internal function and will very likely be modified in v10, or earlier.
+- * We recommend staying with {@link initThrowsErrors} if you don't need `lazyLoadedDiagrams`.
+- *
+- * @param config - **Deprecated** Mermaid sequenceConfig.
+- * @param nodes - One of:
+- * - A DOM Node
+- * - An array of DOM nodes (as would come from a jQuery selector)
+- * - A W3C selector, a la `.mermaid` (default)
+- * @param callback - Function that is called with the id of each generated mermaid diagram.
+- * @returns Resolves on success, otherwise the {@link Promise} will be rejected.
++ * @deprecated This is an internal function and should not be used. Will be removed in v10.
+  */
++
+ const initThrowsErrorsAsync = async function (
+   config?: MermaidConfig,
+   // eslint-disable-next-line no-undef
+@@ -241,14 +252,6 @@ const initThrowsErrorsAsync = async function (
+   callback?: Function
+ ) {
+   const conf = mermaidAPI.getConfig();
+-
+-  const registerLazyLoadedDiagramsErrors: Error[] = [];
+-  for (const registerResult of await registerLazyLoadedDiagrams(conf)) {
+-    if (registerResult.status == 'rejected') {
+-      registerLazyLoadedDiagramsErrors.push(registerResult.reason);
+-    }
+-  }
+-
+   if (config) {
+     // This is a legacy way of setting config. It is not documented and should be removed in the future.
+     // @ts-ignore: TODO Fix ts errors
+@@ -323,10 +326,9 @@ const initThrowsErrorsAsync = async function (
+       handleError(error, errors, mermaid.parseError);
+     }
+   }
+-  const allErrors = [...registerLazyLoadedDiagramsErrors, ...errors];
+-  if (allErrors.length > 0) {
++  if (errors.length > 0) {
+     // TODO: We should be throwing an error object.
+-    throw allErrors[0];
++    throw errors[0];
+   }
+ };
+ 
+@@ -521,7 +523,6 @@ const mermaid: {
+   renderAsync: typeof renderAsync;
+   init: typeof init;
+   initThrowsErrors: typeof initThrowsErrors;
+-  initThrowsErrorsAsync: typeof initThrowsErrorsAsync;
+   initialize: typeof initialize;
+   initializeAsync: typeof initializeAsync;
+   contentLoaded: typeof contentLoaded;
+@@ -536,7 +537,6 @@ const mermaid: {
+   renderAsync,
+   init,
+   initThrowsErrors,
+-  initThrowsErrorsAsync,
+   initialize,
+   initializeAsync,
+   parseError: undefined,

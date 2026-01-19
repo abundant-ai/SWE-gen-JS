@@ -1,0 +1,187 @@
+diff --git a/changelog_unreleased/javascript/18142.md b/changelog_unreleased/javascript/18142.md
+new file mode 100644
+index 000000000..77c2861f8
+--- /dev/null
++++ b/changelog_unreleased/javascript/18142.md
+@@ -0,0 +1,27 @@
++#### Remove redundant parentheses in "return statement" (#18142 by @fisker)
++
++<!-- prettier-ignore -->
++```jsx
++// Input
++function sequenceExpressionInside() {
++  return ( // Reason for a
++    a, b
++  );
++}
++
++// Prettier stable
++function sequenceExpressionInside() {
++  return (
++    // Reason for a
++    (a, b)
++  );
++}
++
++// Prettier main
++function sequenceExpressionInside() {
++  return (
++    // Reason for a
++    a, b
++  );
++}
++```
+diff --git a/src/language-js/parentheses/needs-parentheses.js b/src/language-js/parentheses/needs-parentheses.js
+index e442fdf8b..79a5697ff 100644
+--- a/src/language-js/parentheses/needs-parentheses.js
++++ b/src/language-js/parentheses/needs-parentheses.js
+@@ -18,10 +18,12 @@ import {
+   isNumericLiteral,
+   isObjectExpression,
+   isObjectProperty,
++  isReturnOrThrowStatement,
+   isUnionType,
+   shouldFlatten,
+   startsWithNoLookaheadToken,
+ } from "../utilities/index.js";
++import { returnArgumentHasLeadingComment } from "../utilities/return-statement-has-leading-comment.js";
+ 
+ /**
+  * @import AstPath from "../../common/ast-path.js"
+@@ -190,6 +192,13 @@ function needsParentheses(path, options) {
+   }
+ 
+   switch (parent.type) {
++    case "ReturnStatement":
++    case "ThrowStatement":
++      if (willReturnOrThrowStatementBreak(path, options)) {
++        return false;
++      }
++      break;
++
+     case "ParenthesizedExpression":
+       return false;
+     case "ClassDeclaration":
+@@ -1350,4 +1359,29 @@ function canDecoratorExpressionUnparenthesized(node) {
+   );
+ }
+ 
++function willReturnOrThrowStatementBreak(path, options) {
++  const { key, parent } = path;
++  if (!(key === "argument" && isReturnOrThrowStatement(parent))) {
++    return false;
++  }
++
++  /*
++  When `ReturnStatement` or `ThrowStatement` breaks, parentheses will be added around it's argument.
++  So don't need add parentheses again.
++  But we can't know how the argument printed, so only matches cases that will break for sure
++  */
++
++  const { node } = path;
++
++  if (
++    (node.type === "SequenceExpression" ||
++      node.type === "AssignmentExpression") &&
++    returnArgumentHasLeadingComment(node, options)
++  ) {
++    return true;
++  }
++
++  return false;
++}
++
+ export default needsParentheses;
+diff --git a/src/language-js/print/sequence-expression.js b/src/language-js/print/sequence-expression.js
+index 4e22f1be9..139c2ed0e 100644
+--- a/src/language-js/print/sequence-expression.js
++++ b/src/language-js/print/sequence-expression.js
+@@ -6,6 +6,24 @@ import {
+   line,
+   softline,
+ } from "../../document/index.js";
++import needsParentheses from "../parentheses/needs-parentheses.js";
++
++function shouldIndentSequenceExpression(path, options) {
++  const { key, parent } = path;
++  if (
++    key === "argument" &&
++    (parent.type === "ReturnStatement" || parent.type === "ThrowStatement") &&
++    needsParentheses(path, options)
++  ) {
++    return true;
++  }
++
++  if (key === "body" && parent.type === "ArrowFunctionExpression") {
++    return true;
++  }
++
++  return false;
++}
+ 
+ function printSequenceExpression(path, options, print) {
+   const { parent } = path;
+@@ -26,11 +44,7 @@ function printSequenceExpression(path, options, print) {
+ 
+   const parts = join([",", line], path.map(print, "expressions"));
+ 
+-  if (
+-    ((parent.type === "ReturnStatement" || parent.type === "ThrowStatement") &&
+-      path.key === "argument") ||
+-    (parent.type === "ArrowFunctionExpression" && path.key === "body")
+-  ) {
++  if (shouldIndentSequenceExpression(path, options)) {
+     return group(ifBreak([indent([softline, parts]), softline], parts));
+   }
+ 
+diff --git a/src/language-js/utilities/index.js b/src/language-js/utilities/index.js
+index 6800d93b4..056f4d82d 100644
+--- a/src/language-js/utilities/index.js
++++ b/src/language-js/utilities/index.js
+@@ -1111,6 +1111,11 @@ function isBooleanTypeCoercion(node) {
+   );
+ }
+ 
++const isReturnOrThrowStatement = createTypeCheckFunction([
++  "ReturnStatement",
++  "ThrowStatement",
++]);
++
+ export {
+   CommentCheckFlags,
+   createTypeCheckFunction,
+@@ -1156,6 +1161,7 @@ export {
+   isObjectType,
+   isPrettierIgnoreComment,
+   isRegExpLiteral,
++  isReturnOrThrowStatement,
+   isSignedNumericLiteral,
+   isSimpleCallArgument,
+   isSimpleExpressionByNodeCount,
+diff --git a/src/language-js/utilities/return-statement-has-leading-comment.js b/src/language-js/utilities/return-statement-has-leading-comment.js
+index d1198cb0a..9e304e448 100644
+--- a/src/language-js/utilities/return-statement-has-leading-comment.js
++++ b/src/language-js/utilities/return-statement-has-leading-comment.js
+@@ -12,7 +12,7 @@ import {
+ // This recurses the return argument, looking for the first token
+ // (the leftmost leaf node) and, if it (or its parents) has any
+ // leadingComments, returns true (so it can be wrapped in parens).
+-function returnArgumentHasLeadingComment(node, options) {
++function returnArgumentHasLeadingCommentWithoutCache(node, options) {
+   if (
+     hasLeadingOwnLineComment(options.originalText, node) ||
+     (hasComment(node, CommentCheckFlags.Leading, (comment) =>
+@@ -42,4 +42,13 @@ function returnArgumentHasLeadingComment(node, options) {
+   return false;
+ }
+ 
++const cache = new WeakMap();
++function returnArgumentHasLeadingComment(node, options) {
++  if (!cache.has(node)) {
++    cache.set(node, returnArgumentHasLeadingCommentWithoutCache(node, options));
++  }
++
++  return cache.get(node);
++}
++
+ export { returnArgumentHasLeadingComment };

@@ -1,0 +1,150 @@
+diff --git a/.changeset/six-pans-warn.md b/.changeset/six-pans-warn.md
+new file mode 100644
+index 0000000000..6b67f9c67a
+--- /dev/null
++++ b/.changeset/six-pans-warn.md
+@@ -0,0 +1,5 @@
++---
++'@xstate/fsm': major
++---
++
++Observing a service via `service.subscribe(...)` no longer immediately receives the current state. Instead, the current state can be read from `service.state`, and observers will receive snapshots only when a transition in the service occurs.
+diff --git a/packages/xstate-fsm/src/index.ts b/packages/xstate-fsm/src/index.ts
+index bc527e6645..5fe045abee 100644
+--- a/packages/xstate-fsm/src/index.ts
++++ b/packages/xstate-fsm/src/index.ts
+@@ -261,7 +261,6 @@ export function interpret<
+     },
+     subscribe: (listener: StateMachine.StateListener<typeof state>) => {
+       listeners.add(listener);
+-      listener(state);
+ 
+       return {
+         unsubscribe: () => listeners.delete(listener)
+diff --git a/packages/xstate-react/src/fsm.ts b/packages/xstate-react/src/fsm.ts
+index b7f0ded657..05f532e078 100644
+--- a/packages/xstate-react/src/fsm.ts
++++ b/packages/xstate-react/src/fsm.ts
+@@ -1,13 +1,11 @@
+ import {
+   createMachine,
+-  EventObject,
+   interpret,
+   InterpreterStatus,
+   MachineImplementationsFrom,
+   ServiceFrom,
+   StateFrom,
+-  StateMachine,
+-  Typestate
++  StateMachine
+ } from '@xstate/fsm';
+ import { useCallback, useEffect, useRef, useState } from 'react';
+ import useIsomorphicLayoutEffect from 'use-isomorphic-layout-effect';
+@@ -18,22 +16,6 @@ function identity<T>(a: T): T {
+   return a;
+ }
+ 
+-const getServiceState = <
+-  TContext extends object,
+-  TEvent extends EventObject = EventObject,
+-  TState extends Typestate<TContext> = { value: any; context: TContext }
+->(
+-  service: StateMachine.Service<TContext, TEvent, TState>
+-): StateMachine.State<TContext, TEvent, TState> => {
+-  let currentValue: StateMachine.State<TContext, TEvent, TState>;
+-  service
+-    .subscribe((state) => {
+-      currentValue = state;
+-    })
+-    .unsubscribe();
+-  return currentValue!;
+-};
+-
+ export function useMachine<TMachine extends StateMachine.AnyMachine>(
+   stateMachine: TMachine,
+   options?: MachineImplementationsFrom<TMachine>
+@@ -102,7 +84,7 @@ const isEqual = (
+ export function useService<TService extends StateMachine.AnyService>(
+   service: TService
+ ): [StateFrom<TService>, TService['send'], TService] {
+-  const getSnapshot = useCallback(() => getServiceState(service), [service]);
++  const getSnapshot = useCallback(() => service.state, [service]);
+ 
+   const subscribe = useCallback(
+     (handleStoreChange) => {
+diff --git a/packages/xstate-solid/src/fsm.ts b/packages/xstate-solid/src/fsm.ts
+index 2513f62b7c..d04ca356b1 100644
+--- a/packages/xstate-solid/src/fsm.ts
++++ b/packages/xstate-solid/src/fsm.ts
+@@ -52,13 +52,21 @@ export function useService<TService extends StateMachine.AnyService>(
+     deriveFSMState(serviceMemo().state as StateFrom<TService>)
+   );
+ 
++  const setNewState = (currentState: StateFrom<TService>) => {
++    setState(deriveFSMState(currentState, unwrap(state)));
++  };
++
+   createEffect(() => {
+-    const { unsubscribe } = serviceMemo().subscribe((currentState) =>
+-      setState(
+-        deriveFSMState(currentState as StateFrom<TService>, unwrap(state))
+-      )
+-    );
++    const currentService = serviceMemo();
++    // this eager `setState` here is important because the state could change between render and effect's call
++    // however, it might also create some extra work that might not be necessary
++    // perhaps we should only do this if the state has changed
++    // we'd have to track the "original" state to check if the current one is different from it
++    // (for that purpose we can't use the derived one created by `createImmutable` as that's a copy of the original)
++    setNewState(currentService.state as StateFrom<TService>);
++    const { unsubscribe } = currentService.subscribe(setNewState);
+     onCleanup(unsubscribe);
++    return false;
+   });
+ 
+   const send: TService['send'] = (event) => serviceMemo().send(event);
+diff --git a/packages/xstate-vue/src/fsm.ts b/packages/xstate-vue/src/fsm.ts
+index 53f2352820..41d86db60d 100644
+--- a/packages/xstate-vue/src/fsm.ts
++++ b/packages/xstate-vue/src/fsm.ts
+@@ -7,22 +7,6 @@ import {
+   Typestate
+ } from '@xstate/fsm';
+ 
+-const getServiceValue = <
+-  TContext extends object,
+-  TEvent extends EventObject = EventObject,
+-  TState extends Typestate<TContext> = { value: any; context: TContext }
+->(
+-  service: StateMachine.Service<TContext, TEvent, TState>
+-): StateMachine.State<TContext, TEvent, TState> => {
+-  let currentValue: StateMachine.State<TContext, TEvent, TState>;
+-  service
+-    .subscribe((state) => {
+-      currentValue = state;
+-    })
+-    .unsubscribe();
+-  return currentValue!;
+-};
+-
+ export function useMachine<
+   TContext extends object,
+   TEvent extends EventObject = EventObject
+@@ -44,7 +28,7 @@ export function useMachine<
+   ).start();
+ 
+   const state = shallowRef<StateMachine.State<TContext, TEvent, any>>(
+-    getServiceValue(service)
++    service.state
+   );
+ 
+   onMounted(() => {
+@@ -81,7 +65,7 @@ export function useService<
+   watch(
+     serviceRef,
+     (service, _, onCleanup) => {
+-      state.value = getServiceValue(service);
++      state.value = service.state;
+ 
+       const { unsubscribe } = service.subscribe((currentState) => {
+         if (currentState.changed) {

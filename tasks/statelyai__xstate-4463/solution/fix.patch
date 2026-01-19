@@ -1,0 +1,214 @@
+diff --git a/.changeset/grumpy-eggs-drum.md b/.changeset/grumpy-eggs-drum.md
+new file mode 100644
+index 0000000000..19e1c0abdd
+--- /dev/null
++++ b/.changeset/grumpy-eggs-drum.md
+@@ -0,0 +1,5 @@
++---
++'xstate': patch
++---
++
++`invoke` and `spawn` will now require `input` to be provided if the used actor requires it.
+diff --git a/packages/core/src/actions/spawn.ts b/packages/core/src/actions/spawn.ts
+index dd411ff904..e7d785d1b4 100644
+--- a/packages/core/src/actions/spawn.ts
++++ b/packages/core/src/actions/spawn.ts
+@@ -17,7 +17,10 @@ import {
+   IsLiteralString,
+   InputFrom,
+   UnifiedArg,
+-  Mapper
++  Mapper,
++  RequiredActorOptions,
++  ConditionalRequired,
++  IsNotNever
+ } from '../types.ts';
+ import { resolveReferencedActor } from '../utils.ts';
+ 
+@@ -135,40 +138,40 @@ export interface SpawnAction<
+   _out_TActor?: TActor;
+ }
+ 
++interface SpawnActionOptions<
++  TContext extends MachineContext,
++  TExpressionEvent extends EventObject,
++  TEvent extends EventObject,
++  TActor extends ProvidedActor
++> {
++  id?: ResolvableActorId<TContext, TExpressionEvent, TEvent, TActor['id']>;
++  systemId?: string;
++  input?:
++    | Mapper<TContext, TEvent, InputFrom<TActor['logic']>, TEvent>
++    | InputFrom<TActor['logic']>;
++  syncSnapshot?: boolean;
++}
++
+ type DistributeActors<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TActor extends ProvidedActor
+ > = TActor extends any
+-  ? 'id' extends keyof TActor
+-    ? [
+-        src: TActor['src'],
+-        options: {
+-          id: ResolvableActorId<
+-            TContext,
+-            TExpressionEvent,
+-            TEvent,
+-            TActor['id']
+-          >;
+-          systemId?: string;
+-          input?:
+-            | Mapper<TContext, TEvent, InputFrom<TActor['logic']>, TEvent>
+-            | InputFrom<TActor['logic']>;
+-          syncSnapshot?: boolean;
+-        }
+-      ]
+-    : [
++  ? ConditionalRequired<
++      [
+         src: TActor['src'],
+-        options?: {
+-          id?: ResolvableActorId<TContext, TExpressionEvent, TEvent, string>;
+-          systemId?: string;
+-          input?:
+-            | Mapper<TContext, TEvent, InputFrom<TActor['logic']>, TEvent>
+-            | InputFrom<TActor['logic']>;
+-          syncSnapshot?: boolean;
++        options?: SpawnActionOptions<
++          TContext,
++          TExpressionEvent,
++          TEvent,
++          TActor
++        > & {
++          [K in RequiredActorOptions<TActor>]: unknown;
+         }
+-      ]
++      ],
++      IsNotNever<RequiredActorOptions<TActor>>
++    >
+   : never;
+ 
+ type SpawnArguments<
+diff --git a/packages/core/src/spawn.ts b/packages/core/src/spawn.ts
+index d28004703b..550d4cca73 100644
+--- a/packages/core/src/spawn.ts
++++ b/packages/core/src/spawn.ts
+@@ -11,33 +11,30 @@ import {
+   IsLiteralString,
+   ProvidedActor,
+   Snapshot,
+-  TODO
++  TODO,
++  RequiredActorOptions,
++  IsNotNever,
++  ConditionalRequired
+ } from './types.ts';
+ import { resolveReferencedActor } from './utils.ts';
+ 
+-export type SpawnOptions<
++type SpawnOptions<
+   TActor extends ProvidedActor,
+   TSrc extends TActor['src']
+ > = TActor extends {
+   src: TSrc;
+ }
+-  ? 'id' extends keyof TActor
+-    ? [
+-        options: {
+-          id: TActor['id'];
+-          systemId?: string;
+-          input?: InputFrom<TActor['logic']>;
+-          syncSnapshot?: boolean;
+-        }
+-      ]
+-    : [
++  ? ConditionalRequired<
++      [
+         options?: {
+-          id?: string;
++          id?: TActor['id'];
+           systemId?: string;
+           input?: InputFrom<TActor['logic']>;
+           syncSnapshot?: boolean;
+-        }
+-      ]
++        } & { [K in RequiredActorOptions<TActor>]: unknown }
++      ],
++      IsNotNever<RequiredActorOptions<TActor>>
++    >
+   : never;
+ 
+ export type Spawner<TActor extends ProvidedActor> = IsLiteralString<
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 1962cd990f..b17636535e 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -46,6 +46,7 @@ type ReturnTypeOrValue<T> = T extends AnyFunction ? ReturnType<T> : T;
+ 
+ // https://github.com/microsoft/TypeScript/issues/23182#issuecomment-379091887
+ export type IsNever<T> = [T] extends [never] ? true : false;
++export type IsNotNever<T> = [T] extends [never] ? false : true;
+ 
+ export type Compute<A extends any> = { [K in keyof A]: A[K] } & unknown;
+ export type Prop<T, K> = K extends keyof T ? T[K] : never;
+@@ -190,9 +191,10 @@ export type NoRequiredParams<T extends ParameterizedObject> = T extends any
+     : never
+   : never;
+ 
+-type ConditionalRequired<T, Condition extends boolean> = Condition extends true
+-  ? Required<T>
+-  : T;
++export type ConditionalRequired<
++  T,
++  Condition extends boolean
++> = Condition extends true ? Required<T> : T;
+ 
+ export type WithDynamicParams<
+   TContext extends MachineContext,
+@@ -570,6 +572,12 @@ type DistributeActors<
+          */
+         src: TSrc;
+ 
++        /**
++         * The unique identifier for the invoked machine. If not specified, this
++         * will be the machine's own `id`, or the URL (from `src`).
++         */
++        id?: TSpecificActor['id'];
++
+         // TODO: currently we do not enforce required inputs here
+         // in a sense, we shouldn't - they could be provided within the `implementations` object
+         // how do we verify if the required input has been provided?
+@@ -622,21 +630,7 @@ type DistributeActors<
+                 TDelay
+               >
+             >;
+-      } & (TSpecificActor['id'] extends string
+-        ? {
+-            /**
+-             * The unique identifier for the invoked machine. If not specified, this
+-             * will be the machine's own `id`, or the URL (from `src`).
+-             */
+-            id: TSpecificActor['id'];
+-          }
+-        : {
+-            /**
+-             * The unique identifier for the invoked machine. If not specified, this
+-             * will be the machine's own `id`, or the URL (from `src`).
+-             */
+-            id?: string;
+-          })
++      } & { [K in RequiredActorOptions<TSpecificActor>]: unknown }
+     >
+   : never;
+ 
+@@ -2272,3 +2266,7 @@ export interface ActorSystem<T extends ActorSystemInfo> {
+ }
+ 
+ export type AnyActorSystem = ActorSystem<any>;
++
++export type RequiredActorOptions<TActor extends ProvidedActor> =
++  | ('id' extends keyof TActor ? 'id' : never)
++  | (undefined extends InputFrom<TActor['logic']> ? never : 'input');

@@ -1,0 +1,959 @@
+diff --git a/.changeset/olive-zebras-tap.md b/.changeset/olive-zebras-tap.md
+deleted file mode 100644
+index f5ebfe529e..0000000000
+--- a/.changeset/olive-zebras-tap.md
++++ /dev/null
+@@ -1,31 +0,0 @@
+----
+-'xstate': major
+----
+-
+-You can now import the following from `xstate`:
+-
+-```js
+-import {
+-  // actions
+-  // sendTo (removed)
+-  pure,
+-
+-  // interpret helpers
+-  waitFor,
+-
+-  // actor functions
+-  fromPromise,
+-  fromObservable,
+-  fromCallback,
+-  fromEventObservable,
+-  fromTransition,
+-
+-  // guard functions
+-  stateIn,
+-  not,
+-  and,
+-  or
+-}
+-```
+-
+-The `send` action was removed from exports; use `sendTo(...)` or `raise(...)` instead.
+diff --git a/packages/core/src/actions.ts b/packages/core/src/actions.ts
+index 0fcfccc535..de12743799 100644
+--- a/packages/core/src/actions.ts
++++ b/packages/core/src/actions.ts
+@@ -33,7 +33,6 @@ export { cancel } from './actions/cancel.ts';
+ export { assign } from './actions/assign.ts';
+ export { raise } from './actions/raise.ts';
+ export { choose } from './actions/choose.ts';
+-export { pure } from './actions/pure.ts';
+ export { actionTypes };
+ 
+ export const initEvent = toSCXMLEvent({ type: actionTypes.init });
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index bab0994222..1fb55990de 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -1,11 +1,21 @@
+-import { doneInvoke, forwardTo, sendParent, sendTo } from './actions.ts';
+-export { assign } from './actions/assign.ts';
+-export { cancel } from './actions/cancel.ts';
+-export { choose } from './actions/choose.ts';
+-export { log } from './actions/log.ts';
+-export { pure } from './actions/pure.ts';
+-export { raise } from './actions/raise.ts';
+-export { stop } from './actions/stop.ts';
++import {
++  after,
++  done,
++  doneInvoke,
++  escalate,
++  forwardTo,
++  respond,
++  sendParent,
++  sendTo
++} from './actions.ts';
++import { assign } from './actions/assign.ts';
++import { cancel } from './actions/cancel.ts';
++import { choose } from './actions/choose.ts';
++import { log } from './actions/log.ts';
++import { pure } from './actions/pure.ts';
++import { raise } from './actions/raise.ts';
++import { send } from './actions/send.ts';
++import { stop } from './actions/stop.ts';
+ import { interpret, Interpreter, ActorStatus } from './interpreter.ts';
+ import { createMachine } from './Machine.ts';
+ import { mapState } from './mapState.ts';
+@@ -14,7 +24,6 @@ import { StateNode } from './StateNode.ts';
+ export { SimulatedClock } from './SimulatedClock.ts';
+ export { StateMachine } from './StateMachine.ts';
+ export { getStateNodes } from './stateUtils.ts';
+-export { waitFor } from './waitFor.ts';
+ export * from './typegenTypes.ts';
+ export * from './types.ts';
+ // TODO: decide from where those should be exported
+@@ -28,6 +37,9 @@ export {
+   StateNode,
+   State,
+   mapState,
++  actions,
++  assign,
++  send,
+   sendTo,
+   sendParent,
+   forwardTo,
+@@ -37,15 +49,24 @@ export {
+   doneInvoke,
+   createMachine
+ };
+-export {
+-  fromPromise,
+-  fromObservable,
+-  fromCallback,
+-  fromEventObservable,
+-  fromTransition
+-} from './actors/index.ts';
+ 
+-export { stateIn, not, and, or } from './guards.ts';
++const actions = {
++  raise,
++  send,
++  sendParent,
++  sendTo,
++  log,
++  cancel,
++  stop,
++  assign,
++  after,
++  done,
++  respond,
++  forwardTo,
++  escalate,
++  choose,
++  pure
++};
+ 
+ declare global {
+   interface SymbolConstructor {
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index e4f98c7157..8bce48d5c8 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -33,9 +33,9 @@ import {
+   done,
+   toActionObjects,
+   actionTypes,
+-  resolveActionObject,
+-  raise
++  resolveActionObject
+ } from './actions.ts';
++import { send } from './actions/send.ts';
+ import { cancel } from './actions/cancel.ts';
+ import { invoke } from './actions/invoke.ts';
+ import { stop } from './actions/stop.ts';
+@@ -318,7 +318,7 @@ export function getDelayedTransitions<
+   ) => {
+     const delayRef = isFunction(delay) ? `${stateNode.id}:delay[${i}]` : delay;
+     const eventType = after(delayRef, stateNode.id);
+-    stateNode.entry.push(raise({ type: eventType } as TEvent, { delay }));
++    stateNode.entry.push(send({ type: eventType }, { delay }));
+     stateNode.exit.push(cancel(eventType));
+     return eventType;
+   };
+diff --git a/packages/core/test/actionCreators.test.ts b/packages/core/test/actionCreators.test.ts
+index ac8832acd7..a40626ad71 100644
+--- a/packages/core/test/actionCreators.test.ts
++++ b/packages/core/test/actionCreators.test.ts
+@@ -1,13 +1,14 @@
+ import { createMachine } from '../src/index.ts';
+-import { raise } from '../src/actions.ts';
++import { send } from '../src/actions/send';
+ import { toSCXMLEvent } from '../src/utils';
+ 
+ describe('action creators', () => {
+-  describe('raise()', () => {
++  describe('send()', () => {
+     it('should accept a string event', () => {
+-      const action = raise({ type: 'foo' });
++      const action = send({ type: 'foo' });
+       expect(action.params).toEqual(
+         expect.objectContaining({
++          to: undefined,
+           event: { type: 'foo' },
+           delay: undefined,
+           id: 'foo'
+@@ -16,13 +17,10 @@ describe('action creators', () => {
+     });
+ 
+     it('should accept an event object', () => {
+-      const event = {
+-        type: 'foo' as const,
+-        bar: 'baz'
+-      };
+-      const action = raise<{}, typeof event>(event);
++      const action = send({ type: 'foo', bar: 'baz' });
+       expect(action.params).toEqual(
+         expect.objectContaining({
++          to: undefined,
+           event: { type: 'foo', bar: 'baz' },
+           delay: undefined,
+           id: 'foo'
+@@ -31,9 +29,10 @@ describe('action creators', () => {
+     });
+ 
+     it('should accept an id option', () => {
+-      const action = raise({ type: 'foo' }, { id: 'foo-id' });
++      const action = send({ type: 'foo' }, { id: 'foo-id' });
+       expect(action.params).toEqual(
+         expect.objectContaining({
++          to: undefined,
+           event: { type: 'foo' },
+           delay: undefined,
+           id: 'foo-id'
+@@ -42,9 +41,10 @@ describe('action creators', () => {
+     });
+ 
+     it('should accept a delay option', () => {
+-      const action = raise({ type: 'foo' }, { delay: 1000 });
++      const action = send({ type: 'foo' }, { delay: 1000 });
+       expect(action.params).toEqual(
+         expect.objectContaining({
++          to: undefined,
+           event: { type: 'foo' },
+           delay: 1000,
+           id: 'foo'
+@@ -53,7 +53,7 @@ describe('action creators', () => {
+     });
+ 
+     it('should accept a delay option (expression)', () => {
+-      const action = raise<
++      const action = send<
+         { delay: number },
+         { type: 'EVENT'; value: number } | { type: 'RECEIVED' }
+       >(
+diff --git a/packages/core/test/actions.test.ts b/packages/core/test/actions.test.ts
+index 831703025c..5a9c175418 100644
+--- a/packages/core/test/actions.test.ts
++++ b/packages/core/test/actions.test.ts
+@@ -1,14 +1,11 @@
+ import { ActorRef } from '../src/index.ts';
+-import {
+-  cancel,
+-  choose,
+-  log,
+-  pure,
+-  raise,
+-  sendParent,
+-  sendTo,
+-  stop
+-} from '../src/actions.ts';
++import { cancel } from '../src/actions/cancel.ts';
++import { choose } from '../src/actions/choose.ts';
++import { log } from '../src/actions/log.ts';
++import { pure } from '../src/actions/pure.ts';
++import { raise } from '../src/actions/raise.ts';
++import { sendParent, sendTo } from '../src/actions/send.ts';
++import { stop } from '../src/actions/stop.ts';
+ import {
+   ActorRefFrom,
+   assign,
+diff --git a/packages/core/test/after.test.ts b/packages/core/test/after.test.ts
+index ccdd5ac998..705c6ef101 100644
+--- a/packages/core/test/after.test.ts
++++ b/packages/core/test/after.test.ts
+@@ -329,7 +329,7 @@ describe('delayed transitions', () => {
+         delay: 500
+       });
+       const sendActions = activeState.actions.filter(
+-        (a) => a.type === 'xstate.raise'
++        (a) => a.type === 'xstate.send'
+       );
+       expect(sendActions.length).toBe(1);
+       expect(sendActions[0].params?.delay).toEqual(undefined);
+diff --git a/packages/core/test/event.test.ts b/packages/core/test/event.test.ts
+index 1bae77216a..c316afae60 100644
+--- a/packages/core/test/event.test.ts
++++ b/packages/core/test/event.test.ts
+@@ -6,7 +6,7 @@ import {
+   AnyActorRef
+ } from '../src/index.ts';
+ import { respond } from '../src/actions';
+-import { sendTo } from '../src/actions/send';
++import { send, sendTo } from '../src/actions/send';
+ import { fromCallback } from '../src/actors/callback';
+ 
+ describe('SCXML events', () => {
+@@ -117,7 +117,12 @@ describe('SCXML events', () => {
+             id: 'auth-server',
+             src: authServerMachine
+           },
+-          entry: sendTo('auth-server', { type: 'CODE' }),
++          entry: send(
++            { type: 'CODE' },
++            {
++              to: 'auth-server'
++            }
++          ),
+           on: {
+             TOKEN: 'authorized'
+           }
+diff --git a/packages/core/test/fixtures/factorial.ts b/packages/core/test/fixtures/factorial.ts
+index ca32905366..b92915c339 100644
+--- a/packages/core/test/fixtures/factorial.ts
++++ b/packages/core/test/fixtures/factorial.ts
+@@ -1,4 +1,5 @@
+-import { createMachine, assign } from '../../src';
++import { createMachine, actions } from '../../src';
++const { assign } = actions;
+ 
+ // @ts-ignore
+ const factorialMachine = createMachine<{ n: number; fac: number }>({
+diff --git a/packages/core/test/guards.test.ts b/packages/core/test/guards.test.ts
+index 4e315b4364..10fbab1bae 100644
+--- a/packages/core/test/guards.test.ts
++++ b/packages/core/test/guards.test.ts
+@@ -1,4 +1,4 @@
+-import { interpret, State, createMachine, raise } from '../src/index.ts';
++import { interpret, State, createMachine, actions } from '../src/index.ts';
+ import { and, not, or } from '../src/guards';
+ import { trackEntries } from './utils.ts';
+ 
+@@ -311,7 +311,7 @@ describe('guard conditions', () => {
+           }
+         },
+         b: {
+-          entry: raise({ type: 'MICRO' }),
++          entry: actions.raise({ type: 'MICRO' }),
+           tags: 'theTag',
+           on: {
+             MICRO: {
+diff --git a/packages/core/test/interpreter.test.ts b/packages/core/test/interpreter.test.ts
+index aeb2605864..bf0b626bab 100644
+--- a/packages/core/test/interpreter.test.ts
++++ b/packages/core/test/interpreter.test.ts
+@@ -2,43 +2,43 @@ import { SimulatedClock } from '../src/SimulatedClock';
+ import { machine as idMachine } from './fixtures/id';
+ import {
+   interpret,
++  actions,
+   assign,
++  send,
+   sendParent,
+   StateValue,
+   createMachine,
+   AnyState,
+   InterpreterStatus,
+   ActorRefFrom,
+-  ActorRef,
+-  cancel,
+-  raise,
+-  sendTo,
+-  stop,
+-  log
++  ActorRef
+ } from '../src/index.ts';
+ import { State } from '../src/State';
++import { raise } from '../src/actions/raise';
++import { sendTo } from '../src/actions/send';
++import { stop } from '../src/actions/stop';
++import { log } from '../src/actions/log';
+ import { isObservable } from '../src/utils';
+ import { interval, from } from 'rxjs';
+ import { fromObservable } from '../src/actors/observable';
+ import { fromPromise } from '../src/actors/promise';
+ import { fromCallback } from '../src/actors/callback';
+-import { respond } from '../src/actions.ts';
+ 
+ const lightMachine = createMachine({
+   id: 'light',
+   initial: 'green',
+   states: {
+     green: {
+-      entry: [raise({ type: 'TIMER' }, { delay: 10 })],
++      entry: [actions.send({ type: 'TIMER' }, { delay: 10 })],
+       on: {
+         TIMER: 'yellow',
+         KEEP_GOING: {
+-          actions: [cancel('TIMER')]
++          actions: [actions.cancel('TIMER')]
+         }
+       }
+     },
+     yellow: {
+-      entry: [raise({ type: 'TIMER' }, { delay: 10 })],
++      entry: [actions.send({ type: 'TIMER' }, { delay: 10 })],
+       on: {
+         TIMER: 'red'
+       }
+@@ -272,7 +272,7 @@ describe('interpreter', () => {
+             }
+           },
+           pending: {
+-            entry: raise(
++            entry: send(
+               { type: 'FINISH' },
+               {
+                 delay: ({ context, event }) =>
+@@ -351,7 +351,7 @@ describe('interpreter', () => {
+             }
+           },
+           pending: {
+-            entry: raise(
++            entry: send(
+               { type: 'FINISH' },
+               {
+                 delay: ({ context, _event }) =>
+@@ -424,7 +424,7 @@ describe('interpreter', () => {
+               }
+             },
+             c: {
+-              entry: raise({ type: 'FIRE_DELAY', value: 200 }, { delay: 20 }),
++              entry: send({ type: 'FIRE_DELAY', value: 200 }, { delay: 20 }),
+               on: {
+                 FIRE_DELAY: 'd'
+               }
+@@ -632,20 +632,20 @@ describe('interpreter', () => {
+       states: {
+         first: {
+           entry: [
+-            raise(
++            send(
+               { type: 'FOO' },
+               {
+                 id: 'foo',
+                 delay: 100
+               }
+             ),
+-            raise(
++            send(
+               { type: 'BAR' },
+               {
+                 delay: 200
+               }
+             ),
+-            cancel(() => 'foo')
++            actions.cancel(() => 'foo')
+           ],
+           on: {
+             FOO: 'fail',
+@@ -832,7 +832,7 @@ describe('interpreter', () => {
+       },
+       on: {
+         PING: {
+-          actions: [respond({ type: 'PONG' })]
++          actions: [actions.respond({ type: 'PONG' })]
+         }
+       }
+     });
+@@ -961,6 +961,35 @@ describe('interpreter', () => {
+         .onDone(() => done())
+         .start();
+     });
++
++    it('should be able to raise event using special target', () => {
++      const raiseMachine = createMachine({
++        initial: 'foo',
++        states: {
++          foo: {
++            entry: [
++              send({ type: 'EVENT_2' }),
++              send({ type: 'EVENT_1' }, { to: '#_internal' })
++            ],
++            on: {
++              EVENT_1: 'pass',
++              EVENT_2: 'fail'
++            }
++          },
++          pass: {
++            type: 'final'
++          },
++          fail: {
++            type: 'final'
++          }
++        }
++      });
++
++      const service = interpret(raiseMachine).start();
++      service.onDone(() => {
++        expect(service.getSnapshot().value).toBe('pass');
++      });
++    });
+   });
+ 
+   describe('sendParent() event expressions', () => {
+diff --git a/packages/core/test/invoke.test.ts b/packages/core/test/invoke.test.ts
+index 2b1e68d49a..a7acf47180 100644
+--- a/packages/core/test/invoke.test.ts
++++ b/packages/core/test/invoke.test.ts
+@@ -24,6 +24,7 @@ import {
+   assign,
+   createMachine,
+   interpret,
++  send,
+   sendParent,
+   toSCXMLEvent
+ } from '../src/index.ts';
+@@ -38,7 +39,7 @@ const fetchMachine = createMachine<{ userId: string | undefined }>({
+   initial: 'pending',
+   states: {
+     pending: {
+-      entry: raise({ type: 'RESOLVE', user }),
++      entry: send({ type: 'RESOLVE', user }),
+       on: {
+         RESOLVE: {
+           target: 'success',
+@@ -182,7 +183,7 @@ describe('invoke', () => {
+       initial: 'pending',
+       states: {
+         pending: {
+-          entry: raise({ type: 'RESOLVE', user }),
++          entry: send({ type: 'RESOLVE', user }),
+           on: {
+             RESOLVE: {
+               target: 'success',
+diff --git a/packages/core/test/predictableExec.test.ts b/packages/core/test/predictableExec.test.ts
+index 48f1b954ea..a9fd2b97cf 100644
+--- a/packages/core/test/predictableExec.test.ts
++++ b/packages/core/test/predictableExec.test.ts
+@@ -5,7 +5,7 @@ import {
+   interpret,
+   sendTo
+ } from '../src/index.ts';
+-import { raise, sendParent, stop } from '../src/actions.ts';
++import { raise, send, sendParent, stop } from '../src/actions.ts';
+ import { fromCallback } from '../src/actors/index.ts';
+ import { fromPromise } from '../src/actors/index.ts';
+ 
+@@ -633,7 +633,7 @@ describe('predictableExec', () => {
+             id: 'ponger',
+             src: child
+           },
+-          entry: sendTo('ponger', { type: 'PING' }),
++          entry: send({ type: 'PING' }, { to: 'ponger' }),
+           on: {
+             PONG: 'done'
+           }
+@@ -800,7 +800,7 @@ describe('predictableExec', () => {
+             id: 'ponger',
+             src: child
+           },
+-          entry: sendTo('ponger', { type: 'PING' }),
++          entry: send({ type: 'PING' }, { to: 'ponger' }),
+           on: {
+             PONG: 'done'
+           }
+diff --git a/packages/core/test/waitFor.test.ts b/packages/core/test/waitFor.test.ts
+index 3cf90fe0ca..01aa1e9a06 100644
+--- a/packages/core/test/waitFor.test.ts
++++ b/packages/core/test/waitFor.test.ts
+@@ -1,5 +1,6 @@
+-import { interpret, waitFor } from '../src/index.ts';
++import { interpret } from '../src/index.ts';
+ import { createMachine } from '../src/index.ts';
++import { waitFor } from '../src/waitFor';
+ 
+ describe('waitFor', () => {
+   it('should wait for a condition to be true and return the emitted value', async () => {
+diff --git a/packages/xstate-inspect/examples/server.ts b/packages/xstate-inspect/examples/server.ts
+index ff97ac73bc..1b7e0624fd 100644
+--- a/packages/xstate-inspect/examples/server.ts
++++ b/packages/xstate-inspect/examples/server.ts
+@@ -1,6 +1,6 @@
+ import { inspect } from '@xstate/inspect/server';
+ import WebSocket from 'ws';
+-import { createMachine, interpret, sendTo, toSCXMLEvent } from 'xstate';
++import { createMachine, interpret, send, toSCXMLEvent } from 'xstate';
+ import { fromCallback } from 'xstate/actors';
+ 
+ inspect({
+@@ -33,7 +33,7 @@ const machine = createMachine({
+       }
+     },
+     active: {
+-      entry: sendTo('ponger', { type: 'PING' }, { delay: 1000 }),
++      entry: send({ type: 'PING' }, { to: 'ponger', delay: 1000 }),
+       on: {
+         PONG: 'inactive'
+       }
+diff --git a/packages/xstate-react/test/useMachine.test.tsx b/packages/xstate-react/test/useMachine.test.tsx
+index 478122b441..ca9722d385 100644
+--- a/packages/xstate-react/test/useMachine.test.tsx
++++ b/packages/xstate-react/test/useMachine.test.tsx
+@@ -10,7 +10,7 @@ import {
+   doneInvoke,
+   Interpreter,
+   PersistedMachineState,
+-  raise,
++  send,
+   StateFrom
+ } from 'xstate';
+ import { fromCallback, fromPromise } from 'xstate/actors';
+@@ -924,12 +924,12 @@ describeEachReactMode('useMachine (%s)', ({ suiteKey, render }) => {
+       context: {
+         count: 0
+       },
+-      entry: [assign({ count: 1 }), raise({ type: 'INC' })],
++      entry: [assign({ count: 1 }), send({ type: 'INC' })],
+       on: {
+         INC: {
+           actions: [
+             assign({ count: ({ context }) => context.count + 1 }),
+-            raise({ type: 'UNHANDLED' })
++            send({ type: 'UNHANDLED' })
+           ]
+         }
+       },
+diff --git a/packages/xstate-scxml/src/scxml.ts b/packages/xstate-scxml/src/scxml.ts
+index f4d4ed1837..326ce1c9d7 100644
+--- a/packages/xstate-scxml/src/scxml.ts
++++ b/packages/xstate-scxml/src/scxml.ts
+@@ -7,14 +7,9 @@ import {
+   createMachine,
+   BaseActionObject,
+   AnyStateMachine,
+-  StateMeta,
+-  sendTo,
+-  log,
+-  raise,
+-  assign,
+-  cancel,
+-  choose
++  StateMeta
+ } from 'xstate';
++import * as actions from 'xstate/actions';
+ import { not, stateIn } from 'xstate/guards';
+ 
+ export function mapValues<P, O extends Record<string, unknown>>(
+@@ -178,12 +173,12 @@ function mapAction<
+ >(element: XMLElement): BaseActionObject {
+   switch (element.name) {
+     case 'raise': {
+-      return raise<any, any>({
++      return actions.raise<any, any>({
+         type: element.attributes!.event!
+       } as TEvent);
+     }
+     case 'assign': {
+-      return assign<TContext, TEvent>(({ context, event, ...meta }) => {
++      return actions.assign<TContext, TEvent>(({ context, event, ...meta }) => {
+         const fnBody = `
+             return {'${element.attributes!.location}': ${
+           element.attributes!.expr
+@@ -195,9 +190,9 @@ function mapAction<
+     }
+     case 'cancel':
+       if ('sendid' in element.attributes!) {
+-        return cancel(element.attributes!.sendid! as string);
++        return actions.cancel(element.attributes!.sendid! as string);
+       }
+-      return cancel(({ context, event, ...meta }) => {
++      return actions.cancel(({ context, event, ...meta }) => {
+         const fnBody = `
+             return ${element.attributes!.sendidexpr};
+           `;
+@@ -247,27 +242,16 @@ function mapAction<
+         };
+       }
+ 
+-      const scxmlParams = {
+-        delay: convertedDelay,
+-        id: id as string | undefined
+-      };
+-
+-      if (target) {
+-        return sendTo(target as string, convertedEvent, {
+-          ...scxmlParams,
+-          to: target as string | undefined
+-        });
+-      }
+-
+-      return raise<TContext, TEvent, TEvent>(convertedEvent as TEvent, {
++      return actions.send<TContext, TEvent>(convertedEvent, {
+         delay: convertedDelay,
++        to: target as string | undefined,
+         id: id as string | undefined
+       });
+     }
+     case 'log': {
+       const label = element.attributes!.label;
+ 
+-      return log<TContext, any, any>(
++      return actions.log<TContext, any, any>(
+         ({ context, event, ...meta }) => {
+           const fnBody = `
+               return ${element.attributes!.expr};
+@@ -310,7 +294,7 @@ function mapAction<
+       }
+ 
+       conds.push(current);
+-      return choose(conds);
++      return actions.choose(conds);
+     }
+     default:
+       throw new Error(
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send1.ts b/packages/xstate-scxml/test/fixtures/actionSend/send1.ts
+index ef698a92c3..d0dc37712a 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send1.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send1.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ export default createMachine({
+   initial: 'a',
+@@ -8,7 +8,7 @@ export default createMachine({
+       on: {
+         t: {
+           target: '#b',
+-          actions: raise({ type: 's' }),
++          actions: actions.raise({ type: 's' }),
+           reenter: true
+         }
+       }
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send2.ts b/packages/xstate-scxml/test/fixtures/actionSend/send2.ts
+index 70c663b23c..cbb7631366 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send2.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send2.ts
+@@ -1,11 +1,11 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ const m = createMachine({
+   initial: 'a',
+   states: {
+     a: {
+       id: 'a',
+-      exit: raise({ type: 's' }),
++      exit: actions.raise({ type: 's' }),
+       on: {
+         t: 'b'
+       }
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send3.ts b/packages/xstate-scxml/test/fixtures/actionSend/send3.ts
+index 2cfdf8ad92..a5e5bcde81 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send3.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send3.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ const m = createMachine({
+   initial: 'a',
+@@ -10,7 +10,7 @@ const m = createMachine({
+       }
+     },
+     b: {
+-      entry: raise({ type: 's' }),
++      entry: actions.raise({ type: 's' }),
+       on: {
+         s: 'c'
+       }
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send4.ts b/packages/xstate-scxml/test/fixtures/actionSend/send4.ts
+index 1f5752995a..1d2fa5c309 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send4.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send4.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ const m = createMachine({
+   initial: 'a',
+@@ -8,7 +8,7 @@ const m = createMachine({
+       on: { t: 'b' }
+     },
+     b: {
+-      entry: raise({ type: 's' }),
++      entry: actions.raise({ type: 's' }),
+       always: 'f1',
+       on: {
+         s: 'c'
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send4b.ts b/packages/xstate-scxml/test/fixtures/actionSend/send4b.ts
+index 333a10e19f..ccf9bd73c2 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send4b.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send4b.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ export default createMachine({
+   initial: 'a',
+@@ -8,7 +8,7 @@ export default createMachine({
+       on: { t: 'b' }
+     },
+     b: {
+-      entry: raise({ type: 's' }),
++      entry: actions.raise({ type: 's' }),
+       on: {
+         s: 'c'
+       }
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send7.ts b/packages/xstate-scxml/test/fixtures/actionSend/send7.ts
+index 89b0a1347d..b5467aa0b5 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send7.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send7.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ export default createMachine<any>({
+   initial: 'a',
+@@ -8,7 +8,7 @@ export default createMachine<any>({
+       on: {
+         t: {
+           target: 'b',
+-          actions: raise({ type: 's' })
++          actions: actions.raise({ type: 's' })
+         }
+       }
+     },
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send7b.ts b/packages/xstate-scxml/test/fixtures/actionSend/send7b.ts
+index 5100ae6ea3..6e7da83d83 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send7b.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send7b.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ export default createMachine({
+   initial: 'a',
+@@ -8,7 +8,7 @@ export default createMachine({
+       on: {
+         t: {
+           target: 'b',
+-          actions: raise({ type: 's' })
++          actions: actions.raise({ type: 's' })
+         }
+       }
+     },
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send8.ts b/packages/xstate-scxml/test/fixtures/actionSend/send8.ts
+index 2216bedfc5..3a4e6c3899 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send8.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send8.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ export default createMachine({
+   initial: 'a',
+@@ -8,7 +8,7 @@ export default createMachine({
+       on: {
+         t: {
+           target: '#b1',
+-          actions: raise({ type: 's' })
++          actions: actions.raise({ type: 's' })
+         }
+       }
+     },
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send8b.ts b/packages/xstate-scxml/test/fixtures/actionSend/send8b.ts
+index baa6cdad0c..526479eb13 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send8b.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send8b.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ export default createMachine({
+   initial: 'a',
+@@ -8,7 +8,7 @@ export default createMachine({
+       on: {
+         t: {
+           target: '#b1',
+-          actions: raise({ type: 's' })
++          actions: actions.raise({ type: 's' })
+         }
+       }
+     },
+diff --git a/packages/xstate-scxml/test/fixtures/actionSend/send9.ts b/packages/xstate-scxml/test/fixtures/actionSend/send9.ts
+index 5bde31e9a5..ffd4940440 100644
+--- a/packages/xstate-scxml/test/fixtures/actionSend/send9.ts
++++ b/packages/xstate-scxml/test/fixtures/actionSend/send9.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, actions } from 'xstate';
+ 
+ export default createMachine({
+   initial: 'a',
+@@ -8,7 +8,7 @@ export default createMachine({
+       on: {
+         t: {
+           target: 'b',
+-          actions: raise({ type: 's' })
++          actions: actions.raise({ type: 's' })
+         }
+       }
+     },
+diff --git a/packages/xstate-scxml/test/fixtures/assign-current-small-step/test1.ts b/packages/xstate-scxml/test/fixtures/assign-current-small-step/test1.ts
+index d102f6c606..68e4af2080 100644
+--- a/packages/xstate-scxml/test/fixtures/assign-current-small-step/test1.ts
++++ b/packages/xstate-scxml/test/fixtures/assign-current-small-step/test1.ts
+@@ -1,4 +1,5 @@
+-import { createMachine, assign, log } from 'xstate';
++import { createMachine, assign } from 'xstate';
++import { log } from 'xstate/actions';
+ 
+ export default createMachine<any>({
+   initial: 'a',
+diff --git a/packages/xstate-scxml/test/fixtures/assign/assign_obj_literal.ts b/packages/xstate-scxml/test/fixtures/assign/assign_obj_literal.ts
+index ce087734f0..9b3c5f5a64 100644
+--- a/packages/xstate-scxml/test/fixtures/assign/assign_obj_literal.ts
++++ b/packages/xstate-scxml/test/fixtures/assign/assign_obj_literal.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, log, assign } from 'xstate';
++import { createMachine, actions, assign } from 'xstate';
+ 
+ export default createMachine({
+   initial: 's1',
+@@ -11,7 +11,7 @@ export default createMachine({
+       on: {
+         '*': {
+           target: '#fail',
+-          actions: log(
++          actions: actions.log(
+             ({ event }) => `unhandled input ${JSON.stringify(event)}`,
+             'TEST'
+           )
+diff --git a/packages/xstate-solid/test/useMachine.test.tsx b/packages/xstate-solid/test/useMachine.test.tsx
+index 10b288c759..3e58f617d5 100644
+--- a/packages/xstate-solid/test/useMachine.test.tsx
++++ b/packages/xstate-solid/test/useMachine.test.tsx
+@@ -5,9 +5,9 @@ import {
+   Interpreter,
+   doneInvoke,
+   createMachine,
++  send as xsend,
+   InterpreterStatus,
+-  PersistedMachineState,
+-  raise
++  PersistedMachineState
+ } from 'xstate';
+ import { render, screen, waitFor, fireEvent } from 'solid-testing-library';
+ import { DoneEventObject } from 'xstate';
+@@ -1280,12 +1280,12 @@ describe('useMachine hook', () => {
+       context: {
+         count: 0
+       },
+-      entry: [assign({ count: 1 }), raise({ type: 'INC' })],
++      entry: [assign({ count: 1 }), xsend({ type: 'INC' })],
+       on: {
+         INC: {
+           actions: [
+             assign({ count: ({ context }) => ++context.count }),
+-            raise({ type: 'UNHANDLED' })
++            xsend({ type: 'UNHANDLED' })
+           ]
+         }
+       },
+diff --git a/packages/xstate-test/test/forbiddenAttributes.test.ts b/packages/xstate-test/test/forbiddenAttributes.test.ts
+index 35b5873902..fc5b0c4270 100644
+--- a/packages/xstate-test/test/forbiddenAttributes.test.ts
++++ b/packages/xstate-test/test/forbiddenAttributes.test.ts
+@@ -1,4 +1,4 @@
+-import { createMachine, raise } from 'xstate';
++import { createMachine, send } from 'xstate';
+ import { createTestModel } from '../src/index.ts';
+ 
+ describe('Forbidden attributes', () => {
+@@ -31,7 +31,7 @@ describe('Forbidden attributes', () => {
+   it('Should not let you delayed actions on your machine', () => {
+     const machine = createMachine({
+       entry: [
+-        raise(
++        send(
+           {
+             type: 'EVENT'
+           },

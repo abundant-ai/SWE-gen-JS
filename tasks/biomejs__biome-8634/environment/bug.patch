@@ -1,0 +1,684 @@
+diff --git a/.changeset/cruel-clouds-crash.md b/.changeset/cruel-clouds-crash.md
+new file mode 100644
+index 0000000000..861c32fd17
+--- /dev/null
++++ b/.changeset/cruel-clouds-crash.md
+@@ -0,0 +1,5 @@
++---
++"@biomejs/biome": patch
++---
++
++Fixed [#8488](https://github.com/biomejs/biome/issues/8488): Relative plugin paths are now resolved from the configuration file directory, including when configurations are merged (e.g. `extends: "//"`).
+diff --git a/crates/biome_analyze/src/lib.rs b/crates/biome_analyze/src/lib.rs
+index 69e468f1c3..3581036efc 100644
+--- a/crates/biome_analyze/src/lib.rs
++++ b/crates/biome_analyze/src/lib.rs
+@@ -49,9 +49,7 @@ pub use crate::rule::{
+     RuleDomain, RuleGroup, RuleMeta, RuleMetadata, RuleSource, RuleSourceKind, RuleSourceWithKind,
+     SuppressAction,
+ };
+-pub use crate::services::{
+-    ExtendedConfigurationProvider, FromServices, ServiceBag, ServicesDiagnostic,
+-};
++pub use crate::services::{FromServices, ServiceBag, ServicesDiagnostic};
+ pub use crate::signals::{
+     AnalyzerAction, AnalyzerSignal, AnalyzerTransformation, DiagnosticSignal,
+ };
+diff --git a/crates/biome_analyze/src/services.rs b/crates/biome_analyze/src/services.rs
+index 31509b96ed..68a428e07f 100644
+--- a/crates/biome_analyze/src/services.rs
++++ b/crates/biome_analyze/src/services.rs
+@@ -61,13 +61,3 @@ impl FromServices for () {
+         Ok(())
+     }
+ }
+-
+-/// Trait for providing information about extended configurations.
+-///
+-/// This allows analyzers to query configuration information without depending
+-/// on the full `biome_configuration` crate, breaking circular dependencies.
+-pub trait ExtendedConfigurationProvider: Send + Sync + std::fmt::Debug {
+-    /// Returns `true` if any extended configuration has `files.includes`
+-    /// where the first pattern is the catch-all `**`.
+-    fn any_extended_starts_with_catch_all(&self) -> bool;
+-}
+diff --git a/crates/biome_cli/tests/cases/monorepo.rs b/crates/biome_cli/tests/cases/monorepo.rs
+index 8ea462822e..ee69277d66 100644
+--- a/crates/biome_cli/tests/cases/monorepo.rs
++++ b/crates/biome_cli/tests/cases/monorepo.rs
+@@ -743,3 +743,75 @@ fn plugins_in_child_config_with_extends_root() {
+         result,
+     ));
+ }
++
++#[test]
++fn plugins_from_root_config_work_in_child_config_extends_root() {
++    let mut fs = TemporaryFs::new("plugins_from_root_config_work_in_child_config_extends_root");
++
++    fs.create_file(
++        "biome.json",
++        r#"{
++    "root": true,
++    "plugins": ["./biome/no-object-assign.grit"],
++    "linter": {
++        "enabled": true,
++        "rules": {
++            "recommended": true
++        }
++    }
++}"#,
++    );
++
++    fs.create_file(
++        "biome/no-object-assign.grit",
++        r#"`$fn($args)` where {
++    $fn <: `Object.assign`,
++    register_diagnostic(
++        span = $fn,
++        message = "Prefer object spread instead of Object.assign()",
++        severity = "warn"
++    )
++}"#,
++    );
++
++    // Child config extends root but doesn't define plugins.
++    fs.create_file(
++        "packages/mobile/biome.json",
++        r#"{
++    "extends": "//",
++    "linter": {
++        "enabled": true,
++        "rules": {
++            "recommended": true
++        }
++    }
++}"#,
++    );
++
++    fs.create_file(
++        "packages/mobile/src/file.js",
++        r#"const merged = Object.assign({}, a, b);
++"#,
++    );
++
++    let mut console = BufferConsole::default();
++    let result = run_cli_with_dyn_fs(
++        Box::new(fs.create_os()),
++        &mut console,
++        Args::from(
++            [
++                "lint",
++                &format!("{}/packages/mobile/src/file.js", fs.cli_path()),
++            ]
++            .as_slice(),
++        ),
++    );
++
++    assert_cli_snapshot(SnapshotPayload::new(
++        module_path!(),
++        "plugins_from_root_config_work_in_child_config_extends_root",
++        fs.create_mem(),
++        console,
++        result,
++    ));
++}
+diff --git a/crates/biome_cli/tests/snapshots/main_cases_monorepo/plugins_from_root_config_work_in_child_config_extends_root.snap b/crates/biome_cli/tests/snapshots/main_cases_monorepo/plugins_from_root_config_work_in_child_config_extends_root.snap
+new file mode 100644
+index 0000000000..2f265802fa
+--- /dev/null
++++ b/crates/biome_cli/tests/snapshots/main_cases_monorepo/plugins_from_root_config_work_in_child_config_extends_root.snap
+@@ -0,0 +1,92 @@
++---
++source: crates/biome_cli/tests/snap_test.rs
++assertion_line: 432
++expression: redactor(content)
++---
++## `packages/mobile/biome.json`
++
++```json
++{
++  "extends": "//",
++  "linter": {
++    "enabled": true,
++    "rules": {
++      "recommended": true
++    }
++  }
++}
++```
++
++## `biome.json`
++
++```json
++{
++  "root": true,
++  "plugins": ["./biome/no-object-assign.grit"],
++  "linter": {
++    "enabled": true,
++    "rules": {
++      "recommended": true
++    }
++  }
++}
++```
++
++## `biome/no-object-assign.grit`
++
++```grit
++`$fn($args)` where {
++    $fn <: `Object.assign`,
++    register_diagnostic(
++        span = $fn,
++        message = "Prefer object spread instead of Object.assign()",
++        severity = "warn"
++    )
++}
++```
++
++## `packages/mobile/src/file.js`
++
++```js
++const merged = Object.assign({}, a, b);
++
++```
++
++# Emitted Messages
++
++```block
++packages/mobile/src/file.js:1:16 plugin ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++
++  ! Prefer object spread instead of Object.assign()
++  
++  > 1 │ const merged = Object.assign({}, a, b);
++      │                ^^^^^^^^^^^^^
++    2 │ 
++  
++
++```
++
++```block
++packages/mobile/src/file.js:1:7 lint/correctness/noUnusedVariables  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━
++
++  ! This variable merged is unused.
++  
++  > 1 │ const merged = Object.assign({}, a, b);
++      │       ^^^^^^
++    2 │ 
++  
++  i Unused variables are often the result of typos, incomplete refactors, or other sources of bugs.
++  
++  i Unsafe fix: If this is intentional, prepend merged with an underscore.
++  
++    1   │ - const·merged·=·Object.assign({},·a,·b);
++      1 │ + const·_merged·=·Object.assign({},·a,·b);
++    2 2 │   
++  
++
++```
++
++```block
++Checked 1 file in <TIME>. No fixes applied.
++Found 2 warnings.
++```
+diff --git a/crates/biome_configuration/src/lib.rs b/crates/biome_configuration/src/lib.rs
+index d0e590c22d..3920b0c97e 100644
+--- a/crates/biome_configuration/src/lib.rs
++++ b/crates/biome_configuration/src/lib.rs
+@@ -40,7 +40,6 @@ pub use analyzer::{
+     LinterConfiguration, RuleConfiguration, RuleFixConfiguration, RulePlainConfiguration,
+     RuleWithFixOptions, RuleWithOptions, Rules, linter_configuration,
+ };
+-use biome_analyze::ExtendedConfigurationProvider;
+ use biome_console::fmt::{Display, Formatter};
+ use biome_console::{KeyValuePair, markup};
+ use biome_deserialize::{
+@@ -815,14 +814,3 @@ impl ConfigurationSource {
+         })
+     }
+ }
+-
+-impl ExtendedConfigurationProvider for ConfigurationSource {
+-    fn any_extended_starts_with_catch_all(&self) -> bool {
+-        self.extended_configurations().any(|c| {
+-            c.files
+-                .as_ref()
+-                .and_then(|files| files.includes.as_deref())
+-                .is_some_and(|globs| globs.first().is_some_and(|glob| glob.as_str() == "**"))
+-        })
+-    }
+-}
+diff --git a/crates/biome_json_analyze/Cargo.toml b/crates/biome_json_analyze/Cargo.toml
+index 3e7396970f..76b58248d3 100644
+--- a/crates/biome_json_analyze/Cargo.toml
++++ b/crates/biome_json_analyze/Cargo.toml
+@@ -18,25 +18,26 @@ harness = false
+ name    = "json_analyzer"
+ 
+ [dependencies]
+-biome_analyze      = { workspace = true }
+-biome_console      = { workspace = true }
+-biome_diagnostics  = { workspace = true }
+-biome_json_factory = { workspace = true }
+-biome_json_syntax  = { workspace = true }
+-biome_rowan        = { workspace = true }
+-biome_rule_options = { workspace = true }
+-biome_string_case  = { workspace = true }
+-biome_suppression  = { workspace = true }
+-camino             = { workspace = true }
+-rustc-hash         = { workspace = true }
++biome_analyze       = { workspace = true }
++# biome_configuration is optional because the codegen disables it. The codegen generates the configuration schema, and it depends on this crate to to that. It's kinda like a circular dependency. A chicken and egg problem, if you will.
++biome_configuration = { workspace = true, optional = true }
++biome_console       = { workspace = true }
++biome_diagnostics   = { workspace = true }
++biome_json_factory  = { workspace = true }
++biome_json_syntax   = { workspace = true }
++biome_rowan         = { workspace = true }
++biome_rule_options  = { workspace = true }
++biome_string_case   = { workspace = true }
++biome_suppression   = { workspace = true }
++camino              = { workspace = true }
++rustc-hash          = { workspace = true }
+ 
+ [dev-dependencies]
+-biome_configuration = { workspace = true }
+-biome_json_parser   = { path = "../biome_json_parser" }
+-biome_test_utils    = { path = "../biome_test_utils" }
+-criterion           = { package = "codspeed-criterion-compat", version = "=3.0.5" }
+-insta               = { workspace = true, features = ["glob"] }
+-tests_macros        = { path = "../tests_macros" }
++biome_json_parser = { path = "../biome_json_parser" }
++biome_test_utils  = { path = "../biome_test_utils" }
++criterion         = { package = "codspeed-criterion-compat", version = "=3.0.5" }
++insta             = { workspace = true, features = ["glob"] }
++tests_macros      = { path = "../tests_macros" }
+ 
+ [target.'cfg(all(target_family="unix", not(all(target_arch = "aarch64", target_env = "musl"))))'.dev-dependencies]
+ tikv-jemallocator = { workspace = true }
+@@ -44,5 +45,9 @@ tikv-jemallocator = { workspace = true }
+ [target.'cfg(target_os = "windows")'.dev-dependencies]
+ mimalloc = { workspace = true }
+ 
++[features]
++default       = ["configuration"]
++configuration = ["dep:biome_configuration"]
++
+ [lints]
+ workspace = true
+diff --git a/crates/biome_json_analyze/benches/json_analyzer.rs b/crates/biome_json_analyze/benches/json_analyzer.rs
+index 46a7e86bb5..c5fddd98a5 100644
+--- a/crates/biome_json_analyze/benches/json_analyzer.rs
++++ b/crates/biome_json_analyze/benches/json_analyzer.rs
+@@ -63,7 +63,7 @@ fn bench_analyzer(criterion: &mut Criterion) {
+                         b.iter(|| {
+                             let json_services = JsonAnalyzeServices {
+                                 file_source,
+-                                configuration_provider: None,
++                                configuration_source: None,
+                             };
+ 
+                             biome_json_analyze::analyze(
+diff --git a/crates/biome_json_analyze/src/lib.rs b/crates/biome_json_analyze/src/lib.rs
+index 6e37b9b506..dc92a38332 100644
+--- a/crates/biome_json_analyze/src/lib.rs
++++ b/crates/biome_json_analyze/src/lib.rs
+@@ -11,12 +11,15 @@ pub mod utils;
+ pub use crate::registry::visit_registry;
+ use crate::services::config_source::ConfigSource;
+ use crate::suppression_action::JsonSuppressionAction;
+-pub use biome_analyze::ExtendedConfigurationProvider;
+ use biome_analyze::{
+     AnalysisFilter, AnalyzerOptions, AnalyzerSignal, AnalyzerSuppression, ControlFlow,
+     LanguageRoot, MatchQueryParams, MetadataRegistry, RuleAction, RuleRegistry,
+     to_analyzer_suppressions,
+ };
++#[cfg(feature = "configuration")]
++use biome_configuration::ConfigurationSource;
++#[cfg(not(feature = "configuration"))]
++pub struct ConfigurationSource;
+ use biome_diagnostics::Error;
+ use biome_json_syntax::{JsonFileSource, JsonLanguage, TextRange};
+ use biome_suppression::{SuppressionDiagnostic, parse_suppression_comment};
+@@ -32,8 +35,8 @@ pub static METADATA: LazyLock<MetadataRegistry> = LazyLock::new(|| {
+ });
+ 
+ pub struct JsonAnalyzeServices {
+-    /// Provider for extended configuration information.
+-    pub configuration_provider: Option<Arc<dyn ExtendedConfigurationProvider>>,
++    /// The source of the configuration: the [biome_configuration::Configuration] (user one, or default).
++    pub configuration_source: Option<Arc<ConfigurationSource>>,
+ 
+     /// The source file
+     pub file_source: JsonFileSource,
+@@ -122,7 +125,7 @@ where
+         analyzer.add_visitor(phase, visitor);
+     }
+ 
+-    services.insert_service(json_services.configuration_provider);
++    services.insert_service(json_services.configuration_source);
+     services.insert_service(json_services.file_source);
+ 
+     (
+@@ -175,7 +178,7 @@ mod tests {
+         let options = AnalyzerOptions::default();
+         let services = JsonAnalyzeServices {
+             file_source: JsonFileSource::json(),
+-            configuration_provider: None,
++            configuration_source: None,
+         };
+         analyze(
+             &parsed.tree(),
+diff --git a/crates/biome_json_analyze/src/lint/suspicious/no_biome_first_exception.rs b/crates/biome_json_analyze/src/lint/suspicious/no_biome_first_exception.rs
+index 9e1210d32b..b847d16979 100644
+--- a/crates/biome_json_analyze/src/lint/suspicious/no_biome_first_exception.rs
++++ b/crates/biome_json_analyze/src/lint/suspicious/no_biome_first_exception.rs
+@@ -86,8 +86,18 @@ impl Rule for NoBiomeFirstException {
+         let root = ctx.query();
+         let file_path = ctx.file_path();
+ 
+-        // we check if an extended package starts with `**`
+-        let extends_starts_with_catch_all = ctx.any_extended_starts_with_catch_all();
++        // we check if and extended package starts with `**`
++        #[cfg(feature = "configuration")]
++        let extends_starts_with_catch_all = ctx.extends().is_some_and(|mut extends| {
++            extends.any(|c| {
++                c.files
++                    .as_ref()
++                    .and_then(|files| files.includes.as_deref())
++                    .is_some_and(|globs| globs.first().is_some_and(|glob| glob.as_str() == "**"))
++            })
++        });
++        #[cfg(not(feature = "configuration"))]
++        let extends_starts_with_catch_all = false;
+         // we use ends_with so it works only during testing
+         if !file_path
+             .file_name()
+diff --git a/crates/biome_json_analyze/src/services/config_source.rs b/crates/biome_json_analyze/src/services/config_source.rs
+index cf484a5535..89b198b018 100644
+--- a/crates/biome_json_analyze/src/services/config_source.rs
++++ b/crates/biome_json_analyze/src/services/config_source.rs
+@@ -1,44 +1,65 @@
+ use biome_analyze::{
+-    AddVisitor, ExtendedConfigurationProvider, FromServices, Phase, Phases, QueryKey, Queryable,
+-    RuleKey, RuleMetadata, ServiceBag, ServicesDiagnostic, SyntaxVisitor,
++    AddVisitor, FromServices, Phase, Phases, QueryKey, Queryable, RuleKey, RuleMetadata,
++    ServiceBag, ServicesDiagnostic, SyntaxVisitor,
+ };
++#[cfg(feature = "configuration")]
++use biome_configuration::{ConfigurationSource, ExtendedConfigurationIterator};
+ use biome_json_syntax::{JsonLanguage, JsonRoot, JsonSyntaxNode};
+ use biome_rowan::AstNode;
++#[cfg(feature = "configuration")]
+ use std::sync::Arc;
+ 
++#[cfg(feature = "configuration")]
+ #[derive(Debug, Default)]
+-pub struct ConfigurationSourceService(Option<Arc<dyn ExtendedConfigurationProvider>>);
++pub struct ConfigurationSourceService(Option<std::sync::Arc<ConfigurationSource>>);
+ 
++#[cfg(not(feature = "configuration"))]
++#[derive(Debug, Default)]
++pub struct ConfigurationSourceService;
++
++#[cfg(feature = "configuration")]
+ impl ConfigurationSourceService {
+-    pub(crate) fn any_extended_starts_with_catch_all(&self) -> bool {
++    pub(crate) fn extends(&self) -> Option<ExtendedConfigurationIterator<'_>> {
+         self.0
+             .as_ref()
+-            .is_some_and(|provider| provider.any_extended_starts_with_catch_all())
++            .map(|source| source.extended_configurations())
+     }
+ }
+ 
++#[cfg(feature = "configuration")]
+ impl FromServices for ConfigurationSourceService {
+     fn from_services(
+         rule_key: &RuleKey,
+         _rule_metadata: &RuleMetadata,
+         services: &ServiceBag,
+     ) -> Result<Self, ServicesDiagnostic> {
+-        let source: &Option<Arc<dyn ExtendedConfigurationProvider>> =
++        let source: &Option<Arc<ConfigurationSource>> =
+             services.get_service().ok_or_else(|| {
+-                ServicesDiagnostic::new(rule_key.rule_name(), &["ExtendedConfigurationProvider"])
++                ServicesDiagnostic::new(rule_key.rule_name(), &["ConfigurationSource"])
+             })?;
+ 
+         Ok(Self(source.clone()))
+     }
+ }
+ 
++#[cfg(not(feature = "configuration"))]
++impl FromServices for ConfigurationSourceService {
++    fn from_services(
++        _rule_key: &RuleKey,
++        _rule_metadata: &RuleMetadata,
++        _services: &ServiceBag,
++    ) -> Result<Self, ServicesDiagnostic> {
++        Ok(Self)
++    }
++}
++
+ impl Phase for ConfigurationSourceService {
+     fn phase() -> Phases {
+         Phases::Syntax
+     }
+ }
+ 
+-/// Query type usable by lint rules **that uses the configuration source** and matches on specific [AstNode] types.
++/// Query type usable by lint rules **that uses the package manifest** and matches on specific [AstNode] types.
+ #[derive(Clone)]
+ pub struct ConfigSource<N>(pub N);
+ 
+diff --git a/crates/biome_json_analyze/tests/spec_tests.rs b/crates/biome_json_analyze/tests/spec_tests.rs
+index 4246596dc2..8c8cdfa943 100644
+--- a/crates/biome_json_analyze/tests/spec_tests.rs
++++ b/crates/biome_json_analyze/tests/spec_tests.rs
+@@ -1,7 +1,7 @@
+ use biome_analyze::{AnalysisFilter, AnalyzerAction, ControlFlow, Never, RuleFilter};
+ use biome_configuration::{ConfigurationSource, ExtendedConfigurations};
+ use biome_diagnostics::advice::CodeSuggestionAdvice;
+-use biome_json_analyze::{ExtendedConfigurationProvider, JsonAnalyzeServices};
++use biome_json_analyze::JsonAnalyzeServices;
+ use biome_json_parser::{JsonParserOptions, parse_json};
+ use biome_json_syntax::{JsonFileSource, JsonLanguage};
+ use biome_rowan::AstNode;
+@@ -168,11 +168,11 @@ pub(crate) fn analyze_and_snap(
+     let options = create_analyzer_options::<JsonLanguage>(input_file, &mut diagnostics);
+     let services = JsonAnalyzeServices {
+         file_source,
+-        configuration_provider: configuration_source.map(|(config, list)| {
++        configuration_source: configuration_source.map(|(config, list)| {
+             Arc::new(ConfigurationSource {
+                 source: Some((config, Some(input_file.to_path_buf()))),
+                 extended_configurations: ExtendedConfigurations::from(list),
+-            }) as Arc<dyn ExtendedConfigurationProvider>
++            })
+         }),
+     };
+     let (_, errors) = biome_json_analyze::analyze(&root, filter, &options, services, |event| {
+diff --git a/crates/biome_plugin_loader/Cargo.toml b/crates/biome_plugin_loader/Cargo.toml
+index e56bc399b1..41361faf37 100644
+--- a/crates/biome_plugin_loader/Cargo.toml
++++ b/crates/biome_plugin_loader/Cargo.toml
+@@ -15,7 +15,7 @@ publish              = true
+ biome_analyze            = { workspace = true }
+ biome_console            = { workspace = true }
+ biome_css_syntax         = { workspace = true }
+-biome_deserialize        = { workspace = true }
++biome_deserialize        = { workspace = true, features = ["serde"] }
+ biome_deserialize_macros = { workspace = true }
+ biome_diagnostics        = { workspace = true }
+ biome_fs                 = { workspace = true }
+diff --git a/crates/biome_plugin_loader/src/configuration.rs b/crates/biome_plugin_loader/src/configuration.rs
+index 13618b4363..486998735d 100644
+--- a/crates/biome_plugin_loader/src/configuration.rs
++++ b/crates/biome_plugin_loader/src/configuration.rs
+@@ -2,6 +2,8 @@ use biome_deserialize::{
+     Deserializable, DeserializableType, DeserializableValue, DeserializationContext,
+ };
+ use biome_deserialize_macros::{Deserializable, Merge};
++use biome_fs::normalize_path;
++use camino::Utf8Path;
+ use serde::{Deserialize, Serialize};
+ use std::{
+     ops::{Deref, DerefMut},
+@@ -17,6 +19,26 @@ impl Plugins {
+     pub fn iter(&self) -> impl Iterator<Item = &PluginConfiguration> {
+         self.deref().iter()
+     }
++
++    /// Normalizes plugin paths in-place.
++    ///
++    /// For each relative path, this joins it with `base_dir` and normalizes
++    /// `.` / `..` segments (without resolving symlinks).
++    pub fn normalize_relative_paths(&mut self, base_dir: &Utf8Path) {
++        for plugin_config in self.0.iter_mut() {
++            match plugin_config {
++                PluginConfiguration::Path(plugin_path) => {
++                    let plugin_path_buf = Utf8Path::new(plugin_path.as_str());
++                    if plugin_path_buf.is_absolute() {
++                        continue;
++                    }
++
++                    let normalized = normalize_path(&base_dir.join(plugin_path_buf));
++                    *plugin_path = normalized.to_string();
++                }
++            }
++        }
++    }
+ }
+ 
+ impl FromStr for Plugins {
+@@ -69,3 +91,41 @@ impl Deserializable for PluginConfiguration {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn normalize_relative_paths_makes_paths_base_dir_relative_and_normalized() {
++        let base_dir = Utf8Path::new("base");
++        let mut plugins = Plugins(vec![
++            PluginConfiguration::Path("./biome/../biome/my-plugin.grit".into()),
++            PluginConfiguration::Path("other.grit".into()),
++        ]);
++
++        plugins.normalize_relative_paths(base_dir);
++
++        let PluginConfiguration::Path(first) = &plugins.0[0];
++        assert!(Utf8Path::new(first).starts_with(base_dir));
++        let expected_suffix = Utf8Path::new("biome").join("my-plugin.grit");
++        assert!(Utf8Path::new(first).ends_with(expected_suffix.as_path()));
++
++        let PluginConfiguration::Path(second) = &plugins.0[1];
++        assert!(Utf8Path::new(second).starts_with(base_dir));
++        assert!(Utf8Path::new(second).ends_with("other.grit"));
++    }
++
++    #[test]
++    fn normalize_relative_paths_leaves_absolute_paths_unchanged() {
++        let base_dir = Utf8Path::new("base");
++        let sep = std::path::MAIN_SEPARATOR;
++        let absolute = format!("{sep}abs{sep}my-plugin.grit");
++        let mut plugins = Plugins(vec![PluginConfiguration::Path(absolute.clone())]);
++
++        plugins.normalize_relative_paths(base_dir);
++
++        let PluginConfiguration::Path(result) = &plugins.0[0];
++        assert_eq!(result, &absolute);
++    }
++}
+diff --git a/crates/biome_service/src/configuration.rs b/crates/biome_service/src/configuration.rs
+index 884aac0112..44e934e961 100644
+--- a/crates/biome_service/src/configuration.rs
++++ b/crates/biome_service/src/configuration.rs
+@@ -86,6 +86,23 @@ impl LoadedConfiguration {
+                     &mut diagnostics,
+                 )?);
+                 partial_configuration.migrate_deprecated_fields();
++
++                // Normalize plugin paths relative to the configuration file directory so
++                // merged configurations (e.g. nested configs extending from root) can
++                // still load plugins defined in other configuration files.
++                let config_dir = configuration_file_path
++                    .parent()
++                    .unwrap_or(external_resolution_base_path.as_path());
++                if let Some(plugins) = partial_configuration.plugins.as_mut() {
++                    plugins.normalize_relative_paths(config_dir);
++                }
++                if let Some(overrides) = partial_configuration.overrides.as_mut() {
++                    for pattern in overrides.0.iter_mut() {
++                        if let Some(plugins) = pattern.plugins.as_mut() {
++                            plugins.normalize_relative_paths(config_dir);
++                        }
++                    }
++                }
+                 partial_configuration
+             }
+             None => Configuration::default(),
+diff --git a/crates/biome_service/src/file_handlers/json.rs b/crates/biome_service/src/file_handlers/json.rs
+index ac4e8aa567..68cb40adc2 100644
+--- a/crates/biome_service/src/file_handlers/json.rs
++++ b/crates/biome_service/src/file_handlers/json.rs
+@@ -27,7 +27,7 @@ use biome_formatter::{
+     BracketSpacing, Expand, FormatError, IndentStyle, IndentWidth, LineEnding, LineWidth, Printed,
+ };
+ use biome_fs::{BiomePath, ConfigName};
+-use biome_json_analyze::{ExtendedConfigurationProvider, JsonAnalyzeServices, analyze};
++use biome_json_analyze::{JsonAnalyzeServices, analyze};
+ use biome_json_formatter::context::{JsonFormatOptions, TrailingCommas};
+ use biome_json_formatter::format_node;
+ use biome_json_parser::JsonParserOptions;
+@@ -530,10 +530,7 @@ fn lint(params: LintParams) -> LintResults {
+     let mut process_lint = ProcessLint::new(&params);
+     let services = JsonAnalyzeServices {
+         file_source,
+-        configuration_provider: params
+-            .settings
+-            .full_source()
+-            .map(|s| s as std::sync::Arc<dyn ExtendedConfigurationProvider>),
++        configuration_source: params.settings.full_source(),
+     };
+     let (_, analyze_diagnostics) = analyze(&root, filter, &analyzer_options, services, |signal| {
+         process_lint.process_signal(signal)
+@@ -609,9 +606,7 @@ fn code_actions(params: CodeActionsParams) -> PullActionsResult {
+     };
+     let services = JsonAnalyzeServices {
+         file_source,
+-        configuration_provider: workspace
+-            .full_source()
+-            .map(|s| s as std::sync::Arc<dyn ExtendedConfigurationProvider>),
++        configuration_source: workspace.full_source(),
+     };
+     analyze(&tree, filter, &analyzer_options, services, |signal| {
+         actions.extend(signal.actions().into_code_action_iter().map(|item| {
+@@ -674,10 +669,7 @@ fn fix_all(params: FixAllParams) -> Result<FixFileResult, WorkspaceError> {
+     loop {
+         let services = JsonAnalyzeServices {
+             file_source,
+-            configuration_provider: params
+-                .settings
+-                .full_source()
+-                .map(|s| s as std::sync::Arc<dyn ExtendedConfigurationProvider>),
++            configuration_source: params.settings.full_source(),
+         };
+         let (action, _) = analyze(&tree, filter, &analyzer_options, services, |signal| {
+             process_fix_all.process_signal(signal)
+diff --git a/xtask/rules_check/src/lib.rs b/xtask/rules_check/src/lib.rs
+index 3df32cbc2e..5ef7979282 100644
+--- a/xtask/rules_check/src/lib.rs
++++ b/xtask/rules_check/src/lib.rs
+@@ -383,7 +383,7 @@ fn assert_lint(
+                 let options = test.create_analyzer_options::<JsonLanguage>(config)?;
+                 let json_services = JsonAnalyzeServices {
+                     file_source,
+-                    configuration_provider: None,
++                    configuration_source: None,
+                 };
+                 biome_json_analyze::analyze(&root, filter, &options, json_services, |signal| {
+                     if let Some(mut diag) = signal.diagnostic() {

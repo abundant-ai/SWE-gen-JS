@@ -1,0 +1,247 @@
+diff --git a/src/language-js/clean.js b/src/language-js/clean.js
+index 39dfc0b2f..5dd02f7ed 100644
+--- a/src/language-js/clean.js
++++ b/src/language-js/clean.js
+@@ -189,6 +189,11 @@ function clean(original, cloned) {
+     cloned.type = "TSNonNullExpression";
+     cloned.expression.type = "ChainExpression";
+   }
++
++  // `@typescript-eslint/typescript-estree` v8
++  if (original.type === "TSEnumDeclaration") {
++    delete cloned.body;
++  }
+ }
+ 
+ clean.ignoredProperties = ignoredProperties;
+diff --git a/src/language-js/parse/postprocess/index.js b/src/language-js/parse/postprocess/index.js
+index 7db0b0545..5d28da2f1 100644
+--- a/src/language-js/parse/postprocess/index.js
++++ b/src/language-js/parse/postprocess/index.js
+@@ -2,7 +2,6 @@ import assert from "node:assert";
+ import { locEnd, locStart } from "../../loc.js";
+ import createTypeCheckFunction from "../../utils/create-type-check-function.js";
+ import getRaw from "../../utils/get-raw.js";
+-import getTextWithoutComments from "../../utils/get-text-without-comments.js";
+ import isBlockComment from "../../utils/is-block-comment.js";
+ import isIndentableBlockComment from "../../utils/is-indentable-block-comment.js";
+ import isLineComment from "../../utils/is-line-comment.js";
+@@ -174,30 +173,6 @@ function postprocess(ast, options) {
+           delete node.typeParameter;
+         }
+         break;
+-
+-      // Remove this when update `@babel/parser` to v8
+-      // https://github.com/typescript-eslint/typescript-eslint/pull/8920
+-      case "TSEnumDeclaration":
+-        if (!node.body) {
+-          const idEnd = locEnd(node.id);
+-          const { members } = node;
+-          const textWithoutComments = getTextWithoutComments(
+-            {
+-              originalText: text,
+-              [Symbol.for("comments")]: ast.comments,
+-            },
+-            idEnd,
+-            members[0] ? locStart(members[0]) : locEnd(node),
+-          );
+-          const start = idEnd + textWithoutComments.indexOf("{");
+-          node.body = {
+-            type: "TSEnumBody",
+-            members,
+-            range: [start, locEnd(node)],
+-          };
+-          delete node.members;
+-        }
+-        break;
+     }
+ 
+     /* c8 ignore next 3 */
+diff --git a/src/language-js/print/enum.js b/src/language-js/print/enum.js
+index 3ec414541..acb1bd832 100644
+--- a/src/language-js/print/enum.js
++++ b/src/language-js/print/enum.js
+@@ -1,18 +1,6 @@
+ import { printDeclareToken } from "./misc.js";
+ import { printObject as printEnumMembers } from "./object.js";
+ 
+-/*
+-- `EnumBooleanBody`(flow)
+-- `EnumNumberBody`(flow)
+-- `EnumBigIntBody`(flow)
+-- `EnumStringBody`(flow)
+-- `EnumSymbolBody`(flow)
+-- `TSEnumBody`(TypeScript)
+-*/
+-function printEnumBody(path, options, print) {
+-  return printEnumMembers(path, options, print);
+-}
+-
+ /*
+ - `EnumBooleanMember`(flow)
+ - `EnumNumberMember`(flow)
+@@ -49,12 +37,46 @@ function printEnumMember(path, print) {
+   return [idDoc, " = ", initializerDoc];
+ }
+ 
++/*
++- `EnumBooleanBody`(flow)
++- `EnumNumberBody`(flow)
++- `EnumBigIntBody`(flow)
++- `EnumStringBody`(flow)
++- `EnumSymbolBody`(flow)
++*/
++function printEnumBody(path, options, print) {
++  const { node } = path;
++  let type;
++
++  if (node.type === "EnumSymbolBody" || node.explicitType) {
++    switch (node.type) {
++      case "EnumBooleanBody":
++        type = "boolean";
++        break;
++      case "EnumNumberBody":
++        type = "number";
++        break;
++      case "EnumBigIntBody":
++        type = "bigint";
++        break;
++      case "EnumStringBody":
++        type = "string";
++        break;
++      case "EnumSymbolBody":
++        type = "symbol";
++        break;
++    }
++  }
++
++  return [type ? `of ${type} ` : "", printEnumMembers(path, options, print)];
++}
++
+ /*
+ - `DeclareEnum`(flow)
+ - `EnumDeclaration`(flow)
+ - `TSEnumDeclaration`(TypeScript)
+ */
+-function printEnumDeclaration(path, print) {
++function printEnumDeclaration(path, options, print) {
+   const { node } = path;
+   return [
+     printDeclareToken(path),
+@@ -62,7 +84,9 @@ function printEnumDeclaration(path, print) {
+     "enum ",
+     print("id"),
+     " ",
+-    print("body"),
++    node.type === "TSEnumDeclaration"
++      ? printEnumMembers(path, options, print)
++      : print("body"),
+   ];
+ }
+ 
+diff --git a/src/language-js/print/flow.js b/src/language-js/print/flow.js
+index 3971a2a78..0005631cd 100644
+--- a/src/language-js/print/flow.js
++++ b/src/language-js/print/flow.js
+@@ -159,26 +159,14 @@ function printFlow(path, options, print) {
+ 
+     case "DeclareEnum":
+     case "EnumDeclaration":
+-      return printEnumDeclaration(path, print);
++      return printEnumDeclaration(path, options, print);
+ 
+     case "EnumBooleanBody":
+     case "EnumNumberBody":
+     case "EnumBigIntBody":
+     case "EnumStringBody":
+     case "EnumSymbolBody":
+-      return [
+-        node.type === "EnumSymbolBody" || node.explicitType
+-          ? `of ${node.type
+-              .slice(
+-                // `Enum`
+-                4,
+-                // `Body`
+-                -4,
+-              )
+-              .toLowerCase()} `
+-          : "",
+-        printEnumBody(path, options, print),
+-      ];
++      return printEnumBody(path, options, print);
+ 
+     case "EnumBooleanMember":
+     case "EnumNumberMember":
+diff --git a/src/language-js/print/object.js b/src/language-js/print/object.js
+index d1d788fb4..38a11b83e 100644
+--- a/src/language-js/print/object.js
++++ b/src/language-js/print/object.js
+@@ -32,7 +32,7 @@ function printObject(path, options, print) {
+ 
+   const isTypeAnnotation = node.type === "ObjectTypeAnnotation";
+   const isEnumBody =
+-    node.type === "TSEnumBody" ||
++    node.type === "TSEnumDeclaration" ||
+     node.type === "EnumBooleanBody" ||
+     node.type === "EnumNumberBody" ||
+     node.type === "EnumBigIntBody" ||
+diff --git a/src/language-js/print/typescript.js b/src/language-js/print/typescript.js
+index 92b534fd9..f849ff49c 100644
+--- a/src/language-js/print/typescript.js
++++ b/src/language-js/print/typescript.js
+@@ -18,11 +18,7 @@ import { printBlock } from "./block.js";
+ import printCallArguments from "./call-arguments.js";
+ import { printBinaryCastExpression } from "./cast-expression.js";
+ import { printClassMethod, printClassProperty } from "./class.js";
+-import {
+-  printEnumBody,
+-  printEnumDeclaration,
+-  printEnumMember,
+-} from "./enum.js";
++import { printEnumDeclaration, printEnumMember } from "./enum.js";
+ import { printFunction, printMethodValue } from "./function.js";
+ import {
+   printFunctionParameters,
+@@ -278,9 +274,8 @@ function printTypescript(path, options, print) {
+     case "TSNamespaceExportDeclaration":
+       return ["export as namespace ", print("id"), options.semi ? ";" : ""];
+     case "TSEnumDeclaration":
+-      return printEnumDeclaration(path, print);
+-    case "TSEnumBody":
+-      return printEnumBody(path, options, print);
++      return printEnumDeclaration(path, options, print);
++
+     case "TSEnumMember":
+       return printEnumMember(path, print);
+ 
+diff --git a/src/language-js/traverse/visitor-keys.evaluate.js b/src/language-js/traverse/visitor-keys.evaluate.js
+index a0a64a80f..0c6907088 100644
+--- a/src/language-js/traverse/visitor-keys.evaluate.js
++++ b/src/language-js/traverse/visitor-keys.evaluate.js
+@@ -63,7 +63,11 @@ const excludeKeys = {
+   ImportDeclaration: ["assertions"],
+   ImportExpression: ["attributes"],
+   TSMappedType: ["typeParameter"],
+-  TSEnumDeclaration: ["members"],
++
++  // `body` added in `@typescript-eslint/typescript-estree` v8
++  // https://github.com/typescript-eslint/typescript-eslint/pull/8920
++  // TODO: Use the new AST properties instead
++  TSEnumDeclaration: ["body"],
+ };
+ 
+ const excludeNodeTypes = new Set([
+diff --git a/tests/unit/__snapshots__/visitor-keys.js.snap b/tests/unit/__snapshots__/visitor-keys.js.snap
+index 35763cb93..f29ea2b9c 100644
+--- a/tests/unit/__snapshots__/visitor-keys.js.snap
++++ b/tests/unit/__snapshots__/visitor-keys.js.snap
+@@ -818,8 +818,8 @@ exports[`visitor keys estree 1`] = `
+     "members",
+   ],
+   "TSEnumDeclaration": [
+-    "body",
+     "id",
++    "members",
+   ],
+   "TSEnumMember": [
+     "id",

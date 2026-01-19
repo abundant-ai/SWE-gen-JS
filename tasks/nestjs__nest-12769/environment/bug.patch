@@ -1,0 +1,168 @@
+diff --git a/integration/microservices/e2e/sum-grpc.spec.ts b/integration/microservices/e2e/sum-grpc.spec.ts
+index 7255f4612..cd6459e50 100644
+--- a/integration/microservices/e2e/sum-grpc.spec.ts
++++ b/integration/microservices/e2e/sum-grpc.spec.ts
+@@ -128,27 +128,6 @@ describe('GRPC transport', () => {
+     });
+   });
+ 
+-  it(`GRPC with backpressure control`, async function () {
+-    // This test hit the gRPC server with 1000 messages, but the server
+-    // has to process large (> 1MB) messages, so it will definitely hit
+-    // issues where writing to the stream needs to be paused until a drain
+-    // event. Prior to this test, a bug existed where the server would
+-    // send the incorrect number of messages due to improper backpressure
+-    // handling that wrote messages more than once.
+-    this.timeout(10000);
+-
+-    const largeMessages = client.streamLargeMessages();
+-    // [0, 1, 2, ..., 999]
+-    const expectedIds = Array.from({ length: 1000 }, (_, n) => n);
+-    const receivedIds: number[] = [];
+-
+-    await largeMessages.forEach(msg => {
+-      receivedIds.push(msg.id);
+-    });
+-
+-    expect(receivedIds).to.deep.equal(expectedIds);
+-  });
+-
+   after(async () => {
+     await app.close();
+   });
+diff --git a/integration/microservices/src/grpc/grpc.controller.ts b/integration/microservices/src/grpc/grpc.controller.ts
+index f3a9ba68a..11c75e37b 100644
+--- a/integration/microservices/src/grpc/grpc.controller.ts
++++ b/integration/microservices/src/grpc/grpc.controller.ts
+@@ -128,27 +128,6 @@ export class GrpcController {
+     return svc.sum2({ data });
+   }
+ 
+-  @GrpcMethod('Math')
+-  streamLargeMessages(_req: unknown, _meta: unknown) {
+-    // Send 1000 messages of >1MB each relatively fast
+-    // This should be enough to trigger backpressure issues
+-    // while writing to the socket.
+-    return new Observable(subscriber => {
+-      let n = 0;
+-      const interval = setInterval(() => {
+-        // We'll be checking the ids. The `data` is just to make the
+-        // message large enough to trigger backpressure issues.
+-        subscriber.next({ id: n++, data: 'a'.repeat(1024 * 1024) });
+-        if (n === 1000) {
+-          subscriber.complete();
+-        }
+-      }, 0);
+-      return () => {
+-        clearInterval(interval);
+-      };
+-    });
+-  }
+-
+   @Post('error')
+   @HttpCode(200)
+   serializeError(
+diff --git a/integration/microservices/src/grpc/math.proto b/integration/microservices/src/grpc/math.proto
+index a6152187b..0ca9b3509 100644
+--- a/integration/microservices/src/grpc/math.proto
++++ b/integration/microservices/src/grpc/math.proto
+@@ -7,16 +7,8 @@ service Math {
+   rpc SumStream(stream RequestSum) returns(stream SumResult);
+   rpc SumStreamPass(stream RequestSum) returns(stream SumResult);
+   rpc Divide (RequestDivide) returns (DivideResult);
+-  rpc StreamLargeMessages(Empty) returns (stream BackpressureData) {}
+ }
+ 
+-message BackpressureData {
+-    int32 id = 1;
+-    string data = 2;
+-}
+-
+-message Empty {}
+-
+ message SumResult {
+   int32 result = 1;
+ }
+diff --git a/packages/microservices/server/server-grpc.ts b/packages/microservices/server/server-grpc.ts
+index 622b94d99..344a893f1 100644
+--- a/packages/microservices/server/server-grpc.ts
++++ b/packages/microservices/server/server-grpc.ts
+@@ -269,7 +269,6 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
+       let shouldErrorAfterDraining = false;
+       let error: any;
+       let shouldResolveAfterDraining = false;
+-      let writing = true;
+ 
+       // Used to manage finalization
+       const subscription = new Subscription();
+@@ -291,18 +290,19 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
+       subscription.add(() => call.end());
+ 
+       const drain = () => {
+-        writing = true;
+         while (valuesWaitingToBeDrained.length > 0) {
+-          const value = valuesWaitingToBeDrained.shift()!;
+-          if (writing) {
+-            // The first time `call.write` returns false, we need to stop.
+-            // It wrote the value, but it won't write anything else.
+-            writing = call.write(value);
+-            if (!writing) {
+-              // We can't write anymore so we need to wait for the drain event
+-              return;
+-            }
++          // Try to write the value, THEN shift it off, because
++          // if we can't write the value, we need to keep it in the
++          // buffer at it's position to ensure ordering.
++          const value = valuesWaitingToBeDrained[0];
++          if (!call.write(value)) {
++            // We can't write anymore so we need to wait for the drain event
++            // stop draining for now.
++            return;
+           }
++
++          // We successfully wrote the value, so we can shift it off the buffer
++          valuesWaitingToBeDrained.shift();
+         }
+ 
+         if (shouldResolveAfterDraining) {
+@@ -320,9 +320,7 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
+       subscription.add(
+         source.subscribe({
+           next(value) {
+-            if (writing) {
+-              writing = call.write(value);
+-            } else {
++            if (!call.write(value)) {
+               // If we can't write, that's because we need to
+               // wait for the drain event before we can write again
+               // buffer the value and wait for the drain event
+@@ -385,7 +383,8 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
+       if (isResponseStream) {
+         try {
+           await this.writeObservableToGrpc(res, call);
+-        } catch (err) {
++        }
++        catch (err) {
+           call.emit('error', err);
+           return;
+         }
+diff --git a/packages/microservices/test/server/server-grpc.spec.ts b/packages/microservices/test/server/server-grpc.spec.ts
+index 89d222590..b256c107b 100644
+--- a/packages/microservices/test/server/server-grpc.spec.ts
++++ b/packages/microservices/test/server/server-grpc.spec.ts
+@@ -602,12 +602,11 @@ describe('ServerGrpc', () => {
+           const call = {
+             write: sinon.spy(value => {
+               // Simulating a writable stream becoming overwhelmed.
+-              if (writeCounter++ < highwaterMark) {
+-                // We can write this value to the stream.
++              const canWrite = writeCounter++ < highwaterMark;
++              if (canWrite) {
+                 written.push(value);
+               }
+-              // But as soon as we pass the highwater mark, we can't write anymore.
+-              return writeCounter < highwaterMark;
++              return canWrite;
+             }),
+             end: sinon.spy(() => {
+               written.push('end');

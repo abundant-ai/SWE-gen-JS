@@ -1,0 +1,104 @@
+diff --git a/src/classes/queue-getters.ts b/src/classes/queue-getters.ts
+index fc826acb7e..5bd9f20263 100644
+--- a/src/classes/queue-getters.ts
++++ b/src/classes/queue-getters.ts
+@@ -515,35 +515,16 @@ export class QueueGetters<JobBase extends Job = Job> extends QueueBase {
+     start = 0,
+     end = -1,
+   ): Promise<Metrics> {
+-    const client = await this.client;
+-    const metricsKey = this.toKey(`metrics:${type}`);
+-    const dataKey = `${metricsKey}:data`;
+-
+-    const multi = client.multi();
+-    multi.hmget(metricsKey, 'count', 'prevTS', 'prevCount');
+-    multi.lrange(dataKey, start, end);
+-    multi.llen(dataKey);
+-
+-    const [hmget, range, len] = (await multi.exec()) as [
+-      [Error, [string, string, string]],
+-      [Error, []],
+-      [Error, number],
+-    ];
+-    const [err, [count, prevTS, prevCount]] = hmget;
+-    const [err2, data] = range;
+-    const [err3, numPoints] = len;
+-    if (err || err2) {
+-      throw err || err2 || err3;
+-    }
++    const [meta, data, count] = await this.scripts.getMetrics(type, start, end);
+ 
+     return {
+       meta: {
+-        count: parseInt(count || '0', 10),
+-        prevTS: parseInt(prevTS || '0', 10),
+-        prevCount: parseInt(prevCount || '0', 10),
++        count: parseInt(meta[0] || '0', 10),
++        prevTS: parseInt(meta[1] || '0', 10),
++        prevCount: parseInt(meta[2] || '0', 10),
+       },
+-      data,
+-      count: numPoints,
++      data: data.map(point => +point || 0),
++      count,
+     };
+   }
+ 
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 29e6568855..d87e1ccddf 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -1409,6 +1409,28 @@ export class Scripts {
+     }
+   }
+ 
++  async getMetrics(
++    type: 'completed' | 'failed',
++    start = 0,
++    end = -1,
++  ): Promise<[string[], string[], number]> {
++    const client = await this.queue.client;
++
++    const keys: (string | number)[] = [
++      this.queue.toKey(`metrics:${type}`),
++      this.queue.toKey(`metrics:${type}:data`),
++    ];
++    const args = [start, end];
++
++    const result = await this.execCommand(
++      client,
++      'getMetrics',
++      keys.concat(args),
++    );
++
++    return result;
++  }
++
+   async moveToActive(client: RedisClient, token: string, name?: string) {
+     const opts = this.queue.opts as WorkerOptions;
+ 
+diff --git a/src/commands/getMetrics-2.lua b/src/commands/getMetrics-2.lua
+new file mode 100644
+index 0000000000..699255f459
+--- /dev/null
++++ b/src/commands/getMetrics-2.lua
+@@ -0,0 +1,19 @@
++--[[
++  Get metrics
++
++  Input:
++    KEYS[1] 'metrics' key
++    KEYS[2] 'metrics data' key
++
++    ARGV[1] start index
++    ARGV[2] end index
++]]
++local rcall = redis.call;
++local metricsKey = KEYS[1]
++local dataKey = KEYS[2]
++
++local metrics = rcall("HMGET", metricsKey, "count", "prevTS", "prevCount")
++local data = rcall("LRANGE", dataKey, tonumber(ARGV[1]), tonumber(ARGV[2]))
++local numPoints = rcall("LLEN", dataKey)
++
++return {metrics, data, numPoints}

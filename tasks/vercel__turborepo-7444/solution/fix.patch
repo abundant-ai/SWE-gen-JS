@@ -1,0 +1,456 @@
+diff --git a/crates/turborepo-api-client/src/error.rs b/crates/turborepo-api-client/src/error.rs
+index 51067ddb95..5bd378db7b 100644
+--- a/crates/turborepo-api-client/src/error.rs
++++ b/crates/turborepo-api-client/src/error.rs
+@@ -36,6 +36,17 @@ pub enum Error {
+         err: serde_json::Error,
+         text: String,
+     },
++    #[error(
++        "[HTTP {status}] request to {url} returned \"{message}\" \ntry logging in again, or force \
++         a new token (turbo login <--sso-team your_team> -f)."
++    )]
++    InvalidToken {
++        status: u16,
++        url: String,
++        message: String,
++    },
++    #[error("[HTTP 403] token is forbidden from accessing {url}")]
++    ForbiddenToken { url: String },
+ }
+ 
+ pub type Result<T> = std::result::Result<T, Error>;
+diff --git a/crates/turborepo-api-client/src/lib.rs b/crates/turborepo-api-client/src/lib.rs
+index 2e43e0fa8b..6c32430e0b 100644
+--- a/crates/turborepo-api-client/src/lib.rs
++++ b/crates/turborepo-api-client/src/lib.rs
+@@ -89,6 +89,7 @@ pub trait CacheClient {
+ #[async_trait]
+ pub trait TokenClient {
+     async fn get_metadata(&self, token: &str) -> Result<ResponseTokenMetadata>;
++    async fn delete_token(&self, token: &str) -> Result<()>;
+ }
+ 
+ #[derive(Clone)]
+@@ -416,22 +417,111 @@ impl CacheClient for APIClient {
+ #[async_trait]
+ impl TokenClient for APIClient {
+     async fn get_metadata(&self, token: &str) -> Result<ResponseTokenMetadata> {
+-        let url = self.make_url("/v5/user/tokens/current")?;
++        let endpoint = "/v5/user/tokens/current";
++        let url = self.make_url(endpoint)?;
+         let request_builder = self
+             .client
+             .get(url)
+             .header("User-Agent", self.user_agent.clone())
+             .header("Authorization", format!("Bearer {}", token))
+             .header("Content-Type", "application/json");
+-        let response = retry::make_retryable_request(request_builder).await?;
+ 
+         #[derive(Deserialize, Debug)]
+         struct Response {
+             #[serde(rename = "token")]
+             metadata: ResponseTokenMetadata,
+         }
+-        let body = response.json::<Response>().await?;
+-        Ok(body.metadata)
++        #[derive(Deserialize, Debug)]
++        struct ErrorResponse {
++            error: ErrorDetails,
++        }
++        #[derive(Deserialize, Debug)]
++        struct ErrorDetails {
++            message: String,
++            #[serde(rename = "invalidToken", default)]
++            invalid_token: bool,
++        }
++
++        let response = retry::make_retryable_request(request_builder).await?;
++        let status = response.status();
++        // Give a better error message for invalid tokens. This endpoint returns the
++        // following statuses:
++        // 200: OK
++        // 400: Bad Request
++        // 403: Forbidden
++        // 404: Not Found
++        match status {
++            StatusCode::OK => Ok(response.json::<Response>().await?.metadata),
++            // If we're forbidden, check to see if the token is invalid. If so, give back a nice
++            // error message.
++            StatusCode::FORBIDDEN => {
++                let body = response.json::<ErrorResponse>().await?;
++                if body.error.invalid_token {
++                    return Err(Error::InvalidToken {
++                        status: status.as_u16(),
++                        // Call make_url again since url is moved.
++                        url: self.make_url(endpoint)?.to_string(),
++                        message: body.error.message,
++                    });
++                }
++                return Err(Error::ForbiddenToken {
++                    url: self.make_url(endpoint)?.to_string(),
++                });
++            }
++            _ => Err(response.error_for_status().unwrap_err().into()),
++        }
++    }
++
++    /// Invalidates the given token on the server.
++    async fn delete_token(&self, token: &str) -> Result<()> {
++        let endpoint = "/v3/user/tokens/current";
++        let url = self.make_url(endpoint)?;
++        let request_builder = self
++            .client
++            .delete(url)
++            .header("User-Agent", self.user_agent.clone())
++            .header("Authorization", format!("Bearer {}", token))
++            .header("Content-Type", "application/json");
++
++        #[derive(Deserialize, Debug)]
++        struct ErrorResponse {
++            error: ErrorDetails,
++        }
++        #[derive(Deserialize, Debug)]
++        struct ErrorDetails {
++            message: String,
++            #[serde(rename = "invalidToken", default)]
++            invalid_token: bool,
++        }
++
++        let response = retry::make_retryable_request(request_builder).await?;
++        let status = response.status();
++        // Give a better error message for invalid tokens. This endpoint returns the
++        // following statuses:
++        // 200: OK
++        // 400: Bad Request
++        // 403: Forbidden
++        // 404: Not Found
++        match status {
++            StatusCode::OK => Ok(()),
++            // If we're forbidden, check to see if the token is invalid. If so, give back a nice
++            // error message.
++            StatusCode::FORBIDDEN => {
++                let body = response.json::<ErrorResponse>().await?;
++                if body.error.invalid_token {
++                    return Err(Error::InvalidToken {
++                        status: status.as_u16(),
++                        // Call make_url again since url is moved.
++                        url: self.make_url(endpoint)?.to_string(),
++                        message: body.error.message,
++                    });
++                }
++                return Err(Error::ForbiddenToken {
++                    url: self.make_url(endpoint)?.to_string(),
++                });
++            }
++            _ => Err(response.error_for_status().unwrap_err().into()),
++        }
+     }
+ }
+ 
+diff --git a/crates/turborepo-auth/src/auth/login.rs b/crates/turborepo-auth/src/auth/login.rs
+index fed11be09c..d2201c5e97 100644
+--- a/crates/turborepo-auth/src/auth/login.rs
++++ b/crates/turborepo-auth/src/auth/login.rs
+@@ -45,6 +45,7 @@ pub async fn login<T: Client + TokenClient + CacheClient>(
+             ui::print_cli_authorized(user_email, &ui);
+         }
+     };
++
+     // Check if passed in token exists first.
+     if !force {
+         if let Some(token) = existing_token {
+@@ -297,6 +298,9 @@ mod tests {
+                 created_at: 123456,
+             })
+         }
++        async fn delete_token(&self, _token: &str) -> turborepo_api_client::Result<()> {
++            Ok(())
++        }
+     }
+ 
+     #[async_trait]
+diff --git a/crates/turborepo-auth/src/auth/logout.rs b/crates/turborepo-auth/src/auth/logout.rs
+index 0da6a9c8db..f2ea3e6d57 100644
+--- a/crates/turborepo-auth/src/auth/logout.rs
++++ b/crates/turborepo-auth/src/auth/logout.rs
+@@ -1,22 +1,33 @@
+ use tracing::error;
+-use turborepo_api_client::Client;
++use turbopath::AbsoluteSystemPath;
++use turborepo_api_client::TokenClient;
+ use turborepo_ui::{cprintln, GREY};
+ 
+-use crate::{Error, LogoutOptions};
++use crate::{Error, LogoutOptions, Token};
+ 
+-pub fn logout<T: Client>(options: &LogoutOptions<T>) -> Result<(), Error> {
+-    if let Err(err) = remove_token(options) {
++pub async fn logout<T: TokenClient>(options: &LogoutOptions<'_, T>) -> Result<(), Error> {
++    let LogoutOptions {
++        ui,
++        api_client,
++        path,
++        invalidate,
++    } = *options;
++
++    if invalidate {
++        Token::from_file(path)?.invalidate(api_client).await?;
++    }
++
++    if let Err(err) = remove_token(path) {
+         error!("could not logout. Something went wrong: {}", err);
+         return Err(err);
+     }
+ 
+-    cprintln!(options.ui, GREY, ">>> Logged out");
++    cprintln!(ui, GREY, ">>> Logged out");
+     Ok(())
+ }
+ 
+-fn remove_token<T: Client>(options: &LogoutOptions<T>) -> Result<(), Error> {
+-    // Read the existing content from the global configuration path
+-    let content = options.path.read_to_string()?;
++fn remove_token(path: &AbsoluteSystemPath) -> Result<(), Error> {
++    let content = path.read_to_string()?;
+ 
+     // Attempt to deserialize the content into a serde_json::Value
+     let mut data: serde_json::Value = serde_json::from_str(&content)?;
+@@ -32,33 +43,30 @@ fn remove_token<T: Client>(options: &LogoutOptions<T>) -> Result<(), Error> {
+ 
+     // Serialize the updated data back to a string
+     let new_content = serde_json::to_string_pretty(&data)?;
+-
+-    // Write the updated content back to the file
+-    options.path.create_with_contents(new_content)?;
++    path.create_with_contents(new_content)?;
+ 
+     Ok(())
+ }
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::backtrace::Backtrace;
++
+     use async_trait::async_trait;
+     use reqwest::{RequestBuilder, Response};
+     use tempfile::tempdir;
+     use turbopath::AbsoluteSystemPathBuf;
+-    use turborepo_ui::UI;
++    use turborepo_api_client::Client;
+     use turborepo_vercel_api::{
+-        SpacesResponse, Team, TeamsResponse, UserResponse, VerifiedSsoUser,
++        token::ResponseTokenMetadata, SpacesResponse, Team, TeamsResponse, UserResponse,
++        VerifiedSsoUser,
+     };
+     use url::Url;
+ 
+     use super::*;
+ 
+-    struct MockApiClient {}
+-
+-    impl MockApiClient {
+-        fn new() -> Self {
+-            Self {}
+-        }
++    struct MockApiClient {
++        pub succeed_delete_request: bool,
+     }
+ 
+     #[async_trait]
+@@ -104,6 +112,27 @@ mod tests {
+         }
+     }
+ 
++    #[async_trait]
++    impl TokenClient for MockApiClient {
++        async fn delete_token(&self, _token: &str) -> turborepo_api_client::Result<()> {
++            if self.succeed_delete_request {
++                Ok(())
++            } else {
++                Err(turborepo_api_client::Error::UnknownStatus {
++                    code: "code".to_string(),
++                    message: "this failed".to_string(),
++                    backtrace: Backtrace::capture(),
++                })
++            }
++        }
++        async fn get_metadata(
++            &self,
++            _token: &str,
++        ) -> turborepo_api_client::Result<ResponseTokenMetadata> {
++            unimplemented!("get_metadata")
++        }
++    }
++
+     #[test]
+     fn test_remove_token() {
+         let tmp_dir = tempdir().unwrap();
+@@ -113,13 +142,33 @@ mod tests {
+         path.create_with_contents(content)
+             .expect("could not create file");
+ 
++        remove_token(&path).unwrap();
++
++        let new_content = path.read_to_string().unwrap();
++        assert_eq!(new_content, "{}");
++    }
++
++    #[tokio::test]
++    async fn test_invalidate_token() {
++        let tmp_dir = tempdir().unwrap();
++        let path = AbsoluteSystemPathBuf::try_from(tmp_dir.path().join("config.json"))
++            .expect("could not create path");
++        let content = r#"{"token":"some-token"}"#;
++        path.create_with_contents(content)
++            .expect("could not create file");
++
++        let api_client = MockApiClient {
++            succeed_delete_request: true,
++        };
++
+         let options = LogoutOptions {
+-            ui: &UI::new(false),
+-            api_client: &MockApiClient::new(),
++            ui: &turborepo_ui::UI::new(false),
++            api_client: &api_client,
+             path: &path,
++            invalidate: true,
+         };
+ 
+-        remove_token(&options).unwrap();
++        logout(&options).await.unwrap();
+ 
+         let new_content = path.read_to_string().unwrap();
+         assert_eq!(new_content, "{}");
+diff --git a/crates/turborepo-auth/src/auth/mod.rs b/crates/turborepo-auth/src/auth/mod.rs
+index 4b4a841559..f55fd02d40 100644
+--- a/crates/turborepo-auth/src/auth/mod.rs
++++ b/crates/turborepo-auth/src/auth/mod.rs
+@@ -50,6 +50,8 @@ pub struct LogoutOptions<'a, T> {
+ 
+     /// The path where we should look for the token to logout.
+     pub path: &'a AbsoluteSystemPath,
++    /// If we should invalidate the token on the server.
++    pub invalidate: bool,
+ }
+ 
+ fn extract_vercel_token() -> Result<Option<String>, Error> {
+diff --git a/crates/turborepo-auth/src/auth/sso.rs b/crates/turborepo-auth/src/auth/sso.rs
+index cd68366eb2..23d41d2baf 100644
+--- a/crates/turborepo-auth/src/auth/sso.rs
++++ b/crates/turborepo-auth/src/auth/sso.rs
+@@ -295,6 +295,9 @@ mod tests {
+                 created_at: 123456,
+             })
+         }
++        async fn delete_token(&self, _token: &str) -> turborepo_api_client::Result<()> {
++            Ok(())
++        }
+     }
+ 
+     #[async_trait]
+diff --git a/crates/turborepo-auth/src/lib.rs b/crates/turborepo-auth/src/lib.rs
+index c354b4911b..74461d8ae0 100644
+--- a/crates/turborepo-auth/src/lib.rs
++++ b/crates/turborepo-auth/src/lib.rs
+@@ -96,8 +96,8 @@ impl Token {
+         // passed in a user's email if the token is valid.
+         valid_message_fn: Option<impl FnOnce(&str)>,
+     ) -> Result<bool, Error> {
+-        let is_active = self.is_active(client).await?;
+-        let has_cache_access = self.has_cache_access(client, None).await?;
++        let (is_active, has_cache_access) =
++            tokio::try_join!(self.is_active(client), self.has_cache_access(client, None))?;
+         if !is_active || !has_cache_access {
+             return Ok(false);
+         }
+@@ -220,6 +220,12 @@ impl Token {
+             .await
+             .map_err(Error::from)
+     }
++
++    /// Invalidates the token on the server.
++    pub async fn invalidate<T: TokenClient>(&self, client: &T) -> Result<(), Error> {
++        client.delete_token(self.into_inner()).await?;
++        Ok(())
++    }
+     /// Returns the underlying token string.
+     pub fn into_inner(&self) -> &str {
+         match self {
+diff --git a/crates/turborepo-lib/src/cli/mod.rs b/crates/turborepo-lib/src/cli/mod.rs
+index 40a773d352..375f249369 100644
+--- a/crates/turborepo-lib/src/cli/mod.rs
++++ b/crates/turborepo-lib/src/cli/mod.rs
+@@ -493,7 +493,11 @@ pub enum Command {
+         force: bool,
+     },
+     /// Logout to your Vercel account
+-    Logout {},
++    Logout {
++        /// Invalidate the token on the server
++        #[clap(long)]
++        invalidate: bool,
++    },
+     /// Prepare a subset of your monorepo.
+     Prune {
+         #[clap(hide = true, long)]
+@@ -1122,12 +1126,15 @@ pub async fn run(
+ 
+             Ok(0)
+         }
+-        Command::Logout { .. } => {
++        Command::Logout { invalidate } => {
+             let event = CommandEventBuilder::new("logout").with_parent(&root_telemetry);
+             event.track_call();
++            let invalidate = *invalidate;
++
+             let mut base = CommandBase::new(cli_args, repo_root, version, ui);
+             let event_child = event.child();
+-            logout::logout(&mut base, event_child)?;
++
++            logout::logout(&mut base, invalidate, event_child).await?;
+ 
+             Ok(0)
+         }
+@@ -2015,7 +2022,7 @@ mod test {
+         assert_eq!(
+             Args::try_parse_from(["turbo", "logout"]).unwrap(),
+             Args {
+-                command: Some(Command::Logout {}),
++                command: Some(Command::Logout { invalidate: false }),
+                 ..Args::default()
+             }
+         );
+@@ -2025,7 +2032,7 @@ mod test {
+             command_args: vec![],
+             global_args: vec![vec!["--cwd", "../examples/with-yarn"]],
+             expected_output: Args {
+-                command: Some(Command::Logout {}),
++                command: Some(Command::Logout { invalidate: false }),
+                 cwd: Some(Utf8PathBuf::from("../examples/with-yarn")),
+                 ..Args::default()
+             },
+diff --git a/crates/turborepo-lib/src/commands/logout.rs b/crates/turborepo-lib/src/commands/logout.rs
+index be69e74fe2..b63359c31f 100644
+--- a/crates/turborepo-lib/src/commands/logout.rs
++++ b/crates/turborepo-lib/src/commands/logout.rs
+@@ -3,11 +3,17 @@ use turborepo_telemetry::events::command::CommandEventBuilder;
+ 
+ use crate::{cli::Error, commands::CommandBase};
+ 
+-pub fn logout(base: &mut CommandBase, _telemetry: CommandEventBuilder) -> Result<(), Error> {
++pub async fn logout(
++    base: &mut CommandBase,
++    invalidate: bool,
++    _telemetry: CommandEventBuilder,
++) -> Result<(), Error> {
+     auth_logout(&LogoutOptions {
+         ui: &base.ui,
+         api_client: &base.api_client()?,
+         path: &base.global_config_path()?,
++        invalidate,
+     })
++    .await
+     .map_err(Error::from)
+ }

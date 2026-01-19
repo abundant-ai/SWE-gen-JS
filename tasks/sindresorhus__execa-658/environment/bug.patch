@@ -1,0 +1,180 @@
+diff --git a/index.js b/index.js
+index 3993602..512ebee 100644
+--- a/index.js
++++ b/index.js
+@@ -6,6 +6,7 @@ import {fileURLToPath} from 'node:url';
+ import crossSpawn from 'cross-spawn';
+ import stripFinalNewline from 'strip-final-newline';
+ import {npmRunPathEnv} from 'npm-run-path';
++import onetime from 'onetime';
+ import {makeError} from './lib/error.js';
+ import {handleInputAsync, pipeOutputAsync} from './lib/stdio/async.js';
+ import {handleInputSync, pipeOutputSync} from './lib/stdio/sync.js';
+@@ -126,27 +127,27 @@ export function execa(rawFile, rawArgs, rawOptions) {
+ 		return dummySpawned;
+ 	}
+ 
++	const spawnedPromise = getSpawnedPromise(spawned);
++	const timedPromise = setupTimeout(spawned, options, spawnedPromise);
++	const processDone = setExitHandler(spawned, options, timedPromise);
++
+ 	const context = {isCanceled: false};
+ 
+ 	spawned.kill = spawnedKill.bind(null, spawned.kill.bind(spawned));
+ 	spawned.cancel = spawnedCancel.bind(null, spawned, context);
+ 
++	const handlePromiseOnce = onetime(handlePromise.bind(undefined, {spawned, options, context, stdioStreams, command, escapedCommand, processDone}));
++
+ 	pipeOutputAsync(spawned, stdioStreams);
+ 
+ 	spawned.all = makeAllStream(spawned, options);
+ 
+ 	addPipeMethods(spawned);
+-
+-	const promise = handlePromise({spawned, options, context, stdioStreams, command, escapedCommand});
+-	mergePromise(spawned, promise);
++	mergePromise(spawned, handlePromiseOnce);
+ 	return spawned;
+ }
+ 
+-const handlePromise = async ({spawned, options, context, stdioStreams, command, escapedCommand}) => {
+-	const spawnedPromise = getSpawnedPromise(spawned);
+-	const timedPromise = setupTimeout(spawned, options, spawnedPromise);
+-	const processDone = setExitHandler(spawned, options, timedPromise);
+-
++const handlePromise = async ({spawned, options, context, stdioStreams, command, escapedCommand, processDone}) => {
+ 	const [
+ 		{error, exitCode, signal, timedOut},
+ 		stdoutResult,
+diff --git a/lib/promise.js b/lib/promise.js
+index 0a33b69..73b0171 100644
+--- a/lib/promise.js
++++ b/lib/promise.js
+@@ -11,7 +11,11 @@ const descriptors = ['then', 'catch', 'finally'].map(property => [
+ // The return value is a mixin of `childProcess` and `Promise`
+ export const mergePromise = (spawned, promise) => {
+ 	for (const [property, descriptor] of descriptors) {
+-		const value = descriptor.value.bind(promise);
++		// Starting the main `promise` is deferred to avoid consuming streams
++		const value = typeof promise === 'function'
++			? (...args) => Reflect.apply(descriptor.value, promise(), args)
++			: descriptor.value.bind(promise);
++
+ 		Reflect.defineProperty(spawned, property, {...descriptor, value});
+ 	}
+ };
+diff --git a/package.json b/package.json
+index 2a24b8e..b3a9ce3 100644
+--- a/package.json
++++ b/package.json
+@@ -51,6 +51,7 @@
+ 		"human-signals": "^6.0.0",
+ 		"is-stream": "^3.0.0",
+ 		"npm-run-path": "^5.2.0",
++		"onetime": "^7.0.0",
+ 		"signal-exit": "^4.1.0",
+ 		"strip-final-newline": "^4.0.0"
+ 	},
+diff --git a/test/fixtures/no-await.js b/test/fixtures/no-await.js
+deleted file mode 100755
+index 79121ae..0000000
+--- a/test/fixtures/no-await.js
++++ /dev/null
+@@ -1,9 +0,0 @@
+-#!/usr/bin/env node
+-import process from 'node:process';
+-import {once} from 'node:events';
+-import {execa} from '../../index.js';
+-
+-const [options, file, ...args] = process.argv.slice(2);
+-execa(file, args, JSON.parse(options));
+-const [error] = await once(process, 'unhandledRejection');
+-console.log(error.shortMessage);
+diff --git a/test/promise.js b/test/promise.js
+index 80ebeaa..f2310c2 100644
+--- a/test/promise.js
++++ b/test/promise.js
+@@ -43,11 +43,3 @@ test('throw in finally bubbles up on error', async t => {
+ 	}));
+ 	t.is(message, 'called');
+ });
+-
+-const testNoAwait = async (t, fixtureName, options, message) => {
+-	const {stdout} = await execa('no-await.js', [JSON.stringify(options), fixtureName]);
+-	t.true(stdout.includes(message));
+-};
+-
+-test('Throws if promise is not awaited and process fails', testNoAwait, 'fail.js', {}, 'exit code 2');
+-test('Throws if promise is not awaited and process times out', testNoAwait, 'forever.js', {timeout: 1}, 'timed out');
+diff --git a/test/stream.js b/test/stream.js
+index 64a1b72..cb8370d 100644
+--- a/test/stream.js
++++ b/test/stream.js
+@@ -1,6 +1,5 @@
+ import {Buffer} from 'node:buffer';
+ import {exec} from 'node:child_process';
+-import {once} from 'node:events';
+ import process from 'node:process';
+ import {setTimeout} from 'node:timers/promises';
+ import {promisify} from 'node:util';
+@@ -132,20 +131,12 @@ const testNoMaxBuffer = async (t, streamName) => {
+ test('do not buffer stdout when `buffer` set to `false`', testNoMaxBuffer, 'stdout');
+ test('do not buffer stderr when `buffer` set to `false`', testNoMaxBuffer, 'stderr');
+ 
+-test('do not buffer when streaming and `buffer` is `false`', async t => {
+-	const {stdout} = execa('max-buffer.js', ['stdout', '21'], {maxBuffer: 10, buffer: false});
++test('do not buffer when streaming', async t => {
++	const {stdout} = execa('max-buffer.js', ['stdout', '21'], {maxBuffer: 10});
+ 	const result = await getStream(stdout);
+ 	t.is(result, '....................\n');
+ });
+ 
+-test('buffers when streaming and `buffer` is `true`', async t => {
+-	const childProcess = execa('max-buffer.js', ['stdout', '21'], {maxBuffer: 10});
+-	await Promise.all([
+-		t.throwsAsync(childProcess, {message: /maxBuffer exceeded/}),
+-		t.throwsAsync(getStream(childProcess.stdout), {code: 'ABORT_ERR'}),
+-	]);
+-});
+-
+ test('buffer: false > promise resolves', async t => {
+ 	await t.notThrowsAsync(execa('noop.js', {buffer: false}));
+ });
+@@ -217,31 +208,18 @@ test.serial('Processes buffer stdout before it is read', async t => {
+ 	t.is(stdout, 'foobar');
+ });
+ 
+-test.serial('Processes buffers stdout right away, on successfully exit', async t => {
++// This test is not the desired behavior, but is the current one.
++// I.e. this is mostly meant for documentation and regression testing.
++test.serial('Processes might successfully exit before their stdout is read', async t => {
+ 	const childProcess = execa('noop.js', ['foobar']);
+ 	await setTimeout(1e3);
+ 	const {stdout} = await childProcess;
+-	t.is(stdout, 'foobar');
++	t.is(stdout, '');
+ });
+ 
+-test.serial('Processes buffers stdout right away, on failure', async t => {
++test.serial('Processes might fail before their stdout is read', async t => {
+ 	const childProcess = execa('noop-fail.js', ['foobar'], {reject: false});
+ 	await setTimeout(1e3);
+ 	const {stdout} = await childProcess;
+-	t.is(stdout, 'foobar');
+-});
+-
+-test('Processes buffers stdout right away, even if directly read', async t => {
+-	const childProcess = execa('noop.js', ['foobar']);
+-	const data = await once(childProcess.stdout, 'data');
+-	t.is(data.toString().trim(), 'foobar');
+-	const {stdout} = await childProcess;
+-	t.is(stdout, 'foobar');
+-});
+-
+-test('childProcess.stdout|stderr must be read right away', async t => {
+-	const childProcess = execa('noop.js', ['foobar']);
+-	const {stdout} = await childProcess;
+-	t.is(stdout, 'foobar');
+-	t.true(childProcess.stdout.destroyed);
++	t.is(stdout, '');
+ });

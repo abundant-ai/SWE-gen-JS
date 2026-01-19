@@ -1,0 +1,370 @@
+diff --git a/src/components/App.tsx b/src/components/App.tsx
+index ed9f6e8..ecd9e59 100644
+--- a/src/components/App.tsx
++++ b/src/components/App.tsx
+@@ -1,4 +1,3 @@
+-import {EventEmitter} from 'node:events';
+ import process from 'node:process';
+ import React, {PureComponent, type ReactNode} from 'react';
+ import cliCursor from 'cli-cursor';
+@@ -56,8 +55,6 @@ export default class App extends PureComponent<Props, State> {
+ 	// Count how many components enabled raw mode to avoid disabling
+ 	// raw mode until all components don't need it anymore
+ 	rawModeEnabledCount = 0;
+-	// eslint-disable-next-line @typescript-eslint/naming-convention
+-	internal_eventEmitter = new EventEmitter();
+ 
+ 	// Determines if TTY is supported on the provided stdin
+ 	isRawModeSupported(): boolean {
+@@ -79,9 +76,7 @@ export default class App extends PureComponent<Props, State> {
+ 						setRawMode: this.handleSetRawMode,
+ 						isRawModeSupported: this.isRawModeSupported(),
+ 						// eslint-disable-next-line @typescript-eslint/naming-convention
+-						internal_exitOnCtrlC: this.props.exitOnCtrlC,
+-						// eslint-disable-next-line @typescript-eslint/naming-convention
+-						internal_eventEmitter: this.internal_eventEmitter
++						internal_exitOnCtrlC: this.props.exitOnCtrlC
+ 					}}
+ 				>
+ 					<StdoutContext.Provider
+@@ -163,8 +158,9 @@ export default class App extends PureComponent<Props, State> {
+ 		if (isEnabled) {
+ 			// Ensure raw mode is enabled only once
+ 			if (this.rawModeEnabledCount === 0) {
++				stdin.addListener('data', this.handleInput);
++				stdin.resume();
+ 				stdin.setRawMode(true);
+-				stdin.addListener('readable', this.handleReadable);
+ 			}
+ 
+ 			this.rawModeEnabledCount++;
+@@ -174,17 +170,8 @@ export default class App extends PureComponent<Props, State> {
+ 		// Disable raw mode only when no components left that are using it
+ 		if (--this.rawModeEnabledCount === 0) {
+ 			stdin.setRawMode(false);
+-			stdin.removeListener('readable', this.handleReadable);
+-			stdin.unref();
+-		}
+-	};
+-
+-	handleReadable = (): void => {
+-		let chunk;
+-		// eslint-disable-next-line @typescript-eslint/ban-types
+-		while ((chunk = this.props.stdin.read() as string | null) !== null) {
+-			this.handleInput(chunk);
+-			this.internal_eventEmitter.emit('input', chunk);
++			stdin.removeListener('data', this.handleInput);
++			stdin.pause();
+ 		}
+ 	};
+ 
+diff --git a/src/components/StdinContext.ts b/src/components/StdinContext.ts
+index 2f32a1c..8ebb549 100644
+--- a/src/components/StdinContext.ts
++++ b/src/components/StdinContext.ts
+@@ -1,4 +1,3 @@
+-import {EventEmitter} from 'node:events';
+ import process from 'node:process';
+ import {createContext} from 'react';
+ 
+@@ -20,8 +19,6 @@ export type Props = {
+ 	readonly isRawModeSupported: boolean;
+ 
+ 	readonly internal_exitOnCtrlC: boolean;
+-
+-	readonly internal_eventEmitter: EventEmitter;
+ };
+ 
+ /**
+@@ -30,8 +27,6 @@ export type Props = {
+ // eslint-disable-next-line @typescript-eslint/naming-convention
+ const StdinContext = createContext<Props>({
+ 	stdin: process.stdin,
+-	// eslint-disable-next-line @typescript-eslint/naming-convention
+-	internal_eventEmitter: new EventEmitter(),
+ 	setRawMode() {},
+ 	isRawModeSupported: false,
+ 	// eslint-disable-next-line @typescript-eslint/naming-convention
+diff --git a/src/hooks/use-input.ts b/src/hooks/use-input.ts
+index 870ca01..1ec7480 100644
+--- a/src/hooks/use-input.ts
++++ b/src/hooks/use-input.ts
+@@ -1,3 +1,4 @@
++import {type Buffer} from 'node:buffer';
+ import {useEffect} from 'react';
+ import {isUpperCase} from 'is-upper-case';
+ import parseKeypress, {nonAlphanumericKeys} from '../parse-keypress.js';
+@@ -117,8 +118,7 @@ type Options = {
+  */
+ const useInput = (inputHandler: Handler, options: Options = {}) => {
+ 	// eslint-disable-next-line @typescript-eslint/naming-convention
+-	const {stdin, setRawMode, internal_exitOnCtrlC, internal_eventEmitter} =
+-		useStdin();
++	const {stdin, setRawMode, internal_exitOnCtrlC} = useStdin();
+ 
+ 	useEffect(() => {
+ 		if (options.isActive === false) {
+@@ -137,7 +137,7 @@ const useInput = (inputHandler: Handler, options: Options = {}) => {
+ 			return;
+ 		}
+ 
+-		const handleData = (data: string) => {
++		const handleData = (data: Buffer) => {
+ 			const keypress = parseKeypress(data);
+ 
+ 			const key = {
+@@ -190,10 +190,10 @@ const useInput = (inputHandler: Handler, options: Options = {}) => {
+ 			}
+ 		};
+ 
+-		internal_eventEmitter?.on('input', handleData);
++		stdin?.on('data', handleData);
+ 
+ 		return () => {
+-			internal_eventEmitter?.removeListener('input', handleData);
++			stdin?.off('data', handleData);
+ 		};
+ 	}, [options.isActive, stdin, internal_exitOnCtrlC, inputHandler]);
+ };
+diff --git a/test/components.tsx b/test/components.tsx
+index 2738ddb..0d2ef08 100644
+--- a/test/components.tsx
++++ b/test/components.tsx
+@@ -423,6 +423,8 @@ test('disable raw mode when all input components are unmounted', t => {
+ 	stdin.setEncoding = () => {};
+ 	stdin.setRawMode = spy();
+ 	stdin.isTTY = true; // Without this, setRawMode will throw
++	stdin.resume = spy();
++	stdin.pause = spy();
+ 
+ 	const options = {
+ 		stdout,
+@@ -469,15 +471,21 @@ test('disable raw mode when all input components are unmounted', t => {
+ 
+ 	t.true(stdin.setRawMode.calledOnce);
+ 	t.deepEqual(stdin.setRawMode.firstCall.args, [true]);
++	t.true(stdin.resume.calledOnce);
++	t.false(stdin.pause.called);
+ 
+ 	rerender(<Test renderFirstInput />);
+ 
+ 	t.true(stdin.setRawMode.calledOnce);
++	t.true(stdin.resume.calledOnce);
++	t.false(stdin.pause.called);
+ 
+ 	rerender(<Test />);
+ 
+ 	t.true(stdin.setRawMode.calledTwice);
+ 	t.deepEqual(stdin.setRawMode.lastCall.args, [false]);
++	t.true(stdin.resume.calledOnce);
++	t.true(stdin.pause.calledOnce);
+ });
+ 
+ test('setRawMode() should throw if raw mode is not supported', t => {
+@@ -487,6 +495,8 @@ test('setRawMode() should throw if raw mode is not supported', t => {
+ 	stdin.setEncoding = () => {};
+ 	stdin.setRawMode = spy();
+ 	stdin.isTTY = false;
++	stdin.resume = spy();
++	stdin.pause = spy();
+ 
+ 	const didCatchInMount = spy();
+ 	const didCatchInUnmount = spy();
+@@ -530,6 +540,8 @@ test('setRawMode() should throw if raw mode is not supported', t => {
+ 	t.is(didCatchInMount.callCount, 1);
+ 	t.is(didCatchInUnmount.callCount, 1);
+ 	t.false(stdin.setRawMode.called);
++	t.false(stdin.resume.called);
++	t.false(stdin.pause.called);
+ });
+ 
+ test('render different component based on whether stdin is a TTY or not', t => {
+@@ -539,6 +551,8 @@ test('render different component based on whether stdin is a TTY or not', t => {
+ 	stdin.setEncoding = () => {};
+ 	stdin.setRawMode = spy();
+ 	stdin.isTTY = false;
++	stdin.resume = spy();
++	stdin.pause = spy();
+ 
+ 	const options = {
+ 		stdout,
+@@ -588,14 +602,20 @@ test('render different component based on whether stdin is a TTY or not', t => {
+ 	);
+ 
+ 	t.false(stdin.setRawMode.called);
++	t.false(stdin.resume.called);
++	t.false(stdin.pause.called);
+ 
+ 	rerender(<Test renderFirstInput />);
+ 
+ 	t.false(stdin.setRawMode.called);
++	t.false(stdin.resume.called);
++	t.false(stdin.pause.called);
+ 
+ 	rerender(<Test />);
+ 
+ 	t.false(stdin.setRawMode.called);
++	t.false(stdin.resume.called);
++	t.false(stdin.pause.called);
+ });
+ 
+ test('render only last frame when run in CI', async t => {
+diff --git a/test/focus.tsx b/test/focus.tsx
+index 31efb21..ee3045e 100644
+--- a/test/focus.tsx
++++ b/test/focus.tsx
+@@ -2,7 +2,7 @@ import EventEmitter from 'node:events';
+ import React, {useEffect} from 'react';
+ import delay from 'delay';
+ import test from 'ava';
+-import {spy, stub} from 'sinon';
++import {spy} from 'sinon';
+ import {render, Box, Text, useFocus, useFocusManager} from '../src/index.js';
+ import createStdout from './helpers/create-stdout.js';
+ 
+@@ -11,20 +11,12 @@ const createStdin = () => {
+ 	stdin.isTTY = true;
+ 	stdin.setRawMode = spy();
+ 	stdin.setEncoding = () => {};
+-	stdin.read = stub();
+-	stdin.unref = () => {};
++	stdin.resume = () => {};
++	stdin.pause = () => {};
+ 
+ 	return stdin;
+ };
+ 
+-const emitReadable = (stdin: NodeJS.WriteStream, chunk: string) => {
+-	const read = stdin.read as ReturnType<typeof stub>;
+-	read.onCall(0).returns(chunk);
+-	read.onCall(1).returns(null);
+-	stdin.emit('readable');
+-	read.reset();
+-};
+-
+ type TestProps = {
+ 	showFirst?: boolean;
+ 	disableSecond?: boolean;
+@@ -142,7 +134,7 @@ test('unfocus active component on Esc', async t => {
+ 	});
+ 
+ 	await delay(100);
+-	emitReadable(stdin, '\u001B');
++	stdin.emit('data', '\u001B');
+ 	await delay(100);
+ 	t.is(
+ 		(stdout.write as any).lastCall.args[0],
+@@ -160,7 +152,7 @@ test('switch focus to first component on Tab', async t => {
+ 	});
+ 
+ 	await delay(100);
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -179,8 +171,8 @@ test('switch focus to the next component on Tab', async t => {
+ 	});
+ 
+ 	await delay(100);
+-	emitReadable(stdin, '\t');
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -199,8 +191,8 @@ test('switch focus to the first component if currently focused component is the
+ 	});
+ 
+ 	await delay(100);
+-	emitReadable(stdin, '\t');
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -208,7 +200,7 @@ test('switch focus to the first component if currently focused component is the
+ 		['First', 'Second', 'Third ✔'].join('\n')
+ 	);
+ 
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -227,7 +219,7 @@ test('skip disabled component on Tab', async t => {
+ 	});
+ 
+ 	await delay(100);
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -246,7 +238,7 @@ test('switch focus to the previous component on Shift+Tab', async t => {
+ 	});
+ 
+ 	await delay(100);
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -254,7 +246,7 @@ test('switch focus to the previous component on Shift+Tab', async t => {
+ 		['First', 'Second ✔', 'Third'].join('\n')
+ 	);
+ 
+-	emitReadable(stdin, '\u001B[Z');
++	stdin.emit('data', '\u001B[Z');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -273,7 +265,7 @@ test('switch focus to the last component if currently focused component is the f
+ 	});
+ 
+ 	await delay(100);
+-	emitReadable(stdin, '\u001B[Z');
++	stdin.emit('data', '\u001B[Z');
+ 
+ 	t.is(
+ 		(stdout.write as any).lastCall.args[0],
+@@ -291,8 +283,8 @@ test('skip disabled component on Shift+Tab', async t => {
+ 	});
+ 
+ 	await delay(100);
+-	emitReadable(stdin, '\u001B[Z');
+-	emitReadable(stdin, '\u001B[Z');
++	stdin.emit('data', '\u001B[Z');
++	stdin.emit('data', '\u001B[Z');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -332,7 +324,7 @@ test('focus first component after focused component unregisters', async t => {
+ 
+ 	t.is((stdout.write as any).lastCall.args[0], ['Second', 'Third'].join('\n'));
+ 
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -353,7 +345,7 @@ test('toggle focus management', async t => {
+ 	await delay(100);
+ 	rerender(<Test autoFocus disabled />);
+ 	await delay(100);
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(
+@@ -363,7 +355,7 @@ test('toggle focus management', async t => {
+ 
+ 	rerender(<Test autoFocus />);
+ 	await delay(100);
+-	emitReadable(stdin, '\t');
++	stdin.emit('data', '\t');
+ 	await delay(100);
+ 
+ 	t.is(

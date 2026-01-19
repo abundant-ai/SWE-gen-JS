@@ -1,0 +1,392 @@
+diff --git a/packages/angular-query-experimental/src/create-base-query.ts b/packages/angular-query-experimental/src/create-base-query.ts
+index 14494c9eb..2b9dc47d3 100644
+--- a/packages/angular-query-experimental/src/create-base-query.ts
++++ b/packages/angular-query-experimental/src/create-base-query.ts
+@@ -20,8 +20,6 @@ import type { CreateBaseQueryOptions } from './types'
+ 
+ /**
+  * Base implementation for `injectQuery` and `injectInfiniteQuery`.
+- * @param optionsFn
+- * @param Observer
+  */
+ export function createBaseQuery<
+   TQueryFnData,
+@@ -84,7 +82,11 @@ export function createBaseQuery<
+       const defaultedOptions = defaultedOptionsSignal()
+ 
+       untracked(() => {
+-        observer.setOptions(defaultedOptions)
++        observer.setOptions(defaultedOptions, {
++          // Do not notify on updates because of changes in the options because
++          // these changes should already be reflected in the optimistic result.
++          listeners: false,
++        })
+       })
+       onCleanup(() => {
+         ngZone.run(() => resultFromSubscriberSignal.set(null))
+diff --git a/packages/angular-query-experimental/src/inject-queries.ts b/packages/angular-query-experimental/src/inject-queries.ts
+index 7bee74df4..3da49894c 100644
+--- a/packages/angular-query-experimental/src/inject-queries.ts
++++ b/packages/angular-query-experimental/src/inject-queries.ts
+@@ -239,6 +239,7 @@ export function injectQueries<
+       observer.setQueries(
+         defaultedQueries(),
+         options as QueriesObserverOptions<TCombinedResult>,
++        { listeners: false },
+       )
+     })
+ 
+diff --git a/packages/query-core/src/infiniteQueryObserver.ts b/packages/query-core/src/infiniteQueryObserver.ts
+index 2e6acf0cd..b1c18ac01 100644
+--- a/packages/query-core/src/infiniteQueryObserver.ts
++++ b/packages/query-core/src/infiniteQueryObserver.ts
+@@ -17,6 +17,7 @@ import type {
+   QueryKey,
+ } from './types'
+ import type { QueryClient } from './queryClient'
++import type { NotifyOptions } from './queryObserver'
+ import type { Query } from './query'
+ 
+ type InfiniteQueryObserverListener<TData, TError> = (
+@@ -95,11 +96,15 @@ export class InfiniteQueryObserver<
+       TQueryKey,
+       TPageParam
+     >,
++    notifyOptions?: NotifyOptions,
+   ): void {
+-    super.setOptions({
+-      ...options,
+-      behavior: infiniteQueryBehavior(),
+-    })
++    super.setOptions(
++      {
++        ...options,
++        behavior: infiniteQueryBehavior(),
++      },
++      notifyOptions,
++    )
+   }
+ 
+   getOptimisticResult(
+diff --git a/packages/query-core/src/queriesObserver.ts b/packages/query-core/src/queriesObserver.ts
+index c330351f0..f4ea35b34 100644
+--- a/packages/query-core/src/queriesObserver.ts
++++ b/packages/query-core/src/queriesObserver.ts
+@@ -8,6 +8,7 @@ import type {
+   QueryObserverResult,
+ } from './types'
+ import type { QueryClient } from './queryClient'
++import type { NotifyOptions } from './queryObserver'
+ 
+ function difference<T>(array1: Array<T>, array2: Array<T>): Array<T> {
+   return array1.filter((x) => !array2.includes(x))
+@@ -86,6 +87,7 @@ export class QueriesObserver<
+   setQueries(
+     queries: Array<QueryObserverOptions>,
+     options?: QueriesObserverOptions<TCombinedResult>,
++    notifyOptions?: NotifyOptions,
+   ): void {
+     this.#queries = queries
+     this.#options = options
+@@ -109,7 +111,7 @@ export class QueriesObserver<
+ 
+       // set options for the new observers to notify of changes
+       newObserverMatches.forEach((match) =>
+-        match.observer.setOptions(match.defaultedQueryOptions),
++        match.observer.setOptions(match.defaultedQueryOptions, notifyOptions),
+       )
+ 
+       const newObservers = newObserverMatches.map((match) => match.observer)
+diff --git a/packages/query-core/src/queryObserver.ts b/packages/query-core/src/queryObserver.ts
+index 12bb90d50..3dc751f5c 100644
+--- a/packages/query-core/src/queryObserver.ts
++++ b/packages/query-core/src/queryObserver.ts
+@@ -32,6 +32,10 @@ type QueryObserverListener<TData, TError> = (
+   result: QueryObserverResult<TData, TError>,
+ ) => void
+ 
++export interface NotifyOptions {
++  listeners?: boolean
++}
++
+ interface ObserverFetchOptions extends FetchOptions {
+   throwOnError?: boolean
+ }
+@@ -147,6 +151,7 @@ export class QueryObserver<
+       TQueryData,
+       TQueryKey
+     >,
++    notifyOptions?: NotifyOptions,
+   ): void {
+     const prevOptions = this.options
+     const prevQuery = this.#currentQuery
+@@ -195,7 +200,7 @@ export class QueryObserver<
+     }
+ 
+     // Update result
+-    this.updateResult()
++    this.updateResult(notifyOptions)
+ 
+     // Update stale interval if needed
+     if (
+@@ -643,7 +648,7 @@ export class QueryObserver<
+     return nextResult
+   }
+ 
+-  updateResult(): void {
++  updateResult(notifyOptions?: NotifyOptions): void {
+     const prevResult = this.#currentResult as
+       | QueryObserverResult<TData, TError>
+       | undefined
+@@ -664,6 +669,9 @@ export class QueryObserver<
+ 
+     this.#currentResult = nextResult
+ 
++    // Determine which callbacks to trigger
++    const defaultNotifyOptions: NotifyOptions = {}
++
+     const shouldNotifyListeners = (): boolean => {
+       if (!prevResult) {
+         return true
+@@ -698,7 +706,11 @@ export class QueryObserver<
+       })
+     }
+ 
+-    this.#notify({ listeners: shouldNotifyListeners() })
++    if (notifyOptions?.listeners !== false && shouldNotifyListeners()) {
++      defaultNotifyOptions.listeners = true
++    }
++
++    this.#notify({ ...defaultNotifyOptions, ...notifyOptions })
+   }
+ 
+   #updateQuery(): void {
+@@ -728,7 +740,7 @@ export class QueryObserver<
+     }
+   }
+ 
+-  #notify(notifyOptions: { listeners: boolean }): void {
++  #notify(notifyOptions: NotifyOptions): void {
+     notifyManager.batch(() => {
+       // First, trigger the listeners
+       if (notifyOptions.listeners) {
+diff --git a/packages/react-query/src/__tests__/useQuery.test.tsx b/packages/react-query/src/__tests__/useQuery.test.tsx
+index f16ab7085..d59ca8b44 100644
+--- a/packages/react-query/src/__tests__/useQuery.test.tsx
++++ b/packages/react-query/src/__tests__/useQuery.test.tsx
+@@ -2165,64 +2165,6 @@ describe('useQuery', () => {
+     expect(states[2]).toMatchObject({ isStale: true })
+   })
+ 
+-  it('should re-render disabled observers when other observers trigger a query (#8741)', async () => {
+-    const key = queryKey()
+-
+-    const useUserInfoQuery = ({
+-      id,
+-      enabled,
+-    }: {
+-      id: number | null
+-      enabled: boolean
+-    }) => {
+-      return useQuery({
+-        queryKey: [key, id],
+-        queryFn: async () => {
+-          await sleep(10)
+-          return { id, name: 'John' }
+-        },
+-        enabled: !!id && enabled,
+-      })
+-    }
+-
+-    const Page = () => {
+-      const [id, setId] = React.useState<number | null>(null)
+-
+-      const searchQuery = useUserInfoQuery({ id, enabled: false })
+-
+-      return (
+-        <>
+-          <div>User fetching status is {searchQuery.fetchStatus}</div>
+-          <UserInfo id={id} />
+-          <button onClick={() => setId(42)}>
+-            Set ID and trigger user load
+-          </button>
+-        </>
+-      )
+-    }
+-
+-    function UserInfo({ id }: { id: number | null }) {
+-      const searchQuery = useUserInfoQuery({ id, enabled: true })
+-
+-      return <div>UserInfo data is {JSON.stringify(searchQuery.data)} </div>
+-    }
+-
+-    const rendered = renderWithClient(queryClient, <Page />)
+-
+-    rendered.getByText('User fetching status is idle')
+-
+-    fireEvent.click(rendered.getByRole('button', { name: /set id/i }))
+-
+-    await waitFor(() => {
+-      rendered.getByText('User fetching status is fetching')
+-    })
+-    await waitFor(() => {
+-      rendered.getByText('UserInfo data is {"id":42,"name":"John"}')
+-    })
+-
+-    rendered.getByText('User fetching status is idle')
+-  })
+-
+   describe('notifyOnChangeProps', () => {
+     it('should not re-render when it should only re-render only data change and the selected data did not change', async () => {
+       const key = queryKey()
+diff --git a/packages/react-query/src/useBaseQuery.ts b/packages/react-query/src/useBaseQuery.ts
+index ed731e430..640cd9d63 100644
+--- a/packages/react-query/src/useBaseQuery.ts
++++ b/packages/react-query/src/useBaseQuery.ts
+@@ -114,7 +114,9 @@ export function useBaseQuery<
+   )
+ 
+   React.useEffect(() => {
+-    observer.setOptions(defaultedOptions)
++    // Do not notify on updates because of changes in the options because
++    // these changes should already be reflected in the optimistic result.
++    observer.setOptions(defaultedOptions, { listeners: false })
+   }, [defaultedOptions, observer])
+ 
+   // Handle suspense
+diff --git a/packages/react-query/src/useQueries.ts b/packages/react-query/src/useQueries.ts
+index a3b231289..1876b1bea 100644
+--- a/packages/react-query/src/useQueries.ts
++++ b/packages/react-query/src/useQueries.ts
+@@ -279,9 +279,14 @@ export function useQueries<
+   )
+ 
+   React.useEffect(() => {
++    // Do not notify on updates because of changes in the options because
++    // these changes should already be reflected in the optimistic result.
+     observer.setQueries(
+       defaultedQueries,
+       options as QueriesObserverOptions<TCombinedResult>,
++      {
++        listeners: false,
++      },
+     )
+   }, [defaultedQueries, options, observer])
+ 
+diff --git a/packages/solid-query/src/createQueries.ts b/packages/solid-query/src/createQueries.ts
+index 702630b2f..43ea29ed3 100644
+--- a/packages/solid-query/src/createQueries.ts
++++ b/packages/solid-query/src/createQueries.ts
+@@ -309,6 +309,7 @@ export function createQueries<
+             combine: queriesOptions().combine,
+           } as QueriesObserverOptions<TCombinedResult>)
+         : undefined,
++      { listeners: false },
+     )
+   })
+ 
+@@ -320,6 +321,7 @@ export function createQueries<
+             combine: queriesOptions().combine,
+           } as QueriesObserverOptions<TCombinedResult>)
+         : undefined,
++      { listeners: false },
+     )
+   })
+ 
+diff --git a/packages/svelte-query-persist-client/tests/PersistQueryClientProvider.test.ts b/packages/svelte-query-persist-client/tests/PersistQueryClientProvider.test.ts
+index f9d6e7a66..86b99cce9 100644
+--- a/packages/svelte-query-persist-client/tests/PersistQueryClientProvider.test.ts
++++ b/packages/svelte-query-persist-client/tests/PersistQueryClientProvider.test.ts
+@@ -83,7 +83,7 @@ describe('PersistQueryClientProvider', () => {
+     await waitFor(() => rendered.getByText('fetched'))
+ 
+     const states = get(statesStore)
+-    expect(states).toHaveLength(5)
++    expect(states).toHaveLength(4)
+ 
+     expect(states[0]).toMatchObject({
+       status: 'pending',
+@@ -104,12 +104,6 @@ describe('PersistQueryClientProvider', () => {
+     })
+ 
+     expect(states[3]).toMatchObject({
+-      status: 'success',
+-      fetchStatus: 'fetching',
+-      data: 'hydrated',
+-    })
+-
+-    expect(states[4]).toMatchObject({
+       status: 'success',
+       fetchStatus: 'idle',
+       data: 'fetched',
+@@ -145,7 +139,7 @@ describe('PersistQueryClientProvider', () => {
+ 
+     const states = get(statesStore)
+ 
+-    expect(states).toHaveLength(5)
++    expect(states).toHaveLength(4)
+ 
+     expect(states[0]).toMatchObject({
+       status: 'pending',
+@@ -166,12 +160,6 @@ describe('PersistQueryClientProvider', () => {
+     })
+ 
+     expect(states[3]).toMatchObject({
+-      status: 'success',
+-      fetchStatus: 'fetching',
+-      data: 'hydrated',
+-    })
+-
+-    expect(states[4]).toMatchObject({
+       status: 'success',
+       fetchStatus: 'idle',
+       data: 'fetched',
+@@ -206,7 +194,7 @@ describe('PersistQueryClientProvider', () => {
+     await waitFor(() => rendered.getByText('fetched'))
+ 
+     const states = get(statesStore)
+-    expect(states).toHaveLength(5)
++    expect(states).toHaveLength(4)
+ 
+     expect(states[0]).toMatchObject({
+       status: 'success',
+@@ -227,12 +215,6 @@ describe('PersistQueryClientProvider', () => {
+     })
+ 
+     expect(states[3]).toMatchObject({
+-      status: 'success',
+-      fetchStatus: 'fetching',
+-      data: 'hydrated',
+-    })
+-
+-    expect(states[4]).toMatchObject({
+       status: 'success',
+       fetchStatus: 'idle',
+       data: 'fetched',
+diff --git a/packages/svelte-query/src/createBaseQuery.ts b/packages/svelte-query/src/createBaseQuery.ts
+index acd81bdd8..35320603c 100644
+--- a/packages/svelte-query/src/createBaseQuery.ts
++++ b/packages/svelte-query/src/createBaseQuery.ts
+@@ -56,7 +56,9 @@ export function createBaseQuery<
+   >(client, get(defaultedOptionsStore))
+ 
+   defaultedOptionsStore.subscribe(($defaultedOptions) => {
+-    observer.setOptions($defaultedOptions)
++    // Do not notify on updates because of changes in the options because
++    // these changes should already be reflected in the optimistic result.
++    observer.setOptions($defaultedOptions, { listeners: false })
+   })
+ 
+   const result = derived<
+diff --git a/packages/svelte-query/src/createQueries.ts b/packages/svelte-query/src/createQueries.ts
+index 53877565b..ef7282446 100644
+--- a/packages/svelte-query/src/createQueries.ts
++++ b/packages/svelte-query/src/createQueries.ts
+@@ -235,6 +235,7 @@ export function createQueries<
+     observer.setQueries(
+       $defaultedQueries,
+       options as QueriesObserverOptions<TCombinedResult>,
++      { listeners: false },
+     )
+   })
+ 

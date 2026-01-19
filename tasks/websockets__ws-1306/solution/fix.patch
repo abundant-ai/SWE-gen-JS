@@ -1,0 +1,133 @@
+diff --git a/README.md b/README.md
+index 83d21dad..423ed6a3 100644
+--- a/README.md
++++ b/README.md
+@@ -81,6 +81,47 @@ The extension is disabled by default on the server and enabled by default on
+ the client. It adds a significant overhead in terms of performance and memory
+ consumption so we suggest to enable it only if it is really needed.
+ 
++Note that Node.js has a variety of issues with high-performance compression,
++where increased concurrency, especially on Linux, can lead to
++[catastrophic memory fragmentation][node-zlib-bug] and slow performance.
++If you intend to use `permessage-deflate` in production, it is worthwhile
++to set up a test representative of your workload and ensure Node.js/zlib will
++handle it with acceptable performance and memory usage.
++
++Tuning of `permessage-deflate` can be done via the options defined below.
++You can also use `zlibDeflateOptions` and `zlibInflateOptions`, which is passed
++directly into the creation of
++[raw deflate/inflate streams][node-zlib-deflaterawdocs].
++
++See [the docs][ws-server-options] for more options.
++
++```js
++const WebSocket = require('ws');
++
++const wss = new WebSocket.Server({
++  port: 8080,
++  perMessageDeflate: {
++    zlibDeflateOptions: { // See zlib defaults
++      chunkSize: 1024,
++      memLevel: 7,
++      level: 3,
++    },
++    zlibInflateOptions: {
++      chunkSize: 10 * 1024
++    },
++    // Other options settable:
++    clientNoContextTakeover: true, // defaults to negotiated value
++    serverNoContextTakeover: true, // defaults to negotiated value
++    clientMaxWindowBits: 10,       // defaults to negotiated value
++    serverMaxWindowBits: 10,       // defaults to negotiated value
++    // Below options specified as default values
++    concurrencyLimit: 10,          // limits zlib concurrency for perf
++    threshold: 1024,               // Size (in bytes) below which messages
++                                   // should not be compressed
++  }
++});
++```
++
+ The client will only use the extension if it is supported and enabled on the
+ server. To always disable the extension on the client set the
+ `perMessageDeflate` option to `false`.
+@@ -344,3 +385,6 @@ We're using the GitHub [releases][changelog] for changelog entries.
+ [server-report]: http://websockets.github.io/ws/autobahn/servers/
+ [permessage-deflate]: https://tools.ietf.org/html/rfc7692
+ [changelog]: https://github.com/websockets/ws/releases
++[node-zlib-bug]: https://github.com/nodejs/node/issues/8871
++[node-zlib-deflaterawdocs]: https://nodejs.org/api/zlib.html#zlib_zlib_createdeflateraw_options
++[ws-server-options]: https://github.com/websockets/ws/blob/master/doc/ws.md#new-websocketserveroptions-callback
+diff --git a/doc/ws.md b/doc/ws.md
+index da0f285f..213af006 100644
+--- a/doc/ws.md
++++ b/doc/ws.md
+@@ -71,8 +71,8 @@ provided then that is extension parameters:
+   takeover.
+ - `serverMaxWindowBits` {Number} The value of `windowBits`.
+ - `clientMaxWindowBits` {Number} Request a custom client window size.
+-- `level` {Number} The value of zlib's `level` param (0-9, default 8).
+-- `memLevel` {Number} The value of zlib's `memLevel` param (1-9, default 8).
++- `zlibOptions` {Object} [Additional options][zlib-options] to pass to zlib
++  on deflate.
+ - `threshold` {Number} Payloads smaller than this will not be compressed.
+   Defaults to 1024 bytes.
+ - `concurrencyLimit` {Number} The number of concurrent calls to zlib.
+@@ -420,3 +420,4 @@ The URL of the WebSocket server. Server clients don't have this attribute.
+ 
+ [concurrency-limit]: https://github.com/websockets/ws/issues/1202
+ [permessage-deflate]: https://tools.ietf.org/html/draft-ietf-hybi-permessage-compression-19
++[zlib-options]: https://nodejs.org/api/zlib.html#zlib_class_options
+diff --git a/lib/permessage-deflate.js b/lib/permessage-deflate.js
+index 63182200..cabab971 100644
+--- a/lib/permessage-deflate.js
++++ b/lib/permessage-deflate.js
+@@ -44,8 +44,8 @@ class PerMessageDeflate {
+    *     use of a custom server window size
+    * @param {(Boolean|Number)} options.clientMaxWindowBits Advertise support
+    *     for, or request, a custom client window size
+-   * @param {Number} options.level The value of zlib's `level` param
+-   * @param {Number} options.memLevel The value of zlib's `memLevel` param
++   * @param {Object} options.zlibDeflateOptions Options to pass to zlib on deflate
++   * @param {Object} options.zlibInflateOptions Options to pass to zlib on inflate
+    * @param {Number} options.threshold Size (in bytes) below which messages
+    *     should not be compressed
+    * @param {Number} options.concurrencyLimit The number of concurrent calls to
+@@ -345,7 +345,13 @@ class PerMessageDeflate {
+         ? zlib.Z_DEFAULT_WINDOWBITS
+         : this.params[key];
+ 
+-      this._inflate = zlib.createInflateRaw({ windowBits });
++      this._inflate = zlib.createInflateRaw(
++        Object.assign(
++          {},
++          this._options.zlibInflateOptions,
++          { windowBits }
++        )
++      );
+       this._inflate[kTotalLength] = 0;
+       this._inflate[kBuffers] = [];
+       this._inflate[kOwner] = this;
+@@ -412,12 +418,17 @@ class PerMessageDeflate {
+         ? zlib.Z_DEFAULT_WINDOWBITS
+         : this.params[key];
+ 
+-      this._deflate = zlib.createDeflateRaw({
+-        memLevel: this._options.memLevel,
+-        level: this._options.level,
+-        flush: zlib.Z_SYNC_FLUSH,
+-        windowBits
+-      });
++      this._deflate = zlib.createDeflateRaw(
++        Object.assign(
++          // TODO deprecate memLevel/level and recommend zlibDeflateOptions instead
++          {
++            memLevel: this._options.memLevel,
++            level: this._options.level
++          },
++          this._options.zlibDeflateOptions,
++          { windowBits }
++        )
++      );
+ 
+       this._deflate[kTotalLength] = 0;
+       this._deflate[kBuffers] = [];

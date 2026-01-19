@@ -1,0 +1,320 @@
+diff --git a/docs/src/rules/no-use-before-define.md b/docs/src/rules/no-use-before-define.md
+index 726f5fd86..062b9dd74 100644
+--- a/docs/src/rules/no-use-before-define.md
++++ b/docs/src/rules/no-use-before-define.md
+@@ -157,6 +157,18 @@ export { foo };
+   These references are safe even if the variables are declared later in the code.
+   Default is `false`.
+ 
++This rule additionally supports TypeScript type syntax. The following options enable checking for the references to `type`, `interface` and `enum` declarations:
++
++* `enums` (`boolean`) -
++  If it is `true`, the rule warns every reference to an `enum` before it is defined.
++  Defult is `true`.
++* `typedefs` (`boolean`) -
++  If it is `true`, this rule warns every reference to a type `alias` or `interface` before its declaration. If `false`, the rule allows using type `alias`es and `interface`s before they are defined.
++  Default is `true`.
++* `ignoreTypeReferences` (`boolean`) -
++  If it is `true`, rule will ignore all type references, such as in type annotations and assertions.
++  Default is `true`.
++
+ This rule accepts `"nofunc"` string as an option.
+ `"nofunc"` is the same as `{ "functions": false, "classes": true, "variables": true, "allowNamedExports": false }`.
+ 
+@@ -350,3 +362,129 @@ const d = 1;
+ ```
+ 
+ :::
++
++### enums (TypeScript only)
++
++Examples of **incorrect** code for the `{ "enums": true }` option:
++
++::: incorrect
++
++```ts
++/*eslint no-use-before-define: ["error", { "enums": true }]*/
++
++const x = Foo.FOO;
++
++enum Foo {
++  FOO,
++}
++```
++
++:::
++
++Examples of **correct** code for the `{ "enums": true }` option:
++
++::: correct
++
++```ts
++/*eslint no-use-before-define: ["error", { "enums": true }]*/
++
++enum Foo {
++  FOO,
++}
++
++const x = Foo.FOO;
++```
++
++:::
++
++### typedefs (TypeScript only)
++
++Examples of **incorrect** code for the `{ "enums": true }` with `{ "ignoreTypeReferences": false }` option:
++
++::: incorrect
++
++```ts
++/*eslint no-use-before-define: ["error", { "typedefs": true, "ignoreTypeReferences": false }]*/
++
++let myVar: StringOrNumber;
++
++type StringOrNumber = string | number;
++
++const x: Foo = {};
++
++interface Foo {}
++```
++
++:::
++
++Examples of **correct** code for the `{ "typedefs": true }` with `{ "ignoreTypeReferences": false }` option:
++
++::: correct
++
++```ts
++/*eslint no-use-before-define: ["error", { "typedefs": true, "ignoreTypeReferences": false }]*/
++
++type StringOrNumber = string | number;
++
++let myVar: StringOrNumber;
++
++interface Foo {}
++
++const x: Foo = {};
++```
++
++:::
++
++### ignoreTypeReferences (TypeScript only)
++
++Examples of **incorrect** code for the `{ "ignoreTypeReferences": false }` option:
++
++::: incorrect
++
++```ts
++/*eslint no-use-before-define: ["error", { "ignoreTypeReferences": false }]*/
++
++let var1: StringOrNumber;
++
++type StringOrNumber = string | number;
++
++let var2: Enum;
++
++enum Enum {}
++```
++
++:::
++
++Examples of **correct** code for the `{ "ignoreTypeReferences": false }` option:
++
++::: correct
++
++```ts
++/*eslint no-use-before-define: ["error", { "ignoreTypeReferences": false }]*/
++
++type StringOrNumber = string | number;
++
++let myVar: StringOrNumber;
++
++enum Enum {}
++
++let var2: Enum;
++```
++
++Examples of **correct** code for the `{ "ignoreTypeReferences": false }` with `{ "typedefs": false }` option:
++
++::: correct
++
++```ts
++/*eslint no-use-before-define: ["error", { "ignoreTypeReferences": false, "typedefs": false, }]*/
++
++let myVar: StringOrNumber;
++
++type StringOrNumber = string | number;
++
++const x: Foo = {};
++
++interface Foo {}
++```
++
++:::
+diff --git a/lib/rules/no-use-before-define.js b/lib/rules/no-use-before-define.js
+index 9c5669e85..62631fcee 100644
+--- a/lib/rules/no-use-before-define.js
++++ b/lib/rules/no-use-before-define.js
+@@ -30,6 +30,9 @@ function parseOptions(options) {
+ 		classes: true,
+ 		variables: true,
+ 		allowNamedExports: false,
++		enums: true,
++		typedefs: true,
++		ignoreTypeReferences: true,
+ 	};
+ }
+ 
+@@ -208,6 +211,57 @@ function isEvaluatedDuringInitialization(reference) {
+ 	return false;
+ }
+ 
++/**
++ * check whether the reference contains a type query.
++ * @param {ASTNode} node Identifier node to check.
++ * @returns {boolean} true if reference contains type query.
++ */
++function referenceContainsTypeQuery(node) {
++	switch (node.type) {
++		case "TSTypeQuery":
++			return true;
++
++		case "TSQualifiedName":
++		case "Identifier":
++			return referenceContainsTypeQuery(node.parent);
++
++		default:
++			// if we find a different node, there's no chance that we're in a TSTypeQuery
++			return false;
++	}
++}
++
++/**
++ * Decorators are transpiled such that the decorator is placed after the class declaration
++ * So it is considered safe
++ * @param {Variable} variable The variable to check.
++ * @param {Reference} reference The reference to check.
++ * @returns {boolean} `true` if the reference is in a class decorator.
++ */
++function isClassRefInClassDecorator(variable, reference) {
++	if (variable.defs[0].type !== "ClassName") {
++		return false;
++	}
++
++	if (
++		!variable.defs[0].node.decorators ||
++		variable.defs[0].node.decorators.length === 0
++	) {
++		return false;
++	}
++
++	for (const deco of variable.defs[0].node.decorators) {
++		if (
++			reference.identifier.range[0] >= deco.range[0] &&
++			reference.identifier.range[1] <= deco.range[1]
++		) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
+ //------------------------------------------------------------------------------
+ // Rule Definition
+ //------------------------------------------------------------------------------
+@@ -237,6 +291,9 @@ module.exports = {
+ 							classes: { type: "boolean" },
+ 							variables: { type: "boolean" },
+ 							allowNamedExports: { type: "boolean" },
++							enums: { type: "boolean" },
++							typedefs: { type: "boolean" },
++							ignoreTypeReferences: { type: "boolean" },
+ 						},
+ 						additionalProperties: false,
+ 					},
+@@ -250,6 +307,9 @@ module.exports = {
+ 				functions: true,
+ 				variables: true,
+ 				allowNamedExports: false,
++				enums: true,
++				typedefs: true,
++				ignoreTypeReferences: true,
+ 			},
+ 		],
+ 
+@@ -310,6 +370,41 @@ module.exports = {
+ 				return false;
+ 			}
+ 
++			if (!options.enums && definitionType === "TSEnumName") {
++				return false;
++			}
++
++			if (!options.typedefs && definitionType === "Type") {
++				return false;
++			}
++
++			if (
++				options.ignoreTypeReferences &&
++				(referenceContainsTypeQuery(identifier) ||
++					identifier.parent.type === "TSTypeReference")
++			) {
++				return false;
++			}
++
++			// skip nested namespace aliases as variable references
++			if (identifier.parent.type === "TSQualifiedName") {
++				let currentNode = identifier.parent;
++
++				while (currentNode.type === "TSQualifiedName") {
++					currentNode = currentNode.left;
++				}
++
++				if (currentNode === identifier) {
++					return true;
++				}
++
++				return false;
++			}
++
++			if (isClassRefInClassDecorator(variable, reference)) {
++				return false;
++			}
++
+ 			return true;
+ 		}
+ 
+@@ -326,7 +421,8 @@ module.exports = {
+ 				if (
+ 					reference.identifier.range[1] <
+ 						definitionIdentifier.range[1] ||
+-					isEvaluatedDuringInitialization(reference)
++					(isEvaluatedDuringInitialization(reference) &&
++						reference.identifier.parent.type !== "TSTypeReference")
+ 				) {
+ 					context.report({
+ 						node: reference.identifier,
+diff --git a/lib/types/rules.d.ts b/lib/types/rules.d.ts
+index 27b9ce1db..e24328cf6 100644
+--- a/lib/types/rules.d.ts
++++ b/lib/types/rules.d.ts
+@@ -4018,6 +4018,18 @@ export interface ESLintRules extends Linter.RulesRecord {
+ 					 * @default false
+ 					 */
+ 					allowNamedExports: boolean;
++					/**
++					 * @default true
++					 */
++					enums: boolean;
++					/**
++					 * @default true
++					 */
++					typedefs: boolean;
++					/**
++					 * @default true
++					 */
++					ignoreTypeReferences: boolean;
+ 			  }>
+ 			| "nofunc",
+ 		]

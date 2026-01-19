@@ -1,0 +1,189 @@
+diff --git a/crates/turborepo-vt100/src/entire_screen.rs b/crates/turborepo-vt100/src/entire_screen.rs
+deleted file mode 100644
+index 684b0e7194..0000000000
+--- a/crates/turborepo-vt100/src/entire_screen.rs
++++ /dev/null
+@@ -1,21 +0,0 @@
+-pub struct EntireScreen<'a>(pub(crate) &'a crate::Screen);
+-
+-impl<'a> EntireScreen<'a> {
+-    #[must_use]
+-    pub fn cell(&self, row: u16, col: u16) -> Option<&crate::Cell> {
+-        self.0.grid().all_row(row).and_then(|r| r.get(col))
+-    }
+-
+-    #[must_use]
+-    pub fn contents(&self) -> String {
+-        let mut s = String::new();
+-        self.0.grid().write_full_contents(&mut s);
+-        s
+-    }
+-
+-    /// Size required to render all contents
+-    #[must_use]
+-    pub fn size(&self) -> (usize, u16) {
+-        self.0.grid().size_with_contents()
+-    }
+-}
+diff --git a/crates/turborepo-vt100/src/grid.rs b/crates/turborepo-vt100/src/grid.rs
+index 4c8b7cf264..2c01769cc9 100644
+--- a/crates/turborepo-vt100/src/grid.rs
++++ b/crates/turborepo-vt100/src/grid.rs
+@@ -63,22 +63,6 @@ impl Grid {
+         self.size
+     }
+ 
+-    /// Size of screen without trailing blank rows
+-    pub fn size_with_contents(&self) -> (usize, u16) {
+-        let cols = self.size.cols;
+-        let last_row_with_content = self.all_rows().enumerate().fold(
+-            0,
+-            |last_row_with_contents, (row_index, row)| {
+-                if row.is_blank() {
+-                    last_row_with_contents
+-                } else {
+-                    row_index
+-                }
+-            },
+-        );
+-        (last_row_with_content + 1, cols)
+-    }
+-
+     pub fn set_size(&mut self, size: Size) {
+         if size.cols != self.size.cols {
+             for row in &mut self.rows {
+@@ -145,21 +129,6 @@ impl Grid {
+         self.rows.iter()
+     }
+ 
+-    pub fn all_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
+-        self.scrollback.iter().chain(self.rows.iter())
+-    }
+-
+-    pub(crate) fn all_row(&self, row: u16) -> Option<&crate::row::Row> {
+-        let row = usize::from(row);
+-        if row < self.scrollback.len() {
+-            self.scrollback.get(row)
+-        } else if row < self.scrollback.len() + self.rows.len() {
+-            self.rows.get(row - self.scrollback.len())
+-        } else {
+-            None
+-        }
+-    }
+-
+     pub fn drawing_rows_mut(
+         &mut self,
+     ) -> impl Iterator<Item = &mut crate::row::Row> {
+@@ -227,21 +196,6 @@ impl Grid {
+         }
+     }
+ 
+-    pub fn write_full_contents(&self, contents: &mut String) {
+-        let mut wrapping = false;
+-        for row in self.all_rows() {
+-            row.write_contents(contents, 0, self.size.cols, wrapping);
+-            if !row.wrapped() {
+-                contents.push('\n');
+-            }
+-            wrapping = row.wrapped();
+-        }
+-
+-        while contents.ends_with('\n') {
+-            contents.truncate(contents.len() - 1);
+-        }
+-    }
+-
+     pub fn write_contents_formatted(
+         &self,
+         contents: &mut Vec<u8>,
+diff --git a/crates/turborepo-vt100/src/lib.rs b/crates/turborepo-vt100/src/lib.rs
+index 3817fa4567..418c08719a 100644
+--- a/crates/turborepo-vt100/src/lib.rs
++++ b/crates/turborepo-vt100/src/lib.rs
+@@ -50,7 +50,6 @@
+ mod attrs;
+ mod callbacks;
+ mod cell;
+-mod entire_screen;
+ mod grid;
+ mod parser;
+ mod perform;
+@@ -61,6 +60,5 @@ mod term;
+ pub use attrs::Color;
+ pub use callbacks::Callbacks;
+ pub use cell::Cell;
+-pub use entire_screen::EntireScreen;
+ pub use parser::Parser;
+ pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+diff --git a/crates/turborepo-vt100/src/parser.rs b/crates/turborepo-vt100/src/parser.rs
+index 0904369664..2844e17f7e 100644
+--- a/crates/turborepo-vt100/src/parser.rs
++++ b/crates/turborepo-vt100/src/parser.rs
+@@ -57,13 +57,6 @@ impl Parser {
+     pub fn screen_mut(&mut self) -> &mut crate::Screen {
+         &mut self.screen.0
+     }
+-
+-    /// Returns a reference to an `EntireScreen` object containing the
+-    /// terminal state where all contents including scrollback and displayed.
+-    #[must_use]
+-    pub fn entire_screen(&self) -> crate::EntireScreen {
+-        crate::EntireScreen(self.screen())
+-    }
+ }
+ 
+ impl Default for Parser {
+diff --git a/crates/turborepo-vt100/src/row.rs b/crates/turborepo-vt100/src/row.rs
+index 4d0605eae8..eb56f4e3c8 100644
+--- a/crates/turborepo-vt100/src/row.rs
++++ b/crates/turborepo-vt100/src/row.rs
+@@ -29,10 +29,6 @@ impl Row {
+         self.wrapped = false;
+     }
+ 
+-    pub fn is_blank(&self) -> bool {
+-        self.cells().all(|cell| !cell.has_contents())
+-    }
+-
+     fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
+         self.cells.iter()
+     }
+diff --git a/crates/turborepo-vt100/tests/entire_screen.rs b/crates/turborepo-vt100/tests/entire_screen.rs
+deleted file mode 100644
+index 2956eaad6f..0000000000
+--- a/crates/turborepo-vt100/tests/entire_screen.rs
++++ /dev/null
+@@ -1,33 +0,0 @@
+-use turborepo_vt100 as vt100;
+-
+-#[test]
+-fn test_screen_includes_scrollback() {
+-    let mut parser = vt100::Parser::new(2, 20, 100);
+-    parser.process(b"foo\r\nbar\r\nbaz\r\n");
+-    let screen = parser.entire_screen();
+-    assert_eq!(screen.contents(), "foo\nbar\nbaz");
+-    assert_eq!(screen.size(), (3, 20));
+-}
+-
+-#[test]
+-fn test_screen_trims_trailing_blank_lines() {
+-    let mut parser = vt100::Parser::new(8, 20, 0);
+-    parser.process(b"foo\r\nbar\r\n");
+-    let screen = parser.entire_screen();
+-    assert_eq!(screen.contents(), "foo\nbar");
+-    assert_eq!(screen.size(), (2, 20));
+-}
+-
+-#[test]
+-fn test_wrapped_lines_size() {
+-    let mut parser = vt100::Parser::new(8, 8, 10);
+-    parser.process(b"one long line\r\nbar\r\n");
+-    let screen = parser.entire_screen();
+-    assert_eq!(screen.contents(), "one long line\nbar");
+-    assert_eq!(screen.size(), (3, 8));
+-    assert_eq!(screen.cell(0, 0).unwrap().contents(), "o");
+-    assert_eq!(screen.cell(1, 0).unwrap().contents(), " ");
+-    // "one long line"
+-    //         ^ last char that fits on line, rest will appear on next row
+-    assert_eq!(screen.cell(2, 0).unwrap().contents(), "b");
+-}

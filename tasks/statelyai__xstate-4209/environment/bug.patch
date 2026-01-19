@@ -1,0 +1,612 @@
+diff --git a/.changeset/pink-pandas-promise.md b/.changeset/pink-pandas-promise.md
+deleted file mode 100644
+index 1d088cffd5..0000000000
+--- a/.changeset/pink-pandas-promise.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-Allow the `TGuard` type to flow into actions. Thanks to that `choose` can benefit from strongly-typed guards.
+diff --git a/packages/core/src/actions/choose.ts b/packages/core/src/actions/choose.ts
+index 38f498f6d4..673ac52345 100644
+--- a/packages/core/src/actions/choose.ts
++++ b/packages/core/src/actions/choose.ts
+@@ -19,15 +19,7 @@ function resolve(
+   {
+     branches
+   }: {
+-    branches: Array<
+-      ChooseBranch<
+-        MachineContext,
+-        EventObject,
+-        EventObject,
+-        ParameterizedObject,
+-        ParameterizedObject
+-      >
+-    >;
++    branches: Array<ChooseBranch<MachineContext, EventObject>>;
+   }
+ ) {
+   const matchedActions = branches.find((condition) => {
+@@ -45,17 +37,10 @@ export function choose<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TAction extends ParameterizedObject,
+-  TGuard extends ParameterizedObject
++  TAction extends ParameterizedObject
+ >(
+   branches: ReadonlyArray<
+-    ChooseBranch<
+-      TContext,
+-      TExpressionEvent,
+-      TEvent,
+-      NoInfer<TAction>,
+-      NoInfer<TGuard>
+-    >
++    ChooseBranch<TContext, TExpressionEvent, TEvent, NoInfer<TAction>>
+   >
+ ) {
+   function choose(
+@@ -74,6 +59,5 @@ export function choose<
+   return choose as {
+     (args: ActionArgs<TContext, TExpressionEvent, TExpressionAction>): void;
+     _out_TAction?: TAction;
+-    _out_TGuard?: TGuard;
+   };
+ }
+diff --git a/packages/core/src/actions/pure.ts b/packages/core/src/actions/pure.ts
+index 39e4045c16..4d810a73c8 100644
+--- a/packages/core/src/actions/pure.ts
++++ b/packages/core/src/actions/pure.ts
+@@ -43,8 +43,7 @@ export function pure<
+   TExpressionAction extends ParameterizedObject | undefined =
+     | ParameterizedObject
+     | undefined,
+-  TAction extends ParameterizedObject = ParameterizedObject,
+-  TGuard extends ParameterizedObject = ParameterizedObject
++  TAction extends ParameterizedObject = ParameterizedObject
+ >(
+   getActions: ({
+     context,
+@@ -58,8 +57,7 @@ export function pure<
+         TExpressionEvent,
+         NoInfer<TEvent>,
+         undefined,
+-        NoInfer<TAction>,
+-        NoInfer<TGuard>
++        NoInfer<TAction>
+       >
+     | undefined
+ ) {
+@@ -76,7 +74,6 @@ export function pure<
+   return pure as {
+     (args: ActionArgs<TContext, TExpressionEvent, TExpressionAction>): void;
+     _out_TAction?: TAction;
+-    _out_TGuard?: TGuard;
+     _out_TEvent?: TEvent;
+   };
+ }
+diff --git a/packages/core/src/guards.ts b/packages/core/src/guards.ts
+index 31a58ad08e..bb53bf6a90 100644
+--- a/packages/core/src/guards.ts
++++ b/packages/core/src/guards.ts
+@@ -40,19 +40,10 @@ export type Guard<
+   | TGuard
+   | GuardPredicate<TContext, TExpressionEvent, TExpressionGuard, TGuard>;
+ 
+-export type UnknownGuard = UnknownReferencedGuard | UnknownInlineGuard;
+-
+-type UnknownReferencedGuard = Guard<
+-  MachineContext,
+-  EventObject,
+-  ParameterizedObject,
+-  ParameterizedObject
+->;
+-
+-type UnknownInlineGuard = Guard<
++export type UnknownGuard = Guard<
+   MachineContext,
+   EventObject,
+-  undefined,
++  ParameterizedObject | undefined,
+   ParameterizedObject
+ >;
+ 
+@@ -209,7 +200,7 @@ export function evaluateGuard<
+   TContext extends MachineContext,
+   TExpressionEvent extends EventObject
+ >(
+-  guard: UnknownGuard | UnknownInlineGuard,
++  guard: UnknownGuard,
+   context: TContext,
+   event: TExpressionEvent,
+   state: AnyState
+@@ -219,9 +210,20 @@ export function evaluateGuard<
+ 
+   const resolved = isInline
+     ? guard
+-    : machine.implementations.guards[
+-        typeof guard === 'string' ? guard : guard.type
+-      ];
++    : // the existing type of `.guards` assumes non-nullable `TExpressionGuard`
++      // it's fine to cast this here to get a common type and lack of errors in the rest of the code
++      // our logic below makes sure that we call those 2 "variants" correctly
++      (
++        machine.implementations.guards as Record<
++          string,
++          GuardPredicate<
++            MachineContext,
++            EventObject,
++            ParameterizedObject | undefined,
++            ParameterizedObject
++          >
++        >
++      )[typeof guard === 'string' ? guard : guard.type];
+ 
+   if (!isInline && !resolved) {
+     throw new Error(
+@@ -232,7 +234,7 @@ export function evaluateGuard<
+   }
+ 
+   if (typeof resolved !== 'function') {
+-    return evaluateGuard(resolved!, context, event, state);
++    return evaluateGuard(resolved, context, event, state);
+   }
+ 
+   const guardArgs = {
+@@ -246,10 +248,7 @@ export function evaluateGuard<
+   };
+ 
+   if (!('check' in resolved)) {
+-    // the existing type of `.guards` assumes non-nullable `TExpressionGuard`
+-    // inline guards expect `TExpressionGuard` to be set to `undefined`
+-    // it's fine to cast this here, our logic makes sure that we call those 2 "variants" correctly
+-    return resolved(guardArgs as never);
++    return resolved(guardArgs);
+   }
+ 
+   const builtinGuard = resolved as unknown as BuiltinGuard;
+diff --git a/packages/core/src/scxml.ts b/packages/core/src/scxml.ts
+index 9c25fb0d62..1d018cbe6f 100644
+--- a/packages/core/src/scxml.ts
++++ b/packages/core/src/scxml.ts
+@@ -176,7 +176,7 @@ function createGuard<
+ 
+ function mapAction(
+   element: XMLElement
+-): ActionFunction<any, any, any, any, any, any> {
++): ActionFunction<any, any, any, any, any> {
+   switch (element.name) {
+     case 'raise': {
+       return raise({
+@@ -322,8 +322,8 @@ return ${element.attributes!.expr};
+ 
+ function mapActions(
+   elements: XMLElement[]
+-): ActionFunction<any, any, any, any, any, any>[] {
+-  const mapped: ActionFunction<any, any, any, any, any, any>[] = [];
++): ActionFunction<any, any, any, any, any>[] {
++  const mapped: ActionFunction<any, any, any, any, any>[] = [];
+ 
+   for (const element of elements) {
+     if (element.type === 'comment') {
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index 4bb9942c6a..23af0f3e59 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -1420,7 +1420,6 @@ export function resolveActionsAndContext<
+               EventObject,
+               EventObject,
+               ParameterizedObject | undefined,
+-              ParameterizedObject,
+               ParameterizedObject
+             >
+           >
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index d6aa7d9593..92362b95be 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -154,13 +154,11 @@ export type ActionFunction<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TAction extends ParameterizedObject,
+-  TGuard extends ParameterizedObject
++  TAction extends ParameterizedObject
+ > = {
+   (args: ActionArgs<TContext, TExpressionEvent, TExpressionAction>): void;
+   _out_TEvent?: TEvent;
+   _out_TAction?: TAction;
+-  _out_TGuard?: TGuard;
+ };
+ 
+ export interface ChooseBranch<
+@@ -168,17 +166,13 @@ export interface ChooseBranch<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject = TExpressionEvent,
+   TAction extends ParameterizedObject = ParameterizedObject,
++  TExpressionGuard extends ParameterizedObject | undefined =
++    | ParameterizedObject
++    | undefined,
+   TGuard extends ParameterizedObject = ParameterizedObject
+ > {
+-  guard?: Guard<TContext, TExpressionEvent, undefined, TGuard>;
+-  actions: Actions<
+-    TContext,
+-    TExpressionEvent,
+-    TEvent,
+-    undefined,
+-    TAction,
+-    TGuard
+-  >;
++  guard?: Guard<TContext, TExpressionEvent, TExpressionGuard, TGuard>;
++  actions: Actions<TContext, TExpressionEvent, TEvent, undefined, TAction>;
+ }
+ 
+ export type NoRequiredParams<T extends ParameterizedObject> = T extends any
+@@ -192,8 +186,7 @@ export type Action<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TAction extends ParameterizedObject,
+-  TGuard extends ParameterizedObject
++  TAction extends ParameterizedObject
+ > =
+   | NoRequiredParams<TAction>
+   | TAction
+@@ -202,8 +195,7 @@ export type Action<
+       TExpressionEvent,
+       TEvent,
+       TExpressionAction,
+-      TAction,
+-      TGuard
++      TAction
+     >;
+ 
+ export type UnknownAction = Action<
+@@ -211,7 +203,6 @@ export type UnknownAction = Action<
+   EventObject,
+   EventObject,
+   ParameterizedObject | undefined,
+-  ParameterizedObject,
+   ParameterizedObject
+ >;
+ 
+@@ -220,10 +211,9 @@ export type Actions<
+   TExpressionEvent extends EventObject,
+   TEvent extends EventObject,
+   TExpressionAction extends ParameterizedObject | undefined,
+-  TAction extends ParameterizedObject,
+-  TGuard extends ParameterizedObject
++  TAction extends ParameterizedObject
+ > = SingleOrArray<
+-  Action<TContext, TExpressionEvent, TEvent, TExpressionAction, TAction, TGuard>
++  Action<TContext, TExpressionEvent, TEvent, TExpressionAction, TAction>
+ >;
+ 
+ export type StateKey = string | AnyState;
+@@ -250,14 +240,7 @@ export interface TransitionConfig<
+   TGuard extends ParameterizedObject
+ > {
+   guard?: Guard<TContext, TExpressionEvent, undefined, TGuard>;
+-  actions?: Actions<
+-    TContext,
+-    TExpressionEvent,
+-    TEvent,
+-    undefined,
+-    TAction,
+-    TGuard
+-  >;
++  actions?: Actions<TContext, TExpressionEvent, TEvent, undefined, TAction>;
+   reenter?: boolean;
+   target?: TransitionTarget | undefined;
+   meta?: Record<string, any>;
+@@ -657,11 +640,11 @@ export interface StateNodeConfig<
+   /**
+    * The action(s) to be executed upon entering the state node.
+    */
+-  entry?: Actions<TContext, TEvent, TEvent, undefined, TAction, TGuard>;
++  entry?: Actions<TContext, TEvent, TEvent, undefined, TAction>;
+   /**
+    * The action(s) to be executed upon exiting the state node.
+    */
+-  exit?: Actions<TContext, TEvent, TEvent, undefined, TAction, TGuard>;
++  exit?: Actions<TContext, TEvent, TEvent, undefined, TAction>;
+   /**
+    * The potential transition(s) to be taken upon reaching a final child state node.
+    *
+@@ -819,16 +802,14 @@ export type SimpleOrStateNodeConfig<
+ export type ActionFunctionMap<
+   TContext extends MachineContext,
+   TEvent extends EventObject,
+-  TAction extends ParameterizedObject = ParameterizedObject,
+-  TGuard extends ParameterizedObject = ParameterizedObject
++  TAction extends ParameterizedObject = ParameterizedObject
+ > = {
+   [K in TAction['type']]?: ActionFunction<
+     TContext,
+     TEvent,
+     TEvent,
+     TAction extends { type: K } ? TAction : never,
+-    TAction,
+-    TGuard
++    TAction
+   >;
+ };
+ 
+@@ -892,19 +873,14 @@ type MachineImplementationsActions<
+     'eventsCausingActions'
+   >,
+   TIndexedEvents = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedEvents'>,
+-  TIndexedActions = Prop<
+-    Prop<TResolvedTypesMeta, 'resolved'>,
+-    'indexedActions'
+-  >,
+-  TIndexedGuards = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedGuards'>
++  TIndexedActions = Prop<Prop<TResolvedTypesMeta, 'resolved'>, 'indexedActions'>
+ > = {
+   [K in keyof TIndexedActions]?: ActionFunction<
+     TContext,
+     MaybeNarrowedEvent<TIndexedEvents, TEventsCausingActions, K>,
+     Cast<Prop<TIndexedEvents, keyof TIndexedEvents>, EventObject>,
+     Cast<TIndexedActions[K], ParameterizedObject>,
+-    Cast<Prop<TIndexedActions, keyof TIndexedActions>, ParameterizedObject>,
+-    Cast<Prop<TIndexedGuards, keyof TIndexedGuards>, ParameterizedObject>
++    Cast<Prop<TIndexedActions, keyof TIndexedActions>, ParameterizedObject>
+   >;
+ };
+ 
+diff --git a/packages/core/test/types.test.ts b/packages/core/test/types.test.ts
+index 589970d91f..35a8ab7cf3 100644
+--- a/packages/core/test/types.test.ts
++++ b/packages/core/test/types.test.ts
+@@ -2006,7 +2006,7 @@ describe('actions', () => {
+ });
+ 
+ describe('choose', () => {
+-  it('should be able to use a defined parametrized action with required params', () => {
++  it('should be able to use a defined parametrized action', () => {
+     createMachine({
+       types: {} as {
+         actions: { type: 'greet'; params: { name: string } } | { type: 'poke' };
+@@ -2016,7 +2016,7 @@ describe('choose', () => {
+           guard: () => true,
+           actions: [
+             {
+-              type: 'greet',
++              type: 'greet' as const, // contextual type isn't helping here and string widens so we need `as const`
+               params: {
+                 name: 'Anders'
+               }
+@@ -2027,26 +2027,6 @@ describe('choose', () => {
+     });
+   });
+ 
+-  it('should not allow to use a defined parametrized action without all of its required params', () => {
+-    createMachine({
+-      types: {} as {
+-        actions: { type: 'greet'; params: { name: string } } | { type: 'poke' };
+-      },
+-      entry: choose([
+-        {
+-          guard: () => true,
+-          actions: [
+-            {
+-              type: 'greet',
+-              // @ts-expect-error
+-              params: {}
+-            }
+-          ]
+-        }
+-      ])
+-    });
+-  });
+-
+   it('should not be possible to use a parametrized action outside of the defined ones', () => {
+     createMachine({
+       types: {} as {
+@@ -2064,36 +2044,6 @@ describe('choose', () => {
+     });
+   });
+ 
+-  it('should be possible to use a parametrized action with no required params using a string', () => {
+-    createMachine({
+-      types: {} as {
+-        actions: { type: 'greet'; params: { name: string } } | { type: 'poke' };
+-      },
+-      entry: choose([
+-        {
+-          guard: () => true,
+-          actions: 'poke'
+-        }
+-      ])
+-    });
+-  });
+-
+-  it('should be possible to use a parametrized action with no required params using an object', () => {
+-    createMachine({
+-      types: {} as {
+-        actions: { type: 'greet'; params: { name: string } } | { type: 'poke' };
+-      },
+-      entry: choose([
+-        {
+-          guard: () => true,
+-          actions: {
+-            type: 'poke'
+-          }
+-        }
+-      ])
+-    });
+-  });
+-
+   it('should be possible to use multiple different defined parametrized actions', () => {
+     createMachine({
+       types: {} as {
+@@ -2104,13 +2054,13 @@ describe('choose', () => {
+           guard: () => true,
+           actions: [
+             {
+-              type: 'greet',
++              type: 'greet' as const,
+               params: {
+                 name: 'Anders'
+               }
+             },
+             {
+-              type: 'poke'
++              type: 'poke' as const
+             }
+           ]
+         }
+@@ -2152,119 +2102,6 @@ describe('choose', () => {
+       }
+     );
+   });
+-
+-  it('should allow a defined parametrized guard to be used as its guard', () => {
+-    createMachine(
+-      {
+-        types: {
+-          guards: {} as
+-            | {
+-                type: 'isGreaterThan';
+-                params: {
+-                  count: number;
+-                };
+-              }
+-            | { type: 'plainGuard' }
+-        }
+-      },
+-      {
+-        actions: {
+-          foo: choose([
+-            {
+-              actions: () => {},
+-              guard: 'plainGuard'
+-            }
+-          ])
+-        }
+-      }
+-    );
+-  });
+-
+-  it('should not allow a guard outside of the defined ones', () => {
+-    createMachine(
+-      {
+-        types: {
+-          guards: {} as
+-            | {
+-                type: 'isGreaterThan';
+-                params: {
+-                  count: number;
+-                };
+-              }
+-            | { type: 'plainGuard' }
+-        }
+-      },
+-      {
+-        actions: {
+-          foo: choose([
+-            {
+-              actions: () => {},
+-              // @ts-expect-error
+-              guard: 'other' as const
+-            }
+-          ])
+-        }
+-      }
+-    );
+-  });
+-
+-  it('should type guard param as undefined in inline custom guard when choose is used in the config', () => {
+-    createMachine({
+-      types: {
+-        guards: {} as
+-          | {
+-              type: 'isGreaterThan';
+-              params: {
+-                count: number;
+-              };
+-            }
+-          | { type: 'plainGuard' }
+-      },
+-      entry: choose([
+-        {
+-          actions: 'someAction',
+-          guard: ({ guard }) => {
+-            ((_accept: undefined) => {})(guard);
+-            // @ts-expect-error
+-            ((_accept: 'not any') => {})(guard);
+-            return true;
+-          }
+-        }
+-      ])
+-    });
+-  });
+-
+-  it('should type guard param as undefined in inline custom guard when choose is used in the implementations', () => {
+-    createMachine(
+-      {
+-        types: {
+-          guards: {} as
+-            | {
+-                type: 'isGreaterThan';
+-                params: {
+-                  count: number;
+-                };
+-              }
+-            | { type: 'plainGuard' }
+-        }
+-      },
+-      {
+-        actions: {
+-          someGuard: choose([
+-            {
+-              actions: 'someAction',
+-              guard: ({ guard }) => {
+-                ((_accept: undefined) => {})(guard);
+-                // @ts-expect-error
+-                ((_accept: 'not any') => {})(guard);
+-                return true;
+-              }
+-            }
+-          ])
+-        }
+-      }
+-    );
+-  });
+ });
+ 
+ describe('pure', () => {
+@@ -2347,28 +2184,6 @@ describe('pure', () => {
+     });
+   });
+ 
+-  it('should be able to directly return a defined action without required params', () => {
+-    createMachine({
+-      types: {} as {
+-        actions: { type: 'greet'; params: { name: string } } | { type: 'poke' };
+-      },
+-      entry: pure(() => {
+-        return 'poke' as const;
+-      })
+-    });
+-  });
+-
+-  it('should be able to return a defined action without required params in an array using a string', () => {
+-    createMachine({
+-      types: {} as {
+-        actions: { type: 'greet'; params: { name: string } } | { type: 'poke' };
+-      },
+-      entry: pure(() => {
+-        return ['poke' as const];
+-      })
+-    });
+-  });
+-
+   it('should be able to return `raise` in a transition with one of the other accepted event types', () => {
+     createMachine({
+       types: {} as {

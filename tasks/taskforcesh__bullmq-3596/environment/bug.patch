@@ -1,0 +1,461 @@
+diff --git a/src/classes/job.ts b/src/classes/job.ts
+index f395e50522..6b794dc41a 100644
+--- a/src/classes/job.ts
++++ b/src/classes/job.ts
+@@ -11,7 +11,6 @@ import {
+   ParentKeys,
+   ParentKeyOpts,
+   RedisClient,
+-  RetryOptions,
+   WorkerOptions,
+ } from '../interfaces';
+ import {
+@@ -1388,28 +1387,17 @@ export class Job<
+    * Attempts to retry the job. Only a job that has failed or completed can be retried.
+    *
+    * @param state - completed / failed
+-   * @param opts - options to retry a job
+    * @returns A promise that resolves when the job has been successfully moved to the wait queue.
+    * The queue emits a waiting event when the job is successfully moved.
+    * @throws Will throw an error if the job does not exist, is locked, or is not in the expected state.
+    */
+-  async retry(
+-    state: FinishedStatus = 'failed',
+-    opts: RetryOptions = {},
+-  ): Promise<void> {
+-    await this.scripts.reprocessJob(this, state, opts);
++  retry(state: FinishedStatus = 'failed'): Promise<void> {
+     this.failedReason = null;
+     this.finishedOn = null;
+     this.processedOn = null;
+     this.returnvalue = null;
+ 
+-    if (opts.resetAttemptsMade) {
+-      this.attemptsMade = 0;
+-    }
+-
+-    if (opts.resetAttemptsStarted) {
+-      this.attemptsStarted = 0;
+-    }
++    return this.scripts.reprocessJob(this, state);
+   }
+ 
+   /**
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 4c58960f4f..2bd328aa33 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -25,7 +25,6 @@ import {
+   MoveToDelayedOpts,
+   RepeatableOptions,
+   RetryJobOpts,
+-  RetryOptions,
+   ScriptQueueContext,
+ } from '../interfaces';
+ import {
+@@ -1421,7 +1420,6 @@ export class Scripts {
+   async reprocessJob<T = any, R = any, N extends string = string>(
+     job: MinimalJob<T, R, N>,
+     state: 'failed' | 'completed',
+-    opts: RetryOptions = {},
+   ): Promise<void> {
+     const client = await this.queue.client;
+ 
+@@ -1441,8 +1439,6 @@ export class Scripts {
+       (job.opts.lifo ? 'R' : 'L') + 'PUSH',
+       state === 'failed' ? 'failedReason' : 'returnvalue',
+       state,
+-      opts.resetAttemptsMade ? '1' : '0',
+-      opts.resetAttemptsStarted ? '1' : '0',
+     ];
+ 
+     const result = await this.execCommand(
+diff --git a/src/commands/reprocessJob-8.lua b/src/commands/reprocessJob-8.lua
+index 583c54e43a..7188c2be13 100644
+--- a/src/commands/reprocessJob-8.lua
++++ b/src/commands/reprocessJob-8.lua
+@@ -15,8 +15,6 @@
+     ARGV[2] (job.opts.lifo ? 'R' : 'L') + 'PUSH'
+     ARGV[3] propVal - failedReason/returnvalue
+     ARGV[4] prev state - failed/completed
+-    ARGV[5] reset attemptsMade - "1" or "0"
+-    ARGV[6] reset attemptsStarted - "1" or "0"
+ 
+   Output:
+      1 means the operation was a success
+@@ -34,17 +32,7 @@ local jobKey = KEYS[1]
+ if rcall("EXISTS", jobKey) == 1 then
+   local jobId = ARGV[1]
+   if (rcall("ZREM", KEYS[3], jobId) == 1) then
+-    local attributesToRemove = {}
+-
+-    if ARGV[5] == "1" then
+-      table.insert(attributesToRemove, "atm")
+-    end
+-
+-    if ARGV[6] == "1" then
+-      table.insert(attributesToRemove, "ats")
+-    end
+-
+-    rcall("HDEL", jobKey, "finishedOn", "processedOn", ARGV[3], unpack(attributesToRemove))
++    rcall("HDEL", jobKey, "finishedOn", "processedOn", ARGV[3])
+ 
+     local target, isPausedOrMaxed = getTargetQueueList(KEYS[5], KEYS[7], KEYS[4], KEYS[6])
+     addJobInTargetList(target, KEYS[8], ARGV[2], isPausedOrMaxed, jobId)
+diff --git a/src/interfaces/index.ts b/src/interfaces/index.ts
+index dee1a621c7..d142efe8fc 100644
+--- a/src/interfaces/index.ts
++++ b/src/interfaces/index.ts
+@@ -23,7 +23,6 @@ export * from './redis-streams';
+ export * from './repeatable-job';
+ export * from './repeatable-options';
+ export * from './repeat-options';
+-export * from './retry-options';
+ export * from './script-queue-context';
+ export * from './sandboxed-job-processor';
+ export * from './sandboxed-job';
+diff --git a/src/interfaces/retry-options.ts b/src/interfaces/retry-options.ts
+deleted file mode 100644
+index ca974600b4..0000000000
+--- a/src/interfaces/retry-options.ts
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/**
+- * Retry method options
+- */
+-export interface RetryOptions {
+-  /**
+-   * Attempts made counter is reset to zero when retrying the job.
+-   */
+-  resetAttemptsMade?: boolean;
+-
+-  /**
+-   * Attempts started counter is reset to zero when retrying the job.
+-   */
+-  resetAttemptsStarted?: boolean;
+-}
+diff --git a/tests/test_worker.ts b/tests/test_worker.ts
+index 2f920ef1af..46a09d39b0 100644
+--- a/tests/test_worker.ts
++++ b/tests/test_worker.ts
+@@ -807,248 +807,96 @@ describe('workers', function () {
+     await worker.close();
+   });
+ 
+-  describe('when job is in failed state', () => {
+-    it('retries a job that fails', async () => {
+-      let failedOnce = false;
+-      const notEvenErr = new Error('Not even!');
+-
+-      const worker = new Worker(
+-        queueName,
+-        async () => {
+-          if (!failedOnce) {
+-            throw notEvenErr;
+-          }
+-        },
+-        { connection, prefix },
+-      );
+-      await worker.waitUntilReady();
++  it('retry a job that fails', async () => {
++    let failedOnce = false;
++    const notEvenErr = new Error('Not even!');
+ 
+-      const failing = new Promise<void>((resolve, reject) => {
+-        worker.once('failed', async (job, err) => {
+-          try {
+-            expect(job).to.be.ok;
+-            expect(job?.data.foo).to.be.eql('bar');
+-            expect(job?.attemptsStarted).to.be.eql(1);
+-            expect(job?.attemptsMade).to.be.eql(1);
+-            expect(err).to.be.eql(notEvenErr);
+-            failedOnce = true;
+-          } catch (err) {
+-            reject(err);
+-          }
+-          resolve();
+-        });
+-      });
++    const worker = new Worker(
++      queueName,
++      async () => {
++        if (!failedOnce) {
++          throw notEvenErr;
++        }
++      },
++      { connection, prefix },
++    );
++    await worker.waitUntilReady();
+ 
+-      const completing = new Promise<void>((resolve, reject) => {
+-        worker.once('completed', job => {
+-          try {
+-            expect(failedOnce).to.be.eql(true);
+-            expect(job?.attemptsStarted).to.be.eql(2);
+-            expect(job?.attemptsMade).to.be.eql(2);
+-            resolve();
+-          } catch (err) {
+-            reject(err);
+-          }
+-        });
++    const failing = new Promise<void>((resolve, reject) => {
++      worker.once('failed', async (job, err) => {
++        try {
++          expect(job).to.be.ok;
++          expect(job.data.foo).to.be.eql('bar');
++          expect(err).to.be.eql(notEvenErr);
++          failedOnce = true;
++        } catch (err) {
++          reject(err);
++        }
++        resolve();
+       });
+-
+-      const job = await queue.add('test', { foo: 'bar' });
+-      expect(job.id).to.be.ok;
+-      expect(job.data.foo).to.be.eql('bar');
+-
+-      await failing;
+-      await job.retry();
+-      await completing;
+-
+-      await worker.close();
+     });
+ 
+-    describe('when passing resetAttemptsMade and resetAttemptsStarted as true', () => {
+-      it('retries a job that fails and resets attemptsMade and attemptsStarted', async () => {
+-        let failedOnce = false;
+-        const notEvenErr = new Error('Not even!');
+-
+-        const worker = new Worker(
+-          queueName,
+-          async () => {
+-            if (!failedOnce) {
+-              throw notEvenErr;
+-            }
+-          },
+-          { connection, prefix },
+-        );
+-        await worker.waitUntilReady();
+-
+-        const failing = new Promise<void>((resolve, reject) => {
+-          worker.once('failed', async (job, err) => {
+-            try {
+-              expect(job).to.be.ok;
+-              expect(job?.data.foo).to.be.eql('bar');
+-              expect(job?.attemptsStarted).to.be.eql(1);
+-              expect(job?.attemptsMade).to.be.eql(1);
+-              expect(err).to.be.eql(notEvenErr);
+-              failedOnce = true;
+-            } catch (err) {
+-              reject(err);
+-            }
+-            resolve();
+-          });
+-        });
+-
+-        const completing = new Promise<void>((resolve, reject) => {
+-          worker.once('completed', job => {
+-            try {
+-              expect(failedOnce).to.be.eql(true);
+-              expect(job?.attemptsStarted).to.be.eql(1);
+-              expect(job?.attemptsMade).to.be.eql(1);
+-              resolve();
+-            } catch (err) {
+-              reject(err);
+-            }
+-          });
+-        });
+-
+-        const job = await queue.add('test', { foo: 'bar' });
+-        expect(job.id).to.be.ok;
+-        expect(job.data.foo).to.be.eql('bar');
+-
+-        await failing;
+-        await job.retry('failed', {
+-          resetAttemptsMade: true,
+-          resetAttemptsStarted: true,
+-        });
+-        await completing;
+-
+-        await worker.close();
++    const completing = new Promise<void>((resolve, reject) => {
++      worker.once('completed', () => {
++        try {
++          expect(failedOnce).to.be.eql(true);
++          resolve();
++        } catch (err) {
++          reject(err);
++        }
+       });
+     });
+-  });
+ 
+-  describe('when job is in completed state', () => {
+-    it('retries a job that completes', async () => {
+-      let completedOnce = false;
++    const job = await queue.add('test', { foo: 'bar' });
++    expect(job.id).to.be.ok;
++    expect(job.data.foo).to.be.eql('bar');
+ 
+-      const worker = new Worker(
+-        queueName,
+-        async () => {
+-          if (!completedOnce) {
+-            return 1;
+-          }
+-          return 2;
+-        },
+-        { connection, prefix },
+-      );
+-      await worker.waitUntilReady();
++    await failing;
++    await job.retry();
++    await completing;
+ 
+-      let count = 1;
+-      const completing = new Promise<void>((resolve, reject) => {
+-        worker.once('completed', async (job, result) => {
+-          try {
+-            expect(job).to.be.ok;
+-            expect(job?.data.foo).to.be.eql('bar');
+-            expect(job?.attemptsStarted).to.be.eql(1);
+-            expect(job?.attemptsMade).to.be.eql(1);
+-            expect(result).to.be.eql(count++);
+-            completedOnce = true;
+-          } catch (err) {
+-            reject(err);
+-          }
+-          resolve();
+-        });
+-      });
++    await worker.close();
++  });
+ 
+-      const job = await queue.add('test', { foo: 'bar' });
+-      expect(job.id).to.be.ok;
+-      expect(job.data.foo).to.be.eql('bar');
++  it('retry a job that completes', async () => {
++    let completedOnce = false;
+ 
+-      await completing;
+-      worker.removeAllListeners('completed');
++    const worker = new Worker(
++      queueName,
++      async () => {
++        if (!completedOnce) {
++          return 1;
++        }
++        return 2;
++      },
++      { connection, prefix },
++    );
++    await worker.waitUntilReady();
+ 
+-      const completing2 = new Promise<void>((resolve, reject) => {
+-        worker.once('completed', async (job, result) => {
+-          try {
+-            expect(job).to.be.ok;
+-            expect(job?.data.foo).to.be.eql('bar');
+-            expect(job?.attemptsStarted).to.be.eql(2);
+-            expect(job?.attemptsMade).to.be.eql(2);
+-            expect(result).to.be.eql(count++);
+-          } catch (err) {
+-            reject(err);
+-          }
+-          resolve();
+-        });
++    let count = 1;
++    const completing = new Promise<void>((resolve, reject) => {
++      worker.once('completed', async (job, result) => {
++        try {
++          expect(job).to.be.ok;
++          expect(job.data.foo).to.be.eql('bar');
++          expect(result).to.be.eql(count++);
++          completedOnce = true;
++        } catch (err) {
++          reject(err);
++        }
++        resolve();
+       });
+-
+-      await job.retry('completed');
+-      await completing2;
+-
+-      await worker.close();
+     });
+ 
+-    describe('when passing resetAttemptsMade and resetAttemptsStarted as true', () => {
+-      it('retries a job that completes and resets attemptsMade and attemptsStarted', async () => {
+-        let completedOnce = false;
+-
+-        const worker = new Worker(
+-          queueName,
+-          async () => {
+-            if (!completedOnce) {
+-              return 1;
+-            }
+-            return 2;
+-          },
+-          { connection, prefix },
+-        );
+-        await worker.waitUntilReady();
+-
+-        let count = 1;
+-        const completing = new Promise<void>((resolve, reject) => {
+-          worker.once('completed', async (job, result) => {
+-            try {
+-              expect(job).to.be.ok;
+-              expect(job?.data.foo).to.be.eql('bar');
+-              expect(job?.attemptsStarted).to.be.eql(1);
+-              expect(job?.attemptsMade).to.be.eql(1);
+-              expect(result).to.be.eql(count++);
+-              completedOnce = true;
+-            } catch (err) {
+-              reject(err);
+-            }
+-            resolve();
+-          });
+-        });
+-
+-        const job = await queue.add('test', { foo: 'bar' });
+-        expect(job.id).to.be.ok;
+-        expect(job.data.foo).to.be.eql('bar');
+-
+-        await completing;
+-        worker.removeAllListeners('completed');
+-
+-        const completing2 = new Promise<void>((resolve, reject) => {
+-          worker.once('completed', async (job, result) => {
+-            try {
+-              expect(job).to.be.ok;
+-              expect(job?.data.foo).to.be.eql('bar');
+-              expect(job?.attemptsStarted).to.be.eql(1);
+-              expect(job?.attemptsMade).to.be.eql(1);
+-              expect(result).to.be.eql(count++);
+-            } catch (err) {
+-              reject(err);
+-            }
+-            resolve();
+-          });
+-        });
++    const job = await queue.add('test', { foo: 'bar' });
++    expect(job.id).to.be.ok;
++    expect(job.data.foo).to.be.eql('bar');
+ 
+-        await job.retry('completed', {
+-          resetAttemptsMade: true,
+-          resetAttemptsStarted: true,
+-        });
+-        await completing2;
++    await completing;
++    await job.retry('completed');
++    await completing;
+ 
+-        await worker.close();
+-      });
+-    });
++    await worker.close();
+   });
+ 
+   describe('when 0.002 is used as blocktimeout', () => {

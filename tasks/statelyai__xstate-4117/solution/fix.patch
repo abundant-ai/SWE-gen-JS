@@ -1,0 +1,267 @@
+diff --git a/.changeset/orange-pillows-deny.md b/.changeset/orange-pillows-deny.md
+new file mode 100644
+index 0000000000..15430a29f0
+--- /dev/null
++++ b/.changeset/orange-pillows-deny.md
+@@ -0,0 +1,15 @@
++---
++'xstate': minor
++---
++
++Actor logic creators now have access to `self`:
++
++```ts
++const promiseLogic = fromPromise(({ self }) => { ... });
++
++const observableLogic = fromObservable(({ self }) => { ... });
++
++const callbackLogic = fromCallback((sendBack, receive, { self }) => { ... });
++
++const transitionLogic = fromTransition((state, event, { self }) => { ... }, ...);
++```
+diff --git a/packages/core/src/actors/callback.ts b/packages/core/src/actors/callback.ts
+index 17c2508299..0c08f784b3 100644
+--- a/packages/core/src/actors/callback.ts
++++ b/packages/core/src/actors/callback.ts
+@@ -3,7 +3,9 @@ import {
+   Receiver,
+   ActorLogic,
+   EventObject,
+-  AnyEventObject
++  AnyEventObject,
++  ActorRefFrom,
++  TODO
+ } from '../types';
+ import { isPromiseLike } from '../utils';
+ import { doneInvoke, error } from '../actions.ts';
+@@ -16,10 +18,20 @@ export interface CallbackInternalState<TEvent extends EventObject> {
+   input?: any;
+ }
+ 
++export type CallbackActorLogic<TEvent extends EventObject> = ActorLogic<
++  TEvent,
++  undefined,
++  CallbackInternalState<TEvent>
++>;
++
++export type CallbackActorRef<TEvent extends EventObject> = ActorRefFrom<
++  CallbackActorLogic<TEvent>
++>;
++
+ export function fromCallback<TEvent extends EventObject>(
+   invokeCallback: InvokeCallback
+-): ActorLogic<TEvent, undefined, CallbackInternalState<TEvent>> {
+-  const logic: ActorLogic<TEvent, undefined, CallbackInternalState<TEvent>> = {
++): CallbackActorLogic<TEvent> {
++  const logic: CallbackActorLogic<TEvent> = {
+     config: invokeCallback,
+     start: (_state, { self }) => {
+       self.send({ type: startSignalType } as TEvent);
+@@ -40,7 +52,8 @@ export function fromCallback<TEvent extends EventObject>(
+ 
+         state.dispose = invokeCallback(sender, receiver, {
+           input: state.input,
+-          system
++          system,
++          self: self as TODO
+         });
+ 
+         if (isPromiseLike(state.dispose)) {
+diff --git a/packages/core/src/actors/observable.ts b/packages/core/src/actors/observable.ts
+index db901d64f0..5c25329abf 100644
+--- a/packages/core/src/actors/observable.ts
++++ b/packages/core/src/actors/observable.ts
+@@ -3,7 +3,8 @@ import {
+   ActorLogic,
+   EventObject,
+   Subscription,
+-  AnyActorSystem
++  AnyActorSystem,
++  ActorRefFrom
+ } from '../types';
+ import { stopSignalType } from '../actors';
+ 
+@@ -19,21 +20,26 @@ export type ObservablePersistedState<T> = Omit<
+   'subscription'
+ >;
+ 
++export type ObservableActorLogic<T> = ActorLogic<
++  EventObject,
++  T | undefined,
++  ObservableInternalState<T>,
++  ObservablePersistedState<T>
++>;
++
++export type ObservableActorRef<T> = ActorRefFrom<ObservableActorLogic<T>>;
++
+ // TODO: this likely shouldn't accept TEvent, observable actor doesn't accept external events
+-export function fromObservable<T, TEvent extends EventObject>(
++export function fromObservable<T>(
+   observableCreator: ({
+     input,
+     system
+   }: {
+     input: any;
+     system: AnyActorSystem;
++    self: ObservableActorRef<T>;
+   }) => Subscribable<T>
+-): ActorLogic<
+-  TEvent,
+-  T | undefined,
+-  ObservableInternalState<T>,
+-  ObservablePersistedState<T>
+-> {
++): ObservableActorLogic<T> {
+   const nextEventType = '$$xstate.next';
+   const errorEventType = '$$xstate.error';
+   const completeEventType = '$$xstate.complete';
+@@ -107,7 +113,8 @@ export function fromObservable<T, TEvent extends EventObject>(
+       }
+       state.subscription = observableCreator({
+         input: state.input,
+-        system
++        system,
++        self
+       }).subscribe({
+         next: (value) => {
+           self.send({ type: nextEventType, data: value });
+@@ -151,13 +158,9 @@ export function fromEventObservable<T extends EventObject>(
+   }: {
+     input: any;
+     system: AnyActorSystem;
++    self: ObservableActorRef<T>;
+   }) => Subscribable<T>
+-): ActorLogic<
+-  EventObject,
+-  T | undefined,
+-  ObservableInternalState<T>,
+-  ObservablePersistedState<T>
+-> {
++): ObservableActorLogic<T> {
+   const errorEventType = '$$xstate.error';
+   const completeEventType = '$$xstate.complete';
+ 
+@@ -218,7 +221,8 @@ export function fromEventObservable<T extends EventObject>(
+ 
+       state.subscription = lazyObservable({
+         input: state.input,
+-        system
++        system,
++        self
+       }).subscribe({
+         next: (value) => {
+           self._parent?.send(value);
+diff --git a/packages/core/src/actors/promise.ts b/packages/core/src/actors/promise.ts
+index 48d976813f..6c5bbd3711 100644
+--- a/packages/core/src/actors/promise.ts
++++ b/packages/core/src/actors/promise.ts
+@@ -1,4 +1,4 @@
+-import { ActorLogic, AnyActorSystem } from '../types';
++import { ActorLogic, ActorRef, ActorRefFrom, AnyActorSystem } from '../types';
+ import { stopSignalType } from '../actors';
+ 
+ export interface PromiseInternalState<T> {
+@@ -23,6 +23,13 @@ export type PromiseEvent<T> =
+       type: 'xstate.stop';
+     };
+ 
++export type PromiseActorLogic<T> = ActorLogic<
++  PromiseEvent<T>,
++  T | undefined,
++  PromiseInternalState<T>
++>;
++export type PromiseActorRef<T> = ActorRefFrom<PromiseActorLogic<T>>;
++
+ export function fromPromise<T>(
+   // TODO: add types
+   promiseCreator: ({
+@@ -31,8 +38,9 @@ export function fromPromise<T>(
+   }: {
+     input: any;
+     system: AnyActorSystem;
++    self: PromiseActorRef<T>;
+   }) => PromiseLike<T>
+-): ActorLogic<PromiseEvent<T>, T | undefined, PromiseInternalState<T>> {
++): PromiseActorLogic<T> {
+   // TODO: add event types, consider making the `PromiseEvent` a private type or smth alike
+   const logic: ActorLogic<
+     PromiseEvent<T>,
+@@ -78,7 +86,7 @@ export function fromPromise<T>(
+       }
+ 
+       const resolvedPromise = Promise.resolve(
+-        promiseCreator({ input: state.input, system })
++        promiseCreator({ input: state.input, system, self })
+       );
+ 
+       resolvedPromise.then(
+diff --git a/packages/core/src/actors/transition.ts b/packages/core/src/actors/transition.ts
+index cf92e6c9e9..ef17cc6968 100644
+--- a/packages/core/src/actors/transition.ts
++++ b/packages/core/src/actors/transition.ts
+@@ -1,4 +1,20 @@
+-import { ActorLogic, ActorContext, ActorSystem, EventObject } from '../types';
++import {
++  ActorLogic,
++  ActorContext,
++  ActorSystem,
++  EventObject,
++  ActorRefFrom
++} from '../types';
++
++export type TransitionActorLogic<
++  TState,
++  TEvent extends EventObject
++> = ActorLogic<TEvent, TState, TState>;
++
++export type TransitionActorRef<
++  TState,
++  TEvent extends EventObject
++> = ActorRefFrom<TransitionActorLogic<TState, TEvent>>;
+ 
+ /**
+  * Returns actor logic from a transition function and its initial state.
+@@ -19,8 +35,16 @@ export function fromTransition<
+     event: TEvent,
+     actorContext: ActorContext<TEvent, TState, TSystem>
+   ) => TState,
+-  initialState: TState | (({ input }: { input: any }) => TState) // TODO: type
+-): ActorLogic<TEvent, TState, TState> {
++  initialState:
++    | TState
++    | (({
++        input,
++        self
++      }: {
++        input: any;
++        self: TransitionActorRef<TState, TEvent>;
++      }) => TState) // TODO: type
++): TransitionActorLogic<TState, TEvent> {
+   const logic: ActorLogic<TEvent, TState, TState, TState> = {
+     config: transition,
+     transition: (state, event, actorContext) => {
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+index 97323daae4..68edbae2f9 100644
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -10,6 +10,7 @@ import {
+   AreAllImplementationsAssumedToBeProvided
+ } from './typegenTypes.ts';
+ import { PromiseEvent } from './actors/promise.ts';
++import { CallbackActorRef } from './actors/callback.ts';
+ 
+ export type AnyFunction = (...args: any[]) => any;
+ 
+@@ -303,7 +304,11 @@ export type InvokeCallback<
+ > = (
+   sendBack: (event: TSentEvent) => void,
+   onReceive: Receiver<TEvent>,
+-  { input, system }: { input: any; system: AnyActorSystem }
++  {
++    input,
++    system,
++    self
++  }: { input: any; system: AnyActorSystem; self: CallbackActorRef<TEvent> }
+ ) => (() => void) | Promise<any> | void;
+ 
+ export interface InvokeMeta {

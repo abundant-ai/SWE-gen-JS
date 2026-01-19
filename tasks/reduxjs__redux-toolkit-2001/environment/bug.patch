@@ -1,0 +1,652 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index b6180d88..5cc462e9 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -96,7 +96,7 @@ jobs:
+       fail-fast: false
+       matrix:
+         node: ['14.x']
+-        ts: ['4.1', '4.2', '4.3', '4.4', '4.5', 'next']
++        ts: ['3.9', '4.0', '4.1', '4.2', '4.3', '4.4', '4.5', 'next']
+     steps:
+       - name: Checkout repo
+         uses: actions/checkout@v2
+diff --git a/packages/action-listener-middleware/src/tests/fork.test.ts b/packages/action-listener-middleware/src/tests/fork.test.ts
+index 47c5b60d..af4fd452 100644
+--- a/packages/action-listener-middleware/src/tests/fork.test.ts
++++ b/packages/action-listener-middleware/src/tests/fork.test.ts
+@@ -52,11 +52,8 @@ describe('fork', () => {
+     },
+   })
+   const { increment, decrement, incrementByAmount } = counterSlice.actions
+-  let middleware = createActionListenerMiddleware()
+-  let store = configureStore({
+-    reducer: counterSlice.reducer,
+-    middleware: (gDM) => gDM().prepend(middleware),
+-  })
++  let middleware: ReturnType<typeof createActionListenerMiddleware>
++  let store: EnhancedStore<CounterSlice>
+ 
+   beforeEach(() => {
+     middleware = createActionListenerMiddleware()
+diff --git a/packages/toolkit/src/configureStore.ts b/packages/toolkit/src/configureStore.ts
+index e0a7896a..86a9190a 100644
+--- a/packages/toolkit/src/configureStore.ts
++++ b/packages/toolkit/src/configureStore.ts
+@@ -20,7 +20,7 @@ import type {
+   CurriedGetDefaultMiddleware,
+ } from './getDefaultMiddleware'
+ import { curryGetDefaultMiddleware } from './getDefaultMiddleware'
+-import type { NoInfer, ExtractDispatchExtensions } from './tsHelpers'
++import type { DispatchForMiddlewares, NoInfer } from './tsHelpers'
+ 
+ const IS_PRODUCTION = process.env.NODE_ENV === 'production'
+ 
+@@ -110,7 +110,7 @@ export interface EnhancedStore<
+    *
+    * @inheritdoc
+    */
+-  dispatch: ExtractDispatchExtensions<M> & Dispatch<A>
++  dispatch: Dispatch<A> & DispatchForMiddlewares<M>
+ }
+ 
+ /**
+@@ -160,7 +160,7 @@ export function configureStore<
+   }
+   if (
+     !IS_PRODUCTION &&
+-    finalMiddleware.some((item: any) => typeof item !== 'function')
++    finalMiddleware.some((item) => typeof item !== 'function')
+   ) {
+     throw new Error(
+       'each middleware provided to configureStore must be a function'
+diff --git a/packages/toolkit/src/getDefaultMiddleware.ts b/packages/toolkit/src/getDefaultMiddleware.ts
+index e54a6676..c08da77b 100644
+--- a/packages/toolkit/src/getDefaultMiddleware.ts
++++ b/packages/toolkit/src/getDefaultMiddleware.ts
+@@ -8,7 +8,6 @@ import { createImmutableStateInvariantMiddleware } from './immutableStateInvaria
+ 
+ import type { SerializableStateInvariantMiddlewareOptions } from './serializableStateInvariantMiddleware'
+ import { createSerializableStateInvariantMiddleware } from './serializableStateInvariantMiddleware'
+-import type { ExcludeFromTuple } from './tsHelpers'
+ import { MiddlewareArray } from './utils'
+ 
+ function isBoolean(x: any): x is boolean {
+@@ -34,7 +33,9 @@ export type ThunkMiddlewareFor<
+   ? never
+   : O extends { thunk: { extraArgument: infer E } }
+   ? ThunkMiddleware<S, AnyAction, E>
+-  : ThunkMiddleware<S, AnyAction>
++  :
++      | ThunkMiddleware<S, AnyAction, null> //The ThunkMiddleware with a `null` ExtraArgument is here to provide backwards-compatibility.
++      | ThunkMiddleware<S, AnyAction>
+ 
+ export type CurriedGetDefaultMiddleware<S = any> = <
+   O extends Partial<GetDefaultMiddlewareOptions> = {
+@@ -44,7 +45,7 @@ export type CurriedGetDefaultMiddleware<S = any> = <
+   }
+ >(
+   options?: O
+-) => MiddlewareArray<ExcludeFromTuple<[ThunkMiddlewareFor<S, O>], never>>
++) => MiddlewareArray<Middleware<{}, S> | ThunkMiddlewareFor<S, O>>
+ 
+ export function curryGetDefaultMiddleware<
+   S = any
+@@ -75,14 +76,14 @@ export function getDefaultMiddleware<
+   }
+ >(
+   options: O = {} as O
+-): MiddlewareArray<ExcludeFromTuple<[ThunkMiddlewareFor<S, O>], never>> {
++): MiddlewareArray<Middleware<{}, S> | ThunkMiddlewareFor<S, O>> {
+   const {
+     thunk = true,
+     immutableCheck = true,
+     serializableCheck = true,
+   } = options
+ 
+-  let middlewareArray = new MiddlewareArray<Middleware[]>()
++  let middlewareArray: Middleware<{}, S>[] = new MiddlewareArray()
+ 
+   if (thunk) {
+     if (isBoolean(thunk)) {
+diff --git a/packages/toolkit/src/tests/MiddlewareArray.typetest.ts b/packages/toolkit/src/tests/MiddlewareArray.typetest.ts
+index 25bb4cb2..d9cfa00f 100644
+--- a/packages/toolkit/src/tests/MiddlewareArray.typetest.ts
++++ b/packages/toolkit/src/tests/MiddlewareArray.typetest.ts
+@@ -1,5 +1,6 @@
+-import { getDefaultMiddleware, configureStore } from '@reduxjs/toolkit'
++import { getDefaultMiddleware } from '@reduxjs/toolkit'
+ import type { Middleware } from 'redux'
++import type { DispatchForMiddlewares } from '@internal/tsHelpers'
+ 
+ declare const expectType: <T>(t: T) => T
+ 
+@@ -11,108 +12,103 @@ declare const middleware2: Middleware<{
+   (_: number): string
+ }>
+ 
++declare const getDispatch: <M extends Array<Middleware>>(
++  m: M
++) => DispatchForMiddlewares<M>
++
+ type ThunkReturn = Promise<'thunk'>
+ declare const thunkCreator: () => () => ThunkReturn
+ 
+ {
++  const defaultMiddleware = getDefaultMiddleware()
++
+   // prepend single element
+   {
+-    const store = configureStore({
+-      reducer: () => 0,
+-      middleware: (gDM) => gDM().prepend(middleware1),
+-    })
+-    expectType<number>(store.dispatch('foo'))
+-    expectType<ThunkReturn>(store.dispatch(thunkCreator()))
++    const concatenated = defaultMiddleware.prepend(middleware1)
++    const dispatch = getDispatch(concatenated)
++    expectType<number>(dispatch('foo'))
++    expectType<ThunkReturn>(dispatch(thunkCreator()))
+ 
+     // @ts-expect-error
+-    expectType<string>(store.dispatch('foo'))
++    expectType<string>(dispatch('foo'))
+   }
+ 
+-  // prepend multiple (rest)
++  // prepepend multiple (rest)
+   {
+-    const store = configureStore({
+-      reducer: () => 0,
+-      middleware: (gDM) => gDM().prepend(middleware1, middleware2),
+-    })
+-    expectType<number>(store.dispatch('foo'))
+-    expectType<string>(store.dispatch(5))
+-    expectType<ThunkReturn>(store.dispatch(thunkCreator()))
++    const concatenated = defaultMiddleware.prepend(middleware1, middleware2)
++    const dispatch = getDispatch(concatenated)
++    expectType<number>(dispatch('foo'))
++    expectType<string>(dispatch(5))
++    expectType<ThunkReturn>(dispatch(thunkCreator()))
+ 
+     // @ts-expect-error
+-    expectType<string>(store.dispatch('foo'))
++    expectType<string>(dispatch('foo'))
+   }
+ 
+   // prepend multiple (array notation)
+   {
+-    const store = configureStore({
+-      reducer: () => 0,
+-      middleware: (gDM) => gDM().prepend([middleware1, middleware2] as const),
+-    })
+-
+-    expectType<number>(store.dispatch('foo'))
+-    expectType<string>(store.dispatch(5))
+-    expectType<ThunkReturn>(store.dispatch(thunkCreator()))
++    const concatenated = defaultMiddleware.prepend([
++      middleware1,
++      middleware2,
++    ] as const)
++    const dispatch = getDispatch(concatenated)
++    expectType<number>(dispatch('foo'))
++    expectType<string>(dispatch(5))
++    expectType<ThunkReturn>(dispatch(thunkCreator()))
+ 
+     // @ts-expect-error
+-    expectType<string>(store.dispatch('foo'))
++    expectType<string>(dispatch('foo'))
+   }
+ 
+   // concat single element
+   {
+-    const store = configureStore({
+-      reducer: () => 0,
+-      middleware: (gDM) => gDM().concat(middleware1),
+-    })
+-
+-    expectType<number>(store.dispatch('foo'))
+-    expectType<ThunkReturn>(store.dispatch(thunkCreator()))
++    const concatenated = defaultMiddleware.concat(middleware1)
++    const dispatch = getDispatch(concatenated)
++    expectType<number>(dispatch('foo'))
++    expectType<ThunkReturn>(dispatch(thunkCreator()))
+ 
+     // @ts-expect-error
+-    expectType<string>(store.dispatch('foo'))
++    expectType<string>(dispatch('foo'))
+   }
+ 
+-  // prepend multiple (rest)
++  // prepepend multiple (rest)
+   {
+-    const store = configureStore({
+-      reducer: () => 0,
+-      middleware: (gDM) => gDM().concat(middleware1, middleware2),
+-    })
+-
+-    expectType<number>(store.dispatch('foo'))
+-    expectType<string>(store.dispatch(5))
+-    expectType<ThunkReturn>(store.dispatch(thunkCreator()))
++    const concatenated = defaultMiddleware.concat(middleware1, middleware2)
++    const dispatch = getDispatch(concatenated)
++    expectType<number>(dispatch('foo'))
++    expectType<string>(dispatch(5))
++    expectType<ThunkReturn>(dispatch(thunkCreator()))
+ 
+     // @ts-expect-error
+-    expectType<string>(store.dispatch('foo'))
++    expectType<string>(dispatch('foo'))
+   }
+ 
+   // concat multiple (array notation)
+   {
+-    const store = configureStore({
+-      reducer: () => 0,
+-      middleware: (gDM) => gDM().concat([middleware1, middleware2] as const),
+-    })
+-
+-    expectType<number>(store.dispatch('foo'))
+-    expectType<string>(store.dispatch(5))
+-    expectType<ThunkReturn>(store.dispatch(thunkCreator()))
++    const concatenated = defaultMiddleware.concat([
++      middleware1,
++      middleware2,
++    ] as const)
++    const dispatch = getDispatch(concatenated)
++    expectType<number>(dispatch('foo'))
++    expectType<string>(dispatch(5))
++    expectType<ThunkReturn>(dispatch(thunkCreator()))
+ 
+     // @ts-expect-error
+-    expectType<string>(store.dispatch('foo'))
++    expectType<string>(dispatch('foo'))
+   }
+ 
+   // concat and prepend
+   {
+-    const store = configureStore({
+-      reducer: () => 0,
+-      middleware: (gDM) => gDM().concat(middleware1).prepend(middleware2),
+-    })
+-
+-    expectType<number>(store.dispatch('foo'))
+-    expectType<string>(store.dispatch(5))
+-    expectType<ThunkReturn>(store.dispatch(thunkCreator()))
++    const concatenated = defaultMiddleware
++      .concat(middleware1)
++      .prepend(middleware2)
++    const dispatch = getDispatch(concatenated)
++    expectType<number>(dispatch('foo'))
++    expectType<string>(dispatch(5))
++    expectType<ThunkReturn>(dispatch(thunkCreator()))
+ 
+     // @ts-expect-error
+-    expectType<string>(store.dispatch('foo'))
++    expectType<string>(dispatch('foo'))
+   }
+ }
+diff --git a/packages/toolkit/src/tests/configureStore.typetest.ts b/packages/toolkit/src/tests/configureStore.typetest.ts
+index 2f918309..a956c9cb 100644
+--- a/packages/toolkit/src/tests/configureStore.typetest.ts
++++ b/packages/toolkit/src/tests/configureStore.typetest.ts
+@@ -1,23 +1,15 @@
+ /* eslint-disable no-lone-blocks */
+-import type {
+-  Dispatch,
+-  AnyAction,
+-  Middleware,
+-  Reducer,
+-  Store,
+-  Action,
+-} from 'redux'
++import type { Dispatch, AnyAction, Middleware, Reducer, Store } from 'redux'
+ import { applyMiddleware } from 'redux'
+-import type { PayloadAction, MiddlewareArray } from '@reduxjs/toolkit'
++import type { PayloadAction } from '@reduxjs/toolkit'
+ import {
+   configureStore,
+   getDefaultMiddleware,
+   createSlice,
+ } from '@reduxjs/toolkit'
+-import type { ThunkMiddleware, ThunkAction, ThunkDispatch } from 'redux-thunk'
+-import thunk from 'redux-thunk'
++import type { ThunkMiddleware, ThunkAction } from 'redux-thunk'
++import thunk, { ThunkDispatch } from 'redux-thunk'
+ import { expectNotAny, expectType } from './helpers'
+-import type { IsAny, ExtractDispatchExtensions } from '../tsHelpers'
+ 
+ const _anyMiddleware: any = () => () => () => {}
+ 
+@@ -308,16 +300,14 @@ const _anyMiddleware: any = () => () => () => {}
+    * Test: multiple custom middleware
+    */
+   {
+-    const middleware = [] as any as [
+-      Middleware<(a: 'a') => 'A', StateA>,
+-      Middleware<(b: 'b') => 'B', StateA>,
+-      ThunkMiddleware<StateA>
+-    ]
+     const store = configureStore({
+       reducer: reducerA,
+-      middleware,
++      middleware: [] as any as [
++        Middleware<(a: 'a') => 'A', StateA>,
++        Middleware<(b: 'b') => 'B', StateA>,
++        ThunkMiddleware<StateA>
++      ],
+     })
+-
+     const result: 'A' = store.dispatch('a')
+     const result2: 'B' = store.dispatch('b')
+     const result3: Promise<'A'> = store.dispatch(thunkA())
+@@ -334,9 +324,7 @@ const _anyMiddleware: any = () => () => () => {}
+       undefined,
+       AnyAction
+     >)
+-    // `null` for the `extra` generic was previously documented in the RTK "Advanced Tutorial", but
+-    // is a bad pattern and users should use `unknown` instead
+-    // @ts-expect-error
++    // null was previously documented in the redux docs
+     store.dispatch(function () {} as ThunkAction<void, {}, null, AnyAction>)
+     // unknown is the best way to type a ThunkAction if you do not care
+     // about the value of the extraArgument, as it will always work with every
+@@ -350,14 +338,13 @@ const _anyMiddleware: any = () => () => () => {}
+    * Test: custom middleware and getDefaultMiddleware
+    */
+   {
+-    const middleware = getDefaultMiddleware<StateA>().prepend(
+-      (() => {}) as any as Middleware<(a: 'a') => 'A', StateA>
+-    )
+     const store = configureStore({
+       reducer: reducerA,
+-      middleware,
++      middleware: [
++        (() => {}) as any as Middleware<(a: 'a') => 'A', StateA>,
++        ...getDefaultMiddleware<StateA>(),
++      ] as const,
+     })
+-
+     const result1: 'A' = store.dispatch('a')
+     const result2: Promise<'A'> = store.dispatch(thunkA())
+     // @ts-expect-error
+@@ -413,10 +400,10 @@ const _anyMiddleware: any = () => () => () => {}
+     const store = configureStore({
+       reducer: reducerA,
+       middleware: (getDefaultMiddleware) =>
+-        getDefaultMiddleware().prepend((() => {}) as any as Middleware<
+-          (a: 'a') => 'A',
+-          StateA
+-        >),
++        [
++          (() => {}) as any as Middleware<(a: 'a') => 'A', StateA>,
++          ...getDefaultMiddleware(),
++        ] as const,
+     })
+     const result1: 'A' = store.dispatch('a')
+     const result2: Promise<'A'> = store.dispatch(thunkA())
+@@ -451,9 +438,10 @@ const _anyMiddleware: any = () => () => () => {}
+     const store = configureStore({
+       reducer: reducerA,
+       middleware: (getDefaultMiddleware) =>
+-        getDefaultMiddleware({ thunk: false }).prepend(
+-          (() => {}) as any as Middleware<(a: 'a') => 'A', StateA>
+-        ),
++        [
++          (() => {}) as any as Middleware<(a: 'a') => 'A', StateA>,
++          ...getDefaultMiddleware({ thunk: false }),
++        ] as const,
+     })
+     const result1: 'A' = store.dispatch('a')
+     // @ts-expect-error
+@@ -472,57 +460,4 @@ const _anyMiddleware: any = () => () => () => {}
+ 
+     expectNotAny(store.dispatch)
+   }
+-
+-  {
+-    interface CounterState {
+-      value: number
+-    }
+-
+-    const counterSlice = createSlice({
+-      name: 'counter',
+-      initialState: { value: 0 } as CounterState,
+-      reducers: {
+-        increment(state) {
+-          state.value += 1
+-        },
+-        decrement(state) {
+-          state.value -= 1
+-        },
+-        // Use the PayloadAction type to declare the contents of `action.payload`
+-        incrementByAmount: (state, action: PayloadAction<number>) => {
+-          state.value += action.payload
+-        },
+-      },
+-    })
+-
+-    type Unsubscribe = () => void
+-
+-    // A fake middleware that tells TS that an unsubscribe callback is being returned for a given action
+-    // This is the same signature that the "listener" middleware uses
+-    const dummyMiddleware: Middleware<
+-      {
+-        (action: Action<'actionListenerMiddleware/add'>): Unsubscribe
+-      },
+-      CounterState
+-    > = (storeApi) => (next) => (action) => {}
+-
+-    const store = configureStore({
+-      reducer: counterSlice.reducer,
+-      middleware: (gDM) => gDM().prepend(dummyMiddleware),
+-    })
+-
+-    // Order matters here! We need the listener type to come first, otherwise
+-    // the thunk middleware type kicks in and TS thinks a plain action is being returned
+-    expectType<
+-      ((action: Action<'actionListenerMiddleware/add'>) => Unsubscribe) &
+-        ThunkDispatch<CounterState, undefined, AnyAction> &
+-        Dispatch<AnyAction>
+-    >(store.dispatch)
+-
+-    const unsubscribe = store.dispatch({
+-      type: 'actionListenerMiddleware/add',
+-    } as const)
+-
+-    expectType<Unsubscribe>(unsubscribe)
+-  }
+ }
+diff --git a/packages/toolkit/src/tests/getDefaultMiddleware.test.ts b/packages/toolkit/src/tests/getDefaultMiddleware.test.ts
+index 2367ae40..06264cb2 100644
+--- a/packages/toolkit/src/tests/getDefaultMiddleware.test.ts
++++ b/packages/toolkit/src/tests/getDefaultMiddleware.test.ts
+@@ -1,20 +1,10 @@
+-import type {
+-  AnyAction,
+-  Middleware,
+-  ThunkAction,
+-  Action,
+-  ThunkDispatch,
+-  Dispatch,
+-} from '@reduxjs/toolkit'
++import type { AnyAction, Middleware, ThunkAction } from '@reduxjs/toolkit'
+ import {
+   getDefaultMiddleware,
+   MiddlewareArray,
+   configureStore,
+ } from '@reduxjs/toolkit'
+ import thunk from 'redux-thunk'
+-import type { ThunkMiddleware } from 'redux-thunk'
+-
+-import { expectType } from './helpers'
+ 
+ describe('getDefaultMiddleware', () => {
+   const ORIGINAL_NODE_ENV = process.env.NODE_ENV
+@@ -37,7 +27,6 @@ describe('getDefaultMiddleware', () => {
+ 
+   it('removes the thunk middleware if disabled', () => {
+     const middleware = getDefaultMiddleware({ thunk: false })
+-    // @ts-ignore
+     expect(middleware.includes(thunk)).toBe(false)
+     expect(middleware.length).toBe(2)
+   })
+@@ -55,46 +44,13 @@ describe('getDefaultMiddleware', () => {
+   })
+ 
+   it('allows passing options to thunk', () => {
+-    const extraArgument = 42 as const
++    const extraArgument = 42
+     const middleware = getDefaultMiddleware({
+       thunk: { extraArgument },
+       immutableCheck: false,
+       serializableCheck: false,
+     })
+ 
+-    const m2 = getDefaultMiddleware({
+-      thunk: false,
+-    })
+-
+-    expectType<MiddlewareArray<[]>>(m2)
+-
+-    const dummyMiddleware: Middleware<
+-      {
+-        (action: Action<'actionListenerMiddleware/add'>): () => void
+-      },
+-      { counter: number }
+-    > = (storeApi) => (next) => (action) => {}
+-
+-    const dummyMiddleware2: Middleware = (storeApi) => (next) => (action) => {}
+-
+-    const m3 = middleware.concat(dummyMiddleware, dummyMiddleware2)
+-
+-    expectType<
+-      MiddlewareArray<
+-        [
+-          ThunkMiddleware<any, AnyAction, 42>,
+-          Middleware<
+-            (action: Action<'actionListenerMiddleware/add'>) => () => void,
+-            {
+-              counter: number
+-            },
+-            Dispatch<AnyAction>
+-          >,
+-          Middleware<{}, any, Dispatch<AnyAction>>
+-        ]
+-      >
+-    >(m3)
+-
+     const testThunk: ThunkAction<void, {}, number, AnyAction> = (
+       dispatch,
+       getState,
+@@ -110,10 +66,6 @@ describe('getDefaultMiddleware', () => {
+       middleware,
+     })
+ 
+-    expectType<ThunkDispatch<any, 42, AnyAction> & Dispatch<AnyAction>>(
+-      store.dispatch
+-    )
+-
+     store.dispatch(testThunk)
+   })
+ 
+diff --git a/packages/toolkit/src/tsHelpers.ts b/packages/toolkit/src/tsHelpers.ts
+index 342f0b0c..e9145732 100644
+--- a/packages/toolkit/src/tsHelpers.ts
++++ b/packages/toolkit/src/tsHelpers.ts
+@@ -1,5 +1,4 @@
+-import type { Middleware, Dispatch } from 'redux'
+-import type { MiddlewareArray } from './utils'
++import type { Middleware } from 'redux'
+ 
+ /**
+  * return True if T is `any`, otherwise return False
+@@ -66,30 +65,20 @@ export type IsUnknownOrNonInferrable<T, True, False> = AtLeastTS35<
+   IsEmptyObj<T, True, IsUnknown<T, True, False>>
+ >
+ 
+-// Appears to have a convenient side effect of ignoring `never` even if that's not what you specified
+-export type ExcludeFromTuple<T, E, Acc extends unknown[] = []> = T extends [
+-  infer Head,
+-  ...infer Tail
+-]
+-  ? ExcludeFromTuple<Tail, E, [...Acc, ...([Head] extends [E] ? [] : [Head])]>
+-  : Acc
+-
+-type ExtractDispatchFromMiddlewareTuple<
+-  MiddlewareTuple extends any[],
+-  Acc extends {}
+-> = MiddlewareTuple extends [infer Head, ...infer Tail]
+-  ? ExtractDispatchFromMiddlewareTuple<
+-      Tail,
+-      Acc & (Head extends Middleware<infer D, any> ? IsAny<D, {}, D> : {})
++/**
++ * Combines all dispatch signatures of all middlewares in the array `M` into
++ * one intersected dispatch signature.
++ */
++export type DispatchForMiddlewares<M> = M extends ReadonlyArray<any>
++  ? UnionToIntersection<
++      M[number] extends infer MiddlewareValues
++        ? MiddlewareValues extends Middleware<infer DispatchExt, any, any>
++          ? DispatchExt extends Function
++            ? IsAny<DispatchExt, never, DispatchExt>
++            : never
++          : never
++        : never
+     >
+-  : Acc
+-
+-export type ExtractDispatchExtensions<M> = M extends MiddlewareArray<
+-  infer MiddlewareTuple
+->
+-  ? ExtractDispatchFromMiddlewareTuple<MiddlewareTuple, {}>
+-  : M extends Middleware[]
+-  ? ExtractDispatchFromMiddlewareTuple<[...M], {}>
+   : never
+ 
+ /**
+diff --git a/packages/toolkit/src/utils.ts b/packages/toolkit/src/utils.ts
+index 5a3c77e1..037db322 100644
+--- a/packages/toolkit/src/utils.ts
++++ b/packages/toolkit/src/utils.ts
+@@ -26,9 +26,10 @@ It is disabled in production builds, so you don't need to worry about that.`)
+  * @public
+  */
+ export class MiddlewareArray<
+-  Middlewares extends Middleware<any, any>[]
+-> extends Array<Middlewares[number]> {
+-  constructor(...items: Middlewares)
++  Middlewares extends Middleware<any, any>
++> extends Array<Middlewares> {
++  constructor(arrayLength?: number)
++  constructor(...items: Middlewares[])
+   constructor(...args: any[]) {
+     super(...args)
+     Object.setPrototypeOf(this, MiddlewareArray.prototype)
+@@ -40,22 +41,22 @@ export class MiddlewareArray<
+ 
+   concat<AdditionalMiddlewares extends ReadonlyArray<Middleware<any, any>>>(
+     items: AdditionalMiddlewares
+-  ): MiddlewareArray<[...Middlewares, ...AdditionalMiddlewares]>
++  ): MiddlewareArray<Middlewares | AdditionalMiddlewares[number]>
+ 
+   concat<AdditionalMiddlewares extends ReadonlyArray<Middleware<any, any>>>(
+     ...items: AdditionalMiddlewares
+-  ): MiddlewareArray<[...Middlewares, ...AdditionalMiddlewares]>
++  ): MiddlewareArray<Middlewares | AdditionalMiddlewares[number]>
+   concat(...arr: any[]) {
+     return super.concat.apply(this, arr)
+   }
+ 
+   prepend<AdditionalMiddlewares extends ReadonlyArray<Middleware<any, any>>>(
+     items: AdditionalMiddlewares
+-  ): MiddlewareArray<[...AdditionalMiddlewares, ...Middlewares]>
++  ): MiddlewareArray<AdditionalMiddlewares[number] | Middlewares>
+ 
+   prepend<AdditionalMiddlewares extends ReadonlyArray<Middleware<any, any>>>(
+     ...items: AdditionalMiddlewares
+-  ): MiddlewareArray<[...AdditionalMiddlewares, ...Middlewares]>
++  ): MiddlewareArray<AdditionalMiddlewares[number] | Middlewares>
+ 
+   prepend(...arr: any[]) {
+     if (arr.length === 1 && Array.isArray(arr[0])) {

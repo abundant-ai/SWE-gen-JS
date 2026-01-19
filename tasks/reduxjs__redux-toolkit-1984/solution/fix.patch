@@ -1,0 +1,335 @@
+diff --git a/docs/api/serializabilityMiddleware.mdx b/docs/api/serializabilityMiddleware.mdx
+index 39265aad..84e7d3f0 100644
+--- a/docs/api/serializabilityMiddleware.mdx
++++ b/docs/api/serializabilityMiddleware.mdx
+@@ -57,9 +57,14 @@ interface SerializableStateInvariantMiddlewareOptions {
+   warnAfter?: number
+ 
+   /**
+-   * Opt out of checking state, but continue checking actions
++   * Opt out of checking state. When set to `true`, other state-related params will be ignored.
+    */
+   ignoreState?: boolean
++
++  /**
++   * Opt out of checking actions. When set to `true`, other action-related params will be ignored.
++   */
++  ignoreActions?: boolean
+ }
+ ```
+ 
+diff --git a/packages/toolkit/etc/redux-toolkit.api.md b/packages/toolkit/etc/redux-toolkit.api.md
+index 6553fa3e..62dd2715 100644
+--- a/packages/toolkit/etc/redux-toolkit.api.md
++++ b/packages/toolkit/etc/redux-toolkit.api.md
+@@ -86,9 +86,9 @@ export interface ActionReducerMapBuilder<State> {
+     reducer: CaseReducer<State, A>
+   ): ActionReducerMapBuilder<State>
+   addDefaultCase(reducer: CaseReducer<State, AnyAction>): {}
+-  addMatcher<A extends AnyAction>(
+-    matcher: ActionMatcher<A> | ((action: AnyAction) => boolean),
+-    reducer: CaseReducer<State, A>
++  addMatcher<A>(
++    matcher: TypeGuard<A> | ((action: any) => boolean),
++    reducer: CaseReducer<State, A extends AnyAction ? A : A & AnyAction>
+   ): Omit<ActionReducerMapBuilder<State>, 'addCase'>
+ }
+ 
+@@ -124,10 +124,10 @@ export type AsyncThunkAction<
+   | ReturnType<AsyncThunkFulfilledActionCreator<Returned, ThunkArg>>
+   | ReturnType<AsyncThunkRejectedActionCreator<ThunkArg, ThunkApiConfig>>
+ > & {
+-  abort(reason?: string): void
++  abort: (reason?: string) => void
+   requestId: string
+   arg: ThunkArg
+-  unwrap(): Promise<Returned>
++  unwrap: () => Promise<Returned>
+ }
+ 
+ // @public
+@@ -138,10 +138,10 @@ export type AsyncThunkOptions<
+   condition?(
+     arg: ThunkArg,
+     api: Pick<GetThunkAPI<ThunkApiConfig>, 'getState' | 'extra'>
+-  ): boolean | undefined
++  ): MaybePromise<boolean | undefined>
+   dispatchConditionRejection?: boolean
+   serializeError?: (x: unknown) => GetSerializedErrorType<ThunkApiConfig>
+-  idGenerator?: () => string
++  idGenerator?: (arg: ThunkArg) => string
+ } & IsUnknown<
+   GetPendingMeta<ThunkApiConfig>,
+   {
+@@ -258,11 +258,18 @@ export function createAction<
+   prepareAction: PA
+ ): PayloadActionCreator<ReturnType<PA>['payload'], T, PA>
+ 
++// @public (undocumented)
++export function createAsyncThunk<Returned, ThunkArg = void>(
++  typePrefix: string,
++  payloadCreator: AsyncThunkPayloadCreator<Returned, ThunkArg, {}>,
++  options?: AsyncThunkOptions<ThunkArg, {}>
++): AsyncThunk<Returned, ThunkArg, {}>
++
+ // @public (undocumented)
+ export function createAsyncThunk<
+   Returned,
+-  ThunkArg = void,
+-  ThunkApiConfig extends AsyncThunkConfig = {}
++  ThunkArg,
++  ThunkApiConfig extends AsyncThunkConfig
+ >(
+   typePrefix: string,
+   payloadCreator: AsyncThunkPayloadCreator<Returned, ThunkArg, ThunkApiConfig>,
+@@ -286,21 +293,21 @@ export function createImmutableStateInvariantMiddleware(
+ export { createNextState }
+ 
+ // @public
+-export function createReducer<S>(
+-  initialState: S,
++export function createReducer<S extends NotFunction<any>>(
++  initialState: S | (() => S),
+   builderCallback: (builder: ActionReducerMapBuilder<S>) => void
+-): Reducer<S>
++): ReducerWithInitialState<S>
+ 
+ // @public
+ export function createReducer<
+-  S,
++  S extends NotFunction<any>,
+   CR extends CaseReducers<S, any> = CaseReducers<S, any>
+ >(
+-  initialState: S,
++  initialState: S | (() => S),
+   actionsMap: CR,
+   actionMatchers?: ActionMatcherDescriptionCollection<S>,
+   defaultCaseReducer?: CaseReducer<S>
+-): Reducer<S>
++): ReducerWithInitialState<S>
+ 
+ export { createSelector }
+ 
+@@ -327,7 +334,7 @@ export interface CreateSliceOptions<
+   extraReducers?:
+     | CaseReducers<NoInfer<State>, any>
+     | ((builder: ActionReducerMapBuilder<NoInfer<State>>) => void)
+-  initialState: State
++  initialState: State | (() => State)
+   name: Name
+   reducers: ValidateSliceCaseReducers<State, CR>
+ }
+@@ -348,7 +355,7 @@ export interface EnhancedStore<
+   A extends Action = AnyAction,
+   M extends Middlewares<S> = Middlewares<S>
+ > extends Store<S, A> {
+-  dispatch: DispatchForMiddlewares<M> & Dispatch<A>
++  dispatch: Dispatch<A> & DispatchForMiddlewares<M>
+ }
+ 
+ // @public (undocumented)
+@@ -509,7 +516,7 @@ export function findNonSerializableValue(
+ 
+ export { freeze }
+ 
+-// @public
++// @public @deprecated
+ export function getDefaultMiddleware<
+   S = any,
+   O extends Partial<GetDefaultMiddlewareOptions> = {
+@@ -783,6 +790,7 @@ export interface Slice<
+ > {
+   actions: CaseReducerActions<CaseReducers>
+   caseReducers: SliceDefinedCaseReducers<CaseReducers>
++  getInitialState: () => State
+   name: Name
+   reducer: Reducer<State>
+ }
+diff --git a/packages/toolkit/etc/rtk-query.api.md b/packages/toolkit/etc/rtk-query.api.md
+index 2da269a7..aeeb76f6 100644
+--- a/packages/toolkit/etc/rtk-query.api.md
++++ b/packages/toolkit/etc/rtk-query.api.md
+@@ -4,6 +4,8 @@
+ 
+ ```ts
+ import type { ActionCreatorWithoutPayload } from '@reduxjs/toolkit'
++import type { AnyAction } from '@reduxjs/toolkit'
++import type { SerializedError } from '@reduxjs/toolkit'
+ import type { ThunkDispatch } from '@reduxjs/toolkit'
+ 
+ // @public (undocumented)
+@@ -77,7 +79,9 @@ export type BaseQueryFn<
+   Args = any,
+   Result = unknown,
+   Error = unknown,
+-  DefinitionExtraOptions = {},
++  DefinitionExtraOptions = {
++    copyWithStructuralSharing?: boolean
++  },
+   Meta = {}
+ > = (
+   args: Args,
+@@ -122,12 +126,27 @@ export interface CreateApiOptions<
+   endpoints(
+     build: EndpointBuilder<BaseQuery, TagTypes, ReducerPath>
+   ): Definitions
++  extractRehydrationInfo?: (
++    action: AnyAction,
++    {
++      reducerPath,
++    }: {
++      reducerPath: ReducerPath
++    }
++  ) =>
++    | undefined
++    | CombinedState<
++        NoInfer<Definitions>,
++        NoInfer<TagTypes>,
++        NoInfer<ReducerPath>
++      >
+   keepUnusedDataFor?: number
+   reducerPath?: ReducerPath
+   refetchOnFocus?: boolean
+   refetchOnMountOrArgChange?: boolean | number
+   refetchOnReconnect?: boolean
+   serializeQueryArgs?: SerializeQueryArgs<BaseQueryArg<BaseQuery>>
++  structuralSharing?: boolean
+   tagTypes?: readonly TagTypes[]
+ }
+ 
+@@ -175,6 +194,7 @@ export function fetchBaseQuery({
+   baseUrl,
+   prepareHeaders,
+   fetchFn,
++  paramsSerializer,
+   ...baseFetchOptions
+ }?: FetchBaseQueryArgs): BaseQueryFn<
+   string | FetchArgs,
+@@ -185,17 +205,32 @@ export function fetchBaseQuery({
+ >
+ 
+ // @public (undocumented)
+-export interface FetchBaseQueryError {
+-  // (undocumented)
+-  data: unknown
+-  // (undocumented)
+-  status: number
+-}
++export type FetchBaseQueryError =
++  | {
++      status: number
++      data: unknown
++    }
++  | {
++      status: 'FETCH_ERROR'
++      data?: undefined
++      error: string
++    }
++  | {
++      status: 'PARSING_ERROR'
++      originalStatus: number
++      data: string
++      error: string
++    }
++  | {
++      status: 'CUSTOM_ERROR'
++      data?: unknown
++      error: string
++    }
+ 
+ // @public (undocumented)
+ export type FetchBaseQueryMeta = {
+   request: Request
+-  response: Response
++  response?: Response
+ }
+ 
+ // @public (undocumented)
+@@ -208,8 +243,16 @@ export type Module<Name extends ModuleName> = {
+     TagTypes extends string
+   >(
+     api: Api<BaseQuery, EndpointDefinitions, ReducerPath, TagTypes, ModuleName>,
+-    options: Required<
+-      CreateApiOptions<BaseQuery, Definitions, ReducerPath, TagTypes>
++    options: WithRequiredProp<
++      CreateApiOptions<BaseQuery, Definitions, ReducerPath, TagTypes>,
++      | 'reducerPath'
++      | 'serializeQueryArgs'
++      | 'keepUnusedDataFor'
++      | 'refetchOnMountOrArgChange'
++      | 'refetchOnFocus'
++      | 'refetchOnReconnect'
++      | 'tagTypes'
++      | 'structuralSharing'
+     >,
+     context: ApiContext<Definitions>
+   ): {
+@@ -255,8 +298,8 @@ export enum QueryStatus {
+ // @public
+ export const retry: BaseQueryEnhancer<
+   unknown,
+-  StaggerOptions,
+-  void | StaggerOptions
++  RetryOptions,
++  void | RetryOptions
+ > & {
+   fail: typeof fail_2
+ }
+diff --git a/packages/toolkit/src/serializableStateInvariantMiddleware.ts b/packages/toolkit/src/serializableStateInvariantMiddleware.ts
+index 39cf8981..5368d11a 100644
+--- a/packages/toolkit/src/serializableStateInvariantMiddleware.ts
++++ b/packages/toolkit/src/serializableStateInvariantMiddleware.ts
+@@ -132,9 +132,14 @@ export interface SerializableStateInvariantMiddlewareOptions {
+   warnAfter?: number
+ 
+   /**
+-   * Opt out of checking state, but continue checking actions
++   * Opt out of checking state. When set to `true`, other state-related params will be ignored.
+    */
+   ignoreState?: boolean
++
++  /**
++   * Opt out of checking actions. When set to `true`, other action-related params will be ignored.
++   */
++  ignoreActions?: boolean
+ }
+ 
+ /**
+@@ -160,10 +165,14 @@ export function createSerializableStateInvariantMiddleware(
+     ignoredPaths = [],
+     warnAfter = 32,
+     ignoreState = false,
++    ignoreActions = false,
+   } = options
+ 
+   return (storeAPI) => (next) => (action) => {
+-    if (ignoredActions.length && ignoredActions.indexOf(action.type) !== -1) {
++    if (
++      ignoreActions ||
++      (ignoredActions.length && ignoredActions.indexOf(action.type) !== -1)
++    ) {
+       return next(action)
+     }
+ 
+diff --git a/yarn.lock b/yarn.lock
+index 101da31a..d1cc443d 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -5513,7 +5513,16 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@rtk-incubator/action-listener-middleware@^0.6.0, @rtk-incubator/action-listener-middleware@workspace:packages/action-listener-middleware":
++"@rtk-incubator/action-listener-middleware@npm:^0.6.0":
++  version: 0.6.0
++  resolution: "@rtk-incubator/action-listener-middleware@npm:0.6.0"
++  peerDependencies:
++    "@reduxjs/toolkit": ^1.6.0
++  checksum: 01e600a9e513f883e4c6d02cbe4565b9691d6b43ebff432a9ad7f4f96d07c3164c3a0c14fde4391e3d3f65e18753e567b67d9645a2af27daba6b0aadd5fa2066
++  languageName: node
++  linkType: hard
++
++"@rtk-incubator/action-listener-middleware@workspace:packages/action-listener-middleware":
+   version: 0.0.0-use.local
+   resolution: "@rtk-incubator/action-listener-middleware@workspace:packages/action-listener-middleware"
+   dependencies:

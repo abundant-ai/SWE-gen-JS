@@ -1,0 +1,250 @@
+diff --git a/.changeset/brave-llamas-hammer.md b/.changeset/brave-llamas-hammer.md
+deleted file mode 100644
+index 188c6aa498..0000000000
+--- a/.changeset/brave-llamas-hammer.md
++++ /dev/null
+@@ -1,9 +0,0 @@
+----
+-'xstate': patch
+----
+-
+-State IDs that have periods in them are now supported if those periods are escaped.
+-
+-The motivation is that external tools, such as [Stately Studio](https://stately.ai/studio), may allow users to enter any text into the state ID field. This change allows those tools to escape periods in state IDs, so that they don't conflict with the internal path-based state IDs.
+-
+-E.g. if a state ID of `"Loading..."` is entered into the state ID field, instead of crashing either the external tool and/or the XState state machine, it should be converted by the tool to `"Loading\\.\\.\\."`, and those periods will be ignored by XState.
+diff --git a/packages/core/src/StateMachine.ts b/packages/core/src/StateMachine.ts
+index 3ceaa78350..28b3531c94 100644
+--- a/packages/core/src/StateMachine.ts
++++ b/packages/core/src/StateMachine.ts
+@@ -1,5 +1,6 @@
+ import isDevelopment from '#is-development';
+ import { assign } from './actions.ts';
++import { STATE_DELIMITER } from './constants.ts';
+ import { $$ACTOR_TYPE, createActor } from './createActor.ts';
+ import { createInitEvent } from './eventUtils.ts';
+ import {
+@@ -48,7 +49,7 @@ import type {
+   TODO,
+   TransitionDefinition
+ } from './types.ts';
+-import { resolveReferencedActor, toStatePath } from './utils.ts';
++import { resolveReferencedActor } from './utils.ts';
+ 
+ export const STATE_IDENTIFIER = '#';
+ export const WILDCARD = '*';
+@@ -400,7 +401,7 @@ export class StateMachine<
+   }
+ 
+   public getStateNodeById(stateId: string): StateNode<TContext, TEvent> {
+-    const fullPath = toStatePath(stateId);
++    const fullPath = stateId.split(STATE_DELIMITER);
+     const relativePath = fullPath.slice(1);
+     const resolvedStateId = isStateId(fullPath[0])
+       ? fullPath[0].slice(STATE_IDENTIFIER.length)
+diff --git a/packages/core/src/stateUtils.ts b/packages/core/src/stateUtils.ts
+index a97563d6f0..5360a1da34 100644
+--- a/packages/core/src/stateUtils.ts
++++ b/packages/core/src/stateUtils.ts
+@@ -216,24 +216,24 @@ export function getCandidates<TEvent extends EventObject>(
+   const candidates =
+     stateNode.transitions.get(receivedEventType) ||
+     [...stateNode.transitions.keys()]
+-      .filter((eventDescriptor) => {
++      .filter((descriptor) => {
+         // check if transition is a wildcard transition,
+         // which matches any non-transient events
+-        if (eventDescriptor === WILDCARD) {
++        if (descriptor === WILDCARD) {
+           return true;
+         }
+ 
+-        if (!eventDescriptor.endsWith('.*')) {
++        if (!descriptor.endsWith('.*')) {
+           return false;
+         }
+ 
+-        if (isDevelopment && /.*\*.+/.test(eventDescriptor)) {
++        if (isDevelopment && /.*\*.+/.test(descriptor)) {
+           console.warn(
+-            `Wildcards can only be the last token of an event descriptor (e.g., "event.*") or the entire event descriptor ("*"). Check the "${eventDescriptor}" event.`
++            `Wildcards can only be the last token of an event descriptor (e.g., "event.*") or the entire event descriptor ("*"). Check the "${descriptor}" event.`
+           );
+         }
+ 
+-        const partialEventTokens = eventDescriptor.split('.');
++        const partialEventTokens = descriptor.split('.');
+         const eventTokens = receivedEventType.split('.');
+ 
+         for (
+@@ -249,7 +249,7 @@ export function getCandidates<TEvent extends EventObject>(
+ 
+             if (isDevelopment && !isLastToken) {
+               console.warn(
+-                `Infix wildcards in transition events are not allowed. Check the "${eventDescriptor}" transition.`
++                `Infix wildcards in transition events are not allowed. Check the "${descriptor}" transition.`
+               );
+             }
+ 
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index d30acabfd2..f1ee0a0d2a 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -1,7 +1,7 @@
+ import isDevelopment from '#is-development';
+ import { isMachineSnapshot } from './State.ts';
+ import type { StateNode } from './StateNode.ts';
+-import { TARGETLESS_KEY } from './constants.ts';
++import { STATE_DELIMITER, TARGETLESS_KEY } from './constants.ts';
+ import type {
+   ActorLogic,
+   AnyActorRef,
+@@ -56,31 +56,7 @@ export function toStatePath(stateId: string | string[]): string[] {
+     return stateId;
+   }
+ 
+-  let result: string[] = [];
+-  let segment = '';
+-
+-  for (let i = 0; i < stateId.length; i++) {
+-    const char = stateId.charCodeAt(i);
+-    switch (char) {
+-      // \
+-      case 92:
+-        // consume the next character
+-        segment += stateId[i + 1];
+-        // and skip over it
+-        i++;
+-        continue;
+-      // .
+-      case 46:
+-        result.push(segment);
+-        segment = '';
+-        continue;
+-    }
+-    segment += stateId[i];
+-  }
+-
+-  result.push(segment);
+-
+-  return result;
++  return stateId.split(STATE_DELIMITER);
+ }
+ 
+ export function toStateValue(
+diff --git a/packages/core/test/id.test.ts b/packages/core/test/id.test.ts
+index 86373a70af..6c82938f54 100644
+--- a/packages/core/test/id.test.ts
++++ b/packages/core/test/id.test.ts
+@@ -1,6 +1,5 @@
+ import { testAll } from './utils';
+ import { createMachine, createActor } from '../src/index.ts';
+-import { getInitialSnapshot, getNextSnapshot } from '../src/getNextSnapshot.ts';
+ 
+ const idMachine = createMachine({
+   initial: 'A',
+@@ -109,104 +108,4 @@ describe('State node IDs', () => {
+       }
+     });
+   });
+-
+-  it('should work with keys that have escaped periods', () => {
+-    const machine = createMachine({
+-      initial: 'start',
+-      states: {
+-        start: {
+-          on: {
+-            escaped: 'foo\\.bar',
+-            unescaped: 'foo.bar'
+-          }
+-        },
+-        'foo.bar': {},
+-        foo: {
+-          initial: 'bar',
+-          states: {
+-            bar: {}
+-          }
+-        }
+-      }
+-    });
+-
+-    const initialState = getInitialSnapshot(machine);
+-    const escapedState = getNextSnapshot(machine, initialState, {
+-      type: 'escaped'
+-    });
+-
+-    expect(escapedState.value).toEqual('foo.bar');
+-
+-    const unescapedState = getNextSnapshot(machine, initialState, {
+-      type: 'unescaped'
+-    });
+-    expect(unescapedState.value).toEqual({ foo: 'bar' });
+-  });
+-
+-  it('should work with IDs that have escaped periods', () => {
+-    const machine = createMachine({
+-      initial: 'start',
+-      states: {
+-        start: {
+-          on: {
+-            escaped: '#foo\\.bar',
+-            unescaped: '#foo.bar'
+-          }
+-        },
+-        stateWithDot: {
+-          id: 'foo.bar'
+-        },
+-        foo: {
+-          id: 'foo',
+-          initial: 'bar',
+-          states: {
+-            bar: {}
+-          }
+-        }
+-      }
+-    });
+-
+-    const initialState = getInitialSnapshot(machine);
+-    const escapedState = getNextSnapshot(machine, initialState, {
+-      type: 'escaped'
+-    });
+-
+-    expect(escapedState.value).toEqual('stateWithDot');
+-
+-    const unescapedState = getNextSnapshot(machine, initialState, {
+-      type: 'unescaped'
+-    });
+-    expect(unescapedState.value).toEqual({ foo: 'bar' });
+-  });
+-
+-  it("should not treat escaped backslash as period's escape", () => {
+-    const machine = createMachine({
+-      initial: 'start',
+-      states: {
+-        start: {
+-          on: {
+-            EV: '#some\\\\.thing'
+-          }
+-        },
+-        foo: {
+-          id: 'some\\.thing'
+-        },
+-        bar: {
+-          id: 'some\\',
+-          initial: 'baz',
+-          states: {
+-            baz: {},
+-            thing: {}
+-          }
+-        }
+-      }
+-    });
+-
+-    const initialState = getInitialSnapshot(machine);
+-    const escapedState = getNextSnapshot(machine, initialState, {
+-      type: 'EV'
+-    });
+-
+-    expect(escapedState.value).toEqual({ bar: 'thing' });
+-  });
+ });

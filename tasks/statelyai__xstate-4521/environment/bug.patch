@@ -1,0 +1,186 @@
+diff --git a/.changeset/weak-swans-care.md b/.changeset/weak-swans-care.md
+deleted file mode 100644
+index 290ea7204e..0000000000
+--- a/.changeset/weak-swans-care.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-'xstate': minor
+----
+-
+-The event type of internal `after` events changed from `xstate.after(1000)#some.state.id` to `xstate.after.1000.some.state.id` for consistency.
+diff --git a/packages/core/src/StateNode.ts b/packages/core/src/StateNode.ts
+index 710a820d9b..37fd7341e0 100644
+--- a/packages/core/src/StateNode.ts
++++ b/packages/core/src/StateNode.ts
+@@ -301,11 +301,11 @@ export class StateNode<
+     return memo(this, 'invoke', () =>
+       toArray(this.config.invoke).map((invokeConfig, i) => {
+         const { src, systemId } = invokeConfig;
+-        const resolvedId = invokeConfig.id ?? createInvokeId(this.id, i);
++        const resolvedId = invokeConfig.id || createInvokeId(this.id, i);
+         const resolvedSrc =
+           typeof src === 'string'
+             ? src
+-            : `xstate.invoke.${createInvokeId(this.id, i)}`;
++            : `xstate#${createInvokeId(this.id, i)}`;
+         return {
+           ...invokeConfig,
+           src: resolvedSrc,
+diff --git a/packages/core/src/eventUtils.ts b/packages/core/src/eventUtils.ts
+index b3c1810b02..84c199d9a3 100644
+--- a/packages/core/src/eventUtils.ts
++++ b/packages/core/src/eventUtils.ts
+@@ -8,8 +8,9 @@ import { DoneActorEvent, DoneStateEvent, ErrorActorEvent } from './types.ts';
+  * @param delayRef The delay in milliseconds
+  * @param id The state node ID where this event is handled
+  */
+-export function createAfterEvent(delayRef: number | string, id: string) {
+-  return { type: `xstate.after.${delayRef}.${id}` } as const;
++export function createAfterEvent(delayRef: number | string, id?: string) {
++  const idSuffix = id ? `#${id}` : '';
++  return { type: `xstate.after(${delayRef})${idSuffix}` } as const;
+ }
+ 
+ /**
+diff --git a/packages/core/src/utils.ts b/packages/core/src/utils.ts
+index f1ee0a0d2a..7baf027ca4 100644
+--- a/packages/core/src/utils.ts
++++ b/packages/core/src/utils.ts
+@@ -240,22 +240,21 @@ export function toObserver<T>(
+ }
+ 
+ export function createInvokeId(stateNodeId: string, index: number): string {
+-  return `${index}.${stateNodeId}`;
++  return `${stateNodeId}[${index}]`;
+ }
+ 
+ export function resolveReferencedActor(machine: AnyStateMachine, src: string) {
+-  const match = src.match(/^xstate\.invoke\.(\d+)\.(.*)/)!;
+-  if (!match) {
+-    return machine.implementations.actors[src];
++  if (src.startsWith('xstate#')) {
++    const [, indexStr] = src.match(/\[(\d+)\]$/)!;
++    const node = machine.getStateNodeById(src.slice(7, -(indexStr.length + 2)));
++    const invokeConfig = node.config.invoke!;
++    return (
++      Array.isArray(invokeConfig)
++        ? invokeConfig[indexStr as any]
++        : (invokeConfig as InvokeConfig<any, any, any, any, any, any>)
++    ).src;
+   }
+-  const [, indexStr, nodeId] = match;
+-  const node = machine.getStateNodeById(nodeId);
+-  const invokeConfig = node.config.invoke!;
+-  return (
+-    Array.isArray(invokeConfig)
+-      ? invokeConfig[indexStr as any]
+-      : (invokeConfig as InvokeConfig<any, any, any, any, any, any>)
+-  ).src;
++  return machine.implementations.actors[src];
+ }
+ 
+ export function getAllOwnEventDescriptors(snapshot: AnyMachineSnapshot) {
+diff --git a/packages/core/test/after.test.ts b/packages/core/test/after.test.ts
+index 8242bd3c87..7cfa899024 100644
+--- a/packages/core/test/after.test.ts
++++ b/packages/core/test/after.test.ts
+@@ -50,7 +50,7 @@ describe('delayed transitions', () => {
+ 
+     expect([...transitions.keys()]).toMatchInlineSnapshot(`
+       [
+-        "xstate.after.1000.light.green",
++        "xstate.after(1000)#light.green",
+       ]
+     `);
+   });
+diff --git a/packages/core/test/inspect.test.ts b/packages/core/test/inspect.test.ts
+index b0a22a0993..4302475fb8 100644
+--- a/packages/core/test/inspect.test.ts
++++ b/packages/core/test/inspect.test.ts
+@@ -328,7 +328,7 @@ describe('inspect', () => {
+         {
+           "event": {
+             "output": 42,
+-            "type": "xstate.done.actor.0.(machine).loading",
++            "type": "xstate.done.actor.(machine).loading[0]",
+           },
+           "sourceId": "x:3",
+           "targetId": "x:2",
+@@ -378,7 +378,7 @@ describe('inspect', () => {
+           "actorId": "x:2",
+           "event": {
+             "output": 42,
+-            "type": "xstate.done.actor.0.(machine).loading",
++            "type": "xstate.done.actor.(machine).loading[0]",
+           },
+           "snapshot": {
+             "value": "loaded",
+diff --git a/packages/core/test/invoke.test.ts b/packages/core/test/invoke.test.ts
+index 1951ced422..ac1aabe644 100644
+--- a/packages/core/test/invoke.test.ts
++++ b/packages/core/test/invoke.test.ts
+@@ -3041,7 +3041,7 @@ describe('invoke', () => {
+               onDone: {
+                 guard: ({ event }) => {
+                   // invoke ID should not be 'someSrc'
+-                  const expectedType = 'xstate.done.actor.0.(machine).a';
++                  const expectedType = 'xstate.done.actor.(machine).a[0]';
+                   expect(event.type).toEqual(expectedType);
+                   return event.type === expectedType;
+                 },
+@@ -3108,7 +3108,7 @@ describe('invoke', () => {
+       );
+ 
+       expect(
+-        createActor(machine).getSnapshot().children['0.machine.a']
++        createActor(machine).getSnapshot().children['machine.a[0]']
+       ).toBeDefined();
+     }
+   );
+@@ -3222,8 +3222,8 @@ describe('invoke', () => {
+     // check within a macrotask so all promise-induced microtasks have a chance to resolve first
+     setTimeout(() => {
+       expect(actual).toEqual([
+-        'xstate.done.actor.0.(machine).first.fetch',
+-        'xstate.done.actor.0.(machine).second.fetch'
++        'xstate.done.actor.(machine).first.fetch[0]',
++        'xstate.done.actor.(machine).second.fetch[0]'
+       ]);
+       done();
+     }, 100);
+diff --git a/packages/core/test/json.test.ts b/packages/core/test/json.test.ts
+index ecfe9120d8..ba20319683 100644
+--- a/packages/core/test/json.test.ts
++++ b/packages/core/test/json.test.ts
+@@ -157,7 +157,7 @@ describe('json', () => {
+         },
+         {
+           "actions": [],
+-          "eventType": "xstate.done.actor.0.active",
++          "eventType": "xstate.done.actor.active[0]",
+           "guard": undefined,
+           "reenter": false,
+           "source": "#active",
+@@ -168,7 +168,7 @@ describe('json', () => {
+         },
+         {
+           "actions": [],
+-          "eventType": "xstate.error.actor.0.active",
++          "eventType": "xstate.error.actor.active[0]",
+           "guard": undefined,
+           "reenter": false,
+           "source": "#active",
+diff --git a/packages/xstate-graph/test/shortestPaths.test.ts b/packages/xstate-graph/test/shortestPaths.test.ts
+index 98ced4a29e..ad737e3438 100644
+--- a/packages/xstate-graph/test/shortestPaths.test.ts
++++ b/packages/xstate-graph/test/shortestPaths.test.ts
+@@ -160,7 +160,7 @@ describe('getShortestPaths', () => {
+ 
+     expect(shortestPaths.map((p) => p.steps.map((s) => s.event.type))).toEqual([
+       ['xstate.init'],
+-      ['xstate.init', 'xstate.after.1000.(machine).a']
++      ['xstate.init', 'xstate.after(1000)#(machine).a']
+     ]);
+   });
+ });

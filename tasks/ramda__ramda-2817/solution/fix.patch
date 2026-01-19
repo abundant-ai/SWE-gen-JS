@@ -1,0 +1,144 @@
+diff --git a/source/internal/_flatCat.js b/source/internal/_flatCat.js
+index 148afe3c..b134c11d 100644
+--- a/source/internal/_flatCat.js
++++ b/source/internal/_flatCat.js
+@@ -4,30 +4,27 @@ import _xArrayReduce from './_xArrayReduce.js';
+ import _xReduce from './_xReduce.js';
+ import _xfBase from './_xfBase.js';
+ 
+-var preservingReduced = function(xf) {
+-  return {
+-    '@@transducer/init': _xfBase.init,
+-    '@@transducer/result': function(result) {
+-      return xf['@@transducer/result'](result);
+-    },
+-    '@@transducer/step': function(result, input) {
+-      var ret = xf['@@transducer/step'](result, input);
+-      return ret['@@transducer/reduced'] ? _forceReduced(ret) : ret;
+-    }
+-  };
++var tInit = '@@transducer/init';
++var tStep = '@@transducer/step';
++var tResult = '@@transducer/result';
++function XPreservingReduced(xf) {
++  this.xf = xf;
++}
++XPreservingReduced.prototype[tInit] = _xfBase.init;
++XPreservingReduced.prototype[tResult] = _xfBase.result;
++XPreservingReduced.prototype[tStep] = function(result, input) {
++  var ret = this.xf[tStep](result, input);
++  return ret['@@transducer/reduced'] ? _forceReduced(ret) : ret;
+ };
+ 
+-var _flatCat = function _xcat(xf) {
+-  var rxf = preservingReduced(xf);
+-  return {
+-    '@@transducer/init': _xfBase.init,
+-    '@@transducer/result': function(result) {
+-      return rxf['@@transducer/result'](result);
+-    },
+-    '@@transducer/step': function(result, input) {
+-      return !_isArrayLike(input) ? _xArrayReduce(rxf, result, [input]) : _xReduce(rxf, result, input);
+-    }
+-  };
++function XFlatCat(xf) {
++  this.xf = new XPreservingReduced(xf);
++}
++XFlatCat.prototype[tInit] = _xfBase.init;
++XFlatCat.prototype[tResult] = _xfBase.result;
++XFlatCat.prototype[tStep] = function(result, input) {
++  return !_isArrayLike(input) ? _xArrayReduce(this.xf, result, [input]) : _xReduce(this.xf, result, input);
+ };
++var _flatCat = function _xcat(xf) { return new XFlatCat(xf); };
+ 
+ export default _flatCat;
+diff --git a/source/internal/_xscan.js b/source/internal/_xscan.js
+new file mode 100644
+index 00000000..89e614fb
+--- /dev/null
++++ b/source/internal/_xscan.js
+@@ -0,0 +1,27 @@
++import _curry3 from './_curry3.js';
++import _xfBase from './_xfBase.js';
++
++var tInit = '@@transducer/init';
++var tStep = '@@transducer/step';
++
++function XScan(reducer, acc, xf) {
++  this.xf = xf;
++  this.f = reducer;
++  this.acc = acc;
++}
++XScan.prototype[tInit] = function() {
++  return this.xf[tStep](this.xf[tInit](), this.acc);
++};
++XScan.prototype['@@transducer/result'] = _xfBase.result;
++XScan.prototype[tStep] = function(result, input) {
++  if (result['@@transducer/reduced']) {
++    return result;
++  }
++  this.acc = this.f(this.acc, input);
++  return this.xf[tStep](result, this.acc);
++};
++
++var _xscan = _curry3(function _xscan(reducer, acc, xf) {
++  return new XScan(reducer, acc, xf);
++});
++export default _xscan;
+diff --git a/source/into.js b/source/into.js
+index fd4e288f..e1aa6e6d 100644
+--- a/source/into.js
++++ b/source/into.js
+@@ -1,4 +1,3 @@
+-import _clone from './internal/_clone.js';
+ import _curry3 from './internal/_curry3.js';
+ import _isTransformer from './internal/_isTransformer.js';
+ import _xReduce from './internal/_xReduce.js';
+@@ -44,9 +43,8 @@ import _stepCat from './internal/_stepCat.js';
+  *      const intoArray = R.into([]);
+  *      intoArray(transducer, numbers); //=> [2, 3]
+  */
+-var into = _curry3(function into(acc, xf, list) {
+-  return _isTransformer(acc)
+-    ? _xReduce(xf(acc), acc['@@transducer/init'](), list)
+-    : _xReduce(xf(_stepCat(acc)), _clone(acc, false), list);
++var into = _curry3(function into(acc, transducer, list) {
++  var xf = transducer(_isTransformer(acc) ? acc : _stepCat(acc));
++  return _xReduce(xf, xf['@@transducer/init'](), list);
+ });
+ export default into;
+diff --git a/source/scan.js b/source/scan.js
+index 369aa62a..5935a80a 100644
+--- a/source/scan.js
++++ b/source/scan.js
+@@ -1,9 +1,13 @@
+ import _curry3 from './internal/_curry3.js';
++import _dispatchable from './internal/_dispatchable.js';
++import _xscan from './internal/_xscan.js';
+ 
+ 
+ /**
+  * Scan is similar to [`reduce`](#reduce), but returns a list of successively
+- * reduced values from the left
++ * reduced values from the left.
++ *
++ * Acts as a transducer if a transformer is given in list position.
+  *
+  * @func
+  * @memberOf R
+@@ -22,7 +26,7 @@ import _curry3 from './internal/_curry3.js';
+  *      const factorials = R.scan(R.multiply, 1, numbers); //=> [1, 1, 2, 6, 24]
+  * @symb R.scan(f, a, [b, c]) = [a, f(a, b), f(f(a, b), c)]
+  */
+-var scan = _curry3(function scan(fn, acc, list) {
++var scan = _curry3(_dispatchable([], _xscan, function scan(fn, acc, list) {
+   var idx = 0;
+   var len = list.length;
+   var result = [acc];
+@@ -32,5 +36,5 @@ var scan = _curry3(function scan(fn, acc, list) {
+     idx += 1;
+   }
+   return result;
+-});
++}));
+ export default scan;

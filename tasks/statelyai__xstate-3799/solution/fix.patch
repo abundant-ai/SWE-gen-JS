@@ -1,0 +1,227 @@
+diff --git a/.changeset/odd-dolls-drum.md b/.changeset/odd-dolls-drum.md
+new file mode 100644
+index 0000000000..9f621a8915
+--- /dev/null
++++ b/.changeset/odd-dolls-drum.md
+@@ -0,0 +1,5 @@
++---
++'@xstate/react': patch
++---
++
++Fixed an issue that caused the internally used `useSyncExternalStore` to warn about the computed snapshot not being cached when a not-started machine servive was passed to `useActor`.
+diff --git a/packages/xstate-react/src/useActor.ts b/packages/xstate-react/src/useActor.ts
+index 5787e19787..3f652510c1 100644
+--- a/packages/xstate-react/src/useActor.ts
++++ b/packages/xstate-react/src/useActor.ts
+@@ -2,8 +2,16 @@ import { useRef, useCallback } from 'react';
+ import useIsomorphicLayoutEffect from 'use-isomorphic-layout-effect';
+ import { ActorRef, EventObject, Sender } from 'xstate';
+ import useConstant from './useConstant';
+-import { useSyncExternalStore } from 'use-sync-external-store/shim';
+-import { getServiceSnapshot, isService } from './utils';
++import { useSyncExternalStoreWithSelector } from 'use-sync-external-store/shim/with-selector';
++import {
++  getServiceSnapshot,
++  isInterpreterStateEqual,
++  isService
++} from './utils';
++
++function identity<T>(a: T) {
++  return a;
++}
+ 
+ export function isActorWithState<T extends ActorRef<any>>(
+   actorRef: T
+@@ -17,9 +25,8 @@ function isDeferredActor<T extends ActorRef<any>>(
+   return 'deferred' in actorRef;
+ }
+ 
+-type EmittedFromActorRef<
+-  TActor extends ActorRef<any, any>
+-> = TActor extends ActorRef<any, infer TEmitted> ? TEmitted : never;
++type EmittedFromActorRef<TActor extends ActorRef<any, any>> =
++  TActor extends ActorRef<any, infer TEmitted> ? TEmitted : never;
+ 
+ function defaultGetSnapshot<TEmitted>(
+   actorRef: ActorRef<any, TEmitted>
+@@ -58,15 +65,27 @@ export function useActor(
+     [actorRef]
+   );
+ 
+-  const boundGetSnapshot = useCallback(() => getSnapshot(actorRef), [
+-    actorRef,
+-    getSnapshot
+-  ]);
++  const boundGetSnapshot = useCallback(
++    () => getSnapshot(actorRef),
++    [actorRef, getSnapshot]
++  );
++
++  const isEqual = useCallback(
++    (prevState, nextState) => {
++      if (isService(actorRef)) {
++        return isInterpreterStateEqual(actorRef, prevState, nextState);
++      }
++      return prevState === nextState;
++    },
++    [actorRef]
++  );
+ 
+-  const storeSnapshot = useSyncExternalStore(
++  const storeSnapshot = useSyncExternalStoreWithSelector(
+     subscribe,
+     boundGetSnapshot,
+-    boundGetSnapshot
++    boundGetSnapshot,
++    identity,
++    isEqual
+   );
+ 
+   const send: Sender<EventObject> = useConstant(() => (...args) => {
+diff --git a/packages/xstate-react/src/useMachine.ts b/packages/xstate-react/src/useMachine.ts
+index b3d16d1bbc..efa4d55080 100644
+--- a/packages/xstate-react/src/useMachine.ts
++++ b/packages/xstate-react/src/useMachine.ts
+@@ -14,6 +14,7 @@ import {
+ } from 'xstate';
+ import { MaybeLazy, Prop } from './types';
+ import { useIdleInterpreter } from './useInterpret';
++import { isInterpreterStateEqual } from './utils';
+ 
+ function identity<T>(a: T): T {
+   return a;
+@@ -31,30 +32,29 @@ export interface UseMachineOptions<TContext, TEvent extends EventObject> {
+   state?: StateConfig<TContext, TEvent>;
+ }
+ 
+-type RestParams<
+-  TMachine extends AnyStateMachine
+-> = AreAllImplementationsAssumedToBeProvided<
+-  TMachine['__TResolvedTypesMeta']
+-> extends false
+-  ? [
+-      options: InterpreterOptions &
+-        UseMachineOptions<TMachine['__TContext'], TMachine['__TEvent']> &
+-        InternalMachineOptions<
+-          TMachine['__TContext'],
+-          TMachine['__TEvent'],
+-          TMachine['__TResolvedTypesMeta'],
+-          true
+-        >
+-    ]
+-  : [
+-      options?: InterpreterOptions &
+-        UseMachineOptions<TMachine['__TContext'], TMachine['__TEvent']> &
+-        InternalMachineOptions<
+-          TMachine['__TContext'],
+-          TMachine['__TEvent'],
+-          TMachine['__TResolvedTypesMeta']
+-        >
+-    ];
++type RestParams<TMachine extends AnyStateMachine> =
++  AreAllImplementationsAssumedToBeProvided<
++    TMachine['__TResolvedTypesMeta']
++  > extends false
++    ? [
++        options: InterpreterOptions &
++          UseMachineOptions<TMachine['__TContext'], TMachine['__TEvent']> &
++          InternalMachineOptions<
++            TMachine['__TContext'],
++            TMachine['__TEvent'],
++            TMachine['__TResolvedTypesMeta'],
++            true
++          >
++      ]
++    : [
++        options?: InterpreterOptions &
++          UseMachineOptions<TMachine['__TContext'], TMachine['__TEvent']> &
++          InternalMachineOptions<
++            TMachine['__TContext'],
++            TMachine['__TEvent'],
++            TMachine['__TResolvedTypesMeta']
++          >
++      ];
+ 
+ type UseMachineReturn<
+   TMachine extends AnyStateMachine,
+@@ -71,32 +71,19 @@ export function useMachine<TMachine extends AnyStateMachine>(
+ 
+   const getSnapshot = useCallback(() => {
+     if (service.status === InterpreterStatus.NotStarted) {
+-      return (options.state
+-        ? State.create(options.state)
+-        : service.machine.initialState) as State<any, any, any, any, any>;
++      return (
++        options.state
++          ? State.create(options.state)
++          : service.machine.initialState
++      ) as State<any, any, any, any, any>;
+     }
+ 
+     return service.getSnapshot();
+   }, [service]);
+ 
+   const isEqual = useCallback(
+-    (prevState, nextState) => {
+-      if (service.status === InterpreterStatus.NotStarted) {
+-        return true;
+-      }
+-
+-      // Only change the current state if:
+-      // - the incoming state is the "live" initial state (since it might have new actors)
+-      // - OR the incoming state actually changed.
+-      //
+-      // The "live" initial state will have .changed === undefined.
+-      const initialStateChanged =
+-        nextState.changed === undefined &&
+-        (Object.keys(nextState.children).length > 0 ||
+-          typeof prevState.changed === 'boolean');
+-
+-      return !(nextState.changed || initialStateChanged);
+-    },
++    (prevState, nextState) =>
++      isInterpreterStateEqual(service, prevState, nextState),
+     [service]
+   );
+ 
+diff --git a/packages/xstate-react/src/utils.ts b/packages/xstate-react/src/utils.ts
+index 34f65616fb..8e3bb51829 100644
+--- a/packages/xstate-react/src/utils.ts
++++ b/packages/xstate-react/src/utils.ts
+@@ -1,4 +1,9 @@
+-import { Interpreter } from 'xstate';
++import {
++  AnyInterpreter,
++  AnyState,
++  Interpreter,
++  InterpreterStatus
++} from 'xstate';
+ 
+ export function partition<T, A extends T, B extends T>(
+   items: T[],
+@@ -68,3 +73,25 @@ export function isService(
+ ): actor is Interpreter<any, any, any, any> {
+   return 'state' in actor && 'machine' in actor;
+ }
++
++export function isInterpreterStateEqual(
++  service: AnyInterpreter,
++  prevState: AnyState,
++  nextState: AnyState
++) {
++  if (service.status === InterpreterStatus.NotStarted) {
++    return true;
++  }
++
++  // Only change the current state if:
++  // - the incoming state is the "live" initial state (since it might have new actors)
++  // - OR the incoming state actually changed.
++  //
++  // The "live" initial state will have .changed === undefined.
++  const initialStateChanged =
++    nextState.changed === undefined &&
++    (Object.keys(nextState.children).length > 0 ||
++      typeof prevState.changed === 'boolean');
++
++  return !(nextState.changed || initialStateChanged);
++}

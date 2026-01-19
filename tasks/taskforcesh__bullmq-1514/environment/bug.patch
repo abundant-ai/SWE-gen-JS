@@ -1,0 +1,191 @@
+diff --git a/src/classes/scripts.ts b/src/classes/scripts.ts
+index 83a1fd639b..dec12f5b06 100644
+--- a/src/classes/scripts.ts
++++ b/src/classes/scripts.ts
+@@ -362,10 +362,6 @@ export class Scripts {
+         return new Error(`Job ${jobId} has pending dependencies. ${command}`);
+       case ErrorCode.ParentJobNotExist:
+         return new Error(`Missing key for parent job ${jobId}. ${command}`);
+-      case ErrorCode.JobLockMismatch:
+-        return new Error(
+-          `Lock mismatch for job ${jobId}. Cmd ${command} from ${state}`,
+-        );
+       default:
+         return new Error(`Unknown code ${code} error for ${jobId}. ${command}`);
+     }
+diff --git a/src/commands/moveToFinished-12.lua b/src/commands/moveToFinished-12.lua
+index 864c34910c..28b0c4beec 100644
+--- a/src/commands/moveToFinished-12.lua
++++ b/src/commands/moveToFinished-12.lua
+@@ -48,7 +48,6 @@
+       -2 Missing lock.
+       -3 Job not in active set
+       -4 Job has pending dependencies
+-      -6 Lock is not owned by this client
+ 
+     Events:
+       'completed/failed'
+@@ -83,19 +82,11 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+ 
+     if token ~= "0" then
+         local lockKey = jobIdKey .. ':lock'
+-        local lockToken = rcall("GET", lockKey)
+-        if lockToken == token then
++        if rcall("GET", lockKey) == token then
+             rcall("DEL", lockKey)
+             rcall("SREM", KEYS[5], ARGV[1])
+         else
+-            if lockToken then
+-                rcall("SET", "DEBUG", lockToken)
+-                -- Lock exists but token does not match
+-                return -6
+-            else 
+-                -- Lock is missing completely
+-                return -2
+-            end
++            return -2
+         end
+     end
+ 
+@@ -127,13 +118,11 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+         if ARGV[5] == "completed" then
+             local dependenciesSet = parentKey .. ":dependencies"
+             if rcall("SREM", dependenciesSet, jobIdKey) == 1 then
+-                updateParentDepsIfNeeded(parentKey, parentQueueKey,
+-                                         dependenciesSet, parentId, jobIdKey,
+-                                         ARGV[4])
++                updateParentDepsIfNeeded(parentKey, parentQueueKey, dependenciesSet,
++                                        parentId, jobIdKey, ARGV[4])
+             end
+         elseif opts['fpof'] then
+-            moveParentFromWaitingChildrenToFailed(parentQueueKey, parentKey,
+-                                                  parentId, jobIdKey, timestamp)
++            moveParentFromWaitingChildrenToFailed(parentQueueKey, parentKey, parentId, jobIdKey, timestamp)
+         end
+     end
+ 
+@@ -171,7 +160,7 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+ 
+     -- Collect metrics
+     if maxMetricsSize ~= "" then
+-        collectMetrics(KEYS[12], KEYS[12] .. ':data', maxMetricsSize, timestamp)
++        collectMetrics(KEYS[12], KEYS[12]..':data', maxMetricsSize, timestamp)
+     end
+ 
+     -- Try to get next job to avoid an extra roundtrip if the queue is not closing,
+@@ -179,20 +168,20 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+     if (ARGV[7] == "1") then
+ 
+         -- Check if there are delayed jobs that can be promoted
+-        promoteDelayedJobs(KEYS[7], KEYS[1], KEYS[3], KEYS[8], KEYS[11],
+-                           KEYS[4], ARGV[8], timestamp)
++        promoteDelayedJobs(KEYS[7], KEYS[1], KEYS[3], KEYS[8], KEYS[11], KEYS[4], ARGV[8], timestamp)
+ 
+         -- Check if we are rate limited first.
+         local pttl = getRateLimitTTL(opts, KEYS[6])
+-        if pttl > 0 then return {0, 0, pttl} end
++        if pttl > 0 then
++            return { 0, 0, pttl }
++        end
+ 
+         jobId = rcall("RPOPLPUSH", KEYS[1], KEYS[2])
+ 
+         if jobId == "0" then
+             rcall("LREM", KEYS[2], 1, 0)
+         elseif jobId then
+-            return
+-                moveJobFromWaitToActive(KEYS, ARGV[8], jobId, timestamp, opts)
++            return moveJobFromWaitToActive(KEYS, ARGV[8], jobId, timestamp, opts)
+         end
+ 
+         -- Return the timestamp for the next delayed job if any.
+@@ -211,7 +200,7 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
+         if activeLen == 0 then
+             rcall("XADD", KEYS[4], "*", "event", "drained")
+         end
+-    end
++    end  
+ 
+     return 0
+ else
+diff --git a/src/enums/error-code.enum.ts b/src/enums/error-code.enum.ts
+index 2d93b46fe1..a3b2e5665e 100644
+--- a/src/enums/error-code.enum.ts
++++ b/src/enums/error-code.enum.ts
+@@ -4,5 +4,4 @@ export enum ErrorCode {
+   JobNotInState = -3,
+   JobPendingDependencies = -4,
+   ParentJobNotExist = -5,
+-  JobLockMismatch = -6,
+ }
+diff --git a/tests/test_worker.ts b/tests/test_worker.ts
+index 66880200cf..487f80e0fb 100644
+--- a/tests/test_worker.ts
++++ b/tests/test_worker.ts
+@@ -1240,7 +1240,8 @@ describe('workers', function () {
+       {
+         connection,
+         lockDuration: 1000,
+-        lockRenewTime: 3000, // The lock will not be updated in time
++        lockRenewTime: 3000, // The lock will not be updated
++        stalledInterval: 100,
+       },
+     );
+     await worker.waitUntilReady();
+@@ -1248,53 +1249,10 @@ describe('workers', function () {
+     const job = await queue.add('test', { bar: 'baz' });
+ 
+     const errorMessage = `Missing lock for job ${job.id}. failed`;
+-    const workerError = new Promise<void>((resolve, reject) => {
++    const workerError = new Promise<void>(resolve => {
+       worker.once('error', error => {
+-        try {
+-          expect(error.message).to.be.equal(errorMessage);
+-          resolve();
+-        } catch (err) {
+-          reject(err);
+-        }
+-      });
+-    });
+-
+-    await workerError;
+-
+-    await worker.close();
+-  });
+-
+-  it('emits error if lock is "stolen"', async function () {
+-    this.timeout(10000);
+-
+-    const connection = new IORedis({
+-      host: 'localhost',
+-      maxRetriesPerRequest: null,
+-    });
+-
+-    const worker = new Worker(
+-      queueName,
+-      async job => {
+-        connection.set(`bull:${queueName}:${job.id}:lock`, 'foo');
+-        return delay(2000);
+-      },
+-      {
+-        connection,
+-      },
+-    );
+-    await worker.waitUntilReady();
+-
+-    const job = await queue.add('test', { bar: 'baz' });
+-
+-    const errorMessage = `Lock mismatch for job ${job.id}. Cmd failed from active`;
+-    const workerError = new Promise<void>((resolve, reject) => {
+-      worker.once('error', error => {
+-        try {
+-          expect(error.message).to.be.equal(errorMessage);
+-          resolve();
+-        } catch (err) {
+-          reject(err);
+-        }
++        expect(error.message).to.be.equal(errorMessage);
++        resolve();
+       });
+     });
+ 

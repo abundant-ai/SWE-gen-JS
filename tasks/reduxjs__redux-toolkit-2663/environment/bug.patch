@@ -1,0 +1,215 @@
+diff --git a/packages/toolkit/src/query/core/buildInitiate.ts b/packages/toolkit/src/query/core/buildInitiate.ts
+index f29514cb..cbb5c19d 100644
+--- a/packages/toolkit/src/query/core/buildInitiate.ts
++++ b/packages/toolkit/src/query/core/buildInitiate.ts
+@@ -5,10 +5,11 @@ import type {
+   QueryArgFrom,
+   ResultTypeFrom,
+ } from '../endpointDefinitions'
+-import { DefinitionType, isQueryDefinition } from '../endpointDefinitions'
++import { DefinitionType } from '../endpointDefinitions'
+ import type { QueryThunk, MutationThunk, QueryThunkArg } from './buildThunks'
+ import type { AnyAction, ThunkAction, SerializedError } from '@reduxjs/toolkit'
+ import type { SubscriptionOptions, RootState } from './apiState'
++import { QueryStatus } from './apiState'
+ import type { InternalSerializeQueryArgs } from '../defaultSerializeQueryArgs'
+ import type { Api, ApiContext } from '../apiTypes'
+ import type { ApiEndpointQuery } from './module'
+@@ -278,11 +279,10 @@ Features like automatic cache collection, automatic refetching etc. will not be
+           endpointDefinition,
+           endpointName,
+         })
+-
+         const thunk = queryThunk({
+           type: 'query',
+           subscribe,
+-          forceRefetch: forceRefetch,
++          forceRefetch,
+           subscriptionOptions,
+           endpointName,
+           originalArgs: arg,
+diff --git a/packages/toolkit/src/query/core/buildThunks.ts b/packages/toolkit/src/query/core/buildThunks.ts
+index 67291aad..d6a111b1 100644
+--- a/packages/toolkit/src/query/core/buildThunks.ts
++++ b/packages/toolkit/src/query/core/buildThunks.ts
+@@ -12,11 +12,10 @@ import type {
+   QueryActionCreatorResult,
+ } from './buildInitiate'
+ import { forceQueryFnSymbol, isUpsertQuery } from './buildInitiate'
+-import {
++import type {
+   AssertTagTypes,
+   EndpointDefinition,
+   EndpointDefinitions,
+-  isQueryDefinition,
+   MutationDefinition,
+   QueryArgFrom,
+   QueryDefinition,
+@@ -475,51 +474,26 @@ In the case of an unhandled error, no tags will be "provided" or "invalidated".`
+     getPendingMeta() {
+       return { startedTimeStamp: Date.now() }
+     },
+-    condition(queryThunkArgs, { getState }) {
++    condition(arg, { getState }) {
+       const state = getState()
+-
+-      const requestState =
+-        state[reducerPath]?.queries?.[queryThunkArgs.queryCacheKey]
++      const requestState = state[reducerPath]?.queries?.[arg.queryCacheKey]
+       const fulfilledVal = requestState?.fulfilledTimeStamp
+-      const currentArg = queryThunkArgs.originalArgs
+-      const previousArg = requestState?.originalArgs
+-      const endpointDefinition =
+-        endpointDefinitions[queryThunkArgs.endpointName]
+ 
+       // Order of these checks matters.
+       // In order for `upsertQueryData` to successfully run while an existing request is in flight,
+       /// we have to check for that first, otherwise `queryThunk` will bail out and not run at all.
+-      if (isUpsertQuery(queryThunkArgs)) {
+-        return true
+-      }
++      if (isUpsertQuery(arg)) return true
+ 
+       // Don't retry a request that's currently in-flight
+-      if (requestState?.status === 'pending') {
+-        return false
+-      }
++      if (requestState?.status === 'pending') return false
+ 
+       // if this is forced, continue
+-      if (isForcedQuery(queryThunkArgs, state)) {
+-        return true
+-      }
+-
+-      if (
+-        isQueryDefinition(endpointDefinition) &&
+-        endpointDefinition?.forceRefetch?.({
+-          currentArg,
+-          previousArg,
+-          endpointState: requestState,
+-          state,
+-        })
+-      ) {
+-        return true
+-      }
++      if (isForcedQuery(arg, state)) return true
+ 
+       // Pull from the cache unless we explicitly force refetch or qualify based on time
+-      if (fulfilledVal) {
++      if (fulfilledVal)
+         // Value is cached and we didn't specify to refresh, skip it.
+         return false
+-      }
+ 
+       return true
+     },
+diff --git a/packages/toolkit/src/query/endpointDefinitions.ts b/packages/toolkit/src/query/endpointDefinitions.ts
+index f0bc6c75..477c8ddd 100644
+--- a/packages/toolkit/src/query/endpointDefinitions.ts
++++ b/packages/toolkit/src/query/endpointDefinitions.ts
+@@ -1,6 +1,6 @@
+ import type { AnyAction, ThunkDispatch } from '@reduxjs/toolkit'
+ import { SerializeQueryArgs } from './defaultSerializeQueryArgs'
+-import type { QuerySubState, RootState } from './core/apiState'
++import type { RootState } from './core/apiState'
+ import type {
+   BaseQueryExtraOptions,
+   BaseQueryFn,
+@@ -339,36 +339,6 @@ export interface QueryExtraOptions<
+     responseData: ResultType
+   ): ResultType | void
+ 
+-  /**
+-   * Check to see if the endpoint should force a refetch in cases where it normally wouldn't.
+-   * This is primarily useful for "infinite scroll" / pagination use cases where
+-   * RTKQ is keeping a single cache entry that is added to over time, in combination
+-   * with `serializeQueryArgs` returning a fixed cache key and a `merge` callback
+-   * set to add incoming data to the cache entry each time.
+-   *
+-   * Example:
+-   *
+-   * ```ts
+-   * forceRefetch({currentArg, previousArg}) {
+-   *   // Assume these are page numbers
+-   *   return currentArg !== previousArg
+-   * },
+-   * serializeQueryArgs({endpointName}) {
+-   *   return endpointName
+-   * },
+-   * merge(currentCacheData, responseData) {
+-   *   currentCacheData.push(...responseData)
+-   * }
+-   *
+-   * ```
+-   */
+-  forceRefetch?(params: {
+-    currentArg: QueryArg | undefined
+-    previousArg: QueryArg | undefined
+-    state: RootState<any, any, string>
+-    endpointState?: QuerySubState<any>
+-  }): boolean
+-
+   /**
+    * All of these are `undefined` at runtime, purely to be used in TypeScript declarations!
+    */
+diff --git a/packages/toolkit/src/query/tests/createApi.test.ts b/packages/toolkit/src/query/tests/createApi.test.ts
+index e21546c8..ed0c0e9c 100644
+--- a/packages/toolkit/src/query/tests/createApi.test.ts
++++ b/packages/toolkit/src/query/tests/createApi.test.ts
+@@ -866,18 +866,6 @@ describe('custom serializeQueryArgs per endpoint', () => {
+         query: (arg) => `${arg}`,
+         serializeQueryArgs: serializer1,
+       }),
+-      listItems: build.query<string[], number>({
+-        query: (pageNumber) => `/listItems?page=${pageNumber}`,
+-        serializeQueryArgs: ({ endpointName }) => {
+-          return endpointName
+-        },
+-        merge: (currentCache, newItems) => {
+-          currentCache.push(...newItems)
+-        },
+-        forceRefetch({ currentArg, previousArg }) {
+-          return currentArg !== previousArg
+-        },
+-      }),
+     }),
+   })
+ 
+@@ -930,37 +918,4 @@ describe('custom serializeQueryArgs per endpoint', () => {
+       ]
+     ).toBeTruthy()
+   })
+-
+-  test('serializeQueryArgs + merge allows refetching as args change with same cache key', async () => {
+-    const allItems = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'i']
+-    const PAGE_SIZE = 3
+-
+-    function paginate<T>(array: T[], page_size: number, page_number: number) {
+-      // human-readable page numbers usually start with 1, so we reduce 1 in the first argument
+-      return array.slice((page_number - 1) * page_size, page_number * page_size)
+-    }
+-
+-    server.use(
+-      rest.get('https://example.com/listItems', (req, res, ctx) => {
+-        const pageString = req.url.searchParams.get('page')
+-        const pageNum = parseInt(pageString || '0')
+-
+-        const results = paginate(allItems, PAGE_SIZE, pageNum)
+-        return res(ctx.json(results))
+-      })
+-    )
+-
+-    // Page number shouldn't matter here, because the cache key ignores that.
+-    // We just need to select the only cache entry.
+-    const selectListItems = api.endpoints.listItems.select(0)
+-
+-    await storeRef.store.dispatch(api.endpoints.listItems.initiate(1))
+-
+-    const initialEntry = selectListItems(storeRef.store.getState())
+-    expect(initialEntry.data).toEqual(['a', 'b', 'c'])
+-
+-    await storeRef.store.dispatch(api.endpoints.listItems.initiate(2))
+-    const updatedEntry = selectListItems(storeRef.store.getState())
+-    expect(updatedEntry.data).toEqual(['a', 'b', 'c', 'd', 'e', 'f'])
+-  })
+ })

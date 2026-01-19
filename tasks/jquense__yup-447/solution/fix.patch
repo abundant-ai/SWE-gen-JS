@@ -1,0 +1,184 @@
+diff --git a/src/Condition.js b/src/Condition.js
+index 9d03437..a5d9024 100644
+--- a/src/Condition.js
++++ b/src/Condition.js
+@@ -1,55 +1,64 @@
+ import has from 'lodash/has';
+ import isSchema from './util/isSchema';
+ 
+-function callOrConcat(schema) {
+-  if (typeof schema === 'function') return schema;
+-
+-  return base => base.concat(schema);
++function wrapCusomFn(fn) {
++  return function(...args) {
++    args.pop();
++    return fn.apply(this, args);
++  };
+ }
+ 
+-class Conditional {
+-  constructor(refs, options) {
+-    let { is, then, otherwise } = options;
++function makeFn(options) {
++  if (typeof options === 'function') return wrapCusomFn(options);
+ 
+-    this.refs = [].concat(refs);
++  if (!has(options, 'is'))
++    throw new TypeError('`is:` is required for `when()` conditions');
+ 
+-    then = callOrConcat(then);
+-    otherwise = callOrConcat(otherwise);
++  if (!options.then && !options.otherwise)
++    throw new TypeError(
++      'either `then:` or `otherwise:` is required for `when()` conditions',
++    );
+ 
+-    if (typeof options === 'function') this.fn = options;
+-    else {
+-      if (!has(options, 'is'))
+-        throw new TypeError('`is:` is required for `when()` conditions');
++  let { is, then, otherwise } = options;
+ 
+-      if (!options.then && !options.otherwise)
+-        throw new TypeError(
+-          'either `then:` or `otherwise:` is required for `when()` conditions',
+-        );
++  let check;
++  if (typeof is === 'function') {
++    check = is;
++  } else {
++    check = (...values) => values.every(value => value === is);
++  }
+ 
+-      let isFn =
+-        typeof is === 'function'
+-          ? is
+-          : (...values) => values.every(value => value === is);
++  let fn = function(...args) {
++    let options = args.pop();
++    let schema = args.pop();
++    let branch = check(...args) ? then : otherwise;
+ 
+-      this.fn = function(...values) {
+-        let currentSchema = values.pop();
+-        let option = isFn(...values) ? then : otherwise;
++    if (!branch) return undefined;
++    if (typeof branch === 'function') return branch(schema);
++    return schema.concat(branch.resolve(options));
++  };
+ 
+-        return option(currentSchema);
+-      };
+-    }
++  return fn;
++}
++
++class Condition {
++  constructor(refs, options) {
++    this.refs = refs;
++    this.fn = makeFn(options);
+   }
+ 
+-  resolve(ctx, options) {
++  resolve(base, options) {
+     let values = this.refs.map(ref => ref.getValue(options));
+ 
+-    let schema = this.fn.apply(ctx, values.concat(ctx));
++    let schema = this.fn.apply(base, values.concat(base, options));
++
++    if (schema === undefined || schema === base) return base;
+ 
+-    if (schema !== undefined && !isSchema(schema))
++    if (!isSchema(schema))
+       throw new TypeError('conditions must return a schema object');
+ 
+-    return schema || ctx;
++    return schema.resolve(options);
+   }
+ }
+ 
+-export default Conditional;
++export default Condition;
+diff --git a/src/Lazy.js b/src/Lazy.js
+index d092667..0de633a 100644
+--- a/src/Lazy.js
++++ b/src/Lazy.js
+@@ -2,16 +2,17 @@ import isSchema from './util/isSchema';
+ 
+ class Lazy {
+   constructor(mapFn) {
+-    this._resolve = (...args) => {
+-      let schema = mapFn(...args);
++    this._resolve = (value, options) => {
++      let schema = mapFn(value, options);
++
+       if (!isSchema(schema))
+         throw new TypeError('lazy() functions must return a valid schema');
+ 
+-      return schema;
++      return schema.resolve(options);
+     };
+   }
+-  resolve({ value, ...rest }) {
+-    return this._resolve(value, rest);
++  resolve(options) {
++    return this._resolve(options.value, options);
+   }
+   cast(value, options) {
+     return this._resolve(value, options).cast(value, options);
+diff --git a/src/mixed.js b/src/mixed.js
+index 27f781c..b59e7ab 100644
+--- a/src/mixed.js
++++ b/src/mixed.js
+@@ -135,14 +135,22 @@ const proto = (SchemaType.prototype = {
+   },
+ 
+   resolve(options) {
+-    if (this._conditions.length) {
+-      return this._conditions.reduce(
++    let schema = this;
++
++    if (schema._conditions.length) {
++      let conditions = schema._conditions;
++
++      schema = schema.clone();
++      schema._conditions = [];
++      schema = conditions.reduce(
+         (schema, condition) => condition.resolve(schema, options),
+-        this,
++        schema,
+       );
++
++      schema = schema.resolve(options);
+     }
+ 
+-    return this;
++    return schema;
+   },
+ 
+   cast(value, options = {}) {
+diff --git a/src/util/reach.js b/src/util/reach.js
+index d033d19..1f8fae7 100644
+--- a/src/util/reach.js
++++ b/src/util/reach.js
+@@ -13,7 +13,7 @@ export function getIn(schema, path, value, context) {
+     return {
+       parent,
+       parentPath: path,
+-      schema: schema.resolve({ context, parent, value }),
++      schema,
+     };
+ 
+   forEach(path, (_part, isBracket, isArray) => {
+@@ -55,10 +55,6 @@ export function getIn(schema, path, value, context) {
+     }
+   });
+ 
+-  if (schema) {
+-    schema = schema.resolve({ context, parent, value });
+-  }
+-
+   return { schema, parent, parentPath: lastPart };
+ }
+ 

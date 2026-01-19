@@ -1,0 +1,510 @@
+diff --git a/index.js b/index.js
+index 1778be2..07d55dc 100644
+--- a/index.js
++++ b/index.js
+@@ -18,7 +18,6 @@ const Buffer = require('safe-buffer').Buffer;
+ const isURL = require('isurl');
+ const isPlainObj = require('is-plain-obj');
+ const PCancelable = require('p-cancelable');
+-const pTimeout = require('p-timeout');
+ const pkg = require('./package');
+ 
+ function requestAsEventEmitter(opts) {
+@@ -102,11 +101,7 @@ function requestAsEventEmitter(opts) {
+ }
+ 
+ function asPromise(opts) {
+-	const timeoutFn = requestPromise => opts.gotTimeout && opts.gotTimeout.request ?
+-		pTimeout(requestPromise, opts.gotTimeout.request, new got.RequestError({message: 'Request timed out', code: 'ETIMEDOUT'}, opts)) :
+-		requestPromise;
+-
+-	return timeoutFn(new PCancelable((onCancel, resolve, reject) => {
++	return new PCancelable((onCancel, resolve, reject) => {
+ 		const ee = requestAsEventEmitter(opts);
+ 		let cancelOnRequest = false;
+ 
+@@ -166,20 +161,13 @@ function asPromise(opts) {
+ 		});
+ 
+ 		ee.on('error', reject);
+-	}));
++	});
+ }
+ 
+ function asStream(opts) {
+ 	const input = new PassThrough();
+ 	const output = new PassThrough();
+ 	const proxy = duplexer3(input, output);
+-	let timeout;
+-
+-	if (opts.gotTimeout && opts.gotTimeout.request) {
+-		timeout = setTimeout(() => {
+-			proxy.emit('error', new got.RequestError({message: 'Request timed out', code: 'ETIMEDOUT'}, opts));
+-		}, opts.gotTimeout.request);
+-	}
+ 
+ 	if (opts.json) {
+ 		throw new Error('got can not be used as stream when options.json is used');
+@@ -215,8 +203,6 @@ function asStream(opts) {
+ 	});
+ 
+ 	ee.on('response', res => {
+-		clearTimeout(timeout);
+-
+ 		const statusCode = res.statusCode;
+ 
+ 		res.pipe(output);
+@@ -350,11 +336,7 @@ function normalizeArguments(url, opts) {
+ 	}
+ 
+ 	if (opts.timeout) {
+-		if (typeof opts.timeout === 'number') {
+-			opts.gotTimeout = {request: opts.timeout};
+-		} else {
+-			opts.gotTimeout = opts.timeout;
+-		}
++		opts.gotTimeout = opts.timeout;
+ 		delete opts.timeout;
+ 	}
+ 
+diff --git a/package.json b/package.json
+index 4c449f0..34f0b99 100644
+--- a/package.json
++++ b/package.json
+@@ -57,7 +57,6 @@
+     "isurl": "^1.0.0-alpha5",
+     "lowercase-keys": "^1.0.0",
+     "p-cancelable": "^0.2.0",
+-    "p-timeout": "^1.1.1",
+     "safe-buffer": "^5.0.1",
+     "timed-out": "^4.0.0",
+     "url-parse-lax": "^1.0.0"
+diff --git a/readme.md b/readme.md
+index ff2bfa9..6f25119 100644
+--- a/readme.md
++++ b/readme.md
+@@ -125,9 +125,9 @@ Query string object that will be added to the request URL. This will override th
+ 
+ Type: `number`, `object`
+ 
+-Milliseconds to wait for the server to end the response before aborting request with `ETIMEDOUT` error.
++Milliseconds to wait for a server to send response headers before aborting request with `ETIMEDOUT` error.
+ 
+-This also accepts an object with separate `connect`, `socket`, and `request` fields for connection, socket, and entire request timeouts.
++Option accepts `object` with separate `connect` and `socket` fields for connection and socket inactivity timeouts.
+ 
+ ###### retries
+ 
+diff --git a/test/arguments.js b/test/arguments.js
+index 101baaa..86859ef 100644
+--- a/test/arguments.js
++++ b/test/arguments.js
+@@ -54,8 +54,12 @@ test('overrides querystring from opts', async t => {
+ });
+ 
+ test('should throw with auth in url', async t => {
+-	const err = await t.throws(got('https://test:45d3ps453@account.myservice.com/api/token'));
+-	t.regex(err.message, /Basic authentication must be done with auth option/);
++	try {
++		await got('https://test:45d3ps453@account.myservice.com/api/token');
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.regex(err.message, /Basic authentication must be done with auth option/);
++	}
+ });
+ 
+ test('should throw when body is set to object', async t => {
+diff --git a/test/error.js b/test/error.js
+index 0e4bdf0..d6d305f 100644
+--- a/test/error.js
++++ b/test/error.js
+@@ -16,30 +16,42 @@ test.before('setup', async () => {
+ });
+ 
+ test('properties', async t => {
+-	const err = await t.throws(got(s.url));
+-	t.truthy(err);
+-	t.truthy(err.response);
+-	t.false({}.propertyIsEnumerable.call(err, 'response'));
+-	t.false({}.hasOwnProperty.call(err, 'code'));
+-	t.is(err.message, 'Response code 404 (Not Found)');
+-	t.is(err.host, `${s.host}:${s.port}`);
+-	t.is(err.method, 'GET');
+-	t.is(err.protocol, 'http:');
+-	t.is(err.url, err.response.requestUrl);
+-	t.is(err.headers.connection, 'close');
++	try {
++		await got(s.url);
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.truthy(err);
++		t.truthy(err.response);
++		t.false({}.propertyIsEnumerable.call(err, 'response'));
++		t.false({}.hasOwnProperty.call(err, 'code'));
++		t.is(err.message, 'Response code 404 (Not Found)');
++		t.is(err.host, `${s.host}:${s.port}`);
++		t.is(err.method, 'GET');
++		t.is(err.protocol, 'http:');
++		t.is(err.url, err.response.requestUrl);
++		t.is(err.headers.connection, 'close');
++	}
+ });
+ 
+ test('dns message', async t => {
+-	const err = await t.throws(got('.com', {retries: 0}));
+-	t.truthy(err);
+-	t.regex(err.message, /getaddrinfo ENOTFOUND/);
+-	t.is(err.host, '.com');
+-	t.is(err.method, 'GET');
++	try {
++		await got('.com', {retries: 0});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.truthy(err);
++		t.regex(err.message, /getaddrinfo ENOTFOUND/);
++		t.is(err.host, '.com');
++		t.is(err.method, 'GET');
++	}
+ });
+ 
+ test('options.body error message', async t => {
+-	const err = await t.throws(got(s.url, {body: () => {}}));
+-	t.regex(err.message, /options.body must be a ReadableStream, string, Buffer or plain Object/);
++	try {
++		await got(s.url, {body: () => {}});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.regex(err.message, /options.body must be a ReadableStream, string, Buffer or plain Object/);
++	}
+ });
+ 
+ test.after('cleanup', async () => {
+diff --git a/test/gzip.js b/test/gzip.js
+index 1ec90b5..0e31a93 100644
+--- a/test/gzip.js
++++ b/test/gzip.js
+@@ -50,10 +50,14 @@ test('decompress content - stream', async t => {
+ });
+ 
+ test('handles gzip error', async t => {
+-	const err = await t.throws(got(`${s.url}/corrupted`));
+-	t.is(err.message, 'incorrect header check');
+-	t.is(err.path, '/corrupted');
+-	t.is(err.name, 'ReadError');
++	try {
++		await got(`${s.url}/corrupted`);
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.is(err.message, 'incorrect header check');
++		t.is(err.path, '/corrupted');
++		t.is(err.name, 'ReadError');
++	}
+ });
+ 
+ test('preserve headers property', async t => {
+diff --git a/test/helpers.js b/test/helpers.js
+index 384cf35..bcc87b1 100644
+--- a/test/helpers.js
++++ b/test/helpers.js
+@@ -22,11 +22,19 @@ test.before('setup', async () => {
+ test('promise mode', async t => {
+ 	t.is((await got.get(s.url)).body, 'ok');
+ 
+-	const err = await t.throws(got.get(`${s.url}/404`));
+-	t.is(err.response.body, 'not found');
+-
+-	const err2 = await t.throws(got.get('.com', {retries: 0}));
+-	t.truthy(err2);
++	try {
++		await got.get(`${s.url}/404`);
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.is(err.response.body, 'not found');
++	}
++
++	try {
++		await got.get('.com', {retries: 0});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.truthy(err);
++	}
+ });
+ 
+ test.after('cleanup', async () => {
+diff --git a/test/http.js b/test/http.js
+index dd7fbfa..f7fedee 100644
+--- a/test/http.js
++++ b/test/http.js
+@@ -50,9 +50,13 @@ test('requestUrl response', async t => {
+ });
+ 
+ test('error with code', async t => {
+-	const err = await t.throws(got(`${s.url}/404`));
+-	t.is(err.statusCode, 404);
+-	t.is(err.response.body, 'not');
++	try {
++		await got(`${s.url}/404`);
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.is(err.statusCode, 404);
++		t.is(err.response.body, 'not');
++	}
+ });
+ 
+ test('status code 304 doesn\'t throw', async t => {
+@@ -73,6 +77,30 @@ test('buffer on encoding === null', async t => {
+ 	t.truthy(Buffer.isBuffer(data));
+ });
+ 
++test('timeout option', async t => {
++	try {
++		await got(`${s.url}/404`, {
++			timeout: 1,
++			retries: 0
++		});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.is(err.code, 'ETIMEDOUT');
++	}
++});
++
++test('timeout option as object', async t => {
++	try {
++		await got(`${s.url}/404`, {
++			timeout: {connect: 1},
++			retries: 0
++		});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.is(err.code, 'ETIMEDOUT');
++	}
++});
++
+ test('query option', async t => {
+ 	t.is((await got(s.url, {query: {recent: true}})).body, 'recent');
+ 	t.is((await got(s.url, {query: 'recent=true'})).body, 'recent');
+diff --git a/test/json-parse.js b/test/json-parse.js
+index 808789c..c678800 100644
+--- a/test/json-parse.js
++++ b/test/json-parse.js
+@@ -47,22 +47,34 @@ test('not parses responses without a body', async t => {
+ });
+ 
+ test('wraps parsing errors', async t => {
+-	const err = await t.throws(got(`${s.url}/invalid`, {json: true}));
+-	t.regex(err.message, /Unexpected token/);
+-	t.true(err.message.indexOf(err.hostname) !== -1, err.message);
+-	t.is(err.path, '/invalid');
++	try {
++		await got(`${s.url}/invalid`, {json: true});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.regex(err.message, /Unexpected token/);
++		t.true(err.message.indexOf(err.hostname) !== -1, err.message);
++		t.is(err.path, '/invalid');
++	}
+ });
+ 
+ test('parses non-200 responses', async t => {
+-	const err = await t.throws(got(`${s.url}/non200`, {json: true}));
+-	t.deepEqual(err.response.body, {data: 'dog'});
++	try {
++		await got(`${s.url}/non200`, {json: true});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.deepEqual(err.response.body, {data: 'dog'});
++	}
+ });
+ 
+ test('ignores errors on invalid non-200 responses', async t => {
+-	const err = await t.throws(got(`${s.url}/non200-invalid`, {json: true}));
+-	t.is(err.message, 'Response code 500 (Internal Server Error)');
+-	t.is(err.response.body, 'Internal error');
+-	t.is(err.path, '/non200-invalid');
++	try {
++		await got(`${s.url}/non200-invalid`, {json: true});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.is(err.message, 'Response code 500 (Internal Server Error)');
++		t.is(err.response.body, 'Internal error');
++		t.is(err.path, '/non200-invalid');
++	}
+ });
+ 
+ test('should have statusCode in err', async t => {
+diff --git a/test/redirects.js b/test/redirects.js
+index 5553450..2b1a93f 100644
+--- a/test/redirects.js
++++ b/test/redirects.js
+@@ -111,9 +111,13 @@ test('relative redirect works', async t => {
+ });
+ 
+ test('throws on endless redirect', async t => {
+-	const err = await t.throws(got(`${http.url}/endless`));
+-	t.is(err.message, 'Redirected 10 times. Aborting.');
+-	t.deepEqual(err.redirectUrls, Array(10).fill(`${http.url}/endless`));
++	try {
++		await got(`${http.url}/endless`);
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.is(err.message, 'Redirected 10 times. Aborting.');
++		t.deepEqual(err.redirectUrls, Array(10).fill(`${http.url}/endless`));
++	}
+ });
+ 
+ test('query in options are not breaking redirects', async t => {
+@@ -128,10 +132,14 @@ test('hostname+path in options are not breaking redirects', async t => {
+ });
+ 
+ test('redirect only GET and HEAD requests', async t => {
+-	const err = await t.throws(got(`${http.url}/relative`, {body: 'wow'}));
+-	t.is(err.message, 'Response code 302 (Found)');
+-	t.is(err.path, '/relative');
+-	t.is(err.statusCode, 302);
++	try {
++		await got(`${http.url}/relative`, {body: 'wow'});
++		t.fail('Exception was not thrown');
++	} catch (err) {
++		t.is(err.message, 'Response code 302 (Found)');
++		t.is(err.path, '/relative');
++		t.is(err.statusCode, 302);
++	}
+ });
+ 
+ test('redirects from http to https works', async t => {
+diff --git a/test/retry.js b/test/retry.js
+index aa5e955..c5dd961 100644
+--- a/test/retry.js
++++ b/test/retry.js
+@@ -36,12 +36,16 @@ test('works on timeout error', async t => {
+ });
+ 
+ test('can be disabled with option', async t => {
+-	const err = await t.throws(got(`${s.url}/try-me`, {
+-		timeout: {connect: 500, socket: 500},
+-		retries: 0
+-	}));
+-	t.truthy(err);
+-	t.is(trys, 1);
++	try {
++		await got(`${s.url}/try-me`, {
++			timeout: {connect: 500, socket: 500},
++			retries: 0
++		});
++		t.fail();
++	} catch (err) {
++		t.truthy(err);
++		t.is(trys, 1);
++	}
+ });
+ 
+ test('function gets iter count', async t => {
+@@ -53,22 +57,28 @@ test('function gets iter count', async t => {
+ });
+ 
+ test('falsy value prevents retries', async t => {
+-	const err = await t.throws(got(`${s.url}/long`, {
+-		timeout: {connect: 100, socket: 100},
+-		retries: () => 0
+-	}));
+-	t.truthy(err);
++	try {
++		await got(`${s.url}/long`, {
++			timeout: {connect: 100, socket: 100},
++			retries: () => 0
++		});
++	} catch (err) {
++		t.truthy(err);
++	}
+ });
+ 
+ test('falsy value prevents retries #2', async t => {
+-	const err = await t.throws(got(`${s.url}/long`, {
+-		timeout: {connect: 100, socket: 100},
+-		retries: (iter, err) => {
+-			t.truthy(err);
+-			return false;
+-		}
+-	}));
+-	t.truthy(err);
++	try {
++		await got(`${s.url}/long`, {
++			timeout: {connect: 100, socket: 100},
++			retries: (iter, err) => {
++				t.truthy(err);
++				return false;
++			}
++		});
++	} catch (err) {
++		t.truthy(err);
++	}
+ });
+ 
+ test.after('cleanup', async () => {
+diff --git a/test/timeout.js b/test/timeout.js
+deleted file mode 100644
+index 9870131..0000000
+--- a/test/timeout.js
++++ /dev/null
+@@ -1,61 +0,0 @@
+-import test from 'ava';
+-import got from '..';
+-import {createServer} from './helpers/server';
+-
+-let s;
+-
+-test.before('setup', async () => {
+-	s = await createServer();
+-
+-	s.on('/', (req, res) => {
+-		res.statusCode = 200;
+-		res.end('OK');
+-	});
+-
+-	await s.listen(s.port);
+-});
+-
+-test('timeout option', async t => {
+-	const err = await t.throws(got(`${s.url}/`, {
+-		timeout: 1,
+-		retries: 0
+-	}));
+-
+-	t.is(err.code, 'ETIMEDOUT');
+-});
+-
+-test('timeout option as object', async t => {
+-	const err = await t.throws(got(`${s.url}/404`, {
+-		timeout: {socket: 50, request: 1},
+-		retries: 0
+-	}));
+-
+-	t.is(err.code, 'ETIMEDOUT');
+-});
+-
+-test('socket timeout', async t => {
+-	const err = await t.throws(got(`${s.url}/404`, {
+-		timeout: {socket: 1},
+-		retries: 0
+-	}));
+-
+-	t.is(err.code, 'ESOCKETTIMEDOUT');
+-});
+-
+-test('connection, request timeout', async t => {
+-	const err = await t.throws(got(`${s.url}/404`, {
+-		timeout: {socket: 50, request: 1},
+-		retries: 0
+-	}));
+-
+-	t.is(err.code, 'ETIMEDOUT');
+-});
+-
+-test.cb('timeout with streams', t => {
+-	got.stream(s.url, {timeout: 1, retries: 0})
+-		.on('error', err => {
+-			t.is(err.code, 'ETIMEDOUT');
+-			t.end();
+-		})
+-		.on('data', t.end);
+-});

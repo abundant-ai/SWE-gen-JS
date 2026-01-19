@@ -1,0 +1,195 @@
+diff --git a/.travis.yml b/.travis.yml
+index 46897f4..e6aa666 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -15,14 +15,14 @@ script:
+   - npm run test-cov
+ 
+ env:
+-  - NODE=8 TYPESCRIPT=typescript@1.6
+-  - NODE=8 TYPESCRIPT=typescript@1.7
+-  - NODE=8 TYPESCRIPT=typescript@1.8
+-  - NODE=8 TYPESCRIPT=typescript@2.0
+-  - NODE=8 TYPESCRIPT=typescript@2.1
++  - NODE=6 TYPESCRIPT=typescript@1.6
++  - NODE=6 TYPESCRIPT=typescript@1.7
++  - NODE=6 TYPESCRIPT=typescript@1.8
++  - NODE=6 TYPESCRIPT=typescript@2.0
++  - NODE=6 TYPESCRIPT=typescript@2.1
+   - NODE=4 TYPESCRIPT=typescript@latest
+-  - NODE=8 TYPESCRIPT=typescript@latest
+-  - NODE=8 TYPESCRIPT=typescript@next
++  - NODE=6 TYPESCRIPT=typescript@latest
++  - NODE=6 TYPESCRIPT=typescript@next
+ 
+ node_js:
+   - stable
+diff --git a/package.json b/package.json
+index 00698fa..1ac68e3 100644
+--- a/package.json
++++ b/package.json
+@@ -14,7 +14,7 @@
+     "LICENSE"
+   ],
+   "scripts": {
+-    "lint": "tslint \"src/**/*.ts\" --project tsconfig.json --type-check",
++    "lint": "tslint \"src/**/*.ts\"",
+     "clean": "rimraf dist",
+     "tsc": "tsc",
+     "build": "npm run clean && npm run tsc",
+@@ -49,7 +49,7 @@
+   },
+   "homepage": "https://github.com/TypeStrong/ts-node",
+   "devDependencies": {
+-    "@types/react": "^16.0.2",
++    "@types/react": "^15.0.38",
+     "chai": "^4.0.1",
+     "istanbul": "^0.4.0",
+     "mocha": "^3.0.0",
+diff --git a/src/_bin.ts b/src/_bin.ts
+index 384c460..7613fac 100644
+--- a/src/_bin.ts
++++ b/src/_bin.ts
+@@ -131,10 +131,10 @@ Options:
+ }
+ 
+ const cwd = process.cwd()
+-const code = argv.eval === undefined ? argv.print : argv.eval
++const code = argv.eval == null ? argv.print : argv.eval
+ const isEvalScript = typeof argv.eval === 'string' || !!argv.print // Minimist struggles with empty strings.
+ const isEval = isEvalScript || stop === process.argv.length
+-const isPrinted = argv.print !== undefined
++const isPrinted = argv.print != null
+ 
+ // Register the TypeScript compiler instance.
+ const service = register({
+@@ -252,18 +252,17 @@ function _eval (input: string, context: any) {
+     EVAL_INSTANCE.output = output
+   }
+ 
+-  return changes.reduce((result, change) => {
+-    return change.added ? exec(change.value, EVAL_FILENAME, context) : result
+-  }, undefined)
+-}
++  let result: any
+ 
+-/**
+- * Execute some code.
+- */
+-function exec (code: string, filename: string, context: any) {
+-  const script = new Script(code, filename)
++  for (const change of changes) {
++    if (change.added) {
++      const script = new Script(change.value, EVAL_FILENAME)
+ 
+-  return script.runInNewContext(context)
++      result = script.runInNewContext(context)
++    }
++  }
++
++  return result
+ }
+ 
+ /**
+@@ -278,17 +277,12 @@ function startRepl () {
+     useGlobal: false
+   })
+ 
+-  // Bookmark the point where we should reset the REPL state.
+-  const resetEval = appendEval('')
+-
+-  function reset () {
+-    resetEval()
++  // Hard fix for TypeScript forcing `Object.defineProperty(exports, ...)`.
++  appendEval('exports = module.exports\n')
+ 
+-    // Hard fix for TypeScript forcing `Object.defineProperty(exports, ...)`.
+-    exec('exports = module.exports', EVAL_FILENAME, (repl as any).context)
+-  }
++  // Bookmark the point where we should reset the REPL state.
++  const reset = appendEval('')
+ 
+-  reset()
+   repl.on('reset', reset)
+ 
+   repl.defineCommand('type', {
+@@ -328,7 +322,7 @@ function replEval (code: string, context: any, _filename: string, callback: (err
+   } catch (error) {
+     if (error instanceof TSError) {
+       // Support recoverable compilations using >= node 6.
+-      if (Recoverable && isRecoverable(error)) {
++      if (typeof Recoverable === 'function' && isRecoverable(error)) {
+         err = new Recoverable(error)
+       } else {
+         err = printError(error)
+diff --git a/src/index.spec.ts b/src/index.spec.ts
+index 535e789..f80d0e3 100644
+--- a/src/index.spec.ts
++++ b/src/index.spec.ts
+@@ -135,12 +135,13 @@ describe('ts-node', function () {
+       })
+     })
+ 
+-    it.skip('eval should work with source maps', function (done) {
++    it('eval should work with source maps', function (done) {
+       exec(`${BIN_EXEC} -p "import './tests/throw'"`, function (err) {
+         expect(err.message).to.contain([
+           `${join(__dirname, '../tests/throw.ts')}:3`,
+           '  bar () { throw new Error(\'this is a demo\') }',
+-          '                 ^'
++          '                 ^',
++          'Error: this is a demo'
+         ].join('\n'))
+ 
+         return done()
+diff --git a/src/index.ts b/src/index.ts
+index 6848d36..9fee0b3 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -123,24 +123,6 @@ export function normalizeSlashes (value: string): string {
+   return value.replace(/\\/g, '/')
+ }
+ 
+-/**
+- * TypeScript diagnostics error.
+- */
+-export class TSError extends BaseError {
+-
+-  name = 'TSError'
+-
+-  constructor (public diagnostics: TSDiagnostic[]) {
+-    super(
+-      `⨯ Unable to compile TypeScript\n${diagnostics.map(x => x.message).join('\n')}`
+-    )
+-  }
+-
+-}
+-
+-/**
+- * Return type for registering `ts-node`.
+- */
+ export interface Register {
+   cwd: string
+   extensions: string[]
+@@ -645,6 +627,21 @@ export function formatDiagnostic (
+   return { message: `${messageText} (${code})`, code }
+ }
+ 
++/**
++ * TypeScript diagnostics error.
++ */
++export class TSError extends BaseError {
++
++  name = 'TSError'
++
++  constructor (public diagnostics: TSDiagnostic[]) {
++    super(
++      `⨯ Unable to compile TypeScript\n${diagnostics.map(x => x.message).join('\n')}`
++    )
++  }
++
++}
++
+ /**
+  * Stringify the `TSError` instance.
+  */

@@ -1,0 +1,379 @@
+diff --git a/README.md b/README.md
+index 9f8d6cd..fa36237 100644
+--- a/README.md
++++ b/README.md
+@@ -466,7 +466,7 @@ let schema = object({
+       loose: boolean(),
+       bar: string().when('loose', {
+         is: true,
+-        otherwise: (schema) => schema.strict(),
++        otherwise: (s) => s.strict(),
+       }),
+     }),
+   ),
+@@ -634,7 +634,7 @@ await schema.isValid(42); // => false
+ await schema.isValid(new Date()); // => true
+ ```
+ 
+-#### `mixed.when(keys: string | string[], builder: object | (values: any[], schema) => Schema): Schema`
++#### `mixed.when(keys: string | Array<string>, builder: object | (value, schema)=> Schema): Schema`
+ 
+ Adjust the schema based on a sibling or sibling children fields. You can provide an object
+ literal where the key `is` is value or a matcher function, `then` provides the true schema and/or
+@@ -652,8 +652,8 @@ let schema = object({
+   count: number()
+     .when('isBig', {
+       is: true, // alternatively: (val) => val == true
+-      then: (schema) => schema..min(5),
+-      otherwise: (schema) => schema..min(0),
++      then: yup.number().min(5),
++      otherwise: yup.number().min(0),
+     })
+     .when('$other', (other, schema) => (other === 4 ? schema.max(6) : schema)),
+ });
+@@ -669,8 +669,8 @@ let schema = object({
+   isBig: boolean(),
+   count: number().when(['isBig', 'isSpecial'], {
+     is: true, // alternatively: (isBig, isSpecial) => isBig && isSpecial
+-    then: (schema) => schema..min(5),
+-    otherwise: (schema) => schema..min(0),
++    then: yup.number().min(5),
++    otherwise: yup.number().min(0),
+   }),
+ });
+ 
+diff --git a/src/Condition.ts b/src/Condition.ts
+index cc71680..3feb5af 100644
+--- a/src/Condition.ts
++++ b/src/Condition.ts
+@@ -2,80 +2,73 @@ import isSchema from './util/isSchema';
+ import Reference from './Reference';
+ import type { ISchema } from './util/types';
+ 
+-export type ConditionBuilder<
+-  T extends ISchema<any, any>,
+-  U extends ISchema<any, any> = T,
+-> = (values: any[], schema: T, options: ResolveOptions) => U;
+-
+-export type ConditionConfig<
+-  T extends ISchema<any>,
+-  TThen extends ISchema<any, any> = T,
+-  TOtherwise extends ISchema<any, any> = T,
+-> = {
++export interface ConditionBuilder<T extends ISchema<any, any>> {
++  (this: T, value: any, schema: T): ISchema<any, any> | void;
++  (v1: any, v2: any, schema: T): ISchema<any, any> | void;
++  (v1: any, v2: any, v3: any, schema: T): ISchema<any, any> | void;
++  (v1: any, v2: any, v3: any, v4: any, schema: T): ISchema<any, any> | void;
++}
++
++export type ConditionConfig<T extends ISchema<any>> = {
+   is: any | ((...values: any[]) => boolean);
+-  then?: (schema: T) => TThen;
+-  otherwise?: (schema: T) => TOtherwise;
++  then?: (schema: T) => ISchema<any>;
++  otherwise?: (schema: T) => ISchema<any>;
+ };
+ 
++export type ConditionOptions<T extends ISchema<any, any>> =
++  | ConditionBuilder<T>
++  | ConditionConfig<T>;
++
+ export type ResolveOptions<TContext = any> = {
+   value?: any;
+   parent?: any;
+   context?: TContext;
+ };
+ 
+-class Condition<
+-  TIn extends ISchema<any, any> = ISchema<any, any>,
+-  TOut extends ISchema<any, any> = TIn,
+-> {
+-  fn: ConditionBuilder<TIn, TOut>;
+-
+-  static fromOptions<
+-    TIn extends ISchema<any, any>,
+-    TThen extends ISchema<any, any>,
+-    TOtherwise extends ISchema<any, any>,
+-  >(refs: Reference[], config: ConditionConfig<TIn, TThen, TOtherwise>) {
+-    if (!config.then && !config.otherwise)
++class Condition<T extends ISchema<any, any> = ISchema<any, any>> {
++  fn: ConditionBuilder<T>;
++
++  constructor(public refs: Reference[], options: ConditionOptions<T>) {
++    this.refs = refs;
++
++    if (typeof options === 'function') {
++      this.fn = options;
++      return;
++    }
++
++    if (!('is' in options))
++      throw new TypeError('`is:` is required for `when()` conditions');
++
++    if (!options.then && !options.otherwise)
+       throw new TypeError(
+         'either `then:` or `otherwise:` is required for `when()` conditions',
+       );
+ 
+-    let { is, then, otherwise } = config;
++    let { is, then, otherwise } = options;
+ 
+     let check =
+       typeof is === 'function'
+         ? is
+         : (...values: any[]) => values.every((value) => value === is);
+ 
+-    return new Condition<TIn, TThen | TOtherwise>(
+-      refs,
+-      (values, schema: any) => {
+-        let branch = check(...values) ? then : otherwise;
++    this.fn = function (...args: any[]) {
++      let _opts = args.pop();
++      let schema = args.pop();
++      let branch = check(...args) ? then : otherwise;
+ 
+-        return branch?.(schema) ?? schema;
+-      },
+-    );
++      return branch?.(schema) ?? schema;
++    };
+   }
+ 
+-  constructor(public refs: Reference[], builder: ConditionBuilder<TIn, TOut>) {
+-    this.refs = refs;
+-    this.fn = builder;
+-  }
+-
+-  resolve(base: TIn, options: ResolveOptions) {
++  resolve(base: T, options: ResolveOptions) {
+     let values = this.refs.map((ref) =>
+       // TODO: ? operator here?
+       ref.getValue(options?.value, options?.parent, options?.context),
+     );
+ 
+-    let schema = this.fn(values, base, options);
++    let schema = this.fn.apply(base, values.concat(base, options) as any);
+ 
+-    if (
+-      schema === undefined ||
+-      // @ts-ignore this can be base
+-      schema === base
+-    ) {
+-      return base;
+-    }
++    if (schema === undefined || schema === base) return base;
+ 
+     if (!isSchema(schema))
+       throw new TypeError('conditions must return a schema object');
+diff --git a/src/schema.ts b/src/schema.ts
+index af0998d..fc1cbe6 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -2,11 +2,7 @@
+ import cloneDeep from 'nanoclone';
+ 
+ import { mixed as locale } from './locale';
+-import Condition, {
+-  ConditionBuilder,
+-  ConditionConfig,
+-  ResolveOptions,
+-} from './Condition';
++import Condition, { ConditionOptions, ResolveOptions } from './Condition';
+ import runTests from './util/runTests';
+ import createValidation, {
+   TestFunction,
+@@ -674,29 +670,11 @@ export default abstract class BaseSchema<
+     return next;
+   }
+ 
+-  when<U extends ISchema<any> = this>(builder: ConditionBuilder<this, U>): U;
+-  when<U extends ISchema<any> = this>(
+-    keys: string | string[],
+-    builder: ConditionBuilder<this, U>,
+-  ): U;
+-  when<
+-    UThen extends ISchema<any> = this,
+-    UOtherwise extends ISchema<any> = this,
+-  >(options: ConditionConfig<this, UThen, UOtherwise>): UThen | UOtherwise;
+-  when<
+-    UThen extends ISchema<any> = this,
+-    UOtherwise extends ISchema<any> = this,
+-  >(
+-    keys: string | string[],
+-    options: ConditionConfig<this, UThen, UOtherwise>,
+-  ): UThen | UOtherwise;
++  when(options: ConditionOptions<this>): this;
++  when(keys: string | string[], options: ConditionOptions<this>): this;
+   when(
+-    keys:
+-      | string
+-      | string[]
+-      | ConditionBuilder<this, any>
+-      | ConditionConfig<this, any, any>,
+-    options?: ConditionBuilder<this, any> | ConditionConfig<this, any, any>,
++    keys: string | string[] | ConditionOptions<this>,
++    options?: ConditionOptions<this>,
+   ) {
+     if (!Array.isArray(keys) && typeof keys !== 'string') {
+       options = keys;
+@@ -711,11 +689,7 @@ export default abstract class BaseSchema<
+       if (dep.isSibling) next.deps.push(dep.key);
+     });
+ 
+-    next.conditions.push(
+-      typeof options === 'function'
+-        ? new Condition(deps, options!)
+-        : Condition.fromOptions(deps, options!),
+-    );
++    next.conditions.push(new Condition(deps, options!) as Condition);
+ 
+     return next;
+   }
+diff --git a/test/array.ts b/test/array.ts
+index fd54426..a59af99 100644
+--- a/test/array.ts
++++ b/test/array.ts
+@@ -181,8 +181,8 @@ describe('Array types', () => {
+     let value = ['2', '3'];
+     let expectedPaths = ['[0]', '[1]'];
+ 
+-    let itemSchema = string().when([], function (_, _s, opts: any) {
+-      let path = opts.path;
++    let itemSchema = string().when([], function (_, context) {
++      let path = context.path;
+       expect(expectedPaths).toContain(path);
+       return string().required();
+     });
+diff --git a/test/mixed.ts b/test/mixed.ts
+index 784f396..167dea4 100644
+--- a/test/mixed.ts
++++ b/test/mixed.ts
+@@ -764,12 +764,12 @@ describe('Mixed Types ', () => {
+ 
+   it('should handle multiple conditionals', function () {
+     let called = false;
+-    let inst = mixed().when(['$prop', '$other'], ([prop, other], schema) => {
++    let inst = mixed().when(['$prop', '$other'], (prop, other) => {
+       expect(other).toBe(true);
+       expect(prop).toBe(1);
+       called = true;
+ 
+-      return schema;
++      return mixed();
+     });
+ 
+     inst.cast({}, { context: { prop: 1, other: true } });
+diff --git a/test/object.ts b/test/object.ts
+index 3e516fd..2afb9b1 100644
+--- a/test/object.ts
++++ b/test/object.ts
+@@ -675,7 +675,9 @@ describe('Object types', () => {
+     let inst = object().shape({
+       noteDate: number()
+         .when('stats.isBig', { is: true, then: (s) => s.min(5) })
+-        .when('other', ([v], schema) => (v === 4 ? schema.max(6) : schema)),
++        .when('other', function (v) {
++          if (v === 4) return this.max(6);
++        }),
+       stats: object({ isBig: bool() }),
+       other: number()
+         .min(1)
+@@ -778,11 +780,11 @@ describe('Object types', () => {
+   it('should allow opt out of topo sort on specific edges', () => {
+     expect(() => {
+       object().shape({
+-        orgID: number().when('location', ([v], schema) => {
+-          return v == null ? schema.required() : schema;
++        orgID: number().when('location', (v, schema) => {
++          if (v == null) return schema.required();
+         }),
+         location: string().when('orgID', (v, schema) => {
+-          return v == null ? schema.required() : schema;
++          if (v == null) return schema.required();
+         }),
+       });
+     }).toThrowError('Cyclic dependency, node was:"location"');
+@@ -790,11 +792,11 @@ describe('Object types', () => {
+     expect(() => {
+       object().shape(
+         {
+-          orgID: number().when('location', ([v], schema) => {
+-            return v == null ? schema.required() : schema;
++          orgID: number().when('location', function (v) {
++            if (v == null) return this.required();
+           }),
+-          location: string().when('orgID', ([v], schema) => {
+-            return v == null ? schema.required() : schema;
++          location: string().when('orgID', function (v) {
++            if (v == null) return this.required();
+           }),
+         },
+         [['location', 'orgID']],
+diff --git a/test/types/types.ts b/test/types/types.ts
+index 2c3a5fe..3807dff 100644
+--- a/test/types/types.ts
++++ b/test/types/types.ts
+@@ -1,6 +1,6 @@
+ /* eslint-disable @typescript-eslint/no-unused-expressions */
+ /* eslint-disable no-unused-labels */
+-import { array, number, string, date, ref, mixed, bool } from '../../src';
++import { array, number, string, date, ref, mixed } from '../../src';
+ import { create as lazy } from '../../src/Lazy';
+ import ObjectSchema, { create as object } from '../../src/object';
+ 
+@@ -720,34 +720,3 @@ Object: {
+     deepPartial.validateSync({})!.address!.line1;
+   }
+ }
+-
+-Conditions: {
+-  // $ExpectType StringSchema<string, AnyObject, undefined, ""> | NumberSchema<number | undefined, AnyObject, undefined, "">
+-  string().when('foo', ([foo], schema) => (foo ? schema.required() : number()));
+-
+-  // $ExpectType StringSchema<string | undefined, AnyObject, undefined, "">
+-  string().when('foo', ([foo], schema) => (foo ? schema.required() : schema));
+-
+-  // $ExpectType StringSchema<string, AnyObject, undefined, ""> | NumberSchema<number | undefined, AnyObject, undefined, "">
+-  string().when('foo', {
+-    is: true,
+-    then: () => number(),
+-    otherwise: (s) => s.required(),
+-  });
+-
+-  const result = object({
+-    foo: bool().defined(),
+-    polyField: mixed<string>().when('foo', {
+-      is: true,
+-      then: () => number(),
+-      otherwise: (s) => s.required(),
+-    }),
+-  }).cast({ foo: true, polyField: '1' });
+-
+-  // $ExpectType { polyField?: string | number | undefined; foo: boolean; }
+-  result;
+-
+-  mixed()
+-    .when('foo', ([foo]) => (foo ? string() : number()))
+-    .min(1);
+-}
+diff --git a/test/yup.js b/test/yup.js
+index 02624c6..4621f71 100644
+--- a/test/yup.js
++++ b/test/yup.js
+@@ -118,13 +118,13 @@ describe('Yup', function () {
+       inst = object().shape({
+         num: number().max(4),
+         nested: object().shape({
+-          arr: array().when('$bar', function ([bar]) {
++          arr: array().when('$bar', function (bar) {
+             return bar !== 3
+               ? array().of(number())
+               : array().of(
+                   object().shape({
+                     foo: number(),
+-                    num: number().when('foo', ([foo]) => {
++                    num: number().when('foo', (foo) => {
+                       if (foo === 5) return num;
+                     }),
+                   }),

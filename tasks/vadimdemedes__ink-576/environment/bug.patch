@@ -1,0 +1,459 @@
+diff --git a/package.json b/package.json
+index 14ad809..6b8edfc 100644
+--- a/package.json
++++ b/package.json
+@@ -52,8 +52,6 @@
+ 		"code-excerpt": "^4.0.0",
+ 		"indent-string": "^5.0.0",
+ 		"is-ci": "^3.0.1",
+-		"is-lower-case": "^2.0.2",
+-		"is-upper-case": "^2.0.2",
+ 		"lodash": "^4.17.21",
+ 		"patch-console": "^2.0.0",
+ 		"react-reconciler": "^0.29.0",
+@@ -150,9 +148,6 @@
+ 			"react-hooks/exhaustive-deps": "off",
+ 			"complexity": "off"
+ 		},
+-		"ignores": [
+-			"src/parse-keypress.ts"
+-		],
+ 		"overrides": [
+ 			{
+ 				"files": [
+diff --git a/src/hooks/use-input.ts b/src/hooks/use-input.ts
+index d081131..93d7823 100644
+--- a/src/hooks/use-input.ts
++++ b/src/hooks/use-input.ts
+@@ -1,7 +1,5 @@
+ import {type Buffer} from 'node:buffer';
+ import {useEffect} from 'react';
+-import {isUpperCase} from 'is-upper-case';
+-import parseKeypress, {nonAlphanumericKeys} from '../parse-keypress.js';
+ import useStdin from './use-stdin.js';
+ 
+ /**
+@@ -137,49 +135,56 @@ const useInput = (inputHandler: Handler, options: Options = {}) => {
+ 		}
+ 
+ 		const handleData = (data: Buffer) => {
+-			const keypress = parseKeypress(data);
++			let input = String(data);
++
++			const meta =
++				input.startsWith('\u001B\u001B') || // Meta + arrow keys
++				(input.startsWith('\u001B') && !input.startsWith('\u001B[')); // Meta + character
++
++			if (meta && input.length > 1) {
++				input = input.slice(1);
++			}
+ 
+ 			const key = {
+-				upArrow: keypress.name === 'up',
+-				downArrow: keypress.name === 'down',
+-				leftArrow: keypress.name === 'left',
+-				rightArrow: keypress.name === 'right',
+-				pageDown: keypress.name === 'pagedown',
+-				pageUp: keypress.name === 'pageup',
+-				return: keypress.name === 'return',
+-				escape: keypress.name === 'escape',
+-				ctrl: keypress.ctrl,
+-				shift: keypress.shift,
+-				tab: keypress.name === 'tab',
+-				backspace: keypress.name === 'backspace',
+-				delete: keypress.name === 'delete',
+-				// `parseKeypress` parses \u001B\u001B[A (meta + up arrow) as meta = false
+-				// but with option = true, so we need to take this into account here
+-				// to avoid breaking changes in Ink.
+-				// TODO(vadimdemedes): consider removing this in the next major version.
+-				meta: keypress.meta || keypress.name === 'escape' || keypress.option
++				upArrow: input === '\u001B[A',
++				downArrow: input === '\u001B[B',
++				leftArrow: input === '\u001B[D',
++				rightArrow: input === '\u001B[C',
++				pageDown: input === '\u001B[6~',
++				pageUp: input === '\u001B[5~',
++				return: input === '\r',
++				escape: input === '\u001B',
++				ctrl: false,
++				// Shift + Tab
++				shift: input === '\u001B[Z',
++				tab: input === '\t' || input === '\u001B[Z',
++				backspace: input === '\u0008',
++				delete: input === '\u007F' || input === '\u001B[3~',
++				meta
+ 			};
+ 
+-			let input = keypress.ctrl ? keypress.name : keypress.sequence;
++			// Copied from `keypress` module
++			if (input <= '\u001A' && !key.return && !key.tab) {
++				// eslint-disable-next-line unicorn/prefer-code-point
++				input = String.fromCharCode(
++					// eslint-disable-next-line unicorn/prefer-code-point
++					input.charCodeAt(0) + 'a'.charCodeAt(0) - 1
++				);
+ 
+-			if (nonAlphanumericKeys.includes(keypress.name)) {
+-				input = '';
++				key.ctrl = true;
+ 			}
+ 
+-			// Strip meta if it's still remaining after `parseKeypress`
+-			// TODO(vadimdemedes): remove this in the next major version.
+-			if (input.startsWith('\u001B')) {
+-				input = input.slice(1);
+-			}
++			const isLatinUppercase = input >= 'A' && input <= 'Z';
++			const isCyrillicUppercase = input >= 'А' && input <= 'Я';
+ 
+-			if (
+-				input.length === 1 &&
+-				typeof input[0] === 'string' &&
+-				isUpperCase(input[0])
+-			) {
++			if (input.length === 1 && (isLatinUppercase || isCyrillicUppercase)) {
+ 				key.shift = true;
+ 			}
+ 
++			if (key.tab || key.backspace || key.delete) {
++				input = '';
++			}
++
+ 			// If app is not supposed to exit on Ctrl+C, then let input listener handle it
+ 			if (!(input === 'c' && key.ctrl) || !internal_exitOnCtrlC) {
+ 				inputHandler(input, key);
+diff --git a/src/parse-keypress.ts b/src/parse-keypress.ts
+deleted file mode 100644
+index b52059e..0000000
+--- a/src/parse-keypress.ts
++++ /dev/null
+@@ -1,242 +0,0 @@
+-// Copied from https://github.com/enquirer/enquirer/blob/36785f3399a41cd61e9d28d1eb9c2fcd73d69b4c/lib/keypress.js
+-import {Buffer} from 'node:buffer';
+-
+-const metaKeyCodeRe = /^(?:\x1b)([a-zA-Z0-9])$/;
+-
+-const fnKeyRe =
+-	/^(?:\x1b+)(O|N|\[|\[\[)(?:(\d+)(?:;(\d+))?([~^$])|(?:1;)?(\d+)?([a-zA-Z]))/;
+-
+-const keyName: Record<string, string> = {
+-	/* xterm/gnome ESC O letter */
+-	OP: 'f1',
+-	OQ: 'f2',
+-	OR: 'f3',
+-	OS: 'f4',
+-	/* xterm/rxvt ESC [ number ~ */
+-	'[11~': 'f1',
+-	'[12~': 'f2',
+-	'[13~': 'f3',
+-	'[14~': 'f4',
+-	/* from Cygwin and used in libuv */
+-	'[[A': 'f1',
+-	'[[B': 'f2',
+-	'[[C': 'f3',
+-	'[[D': 'f4',
+-	'[[E': 'f5',
+-	/* common */
+-	'[15~': 'f5',
+-	'[17~': 'f6',
+-	'[18~': 'f7',
+-	'[19~': 'f8',
+-	'[20~': 'f9',
+-	'[21~': 'f10',
+-	'[23~': 'f11',
+-	'[24~': 'f12',
+-	/* xterm ESC [ letter */
+-	'[A': 'up',
+-	'[B': 'down',
+-	'[C': 'right',
+-	'[D': 'left',
+-	'[E': 'clear',
+-	'[F': 'end',
+-	'[H': 'home',
+-	/* xterm/gnome ESC O letter */
+-	OA: 'up',
+-	OB: 'down',
+-	OC: 'right',
+-	OD: 'left',
+-	OE: 'clear',
+-	OF: 'end',
+-	OH: 'home',
+-	/* xterm/rxvt ESC [ number ~ */
+-	'[1~': 'home',
+-	'[2~': 'insert',
+-	'[3~': 'delete',
+-	'[4~': 'end',
+-	'[5~': 'pageup',
+-	'[6~': 'pagedown',
+-	/* putty */
+-	'[[5~': 'pageup',
+-	'[[6~': 'pagedown',
+-	/* rxvt */
+-	'[7~': 'home',
+-	'[8~': 'end',
+-	/* rxvt keys with modifiers */
+-	'[a': 'up',
+-	'[b': 'down',
+-	'[c': 'right',
+-	'[d': 'left',
+-	'[e': 'clear',
+-
+-	'[2$': 'insert',
+-	'[3$': 'delete',
+-	'[5$': 'pageup',
+-	'[6$': 'pagedown',
+-	'[7$': 'home',
+-	'[8$': 'end',
+-
+-	Oa: 'up',
+-	Ob: 'down',
+-	Oc: 'right',
+-	Od: 'left',
+-	Oe: 'clear',
+-
+-	'[2^': 'insert',
+-	'[3^': 'delete',
+-	'[5^': 'pageup',
+-	'[6^': 'pagedown',
+-	'[7^': 'home',
+-	'[8^': 'end',
+-	/* misc. */
+-	'[Z': 'tab'
+-};
+-
+-export const nonAlphanumericKeys = [...Object.values(keyName), 'backspace'];
+-
+-const isShiftKey = (code: string) => {
+-	return [
+-		'[a',
+-		'[b',
+-		'[c',
+-		'[d',
+-		'[e',
+-		'[2$',
+-		'[3$',
+-		'[5$',
+-		'[6$',
+-		'[7$',
+-		'[8$',
+-		'[Z'
+-	].includes(code);
+-};
+-
+-const isCtrlKey = (code: string) => {
+-	return [
+-		'Oa',
+-		'Ob',
+-		'Oc',
+-		'Od',
+-		'Oe',
+-		'[2^',
+-		'[3^',
+-		'[5^',
+-		'[6^',
+-		'[7^',
+-		'[8^'
+-	].includes(code);
+-};
+-
+-type ParsedKey = {
+-	name: string;
+-	ctrl: boolean;
+-	meta: boolean;
+-	shift: boolean;
+-	option: boolean;
+-	sequence: string;
+-	raw: string | undefined;
+-	code?: string;
+-};
+-
+-const parseKeypress = (s: Buffer | string = ''): ParsedKey => {
+-	let parts;
+-
+-	if (Buffer.isBuffer(s)) {
+-		if (s[0]! > 127 && s[1] === undefined) {
+-			(s[0] as unknown as number) -= 128;
+-			s = '\x1b' + String(s);
+-		} else {
+-			s = String(s);
+-		}
+-	} else if (s !== undefined && typeof s !== 'string') {
+-		s = String(s);
+-	} else if (!s) {
+-		s = '';
+-	}
+-
+-	const key: ParsedKey = {
+-		name: '',
+-		ctrl: false,
+-		meta: false,
+-		shift: false,
+-		option: false,
+-		sequence: s,
+-		raw: s
+-	};
+-
+-	key.sequence = key.sequence || s || key.name;
+-
+-	if (s === '\r') {
+-		// carriage return
+-		key.raw = undefined;
+-		key.name = 'return';
+-	} else if (s === '\n') {
+-		// enter, should have been called linefeed
+-		key.name = 'enter';
+-	} else if (s === '\t') {
+-		// tab
+-		key.name = 'tab';
+-	} else if (s === '\b' || s === '\x1b\b') {
+-		// backspace or ctrl+h
+-		key.name = 'backspace';
+-		key.meta = s.charAt(0) === '\x1b';
+-	} else if (s === '\x7f' || s === '\x1b\x7f') {
+-		// TODO(vadimdemedes): `enquirer` detects delete key as backspace, but I had to split them up to avoid breaking changes in Ink. Merge them back together in the next major version.
+-		// delete
+-		key.name = 'delete';
+-		key.meta = s.charAt(0) === '\x1b';
+-	} else if (s === '\x1b' || s === '\x1b\x1b') {
+-		// escape key
+-		key.name = 'escape';
+-		key.meta = s.length === 2;
+-	} else if (s === ' ' || s === '\x1b ') {
+-		key.name = 'space';
+-		key.meta = s.length === 2;
+-	} else if (s <= '\x1a') {
+-		// ctrl+letter
+-		key.name = String.fromCharCode(s.charCodeAt(0) + 'a'.charCodeAt(0) - 1);
+-		key.ctrl = true;
+-	} else if (s.length === 1 && s >= '0' && s <= '9') {
+-		// number
+-		key.name = 'number';
+-	} else if (s.length === 1 && s >= 'a' && s <= 'z') {
+-		// lowercase letter
+-		key.name = s;
+-	} else if (s.length === 1 && s >= 'A' && s <= 'Z') {
+-		// shift+letter
+-		key.name = s.toLowerCase();
+-		key.shift = true;
+-	} else if ((parts = metaKeyCodeRe.exec(s))) {
+-		// meta+character key
+-		key.meta = true;
+-		key.shift = /^[A-Z]$/.test(parts[1]!);
+-	} else if ((parts = fnKeyRe.exec(s))) {
+-		const segs = [...s];
+-
+-		if (segs[0] === '\u001b' && segs[1] === '\u001b') {
+-			key.option = true;
+-		}
+-
+-		// ansi escape sequence
+-		// reassemble the key code leaving out leading \x1b's,
+-		// the modifier key bitflag and any meaningless "1;" sequence
+-		const code = [parts[1], parts[2], parts[4], parts[6]]
+-			.filter(Boolean)
+-			.join('');
+-
+-		const modifier = ((parts[3] || parts[5] || 1) as number) - 1;
+-
+-		// Parse the key modifier
+-		key.ctrl = !!(modifier & 4);
+-		key.meta = !!(modifier & 10);
+-		key.shift = !!(modifier & 1);
+-		key.code = code;
+-
+-		key.name = keyName[code]!;
+-		key.shift = isShiftKey(code) || key.shift;
+-		key.ctrl = isCtrlKey(code) || key.ctrl;
+-	}
+-
+-	return key;
+-};
+-
+-export default parseKeypress;
+diff --git a/test/fixtures/use-input.tsx b/test/fixtures/use-input.tsx
+index 0e9cd14..11eec8e 100644
+--- a/test/fixtures/use-input.tsx
++++ b/test/fixtures/use-input.tsx
+@@ -71,26 +71,6 @@ function UserInput({test}: {test: string | undefined}) {
+ 			return;
+ 		}
+ 
+-		if (test === 'upArrowCtrl' && key.upArrow && key.ctrl) {
+-			exit();
+-			return;
+-		}
+-
+-		if (test === 'downArrowCtrl' && key.downArrow && key.ctrl) {
+-			exit();
+-			return;
+-		}
+-
+-		if (test === 'leftArrowCtrl' && key.leftArrow && key.ctrl) {
+-			exit();
+-			return;
+-		}
+-
+-		if (test === 'rightArrowCtrl' && key.rightArrow && key.ctrl) {
+-			exit();
+-			return;
+-		}
+-
+ 		if (test === 'pageDown' && key.pageDown && !key.meta) {
+ 			exit();
+ 			return;
+diff --git a/test/hooks.tsx b/test/hooks.tsx
+index e7f6a32..6de6140 100644
+--- a/test/hooks.tsx
++++ b/test/hooks.tsx
+@@ -163,34 +163,6 @@ test.serial('useInput - handle meta + right arrow', async t => {
+ 	t.true(ps.output.includes('exited'));
+ });
+ 
+-test.serial('useInput - handle ctrl + up arrow', async t => {
+-	const ps = term('use-input', ['upArrowCtrl']);
+-	ps.write('\u001B[1;5A');
+-	await ps.waitForExit();
+-	t.true(ps.output.includes('exited'));
+-});
+-
+-test.serial('useInput - handle ctrl + down arrow', async t => {
+-	const ps = term('use-input', ['downArrowCtrl']);
+-	ps.write('\u001B[1;5B');
+-	await ps.waitForExit();
+-	t.true(ps.output.includes('exited'));
+-});
+-
+-test.serial('useInput - handle ctrl + left arrow', async t => {
+-	const ps = term('use-input', ['leftArrowCtrl']);
+-	ps.write('\u001B[1;5D');
+-	await ps.waitForExit();
+-	t.true(ps.output.includes('exited'));
+-});
+-
+-test.serial('useInput - handle ctrl + right arrow', async t => {
+-	const ps = term('use-input', ['rightArrowCtrl']);
+-	ps.write('\u001B[1;5C');
+-	await ps.waitForExit();
+-	t.true(ps.output.includes('exited'));
+-});
+-
+ test.serial('useInput - handle page down', async t => {
+ 	const ps = term('use-input', ['pageDown']);
+ 	ps.write('\u001B[6~');
+@@ -205,14 +177,14 @@ test.serial('useInput - handle page up', async t => {
+ 	t.true(ps.output.includes('exited'));
+ });
+ 
+-test.serial('useInput - handle tab', async t => {
++test.serial('useInput - handle Tab', async t => {
+ 	const ps = term('use-input', ['tab']);
+ 	ps.write('\t');
+ 	await ps.waitForExit();
+ 	t.true(ps.output.includes('exited'));
+ });
+ 
+-test.serial('useInput - handle shift + tab', async t => {
++test.serial('useInput - handle Shift+Tab', async t => {
+ 	const ps = term('use-input', ['shiftTab']);
+ 	ps.write('\u001B[Z');
+ 	await ps.waitForExit();

@@ -1,0 +1,817 @@
+diff --git a/development-docs/repl-api.md b/development-docs/repl-api.md
+deleted file mode 100644
+index 782a13d..0000000
+--- a/development-docs/repl-api.md
++++ /dev/null
+@@ -1,27 +0,0 @@
+-## How to create your own ts-node powered REPL
+-
+-- Create ts-node REPL service which includes EvalState
+-- Create ts-node compiler service using EvalState-aware `readFile` and `fileExists` implementations from REPL
+-- Bind REPL service to compiler service (chicken-and-egg problem necessitates late binding)
+-- Either:
+-  - call REPL method start() to start a REPL
+-  - create your own node repl but pass it REPL service's nodeEval() function
+-
+-```
+-import * as tsnode from 'ts-node';
+-const repl = tsnode.createRepl();
+-const service = tsnode.register({
+-    ... options,
+-    ...repl.evalAwarePartialHost
+-});
+-repl.setService(service);
+-
+-// Start it
+-repl.start();
+-
+-// or
+-const nodeRepl = require('repl').start({
+-    ...options,
+-    eval: repl.nodeEval
+-});
+-```
+diff --git a/package-lock.json b/package-lock.json
+index 889eb55..d7a2f0d 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -984,12 +984,6 @@
+       "integrity": "sha1-6td0q+5y4gQJQzoGY2YCPdaIekE=",
+       "dev": true
+     },
+-    "get-stream": {
+-      "version": "6.0.0",
+-      "resolved": "https://registry.npmjs.org/get-stream/-/get-stream-6.0.0.tgz",
+-      "integrity": "sha512-A1B3Bh1UmL0bidM/YX2NsCOTnGJePL9rO/M+Mw3m9f2gUpfokS0hi5Eah0WSUEWZdZhIZtMjkIYS7mDfOqNHbg==",
+-      "dev": true
+-    },
+     "globals": {
+       "version": "11.12.0",
+       "resolved": "https://registry.npmjs.org/globals/-/globals-11.12.0.tgz",
+diff --git a/package.json b/package.json
+index 9020a58..a08b901 100644
+--- a/package.json
++++ b/package.json
+@@ -92,7 +92,6 @@
+     "@types/source-map-support": "^0.5.0",
+     "axios": "^0.19.0",
+     "chai": "^4.0.1",
+-    "get-stream": "^6.0.0",
+     "lodash": "^4.17.15",
+     "mocha": "^6.2.2",
+     "ntypescript": "^1.201507091536.1",
+diff --git a/src/bin.ts b/src/bin.ts
+index 9ec8567..b9a0bb5 100644
+--- a/src/bin.ts
++++ b/src/bin.ts
+@@ -1,16 +1,32 @@
+ #!/usr/bin/env node
+ 
+ import { join, resolve, dirname } from 'path'
++import { start, Recoverable } from 'repl'
+ import { inspect } from 'util'
+ import Module = require('module')
+ import arg = require('arg')
+-import {
+-  EVAL_FILENAME,
+-  EvalState,
+-  createRepl,
+-  ReplService
+- } from './repl'
+-import { VERSION, TSError, parse, register } from './index'
++import { diffLines } from 'diff'
++import { Script } from 'vm'
++import { readFileSync, statSync, realpathSync } from 'fs'
++import { homedir } from 'os'
++import { VERSION, TSError, parse, Service, register } from './index'
++
++/**
++ * Eval filename for REPL/debug.
++ */
++const EVAL_FILENAME = `[eval].ts`
++
++/**
++ * Eval state management.
++ */
++class EvalState {
++  input = ''
++  output = ''
++  version = 0
++  lines = 0
++
++  constructor (public path: string) {}
++}
+ 
+ /**
+  * Main `bin` functionality.
+@@ -144,8 +160,6 @@ export function main (argv: string[] = process.argv.slice(2), entrypointArgs: Re
+   /** Unresolved.  May point to a symlink, not realpath.  May be missing file extension */
+   const scriptPath = args._.length ? resolve(cwd, args._[0]) : undefined
+   const state = new EvalState(scriptPath || join(cwd, EVAL_FILENAME))
+-  const replService = createRepl({ state })
+-  const { evalAwarePartialHost } = replService
+ 
+   // Register the TypeScript compiler instance.
+   const service = register({
+@@ -166,12 +180,28 @@ export function main (argv: string[] = process.argv.slice(2), entrypointArgs: Re
+     ignoreDiagnostics,
+     compilerOptions,
+     require: argsRequire,
+-    readFile: code !== undefined ? evalAwarePartialHost.readFile : undefined,
+-    fileExists: code !== undefined ? evalAwarePartialHost.fileExists : undefined
+-  })
++    readFile: code !== undefined
++      ? (path: string) => {
++        if (path === state.path) return state.input
+ 
+-  // Bind REPL service to ts-node compiler service (chicken-and-egg problem)
+-  replService.setService(service)
++        try {
++          return readFileSync(path, 'utf8')
++        } catch (err) {/* Ignore. */}
++      }
++      : undefined,
++    fileExists: code !== undefined
++      ? (path: string) => {
++        if (path === state.path) return true
++
++        try {
++          const stats = statSync(path)
++          return stats.isFile() || stats.isFIFO()
++        } catch (err) {
++          return false
++        }
++      }
++      : undefined
++  })
+ 
+   // Output project information.
+   if (version >= 2) {
+@@ -192,7 +222,7 @@ export function main (argv: string[] = process.argv.slice(2), entrypointArgs: Re
+ 
+   // Execute the main contents (either eval, script or piped).
+   if (code !== undefined && !interactive) {
+-    evalAndExit(replService, module, code, print)
++    evalAndExit(service, state, module, code, print)
+   } else {
+     if (args._.length) {
+       Module.runMain()
+@@ -200,11 +230,11 @@ export function main (argv: string[] = process.argv.slice(2), entrypointArgs: Re
+       // Piping of execution _only_ occurs when no other script is specified.
+       // --interactive flag forces REPL
+       if (interactive || process.stdin.isTTY) {
+-        replService.start(code)
++        startRepl(service, state, code)
+       } else {
+         let buffer = code || ''
+         process.stdin.on('data', (chunk: Buffer) => buffer += chunk)
+-        process.stdin.on('end', () => evalAndExit(replService, module, buffer, print))
++        process.stdin.on('end', () => evalAndExit(service, state, module, buffer, print))
+       }
+     }
+   }
+@@ -254,7 +284,7 @@ function getCwd (dir?: string, scriptMode?: boolean, scriptPath?: string) {
+ /**
+  * Evaluate a script.
+  */
+-function evalAndExit (replService: ReplService, module: Module, code: string, isPrinted: boolean) {
++function evalAndExit (service: Service, state: EvalState, module: Module, code: string, isPrinted: boolean) {
+   let result: any
+ 
+   ;(global as any).__filename = module.filename
+@@ -264,7 +294,7 @@ function evalAndExit (replService: ReplService, module: Module, code: string, is
+   ;(global as any).require = module.require.bind(module)
+ 
+   try {
+-    result = replService.evalCode(code)
++    result = _eval(service, state, code)
+   } catch (error) {
+     if (error instanceof TSError) {
+       console.error(error)
+@@ -279,6 +309,203 @@ function evalAndExit (replService: ReplService, module: Module, code: string, is
+   }
+ }
+ 
++/**
++ * Evaluate the code snippet.
++ */
++function _eval (service: Service, state: EvalState, input: string) {
++  const lines = state.lines
++  const isCompletion = !/\n$/.test(input)
++  const undo = appendEval(state, input)
++  let output: string
++
++  try {
++    output = service.compile(state.input, state.path, -lines)
++  } catch (err) {
++    undo()
++    throw err
++  }
++
++  // Use `diff` to check for new JavaScript to execute.
++  const changes = diffLines(state.output, output)
++
++  if (isCompletion) {
++    undo()
++  } else {
++    state.output = output
++  }
++
++  return changes.reduce((result, change) => {
++    return change.added ? exec(change.value, state.path) : result
++  }, undefined)
++}
++
++/**
++ * Execute some code.
++ */
++function exec (code: string, filename: string) {
++  const script = new Script(code, { filename: filename })
++
++  return script.runInThisContext()
++}
++
++/**
++ * Start a CLI REPL.
++ */
++function startRepl (service: Service, state: EvalState, code?: string) {
++  // Eval incoming code before the REPL starts.
++  if (code) {
++    try {
++      _eval(service, state, `${code}\n`)
++    } catch (err) {
++      console.error(err)
++      process.exit(1)
++    }
++  }
++
++  const repl = start({
++    prompt: '> ',
++    input: process.stdin,
++    output: process.stdout,
++    // Mimicking node's REPL implementation: https://github.com/nodejs/node/blob/168b22ba073ee1cbf8d0bcb4ded7ff3099335d04/lib/internal/repl.js#L28-L30
++    terminal: process.stdout.isTTY && !parseInt(process.env.NODE_NO_READLINE!, 10),
++    eval: replEval,
++    useGlobal: true
++  })
++
++  /**
++   * Eval code from the REPL.
++   */
++  function replEval (code: string, _context: any, _filename: string, callback: (err: Error | null, result?: any) => any) {
++    let err: Error | null = null
++    let result: any
++
++    // TODO: Figure out how to handle completion here.
++    if (code === '.scope') {
++      callback(err)
++      return
++    }
++
++    try {
++      result = _eval(service, state, code)
++    } catch (error) {
++      if (error instanceof TSError) {
++        // Support recoverable compilations using >= node 6.
++        if (Recoverable && isRecoverable(error)) {
++          err = new Recoverable(error)
++        } else {
++          console.error(error)
++        }
++      } else {
++        err = error
++      }
++    }
++
++    return callback(err, result)
++  }
++
++  // Bookmark the point where we should reset the REPL state.
++  const resetEval = appendEval(state, '')
++
++  function reset () {
++    resetEval()
++
++    // Hard fix for TypeScript forcing `Object.defineProperty(exports, ...)`.
++    exec('exports = module.exports', state.path)
++  }
++
++  reset()
++  repl.on('reset', reset)
++
++  repl.defineCommand('type', {
++    help: 'Check the type of a TypeScript identifier',
++    action: function (identifier: string) {
++      if (!identifier) {
++        repl.displayPrompt()
++        return
++      }
++
++      const undo = appendEval(state, identifier)
++      const { name, comment } = service.getTypeInfo(state.input, state.path, state.input.length)
++
++      undo()
++
++      if (name) repl.outputStream.write(`${name}\n`)
++      if (comment) repl.outputStream.write(`${comment}\n`)
++      repl.displayPrompt()
++    }
++  })
++
++  // Set up REPL history when available natively via node.js >= 11.
++  if (repl.setupHistory) {
++    const historyPath = process.env.TS_NODE_HISTORY || join(homedir(), '.ts_node_repl_history')
++
++    repl.setupHistory(historyPath, err => {
++      if (!err) return
++
++      console.error(err)
++      process.exit(1)
++    })
++  }
++}
++
++/**
++ * Append to the eval instance and return an undo function.
++ */
++function appendEval (state: EvalState, input: string) {
++  const undoInput = state.input
++  const undoVersion = state.version
++  const undoOutput = state.output
++  const undoLines = state.lines
++
++  // Handle ASI issues with TypeScript re-evaluation.
++  if (undoInput.charAt(undoInput.length - 1) === '\n' && /^\s*[\/\[(`-]/.test(input) && !/;\s*$/.test(undoInput)) {
++    state.input = `${state.input.slice(0, -1)};\n`
++  }
++
++  state.input += input
++  state.lines += lineCount(input)
++  state.version++
++
++  return function () {
++    state.input = undoInput
++    state.output = undoOutput
++    state.version = undoVersion
++    state.lines = undoLines
++  }
++}
++
++/**
++ * Count the number of lines.
++ */
++function lineCount (value: string) {
++  let count = 0
++
++  for (const char of value) {
++    if (char === '\n') {
++      count++
++    }
++  }
++
++  return count
++}
++
++const RECOVERY_CODES: Set<number> = new Set([
++  1003, // "Identifier expected."
++  1005, // "')' expected."
++  1109, // "Expression expected."
++  1126, // "Unexpected end of text."
++  1160, // "Unterminated template literal."
++  1161, // "Unterminated regular expression literal."
++  2355 // "A function whose declared type is neither 'void' nor 'any' must return a value."
++])
++
++/**
++ * Check if a function can recover gracefully.
++ */
++function isRecoverable (error: TSError) {
++  return error.diagnosticCodes.every(code => RECOVERY_CODES.has(code))
++}
++
+ /** Safe `hasOwnProperty` */
+ function hasOwnProperty (object: any, property: string): boolean {
+   return Object.prototype.hasOwnProperty.call(object, property)
+diff --git a/src/index.spec.ts b/src/index.spec.ts
+index 0f7e0f9..f2c5e3a 100644
+--- a/src/index.spec.ts
++++ b/src/index.spec.ts
+@@ -12,8 +12,6 @@ import type _createRequire from 'create-require'
+ const createRequire: typeof _createRequire = require('create-require')
+ import { pathToFileURL } from 'url'
+ import Module = require('module')
+-import { PassThrough } from 'stream'
+-import * as getStream from 'get-stream'
+ 
+ const execP = promisify(exec)
+ 
+@@ -28,7 +26,7 @@ const SOURCE_MAP_REGEXP = /\/\/# sourceMappingURL=data:application\/json;charset
+ const testsDirRequire = createRequire(join(TEST_DIR, 'index.js')) // tslint:disable-line
+ 
+ // Set after ts-node is installed locally
+-let { register, create, VERSION, createRepl }: typeof tsNodeTypes = {} as any
++let { register, create, VERSION }: typeof tsNodeTypes = {} as any
+ 
+ // Pack and install ts-node locally, necessary to test package "exports"
+ before(async function () {
+@@ -37,7 +35,7 @@ before(async function () {
+   await execP(`npm install`, { cwd: TEST_DIR })
+   const packageLockPath = join(TEST_DIR, 'package-lock.json')
+   existsSync(packageLockPath) && unlinkSync(packageLockPath)
+-  ;({ register, create, VERSION, createRepl } = testsDirRequire('ts-node'))
++  ;({ register, create, VERSION } = testsDirRequire('ts-node'))
+ })
+ 
+ describe('ts-node', function () {
+@@ -356,8 +354,8 @@ describe('ts-node', function () {
+       })
+ 
+       cp.stdin!.end('console.log("123")\n')
+-    })
+ 
++    })
+     it('REPL has command to get type information', function (done) {
+       const cp = exec(`${cmd} --interactive`, function (err, stdout) {
+         expect(err).to.equal(null)
+@@ -373,32 +371,6 @@ describe('ts-node', function () {
+       cp.stdin!.end('\nconst a = 123\n.type a')
+     })
+ 
+-    it('REPL can be created via API', async () => {
+-      const stdin = new PassThrough()
+-      const stdout = new PassThrough()
+-      const stderr = new PassThrough()
+-      const replService = createRepl({
+-        stdin,
+-        stdout,
+-        stderr
+-      })
+-      const service = create(replService.evalAwarePartialHost)
+-      replService.setService(service)
+-      replService.start()
+-      stdin.write('\nconst a = 123\n.type a\n')
+-      stdin.end()
+-      await promisify(setTimeout)(1e3)
+-      stdout.end()
+-      stderr.end()
+-      expect(await getStream(stderr)).to.equal('')
+-      expect(await getStream(stdout)).to.equal(
+-        '> \'use strict\'\n' +
+-        '> undefined\n' +
+-        '> const a: 123\n' +
+-        '> '
+-      )
+-    })
+-
+     it('should support require flags', function (done) {
+       exec(`${cmd} -r ./tests/hello-world -pe "console.log('success')"`, function (err, stdout) {
+         expect(err).to.equal(null)
+diff --git a/src/index.ts b/src/index.ts
+index 47b9863..09860c6 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,4 +1,4 @@
+-import { relative, basename, extname, resolve, dirname, join } from 'path'
++import { relative, basename, extname, resolve, dirname, join, isAbsolute } from 'path'
+ import sourceMapSupport = require('source-map-support')
+ import * as ynModule from 'yn'
+ import { BaseError } from 'make-error'
+@@ -10,8 +10,6 @@ import type _createRequire from 'create-require'
+ // tslint:disable-next-line
+ const createRequire = nodeCreateRequire ?? nodeCreateRequireFromPath ?? require('create-require') as typeof _createRequire
+ 
+-export { createRepl, CreateReplOptions, ReplService } from './repl'
+-
+ /**
+  * Does this version of node obey the package.json "type" field
+  * and throw ERR_REQUIRE_ESM when attempting to require() an ESM modules.
+diff --git a/src/repl.ts b/src/repl.ts
+deleted file mode 100644
+index 122abbf..0000000
+--- a/src/repl.ts
++++ /dev/null
+@@ -1,324 +0,0 @@
+-import { diffLines } from 'diff'
+-import { homedir } from 'os'
+-import { join } from 'path'
+-import { Recoverable, start } from 'repl'
+-import { Script } from 'vm'
+-import { Service, CreateOptions, TSError } from './index'
+-import { readFileSync, statSync } from 'fs'
+-import { Console } from 'console'
+-import * as tty from 'tty'
+-
+-/**
+- * Eval filename for REPL/debug.
+- * @internal
+- */
+-export const EVAL_FILENAME = `[eval].ts`
+-
+-export interface ReplService {
+-  readonly state: EvalState
+-  /**
+-   * Bind this REPL to a ts-node compiler service.  A compiler service must be bound before `eval`-ing code or starting the REPL
+-   */
+-  setService (service: Service): void
+-  evalCode (code: string): void
+-  /**
+-   * `eval` implementation compatible with node's REPL API
+-   */
+-  nodeEval (code: string, _context: any, _filename: string, callback: (err: Error | null, result?: any) => any): void
+-  evalAwarePartialHost: EvalAwarePartialHost
+-  /** Start a node REPL */
+-  start (code?: string): void
+-  /** @internal */
+-  readonly stdin: NodeJS.ReadableStream
+-  /** @internal */
+-  readonly stdout: NodeJS.WritableStream
+-  /** @internal */
+-  readonly stderr: NodeJS.WritableStream
+-  /** @internal */
+-  readonly console: Console
+-}
+-
+-export interface CreateReplOptions {
+-  service?: Service
+-  state?: EvalState
+-  stdin?: NodeJS.ReadableStream
+-  stdout?: NodeJS.WritableStream
+-  stderr?: NodeJS.WritableStream
+-}
+-
+-export function createRepl (options: CreateReplOptions = {}) {
+-  let service = options.service
+-  const state = options.state ?? new EvalState(join(process.cwd(), EVAL_FILENAME))
+-  const evalAwarePartialHost = createEvalAwarePartialHost(state)
+-  const stdin = options.stdin ?? process.stdin
+-  const stdout = options.stdout ?? process.stdout
+-  const stderr = options.stderr ?? process.stderr
+-  const _console = stdout === process.stdout && stderr === process.stderr ? console : new Console(stdout, stderr)
+-
+-  const replService: ReplService = {
+-    state: options.state ?? new EvalState(join(process.cwd(), EVAL_FILENAME)),
+-    setService,
+-    evalCode,
+-    nodeEval,
+-    evalAwarePartialHost,
+-    start,
+-    stdin,
+-    stdout,
+-    stderr,
+-    console: _console
+-  }
+-  return replService
+-
+-  function setService (_service: Service) {
+-    service = _service
+-  }
+-
+-  function evalCode (code: string) {
+-    return _eval(service!, state, code)
+-  }
+-
+-  function nodeEval (code: string, _context: any, _filename: string, callback: (err: Error | null, result?: any) => any) {
+-    let err: Error | null = null
+-    let result: any
+-
+-    // TODO: Figure out how to handle completion here.
+-    if (code === '.scope') {
+-      callback(err)
+-      return
+-    }
+-
+-    try {
+-      result = evalCode(code)
+-    } catch (error) {
+-      if (error instanceof TSError) {
+-        // Support recoverable compilations using >= node 6.
+-        if (Recoverable && isRecoverable(error)) {
+-          err = new Recoverable(error)
+-        } else {
+-          console.error(error)
+-        }
+-      } else {
+-        err = error
+-      }
+-    }
+-
+-    return callback(err, result)
+-  }
+-
+-  function start (code?: string) {
+-    // TODO assert that service is set; remove all ! postfixes
+-    return startRepl(replService, service!, state, code)
+-  }
+-}
+-
+-/**
+- * Eval state management. Stores virtual `[eval].ts` file
+- */
+-export class EvalState {
+-  /** @internal */
+-  input = ''
+-  /** @internal */
+-  output = ''
+-  /** @internal */
+-  version = 0
+-  /** @internal */
+-  lines = 0
+-
+-  // tslint:disable-next-line:variable-name
+-  __tsNodeEvalStateBrand: unknown
+-
+-  constructor (public path: string) { }
+-}
+-
+-/**
+- * Filesystem host functions which are aware of the "virtual" [eval].ts file used to compile REPL inputs.
+- * Must be passed to `create()` to create a ts-node compiler service which can compile REPL inputs.
+- */
+-export type EvalAwarePartialHost = Pick<CreateOptions, 'readFile' | 'fileExists'>
+-
+-export function createEvalAwarePartialHost (state: EvalState): EvalAwarePartialHost {
+-  function readFile (path: string) {
+-    if (path === state.path) return state.input
+-
+-    try {
+-      return readFileSync(path, 'utf8')
+-    } catch (err) {/* Ignore. */}
+-  }
+-  function fileExists (path: string) {
+-    if (path === state.path) return true
+-
+-    try {
+-      const stats = statSync(path)
+-      return stats.isFile() || stats.isFIFO()
+-    } catch (err) {
+-      return false
+-    }
+-  }
+-  return { readFile, fileExists }
+-}
+-
+-/**
+- * Evaluate the code snippet.
+- */
+-function _eval (service: Service, state: EvalState, input: string) {
+-  const lines = state.lines
+-  const isCompletion = !/\n$/.test(input)
+-  const undo = appendEval(state, input)
+-  let output: string
+-
+-  try {
+-    output = service.compile(state.input, state.path, -lines)
+-  } catch (err) {
+-    undo()
+-    throw err
+-  }
+-
+-  // Use `diff` to check for new JavaScript to execute.
+-  const changes = diffLines(state.output, output)
+-
+-  if (isCompletion) {
+-    undo()
+-  } else {
+-    state.output = output
+-  }
+-
+-  return changes.reduce((result, change) => {
+-    return change.added ? exec(change.value, state.path) : result
+-  }, undefined)
+-}
+-
+-/**
+- * Execute some code.
+- */
+-function exec (code: string, filename: string) {
+-  const script = new Script(code, { filename: filename })
+-
+-  return script.runInThisContext()
+-}
+-
+-/**
+- * Start a CLI REPL.
+- */
+-function startRepl (replService: ReplService, service: Service, state: EvalState, code?: string) {
+-  // Eval incoming code before the REPL starts.
+-  if (code) {
+-    try {
+-      replService.evalCode(`${code}\n`)
+-    } catch (err) {
+-      replService.console.error(err)
+-      process.exit(1)
+-    }
+-  }
+-
+-  const repl = start({
+-    prompt: '> ',
+-    input: replService.stdin,
+-    output: replService.stdout,
+-    // Mimicking node's REPL implementation: https://github.com/nodejs/node/blob/168b22ba073ee1cbf8d0bcb4ded7ff3099335d04/lib/internal/repl.js#L28-L30
+-    terminal: (replService.stdout as tty.WriteStream).isTTY && !parseInt(process.env.NODE_NO_READLINE!, 10),
+-    eval: replService.nodeEval,
+-    useGlobal: true
+-  })
+-
+-  // Bookmark the point where we should reset the REPL state.
+-  const resetEval = appendEval(state, '')
+-
+-  function reset () {
+-    resetEval()
+-
+-    // Hard fix for TypeScript forcing `Object.defineProperty(exports, ...)`.
+-    exec('exports = module.exports', state.path)
+-  }
+-
+-  reset()
+-  repl.on('reset', reset)
+-
+-  repl.defineCommand('type', {
+-    help: 'Check the type of a TypeScript identifier',
+-    action: function (identifier: string) {
+-      if (!identifier) {
+-        repl.displayPrompt()
+-        return
+-      }
+-
+-      const undo = appendEval(state, identifier)
+-      const { name, comment } = service.getTypeInfo(state.input, state.path, state.input.length)
+-
+-      undo()
+-
+-      if (name) repl.outputStream.write(`${name}\n`)
+-      if (comment) repl.outputStream.write(`${comment}\n`)
+-      repl.displayPrompt()
+-    }
+-  })
+-
+-  // Set up REPL history when available natively via node.js >= 11.
+-  if (repl.setupHistory) {
+-    const historyPath = process.env.TS_NODE_HISTORY || join(homedir(), '.ts_node_repl_history')
+-
+-    repl.setupHistory(historyPath, err => {
+-      if (!err) return
+-
+-      replService.console.error(err)
+-      process.exit(1)
+-    })
+-  }
+-}
+-
+-/**
+- * Append to the eval instance and return an undo function.
+- */
+-function appendEval (state: EvalState, input: string) {
+-  const undoInput = state.input
+-  const undoVersion = state.version
+-  const undoOutput = state.output
+-  const undoLines = state.lines
+-
+-  // Handle ASI issues with TypeScript re-evaluation.
+-  if (undoInput.charAt(undoInput.length - 1) === '\n' && /^\s*[\/\[(`-]/.test(input) && !/;\s*$/.test(undoInput)) {
+-    state.input = `${state.input.slice(0, -1)};\n`
+-  }
+-
+-  state.input += input
+-  state.lines += lineCount(input)
+-  state.version++
+-
+-  return function () {
+-    state.input = undoInput
+-    state.output = undoOutput
+-    state.version = undoVersion
+-    state.lines = undoLines
+-  }
+-}
+-
+-/**
+- * Count the number of lines.
+- */
+-function lineCount (value: string) {
+-  let count = 0
+-
+-  for (const char of value) {
+-    if (char === '\n') {
+-      count++
+-    }
+-  }
+-
+-  return count
+-}
+-
+-const RECOVERY_CODES: Set<number> = new Set([
+-  1003, // "Identifier expected."
+-  1005, // "')' expected."
+-  1109, // "Expression expected."
+-  1126, // "Unexpected end of text."
+-  1160, // "Unterminated template literal."
+-  1161, // "Unterminated regular expression literal."
+-  2355 // "A function whose declared type is neither 'void' nor 'any' must return a value."
+-])
+-
+-/**
+- * Check if a function can recover gracefully.
+- */
+-function isRecoverable (error: TSError) {
+-  return error.diagnosticCodes.every(code => RECOVERY_CODES.has(code))
+-}

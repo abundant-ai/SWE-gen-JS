@@ -1,0 +1,330 @@
+diff --git a/docs/gitbook/guide/jobs/repeatable.md b/docs/gitbook/guide/jobs/repeatable.md
+index 22913d2eeb..2e77393d29 100644
+--- a/docs/gitbook/guide/jobs/repeatable.md
++++ b/docs/gitbook/guide/jobs/repeatable.md
+@@ -31,7 +31,7 @@ await myQueue.add(
+   { color: 'yellow' },
+   {
+     repeat: {
+-      cron: '* 15 3 * * *',
++      pattern: '* 15 3 * * *',
+     },
+   },
+ );
+@@ -108,3 +108,72 @@ For instance, let's say that you have a job that is repeated every second, but t
+ In this particular example, the worker will pick up the next job and also add the next repeatable job delayed 1 second since that is the repeatable interval. The worker will require 5 seconds to process the job, and if there is only 1 worker available then the next job will need to wait a full 5 seconds before it can be processed.
+ 
+ On the other hand, if there were 5 workers available, then they will most likely be able to process all the repeatable jobs with the desired frequency of one job per second.
++
++# Repeat Strategy
++
++By default, we are using [cron-parser](https://www.npmjs.com/package/cron-parser) in the default repeat strategy for cron expressions.
++
++It is possible to define a different strategy to schedule repeatable jobs. For example we can create a custom one for RRULE:
++
++```typescript
++import { Queue, QueueScheduler, Worker } from 'bullmq';
++import { rrulestr } from 'rrule';
++
++const settings = {
++  repeatStrategy: (millis, opts) => {
++    const currentDate =
++      opts.startDate && new Date(opts.startDate) > new Date(millis)
++        ? new Date(opts.startDate)
++        : new Date(millis);
++    const rrule = rrulestr(opts.pattern);
++    if (rrule.origOptions.count && !rrule.origOptions.dtstart) {
++      throw new Error('DTSTART must be defined to use COUNT with rrule');
++    }
++
++    const next_occurrence = rrule.after(currentDate, false);
++    return next_occurrence?.getTime();
++  },
++};
++
++const myQueueScheduler = new QueueScheduler('Paint');
++const myQueue = new Queue('Paint', { settings });
++
++// Repeat job every 10 seconds
++await myQueue.add(
++  'bird',
++  { color: 'bird' },
++  {
++    repeat: {
++      pattern: 'RRULE:FREQ=SECONDLY;INTERVAL=;WKST=MO',
++    },
++    jobId: 'colibri',
++  },
++);
++
++await myQueue.add(
++  'bird',
++  { color: 'bird' },
++  {
++    repeat: {
++      pattern: 'RRULE:FREQ=SECONDLY;INTERVAL=;WKST=MO',
++    },
++    jobId: 'pigeon',
++  },
++);
++
++const worker = new Worker(
++  'Paint',
++  async () => {
++    doSomething();
++  },
++  { settings },
++);
++```
++
++{% hint style="warning" %}
++As you may notice, repeat strategy setting should be provided in Queue and Worker classes. The reason we need in both places is because the first time we add the job to the Queue we need to calculate when is the next iteration, but after that the Worker takes over and we use the worker settings.
++{% endhint %}
++
++{% hint style="info" %}
++Repeat strategy function receives an optional jobName parameter as the 3rd one.
++{% endhint %}
+diff --git a/package.json b/package.json
+index 31e6f156ee..d7d52140a9 100644
+--- a/package.json
++++ b/package.json
+@@ -100,6 +100,7 @@
+     "prettier": "^2.7.1",
+     "pretty-quick": "^3.1.3",
+     "rimraf": "^3.0.2",
++    "rrule": "^2.6.9",
+     "semantic-release": "^19.0.3",
+     "sinon": "^14.0.0",
+     "test-console": "^2.0.0",
+diff --git a/src/classes/repeat.ts b/src/classes/repeat.ts
+index d6cd95cc4c..0951c3cd8e 100644
+--- a/src/classes/repeat.ts
++++ b/src/classes/repeat.ts
+@@ -1,10 +1,25 @@
++import { parseExpression } from 'cron-parser';
+ import { createHash } from 'crypto';
+-import { JobsOptions, RepeatOptions } from '../interfaces';
++import { JobsOptions, RepeatBaseOptions, RepeatOptions } from '../interfaces';
++import { RepeatStrategy } from '../types';
+ import { Job } from './job';
+ import { QueueBase } from './queue-base';
+-import { parseExpression } from 'cron-parser';
++import { RedisConnection } from './redis-connection';
+ 
+ export class Repeat extends QueueBase {
++  private repeatStrategy: RepeatStrategy;
++
++  constructor(
++    name: string,
++    opts?: RepeatBaseOptions,
++    Connection?: typeof RedisConnection,
++  ) {
++    super(name, opts, Connection);
++
++    this.repeatStrategy =
++      (opts.settings && opts.settings.repeatStrategy) || getNextMillis;
++  }
++
+   async addNextRepeatableJob<T = any, R = any, N extends string = string>(
+     name: N,
+     data: T,
+@@ -33,10 +48,11 @@ export class Repeat extends QueueBase {
+ 
+     now = prevMillis < now ? now : prevMillis;
+ 
+-    const nextMillis = getNextMillis(now, repeatOpts);
++    const nextMillis = await this.repeatStrategy(now, repeatOpts, name);
++    const pattern = repeatOpts.pattern || repeatOpts.cron;
+ 
+     const hasImmediately =
+-      (repeatOpts.every || repeatOpts.cron) && repeatOpts.immediately;
++      (repeatOpts.every || pattern) && repeatOpts.immediately;
+     const offset = hasImmediately ? now - nextMillis : undefined;
+     if (nextMillis) {
+       // We store the undecorated opts.jobId into the repeat options
+@@ -143,8 +159,9 @@ export class Repeat extends QueueBase {
+     return this.scripts.removeRepeatable(repeatJobId, repeatJobKey);
+   }
+ 
+-  private keyToData(key: string) {
++  private keyToData(key: string, next?: number) {
+     const data = key.split(':');
++    const pattern = data.slice(4).join(':') || null;
+ 
+     return {
+       key,
+@@ -152,7 +169,9 @@ export class Repeat extends QueueBase {
+       id: data[1] || null,
+       endDate: parseInt(data[2]) || null,
+       tz: data[3] || null,
+-      cron: data[4],
++      cron: pattern,
++      pattern,
++      next,
+     };
+   }
+ 
+@@ -166,16 +185,7 @@ export class Repeat extends QueueBase {
+ 
+     const jobs = [];
+     for (let i = 0; i < result.length; i += 2) {
+-      const data = result[i].split(':');
+-      jobs.push({
+-        key: result[i],
+-        name: data[0],
+-        id: data[1] || null,
+-        endDate: parseInt(data[2]) || null,
+-        tz: data[3] || null,
+-        cron: data[4],
+-        next: parseInt(result[i + 1]),
+-      });
++      jobs.push(this.keyToData(result[i], parseInt(result[i + 1])));
+     }
+     return jobs;
+   }
+@@ -201,16 +211,18 @@ function getRepeatJobId(
+ function getRepeatKey(name: string, repeat: RepeatOptions) {
+   const endDate = repeat.endDate ? new Date(repeat.endDate).getTime() : '';
+   const tz = repeat.tz || '';
+-  const suffix = (repeat.cron ? repeat.cron : String(repeat.every)) || '';
++  const pattern = repeat.pattern || repeat.cron;
++  const suffix = (pattern ? pattern : String(repeat.every)) || '';
+   const jobId = repeat.jobId ? repeat.jobId : '';
+ 
+   return `${name}:${jobId}:${endDate}:${tz}:${suffix}`;
+ }
+ 
+-function getNextMillis(millis: number, opts: RepeatOptions) {
+-  if (opts.cron && opts.every) {
++export const getNextMillis = (millis: number, opts: RepeatOptions): number => {
++  const pattern = opts.pattern || opts.cron;
++  if (pattern && opts.every) {
+     throw new Error(
+-      'Both .cron and .every options are defined for this repeatable job',
++      'Both .cron (or .pattern) and .every options are defined for this repeatable job',
+     );
+   }
+ 
+@@ -225,7 +237,7 @@ function getNextMillis(millis: number, opts: RepeatOptions) {
+     opts.startDate && new Date(opts.startDate) > new Date(millis)
+       ? new Date(opts.startDate)
+       : new Date(millis);
+-  const interval = parseExpression(opts.cron, {
++  const interval = parseExpression(pattern, {
+     ...opts,
+     currentDate,
+   });
+@@ -235,7 +247,7 @@ function getNextMillis(millis: number, opts: RepeatOptions) {
+   } catch (e) {
+     // Ignore error
+   }
+-}
++};
+ 
+ function md5(str: string) {
+   return createHash('md5').update(str).digest('hex');
+diff --git a/src/interfaces/advanced-options.ts b/src/interfaces/advanced-options.ts
+index 29c0c797cb..8a1bddd58e 100644
+--- a/src/interfaces/advanced-options.ts
++++ b/src/interfaces/advanced-options.ts
+@@ -1,4 +1,13 @@
+-export interface AdvancedOptions {
++import { RepeatStrategy } from '../types';
++
++export interface AdvancedRepeatOptions {
++  /**
++   * A set of custom cron strategies keyed by name.
++   */
++  repeatStrategy?: RepeatStrategy;
++}
++
++export interface AdvancedOptions extends AdvancedRepeatOptions {
+   /**
+    * A set of custom backoff strategies keyed by name.
+    */
+diff --git a/src/interfaces/queue-options.ts b/src/interfaces/queue-options.ts
+index df58775976..174ba7041f 100644
+--- a/src/interfaces/queue-options.ts
++++ b/src/interfaces/queue-options.ts
+@@ -1,3 +1,4 @@
++import { AdvancedRepeatOptions } from './advanced-options';
+ import { BaseJobOptions } from './jobs-options';
+ import { ConnectionOptions } from './redis-options';
+ 
+@@ -62,6 +63,15 @@ export interface QueueOptions extends QueueBaseOptions {
+       maxLen: number;
+     };
+   };
++
++  settings?: AdvancedRepeatOptions;
++}
++
++/**
++ * Options for the Repeat class.
++ */
++export interface RepeatBaseOptions extends QueueBaseOptions {
++  settings?: AdvancedRepeatOptions;
+ }
+ 
+ /**
+diff --git a/src/interfaces/repeat-options.ts b/src/interfaces/repeat-options.ts
+index 074153701a..ec337c1142 100644
+--- a/src/interfaces/repeat-options.ts
++++ b/src/interfaces/repeat-options.ts
+@@ -7,9 +7,14 @@ import { ParserOptions } from 'cron-parser';
+  */
+ export interface RepeatOptions extends Omit<ParserOptions, 'iterator'> {
+   /**
++   * @deprecated Use pattern option instead.
+    * A cron pattern
+    */
+   cron?: string;
++  /**
++   * A repeat pattern
++   */
++  pattern?: string;
+   /**
+    * Number of times the job should repeat at max.
+    */
+diff --git a/src/types/index.ts b/src/types/index.ts
+index 958c20493f..e8213fb49a 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -1,3 +1,4 @@
++export * from './repeat-strategy';
+ export * from './finished-status';
+ export * from './job-json-sandbox';
+ export * from './job-type';
+diff --git a/src/types/repeat-strategy.ts b/src/types/repeat-strategy.ts
+new file mode 100644
+index 0000000000..cef79824b2
+--- /dev/null
++++ b/src/types/repeat-strategy.ts
+@@ -0,0 +1,7 @@
++import { RepeatOptions } from '../interfaces/repeat-options';
++
++export type RepeatStrategy = (
++  millis: number,
++  opts: RepeatOptions,
++  name?: string,
++) => number;
+diff --git a/yarn.lock b/yarn.lock
+index 27c1df4bbd..2b09556f51 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -5837,6 +5837,15 @@ rimraf@^3.0.0, rimraf@^3.0.2:
+   dependencies:
+     glob "^7.1.3"
+ 
++rrule@^2.6.9:
++  version "2.6.9"
++  resolved "https://registry.yarnpkg.com/rrule/-/rrule-2.6.9.tgz#8ee4ee261451e84852741f92ded769245580744a"
++  integrity sha512-PE4ErZDMfAcRnc1B35bZgPGS9mbn7Z9bKDgk6+XgrIwvBjeWk7JVEYsqKwHYTrDGzsHPtZTpaon8IyeKzAhj5w==
++  dependencies:
++    tslib "^1.10.0"
++  optionalDependencies:
++    luxon "^1.21.3"
++
+ run-async@^2.4.0:
+   version "2.4.1"
+   resolved "https://registry.yarnpkg.com/run-async/-/run-async-2.4.1.tgz#8440eccf99ea3e70bd409d49aab88e10c189a455"

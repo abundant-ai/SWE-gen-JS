@@ -1,0 +1,118 @@
+diff --git a/src/SupabaseClient.ts b/src/SupabaseClient.ts
+index 46e61b76..f4235289 100644
+--- a/src/SupabaseClient.ts
++++ b/src/SupabaseClient.ts
+@@ -51,6 +51,7 @@ export default class SupabaseClient<
+   protected storageKey: string
+   protected fetch?: Fetch
+   protected changedAccessToken?: string
++  protected accessToken?: () => Promise<string>
+ 
+   protected headers: Record<string, string>
+ 
+@@ -95,11 +96,26 @@ export default class SupabaseClient<
+     this.storageKey = settings.auth.storageKey ?? ''
+     this.headers = settings.global.headers ?? {}
+ 
+-    this.auth = this._initSupabaseAuthClient(
+-      settings.auth ?? {},
+-      this.headers,
+-      settings.global.fetch
+-    )
++    if (!settings.accessToken) {
++      this.auth = this._initSupabaseAuthClient(
++        settings.auth ?? {},
++        this.headers,
++        settings.global.fetch
++      )
++    } else {
++      this.accessToken = settings.accessToken
++
++      this.auth = new Proxy<SupabaseAuthClient>({} as any, {
++        get: (_, prop) => {
++          throw new Error(
++            `@supabase/supabase-js: Supabase Client is configured with the accessToken option, accessing supabase.auth.${String(
++              prop
++            )} is not possible`
++          )
++        },
++      })
++    }
++
+     this.fetch = fetchWithAuth(supabaseKey, this._getAccessToken.bind(this), settings.global.fetch)
+ 
+     this.realtime = this._initRealtimeClient({ headers: this.headers, ...settings.realtime })
+@@ -109,7 +125,9 @@ export default class SupabaseClient<
+       fetch: this.fetch,
+     })
+ 
+-    this._listenForAuthEvents()
++    if (!settings.accessToken) {
++      this._listenForAuthEvents()
++    }
+   }
+ 
+   /**
+@@ -244,6 +262,10 @@ export default class SupabaseClient<
+   }
+ 
+   private async _getAccessToken() {
++    if (this.accessToken) {
++      return await this.accessToken()
++    }
++
+     const { data } = await this.auth.getSession()
+ 
+     return data.session?.access_token ?? null
+diff --git a/src/lib/helpers.ts b/src/lib/helpers.ts
+index 96a82758..d1161d0c 100644
+--- a/src/lib/helpers.ts
++++ b/src/lib/helpers.ts
+@@ -37,7 +37,7 @@ export function applySettingDefaults<
+     global: DEFAULT_GLOBAL_OPTIONS,
+   } = defaults
+ 
+-  return {
++  const result: Required<SupabaseClientOptions<SchemaName>> = {
+     db: {
+       ...DEFAULT_DB_OPTIONS,
+       ...dbOptions,
+@@ -54,5 +54,15 @@ export function applySettingDefaults<
+       ...DEFAULT_GLOBAL_OPTIONS,
+       ...globalOptions,
+     },
++    accessToken: async () => '',
+   }
++
++  if (options.accessToken) {
++    result.accessToken = options.accessToken
++  } else {
++    // hack around Required<>
++    delete (result as any).accessToken
++  }
++
++  return result
+ }
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 9621c7d6..85531a0e 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -66,6 +66,18 @@ export type SupabaseClientOptions<SchemaName> = {
+      */
+     headers?: Record<string, string>
+   }
++  /**
++   * Optional function for using a third-party authentication system with
++   * Supabase. The function should return an access token or ID token (JWT) by
++   * obtaining it from the third-party auth client library. Note that this
++   * function may be called concurrently and many times. Use memoization and
++   * locking techniques if this is not supported by the client libraries.
++   *
++   * When set, the `auth` namespace of the Supabase client cannot be used.
++   * Create another client if you wish to use Supabase Auth and third-party
++   * authentications concurrently in the same application.
++   */
++  accessToken?: () => Promise<string>
+ }
+ 
+ export type GenericTable = {

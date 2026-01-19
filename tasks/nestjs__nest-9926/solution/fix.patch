@@ -1,0 +1,162 @@
+diff --git a/packages/platform-express/adapters/express-adapter.ts b/packages/platform-express/adapters/express-adapter.ts
+index 9bb80c5b1..dba07c6b9 100644
+--- a/packages/platform-express/adapters/express-adapter.ts
++++ b/packages/platform-express/adapters/express-adapter.ts
+@@ -25,6 +25,7 @@ import { RouterMethodFactory } from '@nestjs/core/helpers/router-method-factory'
+ import {
+   json as bodyParserJson,
+   OptionsJson,
++  OptionsUrlencoded,
+   urlencoded as bodyParserUrlencoded,
+ } from 'body-parser';
+ import * as cors from 'cors';
+@@ -32,6 +33,7 @@ import * as express from 'express';
+ import * as http from 'http';
+ import * as https from 'https';
+ import { ServeStaticOptions } from '../interfaces/serve-static-options.interface';
++import { getBodyParserOptions } from './utils/get-body-parser-options.util';
+ 
+ type VersionedRoute = <
+   TRequest extends Record<string, any> = any,
+@@ -194,21 +196,15 @@ export class ExpressAdapter extends AbstractHttpAdapter {
+   }
+ 
+   public registerParserMiddleware(prefix?: string, rawBody?: boolean) {
+-    let bodyParserJsonOptions: OptionsJson | undefined;
+-    if (rawBody === true) {
+-      bodyParserJsonOptions = {
+-        verify: (req: RawBodyRequest<http.IncomingMessage>, _res, buffer) => {
+-          if (Buffer.isBuffer(buffer)) {
+-            req.rawBody = buffer;
+-          }
+-          return true;
+-        },
+-      };
+-    }
++    const bodyParserJsonOptions = getBodyParserOptions<OptionsJson>(rawBody);
++    const bodyParserUrlencodedOptions = getBodyParserOptions<OptionsUrlencoded>(
++      rawBody,
++      { extended: true },
++    );
+ 
+     const parserMiddleware = {
+       jsonParser: bodyParserJson(bodyParserJsonOptions),
+-      urlencodedParser: bodyParserUrlencoded({ extended: true }),
++      urlencodedParser: bodyParserUrlencoded(bodyParserUrlencodedOptions),
+     };
+     Object.keys(parserMiddleware)
+       .filter(parser => !this.isMiddlewareApplied(parser))
+diff --git a/packages/platform-express/adapters/utils/get-body-parser-options.util.ts b/packages/platform-express/adapters/utils/get-body-parser-options.util.ts
+new file mode 100644
+index 000000000..0f1513243
+--- /dev/null
++++ b/packages/platform-express/adapters/utils/get-body-parser-options.util.ts
+@@ -0,0 +1,30 @@
++import type { RawBodyRequest } from '@nestjs/common';
++import type { Options } from 'body-parser';
++import type { IncomingMessage, ServerResponse } from 'http';
++
++const rawBodyParser = (
++  req: RawBodyRequest<IncomingMessage>,
++  _res: ServerResponse,
++  buffer: Buffer,
++) => {
++  if (Buffer.isBuffer(buffer)) {
++    req.rawBody = buffer;
++  }
++  return true;
++};
++
++export function getBodyParserOptions<ParserOptions extends Options>(
++  rawBody: boolean,
++  options?: ParserOptions | undefined,
++): ParserOptions {
++  let parserOptions: ParserOptions = options ?? ({} as ParserOptions);
++
++  if (rawBody === true) {
++    parserOptions = {
++      ...parserOptions,
++      verify: rawBodyParser,
++    };
++  }
++
++  return parserOptions;
++}
+diff --git a/packages/platform-fastify/adapters/fastify-adapter.ts b/packages/platform-fastify/adapters/fastify-adapter.ts
+index 1043bfef4..e18ba56a8 100644
+--- a/packages/platform-fastify/adapters/fastify-adapter.ts
++++ b/packages/platform-fastify/adapters/fastify-adapter.ts
+@@ -41,6 +41,8 @@ import {
+   InjectOptions,
+   Response as LightMyRequestResponse,
+ } from 'light-my-request';
++// `querystring` is used internally in fastify for registering urlencoded body parser.
++import { parse as querystringParse } from 'querystring';
+ import {
+   FastifyStaticOptions,
+   PointOfViewOptions,
+@@ -454,13 +456,9 @@ export class FastifyAdapter<
+     if (this._isParserRegistered) {
+       return;
+     }
+-    this.register(
+-      import('@fastify/formbody') as Parameters<TInstance['register']>[0],
+-    );
+ 
+-    if (rawBody) {
+-      this.registerContentParserWithRawBody();
+-    }
++    this.registerUrlencodedContentParser(rawBody);
++    this.registerJsonContentParser(rawBody);
+ 
+     this._isParserRegistered = true;
+   }
+@@ -509,16 +507,18 @@ export class FastifyAdapter<
+     return !('status' in response);
+   }
+ 
+-  private registerContentParserWithRawBody() {
++  private registerJsonContentParser(rawBody?: boolean) {
++    const { bodyLimit } = this.getInstance().initialConfig;
++
+     this.getInstance().addContentTypeParser<Buffer>(
+       'application/json',
+-      { parseAs: 'buffer' },
++      { parseAs: 'buffer', bodyLimit },
+       (
+         req: RawBodyRequest<FastifyRequest<unknown, TServer, TRawRequest>>,
+         body: Buffer,
+         done,
+       ) => {
+-        if (Buffer.isBuffer(body)) {
++        if (rawBody === true && Buffer.isBuffer(body)) {
+           req.rawBody = body;
+         }
+ 
+@@ -533,6 +533,26 @@ export class FastifyAdapter<
+     );
+   }
+ 
++  private registerUrlencodedContentParser(rawBody?: boolean) {
++    const { bodyLimit } = this.getInstance().initialConfig;
++
++    this.getInstance().addContentTypeParser<Buffer>(
++      'application/x-www-form-urlencoded',
++      { parseAs: 'buffer', bodyLimit },
++      (
++        req: RawBodyRequest<FastifyRequest<unknown, TServer, TRawRequest>>,
++        body: Buffer,
++        done,
++      ) => {
++        if (rawBody === true && Buffer.isBuffer(body)) {
++          req.rawBody = body;
++        }
++
++        done(null, querystringParse(body.toString()));
++      },
++    );
++  }
++
+   private async registerMiddie() {
+     this.isMiddieRegistered = true;
+     await this.register(

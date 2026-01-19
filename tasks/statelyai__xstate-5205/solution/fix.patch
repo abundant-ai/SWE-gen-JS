@@ -1,0 +1,356 @@
+diff --git a/.changeset/modern-scissors-bow.md b/.changeset/modern-scissors-bow.md
+new file mode 100644
+index 0000000000..0a1afc4ddd
+--- /dev/null
++++ b/.changeset/modern-scissors-bow.md
+@@ -0,0 +1,29 @@
++---
++'@xstate/store': minor
++---
++
++Added `createStoreConfig` to create a store config from an object. This is an identity function that returns the config unchanged, but is useful for type inference.
++
++```tsx
++const storeConfig = createStoreConfig({
++  context: { count: 0 },
++  on: { inc: (ctx) => ({ ...ctx, count: ctx.count + 1 }) }
++});
++
++// Reusable store config:
++
++const store = createStore(storeConfig);
++
++// ...
++function Comp1() {
++  const store = useStore(storeConfig);
++
++  // ...
++}
++
++function Comp2() {
++  const store = useStore(storeConfig);
++
++  // ...
++}
++```
+diff --git a/.changeset/serious-onions-call.md b/.changeset/serious-onions-call.md
+new file mode 100644
+index 0000000000..84106169bf
+--- /dev/null
++++ b/.changeset/serious-onions-call.md
+@@ -0,0 +1,37 @@
++---
++'@xstate/store': minor
++---
++
++There is now a `useStore()` hook that allows you to create a local component store from a config object.
++
++```tsx
++import { useStore, useSelector } from '@xstate/store/react';
++
++function Counter() {
++  const store = useStore({
++    context: {
++      name: 'David',
++      count: 0
++    },
++    on: {
++      inc: (ctx, { by }: { by: number }) => ({
++        ...ctx,
++        count: ctx.count + by
++      })
++    }
++  });
++  const count = useSelector(store, (state) => state.count);
++
++  return (
++    <div>
++      <div>Count: {count}</div>
++      <button onClick={() => store.trigger.inc({ by: 1 })}>
++        Increment by 1
++      </button>
++      <button onClick={() => store.trigger.inc({ by: 5 })}>
++        Increment by 5
++      </button>
++    </div>
++  );
++}
++```
+diff --git a/.changeset/two-laws-smoke.md b/.changeset/two-laws-smoke.md
+new file mode 100644
+index 0000000000..ddd8a3b911
+--- /dev/null
++++ b/.changeset/two-laws-smoke.md
+@@ -0,0 +1,5 @@
++---
++'@xstate/store': patch
++---
++
++The `createStoreWithProducer(config)` function now accepts an `emits` object.
+diff --git a/packages/xstate-store/src/index.ts b/packages/xstate-store/src/index.ts
+index 15caa34d3f..41ea096303 100644
+--- a/packages/xstate-store/src/index.ts
++++ b/packages/xstate-store/src/index.ts
+@@ -1,4 +1,8 @@
+ export { shallowEqual } from './shallowEqual';
+ export { fromStore } from './fromStore';
+-export { createStore, createStoreWithProducer } from './store';
++export {
++  createStore,
++  createStoreWithProducer,
++  createStoreConfig
++} from './store';
+ export * from './types';
+diff --git a/packages/xstate-store/src/react.ts b/packages/xstate-store/src/react.ts
+index 306221bcbb..9755faec8f 100644
+--- a/packages/xstate-store/src/react.ts
++++ b/packages/xstate-store/src/react.ts
+@@ -1,5 +1,14 @@
+ import { useCallback, useRef, useSyncExternalStore } from 'react';
+-import { SnapshotFromStore, AnyStore } from './types';
++import {
++  SnapshotFromStore,
++  AnyStore,
++  StoreContext,
++  EventPayloadMap,
++  StoreConfig,
++  Store,
++  ExtractEvents
++} from './types';
++import { createStore } from './store';
+ 
+ function defaultCompare<T>(a: T | undefined, b: T) {
+   return a === b;
+@@ -59,3 +68,32 @@ export function useSelector<TStore extends AnyStore, T>(
+       )
+   );
+ }
++
++export const useStore: {
++  <
++    TContext extends StoreContext,
++    TEventPayloadMap extends EventPayloadMap,
++    TEmitted extends EventPayloadMap
++  >(
++    definition: StoreConfig<TContext, TEventPayloadMap, TEmitted>
++  ): Store<TContext, ExtractEvents<TEventPayloadMap>, ExtractEvents<TEmitted>>;
++  <
++    TContext extends StoreContext,
++    TEventPayloadMap extends EventPayloadMap,
++    TEmitted extends EventPayloadMap
++  >(
++    definition: StoreConfig<TContext, TEventPayloadMap, TEmitted>
++  ): Store<TContext, ExtractEvents<TEventPayloadMap>, ExtractEvents<TEmitted>>;
++} = function useStoreImpl<
++  TContext extends StoreContext,
++  TEventPayloadMap extends EventPayloadMap,
++  TEmitted extends EventPayloadMap
++>(definition: StoreConfig<TContext, TEventPayloadMap, TEmitted>) {
++  const storeRef = useRef<AnyStore>();
++
++  if (!storeRef.current) {
++    storeRef.current = createStore(definition);
++  }
++
++  return storeRef.current;
++};
+diff --git a/packages/xstate-store/src/store.ts b/packages/xstate-store/src/store.ts
+index 5ae50c7003..f238b79687 100644
+--- a/packages/xstate-store/src/store.ts
++++ b/packages/xstate-store/src/store.ts
+@@ -9,6 +9,7 @@ import {
+   Store,
+   StoreAssigner,
+   StoreContext,
++  StoreConfig,
+   StoreEffect,
+   StoreInspectionEvent,
+   StoreProducerAssigner,
+@@ -68,6 +69,7 @@ function createStoreCore<
+       TEmitted
+     >;
+   },
++  emits?: Record<string, (payload: any) => void>, // TODO: improve this type
+   producer?: (
+     context: NoInfer<TContext>,
+     recipe: (context: NoInfer<TContext>) => void
+@@ -117,6 +119,8 @@ function createStoreCore<
+       if (typeof effect === 'function') {
+         effect();
+       } else {
++        // handle the inherent effect first
++        emits?.[effect.type]?.(effect);
+         emit(effect);
+       }
+     }
+@@ -235,21 +239,7 @@ type CreateStoreParameterTypes<
+   TContext extends StoreContext,
+   TEventPayloadMap extends EventPayloadMap,
+   TEmitted extends EventPayloadMap
+-> = [
+-  definition: {
+-    context: TContext;
+-    emits?: {
+-      [K in keyof TEmitted & string]: (payload: TEmitted[K]) => void;
+-    };
+-    on: {
+-      [K in keyof TEventPayloadMap & string]: StoreAssigner<
+-        NoInfer<TContext>,
+-        { type: K } & TEventPayloadMap[K],
+-        ExtractEvents<TEmitted>
+-      >;
+-    };
+-  }
+-];
++> = [definition: StoreConfig<TContext, TEventPayloadMap, TEmitted>];
+ 
+ type CreateStoreReturnType<
+   TContext extends StoreContext,
+@@ -284,6 +274,7 @@ type CreateStoreReturnType<
+  * @param config - The store configuration object
+  * @param config.context - The initial state of the store
+  * @param config.on - An object mapping event types to transition functions
++ * @param config.emits - An object mapping emitted event types to handlers
+  * @returns A store instance with methods to send events and subscribe to state
+  *   changes
+  */
+@@ -292,19 +283,51 @@ function _createStore<
+   TEventPayloadMap extends EventPayloadMap,
+   TEmitted extends EventPayloadMap
+ >(
+-  ...[{ context, on }]: CreateStoreParameterTypes<
++  ...[{ context, on, emits }]: CreateStoreParameterTypes<
+     TContext,
+     TEventPayloadMap,
+     TEmitted
+   >
+ ): CreateStoreReturnType<TContext, TEventPayloadMap, TEmitted> {
+-  return createStoreCore(context, on);
++  return createStoreCore(context, on, emits);
+ }
+ 
++// those overloads are exactly the same, we only duplicate them so TypeScript can:
++// 1. assign contextual parameter types during inference attempt for the first overload when the source object is still context-sensitive and often non-inferrable
++// 2. infer correctly during inference attempt for the second overload when the parameter types are already "known"
+ export const createStore: {
+-  // those overloads are exactly the same, we only duplicate them so TypeScript can:
+-  // 1. assign contextual parameter types during inference attempt for the first overload when the source object is still context-sensitive and often non-inferrable
+-  // 2. infer correctly during inference attempt for the second overload when the parameter types are already "known"
++  /**
++   * Creates a **store** that has its own internal state and can be sent events
++   * that update its internal state based on transitions.
++   *
++   * @example
++   *
++   * ```ts
++   * const store = createStore({
++   *   context: { count: 0, name: 'Ada' },
++   *   on: {
++   *     inc: (context, event: { by: number }) => ({
++   *       ...context,
++   *       count: context.count + event.by
++   *     })
++   *   }
++   * });
++   *
++   * store.subscribe((snapshot) => {
++   *   console.log(snapshot);
++   * });
++   *
++   * store.send({ type: 'inc', by: 5 });
++   * // Logs { context: { count: 5, name: 'Ada' }, status: 'active', ... }
++   * ```
++   *
++   * @param config - The store configuration object
++   * @param config.context - The initial state of the store
++   * @param config.on - An object mapping event types to transition functions
++   * @param config.emits - An object mapping emitted event types to handlers
++   * @returns A store instance with methods to send events and subscribe to
++   *   state changes
++   */
+   <
+     TContext extends StoreContext,
+     TEventPayloadMap extends EventPayloadMap,
+@@ -321,6 +344,33 @@ export const createStore: {
+   ): CreateStoreReturnType<TContext, TEventPayloadMap, TEmitted>;
+ } = _createStore;
+ 
++function _createStoreConfig<
++  TContext extends StoreContext,
++  TEventPayloadMap extends EventPayloadMap,
++  TEmitted extends EventPayloadMap
++>(
++  definition: StoreConfig<TContext, TEventPayloadMap, TEmitted>
++): StoreConfig<TContext, TEventPayloadMap, TEmitted> {
++  return definition;
++}
++
++export const createStoreConfig: {
++  <
++    TContext extends StoreContext,
++    TEventPayloadMap extends EventPayloadMap,
++    TEmitted extends EventPayloadMap
++  >(
++    definition: StoreConfig<TContext, TEventPayloadMap, TEmitted>
++  ): StoreConfig<TContext, TEventPayloadMap, TEmitted>;
++  <
++    TContext extends StoreContext,
++    TEventPayloadMap extends EventPayloadMap,
++    TEmitted extends EventPayloadMap
++  >(
++    definition: StoreConfig<TContext, TEventPayloadMap, TEmitted>
++  ): StoreConfig<TContext, TEventPayloadMap, TEmitted>;
++} = _createStoreConfig;
++
+ /**
+  * Creates a `Store` with a provided producer (such as Immer's `producer(…)` A
+  * store has its own internal state and can receive events.
+@@ -364,13 +414,18 @@ export function createStoreWithProducer<
+         enqueue: EnqueueObject<ExtractEvents<TEmittedPayloadMap>>
+       ) => void;
+     };
++    emits?: {
++      [K in keyof TEmittedPayloadMap & string]: (
++        payload: TEmittedPayloadMap[K]
++      ) => void;
++    };
+   }
+ ): Store<
+   TContext,
+   ExtractEvents<TEventPayloadMap>,
+   ExtractEvents<TEmittedPayloadMap>
+ > {
+-  return createStoreCore(config.context, config.on, producer);
++  return createStoreCore(config.context, config.on, config.emits, producer);
+ }
+ 
+ declare global {
+diff --git a/packages/xstate-store/src/types.ts b/packages/xstate-store/src/types.ts
+index edff42361e..c43103d2dd 100644
+--- a/packages/xstate-store/src/types.ts
++++ b/packages/xstate-store/src/types.ts
+@@ -113,6 +113,24 @@ export interface Store<
+   };
+ }
+ 
++export type StoreConfig<
++  TContext extends StoreContext,
++  TEventPayloadMap extends EventPayloadMap,
++  TEmitted extends EventPayloadMap
++> = {
++  context: TContext;
++  emits?: {
++    [K in keyof TEmitted & string]: (payload: TEmitted[K]) => void;
++  };
++  on: {
++    [K in keyof TEventPayloadMap & string]: StoreAssigner<
++      TContext,
++      { type: K } & TEventPayloadMap[K],
++      ExtractEvents<TEmitted>
++    >;
++  };
++};
++
+ export type IsEmptyObject<T> = T extends Record<string, never> ? true : false;
+ 
+ export type AnyStore = Store<any, any, any>;

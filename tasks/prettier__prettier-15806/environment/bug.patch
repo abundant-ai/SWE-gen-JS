@@ -1,0 +1,740 @@
+diff --git a/changelog_unreleased/javascript/15806.md b/changelog_unreleased/javascript/15806.md
+deleted file mode 100644
+index 8c14c4ebb..000000000
+--- a/changelog_unreleased/javascript/15806.md
++++ /dev/null
+@@ -1,51 +0,0 @@
+-#### Fix inconsistencies for optional-chaining (#15806 by @fisker)
+-
+-Only happens when using `typescript`, `meriyah` or other ESTree parsers except `babel`.
+-
+-<!-- prettier-ignore -->
+-```js
+-// Input
+-function someFunctionName() {
+-  return isEqual(a.map(([t, _]) => t?.id), b.map(([t, _]) => t?.id));
+-  return isEqual(a?.map(([t, _]) => t?.id), b?.map(([t, _]) => t?.id));
+-}
+-theValue = Object.entries(someLongObjectName).filter(
+-  ([listingId]) => someListToCompareToHere.includes(listingId),
+-);
+-theValue = Object.entries(someLongObjectName).filter(
+-  ([listingId]) => someListToCompareToHere?.includes(listingId),
+-);
+-
+-// Prettier stable
+-function someFunctionName() {
+-  return isEqual(
+-    a.map(([t, _]) => t?.id),
+-    b.map(([t, _]) => t?.id),
+-  );
+-  return isEqual(a?.map(([t, _]) => t?.id), b?.map(([t, _]) => t?.id));
+-}
+-theValue = Object.entries(someLongObjectName).filter(([listingId]) =>
+-  someListToCompareToHere.includes(listingId),
+-);
+-theValue = Object.entries(someLongObjectName).filter(
+-  ([listingId]) => someListToCompareToHere?.includes(listingId),
+-);
+-
+-// Prettier main
+-function someFunctionName() {
+-  return isEqual(
+-    a.map(([t, _]) => t?.id),
+-    b.map(([t, _]) => t?.id),
+-  );
+-  return isEqual(
+-    a?.map(([t, _]) => t?.id),
+-    b?.map(([t, _]) => t?.id),
+-  );
+-}
+-theValue = Object.entries(someLongObjectName).filter(([listingId]) =>
+-  someListToCompareToHere.includes(listingId),
+-);
+-theValue = Object.entries(someLongObjectName).filter(([listingId]) =>
+-  someListToCompareToHere?.includes(listingId),
+-);
+-```
+diff --git a/src/language-js/print/call-expression.js b/src/language-js/print/call-expression.js
+index ec1344fae..461e1f940 100644
+--- a/src/language-js/print/call-expression.js
++++ b/src/language-js/print/call-expression.js
+@@ -61,11 +61,7 @@ function printCallExpression(path, options, print) {
+     !isDynamicImport &&
+     !isNew &&
+     isMemberish(node.callee) &&
+-    !path.call(
+-      (path) => pathNeedsParens(path, options),
+-      "callee",
+-      ...(node.callee.type === "ChainExpression" ? ["expression"] : []),
+-    )
++    !path.call((path) => pathNeedsParens(path, options), "callee")
+   ) {
+     return printMemberChain(path, options, print);
+   }
+diff --git a/src/language-js/print/member-chain.js b/src/language-js/print/member-chain.js
+index a6c1dc325..18ba57e6f 100644
+--- a/src/language-js/print/member-chain.js
++++ b/src/language-js/print/member-chain.js
+@@ -50,14 +50,6 @@ import {
+ // MemberExpression and CallExpression. We need to traverse the AST
+ // and make groups out of it to print it in the desired way.
+ function printMemberChain(path, options, print) {
+-  /* c8 ignore next 6 */
+-  if (path.node.type === "ChainExpression") {
+-    return path.call(
+-      () => printMemberChain(path, options, print),
+-      "expression",
+-    );
+-  }
+-
+   const { parent } = path;
+   const isExpressionStatement =
+     !parent || parent.type === "ExpressionStatement";
+@@ -96,11 +88,6 @@ function printMemberChain(path, options, print) {
+ 
+   function rec(path) {
+     const { node } = path;
+-
+-    if (node.type === "ChainExpression") {
+-      return path.call(() => rec(path), "expression");
+-    }
+-
+     if (
+       isCallExpression(node) &&
+       (isMemberish(node.callee) || isCallExpression(node.callee))
+diff --git a/src/language-js/print/member.js b/src/language-js/print/member.js
+index 19a835c78..4dcc9735a 100644
+--- a/src/language-js/print/member.js
++++ b/src/language-js/print/member.js
+@@ -1,31 +1,19 @@
+ import { group, indent, label, softline } from "../../document/builders.js";
+ import {
+-  getCallArguments,
+   isCallExpression,
+   isMemberExpression,
+   isNumericLiteral,
+ } from "../utils/index.js";
+ import { printOptionalToken } from "./misc.js";
+ 
+-const isCallExpressionWithArguments = (node) => {
+-  if (node.type === "ChainExpression" || node.type === "TSNonNullExpression") {
+-    node = node.expression;
+-  }
+-  return isCallExpression(node) && getCallArguments(node).length > 0;
+-};
+-
+ function printMemberExpression(path, options, print) {
+   const objectDoc = print("object");
+   const lookupDoc = printMemberLookup(path, options, print);
+-  const { node } = path;
++  const { node, parent } = path;
+   const firstNonMemberParent = path.findAncestor(
+     (node) =>
+       !(isMemberExpression(node) || node.type === "TSNonNullExpression"),
+   );
+-  const firstNonChainElementWrapperParent = path.findAncestor(
+-    (node) =>
+-      !(node.type === "ChainExpression" || node.type === "TSNonNullExpression"),
+-  );
+ 
+   const shouldInline =
+     (firstNonMemberParent &&
+@@ -36,10 +24,13 @@ function printMemberExpression(path, options, print) {
+     node.computed ||
+     (node.object.type === "Identifier" &&
+       node.property.type === "Identifier" &&
+-      !isMemberExpression(firstNonChainElementWrapperParent)) ||
+-    ((firstNonChainElementWrapperParent.type === "AssignmentExpression" ||
+-      firstNonChainElementWrapperParent.type === "VariableDeclarator") &&
+-      (isCallExpressionWithArguments(node.object) ||
++      !isMemberExpression(parent)) ||
++    ((parent.type === "AssignmentExpression" ||
++      parent.type === "VariableDeclarator") &&
++      ((isCallExpression(node.object) && node.object.arguments.length > 0) ||
++        (node.object.type === "TSNonNullExpression" &&
++          isCallExpression(node.object.expression) &&
++          node.object.expression.arguments.length > 0) ||
+         objectDoc.label?.memberChain));
+ 
+   return label(objectDoc.label, [
+diff --git a/src/language-js/utils/create-type-check-function.js b/src/language-js/utils/create-type-check-function.js
+index 631f90e8e..d29b1176b 100644
+--- a/src/language-js/utils/create-type-check-function.js
++++ b/src/language-js/utils/create-type-check-function.js
+@@ -1,12 +1,5 @@
+-/** @typedef {import("../types/estree.js").Node} Node */
+-/** @typedef {import("../types/estree.js").Comment} Comment */
+-
+-/**
+- * @param {string[]} typesArray
+- * @returns {(node: Node | Comment) => Boolean}
+- */
+-function createTypeCheckFunction(typesArray) {
+-  const types = new Set(typesArray);
++function createTypeCheckFunction(types) {
++  types = new Set(types);
+   return (node) => types.has(node?.type);
+ }
+ 
+diff --git a/src/language-js/utils/index.js b/src/language-js/utils/index.js
+index 6c256c3c7..020f18d58 100644
+--- a/src/language-js/utils/index.js
++++ b/src/language-js/utils/index.js
+@@ -124,6 +124,10 @@ const isLineComment = createTypeCheckFunction([
+   "InterpreterDirective",
+ ]);
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isExportDeclaration = createTypeCheckFunction([
+   "ExportDefaultDeclaration",
+   "DeclareExportDeclaration",
+@@ -132,11 +136,19 @@ const isExportDeclaration = createTypeCheckFunction([
+   "DeclareExportAllDeclaration",
+ ]);
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isArrayOrTupleExpression = createTypeCheckFunction([
+   "ArrayExpression",
+   "TupleExpression",
+ ]);
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isObjectOrRecordExpression = createTypeCheckFunction([
+   "ObjectExpression",
+   "RecordExpression",
+@@ -179,6 +191,10 @@ function isRegExpLiteral(node) {
+   );
+ }
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isLiteral = createTypeCheckFunction([
+   "Literal",
+   "BooleanLiteral",
+@@ -191,6 +207,10 @@ const isLiteral = createTypeCheckFunction([
+   "StringLiteral",
+ ]);
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isSingleWordType = createTypeCheckFunction([
+   "Identifier",
+   "ThisExpression",
+@@ -200,12 +220,20 @@ const isSingleWordType = createTypeCheckFunction([
+   "Import",
+ ]);
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isObjectType = createTypeCheckFunction([
+   "ObjectTypeAnnotation",
+   "TSTypeLiteral",
+   "TSMappedType",
+ ]);
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isFunctionOrArrowExpression = createTypeCheckFunction([
+   "FunctionExpression",
+   "ArrowFunctionExpression",
+@@ -241,6 +269,10 @@ function isAngularTestWrapper(node) {
+   );
+ }
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isJsxElement = createTypeCheckFunction(["JSXElement", "JSXFragment"]);
+ 
+ function isGetterOrSetter(node) {
+@@ -282,6 +314,10 @@ function isTypeAnnotationAFunction(node) {
+   );
+ }
+ 
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
+ const isBinaryish = createTypeCheckFunction([
+   "BinaryExpression",
+   "LogicalExpression",
+@@ -402,22 +438,23 @@ function isTestCall(node, parent) {
+   return false;
+ }
+ 
+-/** @return {(node: Node) => boolean} */
+-const skipChainExpression = (fn) => (node) => {
+-  if (node?.type === "ChainExpression") {
+-    node = node.expression;
+-  }
+-
+-  return fn(node);
+-};
+-
+-const isCallExpression = skipChainExpression(
+-  createTypeCheckFunction(["CallExpression", "OptionalCallExpression"]),
+-);
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
++const isCallExpression = createTypeCheckFunction([
++  "CallExpression",
++  "OptionalCallExpression",
++]);
+ 
+-const isMemberExpression = skipChainExpression(
+-  createTypeCheckFunction(["MemberExpression", "OptionalMemberExpression"]),
+-);
++/**
++ * @param {Node} node
++ * @returns {boolean}
++ */
++const isMemberExpression = createTypeCheckFunction([
++  "MemberExpression",
++  "OptionalMemberExpression",
++]);
+ 
+ /**
+  *
+@@ -680,7 +717,7 @@ function isFunctionCompositionArgs(args) {
+         return true;
+       }
+     } else if (isCallExpression(arg)) {
+-      for (const childArg of getCallArguments(arg)) {
++      for (const childArg of arg.arguments) {
+         if (isFunctionOrArrowExpression(childArg)) {
+           return true;
+         }
+@@ -1013,10 +1050,6 @@ function getCallArguments(node) {
+     return callArgumentsCache.get(node);
+   }
+ 
+-  if (node.type === "ChainExpression") {
+-    return getCallArguments(node.expression);
+-  }
+-
+   let args = node.arguments;
+   if (node.type === "ImportExpression") {
+     args = [node.source];
+@@ -1038,14 +1071,6 @@ function getCallArguments(node) {
+ 
+ function iterateCallArgumentsPath(path, iteratee) {
+   const { node } = path;
+-
+-  if (node.type === "ChainExpression") {
+-    return path.call(
+-      () => iterateCallArgumentsPath(path, iteratee),
+-      "expression",
+-    );
+-  }
+-
+   if (node.type === "ImportExpression") {
+     path.call((sourcePath) => iteratee(sourcePath, 0), "source");
+ 
+@@ -1064,22 +1089,17 @@ function iterateCallArgumentsPath(path, iteratee) {
+ }
+ 
+ function getCallArgumentSelector(node, index) {
+-  const selectors = [];
+-  if (node.type === "ChainExpression") {
+-    selectors.push("expression");
+-  }
+-
+   if (node.type === "ImportExpression") {
+     if (index === 0 || index === (node.attributes || node.options ? -2 : -1)) {
+-      return [...selectors, "source"];
++      return "source";
+     }
+     // import attributes
+     if (node.attributes && (index === 1 || index === -1)) {
+-      return [...selectors, "attributes"];
++      return "attributes";
+     }
+     // deprecated import assertions
+     if (node.options && (index === 1 || index === -1)) {
+-      return [...selectors, "options"];
++      return "options";
+     }
+     throw new RangeError("Invalid argument index");
+   }
+@@ -1090,7 +1110,7 @@ function getCallArgumentSelector(node, index) {
+   if (index < 0 || index >= node.arguments.length) {
+     throw new RangeError("Invalid argument index");
+   }
+-  return [...selectors, "arguments", index];
++  return ["arguments", index];
+ }
+ 
+ function isPrettierIgnoreComment(comment) {
+diff --git a/tests/format/js/chain-expression/__snapshots__/jsfmt.spec.js.snap b/tests/format/js/chain-expression/__snapshots__/jsfmt.spec.js.snap
+index 4bd0c7234..0bda344cb 100644
+--- a/tests/format/js/chain-expression/__snapshots__/jsfmt.spec.js.snap
++++ b/tests/format/js/chain-expression/__snapshots__/jsfmt.spec.js.snap
+@@ -1,86 +1,5 @@
+ // Jest Snapshot v1, https://goo.gl/fbAQLP
+ 
+-exports[`issue-15785-1.js format 1`] = `
+-====================================options=====================================
+-parsers: ["babel", "typescript", "flow"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-function someFunctionName(
+-  someLongBreakingParameterName,
+-  anotherLongParameterName,
+-) {
+-  return isEqual(a?.map(([t, _]) => t?.id), b?.map(([t, _]) => t?.id));
+-  return isEqual(a.map(([t, _]) => t?.id), b.map(([t, _]) => t?.id));
+-}
+-
+-
+-=====================================output=====================================
+-function someFunctionName(
+-  someLongBreakingParameterName,
+-  anotherLongParameterName,
+-) {
+-  return isEqual(
+-    a?.map(([t, _]) => t?.id),
+-    b?.map(([t, _]) => t?.id),
+-  );
+-  return isEqual(
+-    a.map(([t, _]) => t?.id),
+-    b.map(([t, _]) => t?.id),
+-  );
+-}
+-
+-================================================================================
+-`;
+-
+-exports[`issue-15785-2.js format 1`] = `
+-====================================options=====================================
+-parsers: ["babel", "typescript", "flow"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-const theValue = Object.entries(someLongObjectName).filter(
+-  ([listingId]) => someListToCompareToHere?.includes(listingId),
+-);
+-const theValue2 = Object.entries(someLongObjectName).filter(
+-  ([listingId]) => someListToCompareToHere.includes(listingId),
+-);
+-
+-=====================================output=====================================
+-const theValue = Object.entries(someLongObjectName).filter(([listingId]) =>
+-  someListToCompareToHere?.includes(listingId),
+-);
+-const theValue2 = Object.entries(someLongObjectName).filter(([listingId]) =>
+-  someListToCompareToHere.includes(listingId),
+-);
+-
+-================================================================================
+-`;
+-
+-exports[`issue-15785-3.js format 1`] = `
+-====================================options=====================================
+-parsers: ["babel", "typescript", "flow"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-logger.log(
+-  \`A long template string with a conditional: \${channel?.id}, and then some more content that continues until \${JSON.stringify(location)}\`
+-);
+-logger.log(
+-  \`A long template string with a conditional: \${channel.id}, and then some more content that continues until \${JSON.stringify(location)}\`
+-);
+-
+-=====================================output=====================================
+-logger.log(
+-  \`A long template string with a conditional: \${channel?.id}, and then some more content that continues until \${JSON.stringify(location)}\`,
+-);
+-logger.log(
+-  \`A long template string with a conditional: \${channel.id}, and then some more content that continues until \${JSON.stringify(location)}\`,
+-);
+-
+-================================================================================
+-`;
+-
+ exports[`test.js format 1`] = `
+ ====================================options=====================================
+ parsers: ["babel", "typescript", "flow"]
+@@ -108,111 +27,3 @@ new (a?.())();
+ 
+ ================================================================================
+ `;
+-
+-exports[`test-2.js format 1`] = `
+-====================================options=====================================
+-parsers: ["babel", "typescript", "flow"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-{{{{
+-        const [lastCommittedX, lastCommittedY] =
+-          multiElement?.lastCommittedPoint ?? [0, 0];
+-}}}}
+-
+-=====================================output=====================================
+-{
+-  {
+-    {
+-      {
+-        const [lastCommittedX, lastCommittedY] =
+-          multiElement?.lastCommittedPoint ?? [0, 0];
+-      }
+-    }
+-  }
+-}
+-
+-================================================================================
+-`;
+-
+-exports[`test-3.js format 1`] = `
+-====================================options=====================================
+-parsers: ["babel", "typescript", "flow"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-function getLanguageByInterpreter(languages, file) {
+-  return languages.find((language) => language.interpreters?.includes(interpreter),
+-  );
+-  return languages.find((language) =>language.interpreters.includes(interpreter),
+-  );
+-}
+-
+-=====================================output=====================================
+-function getLanguageByInterpreter(languages, file) {
+-  return languages.find((language) =>
+-    language.interpreters?.includes(interpreter),
+-  );
+-  return languages.find((language) =>
+-    language.interpreters.includes(interpreter),
+-  );
+-}
+-
+-================================================================================
+-`;
+-
+-exports[`test-4.js format 1`] = `
+-====================================options=====================================
+-parsers: ["babel", "typescript", "flow"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-// https://github.com/marmelab/react-admin/blob/8c1ddfeb4e011a94609d709c0f4f139fb5d480e8/packages/ra-data-localstorage/src/index.ts#L112
+-export default (params) => {
+-    return {
+-        updateMany: (resource, params) => {
+-            updateLocalStorage(() => {
+-                params.ids.forEach(id => {
+-                    const index = data.data.data.data.data[resource]?.findIndex(
+-                        record => record.id == id
+-                    );
+-                    const index2 = data.data.data.data.data[resource].findIndex(
+-                        record => record.id == id
+-                    );
+-                    data[resource][index] = {
+-                        ...data[resource][index],
+-                        ...params.data,
+-                    };
+-                });
+-            });
+-            return baseDataProvider.updateMany(resource, params);
+-        },
+-    }
+-}
+-
+-=====================================output=====================================
+-// https://github.com/marmelab/react-admin/blob/8c1ddfeb4e011a94609d709c0f4f139fb5d480e8/packages/ra-data-localstorage/src/index.ts#L112
+-export default (params) => {
+-  return {
+-    updateMany: (resource, params) => {
+-      updateLocalStorage(() => {
+-        params.ids.forEach((id) => {
+-          const index = data.data.data.data.data[resource]?.findIndex(
+-            (record) => record.id == id,
+-          );
+-          const index2 = data.data.data.data.data[resource].findIndex(
+-            (record) => record.id == id,
+-          );
+-          data[resource][index] = {
+-            ...data[resource][index],
+-            ...params.data,
+-          };
+-        });
+-      });
+-      return baseDataProvider.updateMany(resource, params);
+-    },
+-  };
+-};
+-
+-================================================================================
+-`;
+diff --git a/tests/format/js/chain-expression/issue-15785-1.js b/tests/format/js/chain-expression/issue-15785-1.js
+deleted file mode 100644
+index b712e1101..000000000
+--- a/tests/format/js/chain-expression/issue-15785-1.js
++++ /dev/null
+@@ -1,8 +0,0 @@
+-function someFunctionName(
+-  someLongBreakingParameterName,
+-  anotherLongParameterName,
+-) {
+-  return isEqual(a?.map(([t, _]) => t?.id), b?.map(([t, _]) => t?.id));
+-  return isEqual(a.map(([t, _]) => t?.id), b.map(([t, _]) => t?.id));
+-}
+-
+diff --git a/tests/format/js/chain-expression/issue-15785-2.js b/tests/format/js/chain-expression/issue-15785-2.js
+deleted file mode 100644
+index 2579ceb83..000000000
+--- a/tests/format/js/chain-expression/issue-15785-2.js
++++ /dev/null
+@@ -1,6 +0,0 @@
+-const theValue = Object.entries(someLongObjectName).filter(
+-  ([listingId]) => someListToCompareToHere?.includes(listingId),
+-);
+-const theValue2 = Object.entries(someLongObjectName).filter(
+-  ([listingId]) => someListToCompareToHere.includes(listingId),
+-);
+diff --git a/tests/format/js/chain-expression/issue-15785-3.js b/tests/format/js/chain-expression/issue-15785-3.js
+deleted file mode 100644
+index b08e22591..000000000
+--- a/tests/format/js/chain-expression/issue-15785-3.js
++++ /dev/null
+@@ -1,6 +0,0 @@
+-logger.log(
+-  `A long template string with a conditional: ${channel?.id}, and then some more content that continues until ${JSON.stringify(location)}`
+-);
+-logger.log(
+-  `A long template string with a conditional: ${channel.id}, and then some more content that continues until ${JSON.stringify(location)}`
+-);
+diff --git a/tests/format/js/chain-expression/test-2.js b/tests/format/js/chain-expression/test-2.js
+deleted file mode 100644
+index 943ecac70..000000000
+--- a/tests/format/js/chain-expression/test-2.js
++++ /dev/null
+@@ -1,4 +0,0 @@
+-{{{{
+-        const [lastCommittedX, lastCommittedY] =
+-          multiElement?.lastCommittedPoint ?? [0, 0];
+-}}}}
+diff --git a/tests/format/js/chain-expression/test-3.js b/tests/format/js/chain-expression/test-3.js
+deleted file mode 100644
+index 5cd3432af..000000000
+--- a/tests/format/js/chain-expression/test-3.js
++++ /dev/null
+@@ -1,6 +0,0 @@
+-function getLanguageByInterpreter(languages, file) {
+-  return languages.find((language) => language.interpreters?.includes(interpreter),
+-  );
+-  return languages.find((language) =>language.interpreters.includes(interpreter),
+-  );
+-}
+diff --git a/tests/format/js/chain-expression/test-4.js b/tests/format/js/chain-expression/test-4.js
+deleted file mode 100644
+index 5f0843743..000000000
+--- a/tests/format/js/chain-expression/test-4.js
++++ /dev/null
+@@ -1,22 +0,0 @@
+-// https://github.com/marmelab/react-admin/blob/8c1ddfeb4e011a94609d709c0f4f139fb5d480e8/packages/ra-data-localstorage/src/index.ts#L112
+-export default (params) => {
+-    return {
+-        updateMany: (resource, params) => {
+-            updateLocalStorage(() => {
+-                params.ids.forEach(id => {
+-                    const index = data.data.data.data.data[resource]?.findIndex(
+-                        record => record.id == id
+-                    );
+-                    const index2 = data.data.data.data.data[resource].findIndex(
+-                        record => record.id == id
+-                    );
+-                    data[resource][index] = {
+-                        ...data[resource][index],
+-                        ...params.data,
+-                    };
+-                });
+-            });
+-            return baseDataProvider.updateMany(resource, params);
+-        },
+-    }
+-}
+diff --git a/tests/format/typescript/chain-expression/__snapshots__/jsfmt.spec.js.snap b/tests/format/typescript/chain-expression/__snapshots__/jsfmt.spec.js.snap
+index e8a4f7845..ca466a68c 100644
+--- a/tests/format/typescript/chain-expression/__snapshots__/jsfmt.spec.js.snap
++++ b/tests/format/typescript/chain-expression/__snapshots__/jsfmt.spec.js.snap
+@@ -19,42 +19,3 @@ printWidth: 80
+ 
+ ================================================================================
+ `;
+-
+-exports[`test2.ts format 1`] = `
+-====================================options=====================================
+-parsers: ["typescript"]
+-printWidth: 80
+-                                                                                | printWidth
+-=====================================input======================================
+-{{
+-    const rotation1 = getTransformHandles(arrow, h.state.zoom, 'mouse')
+-      .rotation!;
+-    const rotation2 = getTransformHandles(arrow, h.state.zoom, 'mouse')
+-      .rotation;
+-    const rotation3 = getTransformHandles(arrow, h.state.zoom, 'mouse')
+-      ?.rotation;
+-}}
+-
+-=====================================output=====================================
+-{
+-  {
+-    const rotation1 = getTransformHandles(
+-      arrow,
+-      h.state.zoom,
+-      "mouse",
+-    ).rotation!;
+-    const rotation2 = getTransformHandles(
+-      arrow,
+-      h.state.zoom,
+-      "mouse",
+-    ).rotation;
+-    const rotation3 = getTransformHandles(
+-      arrow,
+-      h.state.zoom,
+-      "mouse",
+-    )?.rotation;
+-  }
+-}
+-
+-================================================================================
+-`;
+diff --git a/tests/format/typescript/chain-expression/test2.ts b/tests/format/typescript/chain-expression/test2.ts
+deleted file mode 100644
+index 8adf4de8d..000000000
+--- a/tests/format/typescript/chain-expression/test2.ts
++++ /dev/null
+@@ -1,8 +0,0 @@
+-{{
+-    const rotation1 = getTransformHandles(arrow, h.state.zoom, 'mouse')
+-      .rotation!;
+-    const rotation2 = getTransformHandles(arrow, h.state.zoom, 'mouse')
+-      .rotation;
+-    const rotation3 = getTransformHandles(arrow, h.state.zoom, 'mouse')
+-      ?.rotation;
+-}}

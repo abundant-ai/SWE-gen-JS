@@ -1,0 +1,373 @@
+diff --git a/changelog_unreleased/javascript/17491.md b/changelog_unreleased/javascript/17491.md
+deleted file mode 100644
+index 5bddab05a..000000000
+--- a/changelog_unreleased/javascript/17491.md
++++ /dev/null
+@@ -1,15 +0,0 @@
+-#### Support type cast comments for acorn parser (#17491 by @ArnaudBarre)
+-
+-This was previously only supported by the Babel parser.
+-
+-<!-- prettier-ignore -->
+-```js
+-// Input
+-/** @type {MyType} */ (x).foo;
+-
+-// Prettier stable (--parser=acorn)
+-/** @type {MyType} */ x.foo;
+-
+-// Prettier main (--parser=acorn)
+-/** @type {MyType} */ (x).foo;
+-```
+diff --git a/src/language-js/clean.js b/src/language-js/clean.js
+index aa209a344..690fbda35 100644
+--- a/src/language-js/clean.js
++++ b/src/language-js/clean.js
+@@ -3,6 +3,7 @@ import {
+   isNumericLiteral,
+   isStringLiteral,
+ } from "./utils/index.js";
++import isBlockComment from "./utils/is-block-comment.js";
+ 
+ const ignoredProperties = new Set([
+   "range",
+@@ -26,7 +27,7 @@ const removeTemplateElementsValue = (node) => {
+   }
+ };
+ 
+-function clean(original, cloned) {
++function clean(original, cloned, parent) {
+   if (original.type === "Program") {
+     delete cloned.sourceType;
+   }
+@@ -172,12 +173,28 @@ function clean(original, cloned) {
+   ) {
+     removeTemplateElementsValue(cloned.quasi);
+   }
+-
+-  // TODO: Only delete value when there is leading comment which is exactly
+-  // `/* GraphQL */` or `/* HTML */`
+-  // Also see ./embed.js
+   if (original.type === "TemplateLiteral") {
+-    removeTemplateElementsValue(cloned);
++    // This checks for a leading comment that is exactly `/* GraphQL */`
++    // In order to be in line with other implementations of this comment tag
++    // we will not trim the comment value and we will expect exactly one space on
++    // either side of the GraphQL string
++    // Also see ./embed.js
++    const hasLanguageComment = original.leadingComments?.some(
++      (comment) =>
++        isBlockComment(comment) &&
++        ["GraphQL", "HTML"].some(
++          (languageName) => comment.value === ` ${languageName} `,
++        ),
++    );
++    if (
++      hasLanguageComment ||
++      (parent.type === "CallExpression" && parent.callee.name === "graphql") ||
++      // TODO: check parser
++      // `flow` and `typescript` don't have `leadingComments`
++      !original.leadingComments
++    ) {
++      removeTemplateElementsValue(cloned);
++    }
+   }
+ 
+   // We print `(a?.b!).c` as `(a?.b)!.c`, but `typescript` parse them differently
+diff --git a/src/language-js/parse/acorn.js b/src/language-js/parse/acorn.js
+index 654fa67dc..68f260d37 100644
+--- a/src/language-js/parse/acorn.js
++++ b/src/language-js/parse/acorn.js
+@@ -17,7 +17,6 @@ const parseOptions = {
+   allowSuperOutsideMethod: true,
+   locations: true,
+   ranges: true,
+-  preserveParens: true,
+ };
+ 
+ function createParseError(error) {
+diff --git a/src/language-js/parse/babel.js b/src/language-js/parse/babel.js
+index d9a68e157..f7e15bc65 100644
+--- a/src/language-js/parse/babel.js
++++ b/src/language-js/parse/babel.js
+@@ -27,7 +27,6 @@ const parseOptions = {
+   errorRecovery: true,
+   createParenthesizedExpressions: true,
+   createImportExpressions: true,
+-  attachComment: false,
+   plugins: [
+     // When adding a plugin, please add a test in `tests/format/js/babel-plugins`,
+     // To remove plugins, remove it here and run `yarn test tests/format/js/babel-plugins` to verify
+@@ -152,7 +151,7 @@ function createParse({ isExpression = false, optionsCombinations }) {
+       ast = wrapBabelExpression(ast, { text, rootMarker: options.rootMarker });
+     }
+ 
+-    return postprocess(ast, { text });
++    return postprocess(ast, { parser: "babel", text });
+   };
+ }
+ 
+diff --git a/src/language-js/parse/postprocess/index.js b/src/language-js/parse/postprocess/index.js
+index 02d593856..d00896f69 100644
+--- a/src/language-js/parse/postprocess/index.js
++++ b/src/language-js/parse/postprocess/index.js
+@@ -51,41 +51,22 @@ function postprocess(ast, options) {
+     comments.unshift(interpreter);
+   }
+ 
+-  if (isNonEmptyArray(ast.comments)) {
+-    let followingComment;
+-    for (let i = ast.comments.length - 1; i >= 0; i--) {
+-      const comment = ast.comments[i];
++  // Keep Babel's non-standard ParenthesizedExpression nodes only if they have Closure-style type cast comments.
++  if (parser === "babel") {
++    const startOffsetsOfTypeCastedNodes = new Set();
+ 
+-      if (
+-        followingComment &&
+-        locEnd(comment) === locStart(followingComment) &&
+-        isBlockComment(comment) &&
+-        isBlockComment(followingComment) &&
+-        isIndentableBlockComment(comment) &&
+-        isIndentableBlockComment(followingComment)
+-      ) {
+-        ast.comments.splice(i + 1, 1);
+-        comment.value += "*//*" + followingComment.value;
+-        comment.range = [locStart(comment), locEnd(followingComment)];
+-      }
++    // Comments might be attached not directly to ParenthesizedExpression but to its ancestor.
++    // E.g.: /** @type {Foo} */ (foo).bar();
++    // Let's use the fact that those ancestors and ParenthesizedExpression have the same start offset.
+ 
+-      /* c8 ignore next 3 */
+-      if (!isLineComment(comment) && !isBlockComment(comment)) {
+-        throw new TypeError(`Unknown comment type: "${comment.type}".`);
+-      }
+-
+-      /* c8 ignore next 3 */
+-      if (process.env.NODE_ENV !== "production") {
+-        assertComment(comment, text);
++    ast = visitNode(ast, (node) => {
++      if (node.leadingComments?.some(isTypeCastComment)) {
++        startOffsetsOfTypeCastedNodes.add(locStart(node));
+       }
++    });
+ 
+-      followingComment = comment;
+-    }
+-  }
+-
+-  ast = visitNode(ast, (node) => {
+-    switch (node.type) {
+-      case "ParenthesizedExpression": {
++    ast = visitNode(ast, (node) => {
++      if (node.type === "ParenthesizedExpression") {
+         const { expression } = node;
+ 
+         // Align range with `flow`
+@@ -94,24 +75,17 @@ function postprocess(ast, options) {
+           return expression;
+         }
+ 
+-        // Keep ParenthesizedExpression nodes only if they have Closure-style type cast comments.
+-        const nodeStart = locStart(node);
+-        const previousComment = ast.comments.findLast(
+-          (comment) => locEnd(comment) <= nodeStart,
+-        );
+-        const keepTypeCast =
+-          previousComment &&
+-          isTypeCastComment(previousComment) &&
+-          // check that there are only white spaces between the comment and the parenthesis
+-          text.slice(locEnd(previousComment), nodeStart).trim().length === 0;
+-
+-        if (!keepTypeCast) {
++        const start = locStart(node);
++        if (!startOffsetsOfTypeCastedNodes.has(start)) {
+           expression.extra = { ...expression.extra, parenthesized: true };
+           return expression;
+         }
+-        break;
+       }
++    });
++  }
+ 
++  ast = visitNode(ast, (node) => {
++    switch (node.type) {
+       case "LogicalExpression":
+         // We remove unneeded parens around same-operator LogicalExpressions
+         if (isUnbalancedLogicalTree(node)) {
+@@ -178,6 +152,37 @@ function postprocess(ast, options) {
+     }
+   });
+ 
++  if (isNonEmptyArray(ast.comments)) {
++    let followingComment;
++    for (let i = ast.comments.length - 1; i >= 0; i--) {
++      const comment = ast.comments[i];
++
++      if (
++        followingComment &&
++        locEnd(comment) === locStart(followingComment) &&
++        isBlockComment(comment) &&
++        isBlockComment(followingComment) &&
++        isIndentableBlockComment(comment) &&
++        isIndentableBlockComment(followingComment)
++      ) {
++        ast.comments.splice(i + 1, 1);
++        comment.value += "*//*" + followingComment.value;
++        comment.range = [locStart(comment), locEnd(followingComment)];
++      }
++
++      if (!isLineComment(comment) && !isBlockComment(comment)) {
++        throw new TypeError(`Unknown comment type: "${comment.type}".`);
++      }
++
++      /* c8 ignore next 3 */
++      if (process.env.NODE_ENV !== "production") {
++        assertComment(comment, text);
++      }
++
++      followingComment = comment;
++    }
++  }
++
+   // In `typescript`/`espree`/`flow`, `Program` doesn't count whitespace and comments
+   // See https://github.com/eslint/espree/issues/488
+   if (ast.type === "Program") {
+diff --git a/tests/config/run-format-test.js b/tests/config/run-format-test.js
+index e4ae5c103..b497d1bf5 100644
+--- a/tests/config/run-format-test.js
++++ b/tests/config/run-format-test.js
+@@ -63,7 +63,7 @@ const espreeDisabledTests = new Set(
+     "comments-closure-typecast",
+   ].map((directory) => path.join(__dirname, "../format/js", directory)),
+ );
+-const acornDisabledTests = new Set();
++const acornDisabledTests = espreeDisabledTests;
+ const meriyahDisabledTests = new Set([
+   ...espreeDisabledTests,
+   ...[
+diff --git a/tests/format/js/comments-closure-typecast/__snapshots__/format.test.js.snap b/tests/format/js/comments-closure-typecast/__snapshots__/format.test.js.snap
+index fae7b4d1a..795619367 100644
+--- a/tests/format/js/comments-closure-typecast/__snapshots__/format.test.js.snap
++++ b/tests/format/js/comments-closure-typecast/__snapshots__/format.test.js.snap
+@@ -215,7 +215,7 @@ var a =
+    * bla bla bla
+    */
+   //2
+-  window["s"].toString();
++  (window["s"]).toString();
+ console.log(a.foo());
+ 
+ ================================================================================
+@@ -361,14 +361,14 @@ const prop = /** @type {Object} */(myObject.property).someProp;
+ const test = /** @type (function (*): ?|undefined) */
+       (goog.partial(NewThing.onTemplateChange, rationaleField, typeField));
+ 
+-const foo1 = /** @type (function (*): ?|undefined) */ (goog.partial(NewThing.onTemplateChange, rationaleField, typeField));
++const test = /** @type (function (*): ?|undefined) */ (goog.partial(NewThing.onTemplateChange, rationaleField, typeField));
+ 
+ const model = /** @type {?{getIndex: Function}} */ (model);
+ 
+ const foo = /** @type {string} */
+   (bar);
+ 
+-const foo2 = /** @type (function (*): ?|undefined) */ (foo);
++const test = /** @type (function (*): ?|undefined) */ (foo);
+ 
+ =====================================output=====================================
+ /** @type {Object} */ (myObject.property).someProp = true;
+@@ -380,7 +380,7 @@ const test =
+   /** @type (function (*): ?|undefined) */
+   (goog.partial(NewThing.onTemplateChange, rationaleField, typeField));
+ 
+-const foo1 = /** @type (function (*): ?|undefined) */ (
++const test = /** @type (function (*): ?|undefined) */ (
+   goog.partial(NewThing.onTemplateChange, rationaleField, typeField)
+ );
+ 
+@@ -388,7 +388,7 @@ const model = /** @type {?{getIndex: Function}} */ (model);
+ 
+ const foo = /** @type {string} */ (bar);
+ 
+-const foo2 = /** @type (function (*): ?|undefined) */ (foo);
++const test = /** @type (function (*): ?|undefined) */ (foo);
+ 
+ ================================================================================
+ `;
+@@ -405,7 +405,7 @@ function jsdocCastInReturn() {
+   return /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */ (fooBarBaz);
+ }
+ 
+-const myLongVariableFoo1 = /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
++const myLongVariableName = /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
+       (fooBarBaz);
+ 
+ function jsdocCastInReturn() {
+@@ -413,7 +413,7 @@ function jsdocCastInReturn() {
+     (fooBarBaz));
+ }
+ 
+-const myLongVariableFoo2 = /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
++const myLongVariableName = /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
+       (fooBarBaz);
+ 
+ function jsdocCastInReturn() {
+@@ -431,7 +431,7 @@ function jsdocCastInReturn() {
+   );
+ }
+ 
+-const myLongVariableFoo1 =
++const myLongVariableName =
+   /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
+   (fooBarBaz);
+ 
+@@ -442,7 +442,7 @@ function jsdocCastInReturn() {
+   );
+ }
+ 
+-const myLongVariableFoo2 =
++const myLongVariableName =
+   /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
+   (fooBarBaz);
+ 
+diff --git a/tests/format/js/comments-closure-typecast/issue-4124.js b/tests/format/js/comments-closure-typecast/issue-4124.js
+index 44c9ce127..da87ba6ba 100644
+--- a/tests/format/js/comments-closure-typecast/issue-4124.js
++++ b/tests/format/js/comments-closure-typecast/issue-4124.js
+@@ -6,11 +6,11 @@ const prop = /** @type {Object} */(myObject.property).someProp;
+ const test = /** @type (function (*): ?|undefined) */
+       (goog.partial(NewThing.onTemplateChange, rationaleField, typeField));
+ 
+-const foo1 = /** @type (function (*): ?|undefined) */ (goog.partial(NewThing.onTemplateChange, rationaleField, typeField));
++const test = /** @type (function (*): ?|undefined) */ (goog.partial(NewThing.onTemplateChange, rationaleField, typeField));
+ 
+ const model = /** @type {?{getIndex: Function}} */ (model);
+ 
+ const foo = /** @type {string} */
+   (bar);
+ 
+-const foo2 = /** @type (function (*): ?|undefined) */ (foo);
++const test = /** @type (function (*): ?|undefined) */ (foo);
+diff --git a/tests/format/js/comments-closure-typecast/issue-8045.js b/tests/format/js/comments-closure-typecast/issue-8045.js
+index ee1400285..02c7fb2c7 100644
+--- a/tests/format/js/comments-closure-typecast/issue-8045.js
++++ b/tests/format/js/comments-closure-typecast/issue-8045.js
+@@ -4,7 +4,7 @@ function jsdocCastInReturn() {
+   return /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */ (fooBarBaz);
+ }
+ 
+-const myLongVariableFoo1 = /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
++const myLongVariableName = /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
+       (fooBarBaz);
+ 
+ function jsdocCastInReturn() {
+@@ -12,7 +12,7 @@ function jsdocCastInReturn() {
+     (fooBarBaz));
+ }
+ 
+-const myLongVariableFoo2 = /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
++const myLongVariableName = /** @type {ThisIsAVeryLongTypeThatShouldTriggerLineWrapping} */
+       (fooBarBaz);
+ 
+ function jsdocCastInReturn() {
