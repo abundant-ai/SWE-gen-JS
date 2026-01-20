@@ -25,13 +25,13 @@
 Install [**Harbor**](https://github.com/laude-institute/harbor):
 
 ```shell
-uv pip install harbor
+uv tool install harbor
 ```
 
 Run the dataset oracle solutions to verify setup:
 
 ```shell
-uv run harbor run --dataset swe-gen-js \
+harbor run --dataset swe-gen-js \
    --agent oracle \
    --n-concurrent 4 
 ```
@@ -42,7 +42,7 @@ Run with Codex:
 
 ```shell
 export OPENAI_API_KEY=<YOUR-KEY> 
-uv run harbor run --dataset swe-gen-js \
+harbor run --dataset swe-gen-js \
    --agent codex \
    --model openai/gpt-5.2-codex \
    --n-concurrent 4
