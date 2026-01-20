@@ -11,7 +11,7 @@
 ############################################################################
 ```
 
-> 1000 JS/TS tasks generated from 30 open-source GitHub repos using [SWE-gen](https://github.com/abundant-ai/taskgen).
+> 1000 JS/TS tasks generated from 30 open-source GitHub repos using [SWE-gen](https://github.com/abundant-ai/SWE-gen).
 
 ## Each task
 - is a merged GitHub PR with linked Issues
