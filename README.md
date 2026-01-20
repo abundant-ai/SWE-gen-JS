@@ -47,3 +47,7 @@ harbor run --dataset swe-gen-js \
    --model openai/gpt-5.2-codex \
    --n-concurrent 4
 ```
+
+<p align="center">
+  <img src="assets/pie_chart.png" style="height: 20em" alt="SWE-gen JS pie chart" />
+</p>
