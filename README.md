@@ -1,15 +1,10 @@
 # SWE-gen JS
 
-```
-############################################################################
-#   ______       _________        ____ ____  ____      ____ ______         #
-#  / ___/ |     / / ____/  _____  / __ `/ _ \/ __ \      / // ___/         #
-#  \__ \| | /| / / __/    /____/ / /_/ /  __/ / / /     / / \__ \          #
-# ___/ /| |/ |/ / /___          \__, /\___/_/ /_/  |\__/ / ___/ /          #
-#/____/ |__/|__/_____/         /____/              \___/  /____/           #
-#                                                                          #
-############################################################################
-```
+<p align="center">
+  <a href="https://github.com/abundant-ai/SWE-gen-JS">
+    <img src="assets/swegen-js-banner.jpg" style="height: 10em" alt="SWE-gen JS banner" />
+  </a>
+</p>
 
 > 1000 JS/TS tasks generated from 30 open-source GitHub repos using [SWE-gen](https://github.com/abundant-ai/SWE-gen).
 
